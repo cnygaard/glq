@@ -223,6 +223,24 @@ class E8ShellCodebook:
                 best_nmse, best_rs = nmse, rs
         return best_rs
 
+    def make_small(self, n_entries=256):
+        """Create a small codebook from the first n_entries vectors (shells 0-1).
+
+        Used as the secondary codebook for 3bpw two-stage quantization.
+        256 entries = 8 bits -> 24 bits / 8 dims = 3bpw.
+        """
+        assert n_entries <= self.CODEBOOK_SIZE
+        small_cb = self.codebook[:n_entries].clone()
+        obj = object.__new__(type(self))
+        obj.codebook = small_cb.to(self.device)
+        obj.codebook_norms = (obj.codebook ** 2).sum(-1)
+        obj.codesz = self.DIM
+        obj.device = self.device
+        obj.opt_scale = obj._compute_opt_scale()
+        obj.resid_scale = 1.0  # not used for small codebook
+        obj.CODEBOOK_SIZE = n_entries
+        return obj
+
     def to(self, device):
         """Move codebook tensors to a device. Returns a new instance."""
         return self.from_precomputed(

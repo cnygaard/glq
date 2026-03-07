@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from .codebook import E8ShellCodebook
 from .rht import RHT
-from .ldlq import quantize_ldlq_codebook, quantize_ldlq_codebook_rvq
+from .ldlq import quantize_ldlq_codebook, quantize_ldlq_codebook_2stage
 
 
 # ---- Hessian capture ----
@@ -130,7 +130,9 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
     if bpw == 2:
         result = quantize_ldlq_codebook(W_pad, H_pad, codebook, tune_iters=tune_iters)
     else:
-        result = quantize_ldlq_codebook_rvq(W_pad, H_pad, codebook, tune_iters=tune_iters)
+        result = quantize_ldlq_codebook_2stage(
+            W_pad, H_pad, codebook, codebook,
+            resid_scale=codebook.resid_scale, tune_iters=tune_iters)
 
     # Dequantize for error propagation
     W_hat_tilde = result['W_hat'][:, :n_tilde]

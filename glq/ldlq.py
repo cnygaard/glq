@@ -1,5 +1,6 @@
 """Block LDL decomposition and LDLQ codebook quantization."""
 
+import math
 import torch
 from typing import Tuple, Optional
 
@@ -114,19 +115,33 @@ def quantize_ldlq_codebook(
     }
 
 
-def quantize_ldlq_codebook_rvq(
+def quantize_ldlq_codebook_2stage(
     W: torch.Tensor,
     H: torch.Tensor,
-    codebook,
+    codebook1,
+    codebook2,
+    resid_scale: float,
     tune_iters: int = 0,
     Wscale: Optional[float] = None,
 ):
     """
-    LDLQ with two-stage RVQ codebook — 4 bpw (32 bits / 8 dims).
+    Two-stage LDLQ: primary codebook + secondary codebook on residual.
+
+    For 4bpw: codebook1 = codebook2 = E8 full (65536 entries), 32 bits / 8 dims.
+    For 3bpw: codebook1 = E8 full, codebook2 = E8 small (256 entries), 24 bits / 8 dims.
+
+    Args:
+        W: (m, n) weight matrix. n must be divisible by codebook1.codesz.
+        H: (n, n) Hessian.
+        codebook1: primary codebook (E8ShellCodebook, 65536 entries).
+        codebook2: secondary codebook for residual.
+        resid_scale: scale factor for residual before stage-2 quantization.
+        tune_iters: extra refinement passes.
+        Wscale: global scale. If None, computed from rms(W)/opt_scale.
     """
-    device = codebook.device
+    device = codebook1.device
     m, n = W.shape
-    b = codebook.codesz
+    b = codebook1.codesz
     assert n % b == 0
     num_blocks = n // b
 
@@ -139,10 +154,12 @@ def quantize_ldlq_codebook_rvq(
 
     if Wscale is None:
         W_rms = W.pow(2).mean().sqrt().item()
-        Wscale = W_rms / codebook.opt_scale if W_rms > 1e-10 else 1.0
+        Wscale = W_rms / codebook1.opt_scale if W_rms > 1e-10 else 1.0
 
     Wr = W / Wscale
     hatWr = torch.zeros_like(Wr)
+    all_indices1 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
+    all_indices2 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
 
     for k in reversed(range(num_blocks)):
         kb, ke = k * b, (k + 1) * b
@@ -150,29 +167,51 @@ def quantize_ldlq_codebook_rvq(
             feedback = (Wr[:, ke:] - hatWr[:, ke:]) @ L[ke:, kb:ke]
         else:
             feedback = 0.0
-        WXWX = Wr[:, kb:ke] + feedback
-        hatWr[:, kb:ke], _ = codebook.quantize_rvq(WXWX)
+        target = Wr[:, kb:ke] + feedback
+
+        dec1, idx1 = codebook1.quantize(target)
+        all_indices1[:, k] = idx1
+
+        residual = target - dec1
+        dec2, idx2 = codebook2.quantize(residual * resid_scale)
+        all_indices2[:, k] = idx2
+
+        hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
 
     for _ in range(tune_iters):
         for k in reversed(range(num_blocks)):
             kb, ke = k * b, (k + 1) * b
-            residual = Wr - hatWr
+            residual_full = Wr - hatWr
             H_col = H_reg[:, kb:ke]
             H_diag_inv = torch.linalg.inv(H_reg[kb:ke, kb:ke])
-            feedback = residual @ H_col @ H_diag_inv
-            WXWX = hatWr[:, kb:ke] + feedback
-            hatWr[:, kb:ke], _ = codebook.quantize_rvq(WXWX)
+            feedback = residual_full @ H_col @ H_diag_inv
+            target = hatWr[:, kb:ke] + feedback
+
+            dec1, idx1 = codebook1.quantize(target)
+            all_indices1[:, k] = idx1
+
+            residual = target - dec1
+            dec2, idx2 = codebook2.quantize(residual * resid_scale)
+            all_indices2[:, k] = idx2
+
+            hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
 
     W_hat = hatWr * Wscale
 
     quant_mse = ((W - W_hat) ** 2).mean().item()
     diff = W - W_hat
     proxy_loss = (diff @ H @ diff.T).diagonal().mean().item()
-    bpw = 32.0 / b + 32.0 / (m * n)
+
+    cb2_size = codebook2.codebook.shape[0]
+    bits2 = math.ceil(math.log2(cb2_size)) if cb2_size > 1 else 0
+    bpw = (16 + bits2) / b + 32.0 / (m * n)
 
     return {
         'W_hat': W_hat,
+        'indices1': all_indices1,
+        'indices2': all_indices2,
         'Wscale': Wscale,
+        'resid_scale': resid_scale,
         'bpw': bpw,
         'quant_mse': quant_mse,
         'proxy_loss': proxy_loss,
