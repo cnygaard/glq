@@ -34,7 +34,7 @@ $SSH "source ~/venv/bin/activate && \
 
 echo "=== Installing llm-compressor + deps ==="
 $SSH "source ~/venv/bin/activate && \
-    pip install --quiet 'llmcompressor>=0.5' transformers datasets accelerate sentencepiece protobuf"
+    pip install --quiet 'llmcompressor>=0.5' transformers datasets accelerate sentencepiece protobuf triton fast-hadamard-transform"
 
 echo "=== Syncing code ==="
 eval $RSYNC "$PROJ/glq/" "ubuntu@$IP:~/golay-leech-quant/glq/"

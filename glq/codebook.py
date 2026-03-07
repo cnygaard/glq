@@ -1,9 +1,18 @@
 """E8 lattice shell codebook for 2bpw quantization."""
 
 import math
+import os
 import time
 import torch
 from typing import Tuple
+
+_BUNDLED_CODEBOOK = os.path.join(os.path.dirname(__file__), 'e8_codebook.pt')
+
+try:
+    import triton  # noqa: F401
+    _triton_available = True
+except ImportError:
+    _triton_available = False
 
 
 def e8_basis() -> Tuple[torch.Tensor, torch.Tensor]:
@@ -139,6 +148,9 @@ class E8ShellCodebook:
 
         self.codebook = vecs.float().to(device)
         self.codebook_norms = (self.codebook ** 2).sum(-1)
+        self.codebook_half = self.codebook.half()
+        self.codebook_half_t = self.codebook_half.T.contiguous()
+        self.codebook_norms_half = self.codebook_norms.half()
         self.codesz = self.DIM
         self.device = device
 
@@ -156,25 +168,50 @@ class E8ShellCodebook:
         obj = object.__new__(cls)
         obj.codebook = codebook_tensor.float().to(device)
         obj.codebook_norms = (obj.codebook ** 2).sum(-1)
+        obj.codebook_half = obj.codebook.half()
+        obj.codebook_half_t = obj.codebook_half.T.contiguous()
+        obj.codebook_norms_half = obj.codebook_norms.half()
         obj.codesz = cls.DIM
         obj.device = device
         obj.opt_scale = opt_scale if opt_scale is not None else obj._compute_opt_scale()
         obj.resid_scale = resid_scale if resid_scale is not None else obj._compute_resid_scale()
         return obj
 
-    def quantize(self, x, _batch_size=4096):
-        """Nearest-neighbour lookup via batch matmul."""
+    def quantize(self, x, _batch_size=16384):
+        """Nearest-neighbour lookup. Uses Triton kernel on CUDA, fp16 matmul fallback."""
+        if x.is_cuda and _triton_available:
+            return self._quantize_triton(x)
+        return self._quantize_pytorch(x, _batch_size)
+
+    def _quantize_triton(self, x):
+        """Fused codebook NN via Triton kernel (no intermediate distance matrix)."""
+        from .codebook_kernel import triton_codebook_nn
+        indices = triton_codebook_nn(x, self.codebook, self.codebook_norms)
+        return self.codebook[indices], indices
+
+    def _quantize_pytorch(self, x, _batch_size=16384):
+        """Batched fp16 matmul + argmin fallback."""
+        use_half = x.is_cuda
+        if use_half:
+            cb_t = self.codebook_half_t
+            cb_norms = self.codebook_norms_half
+        else:
+            cb_t = self.codebook.T
+            cb_norms = self.codebook_norms
+
         if x.shape[0] <= _batch_size:
-            dots = x @ self.codebook.T
-            dists = -2.0 * dots + self.codebook_norms
+            xq = x.half() if use_half else x
+            dots = xq @ cb_t
+            dists = -2.0 * dots + cb_norms
             indices = dists.argmin(dim=-1)
             return self.codebook[indices], indices
 
         all_indices = []
         for start in range(0, x.shape[0], _batch_size):
             chunk = x[start:start + _batch_size]
-            dots = chunk @ self.codebook.T
-            dists = -2.0 * dots + self.codebook_norms
+            xq = chunk.half() if use_half else chunk
+            dots = xq @ cb_t
+            dists = -2.0 * dots + cb_norms
             all_indices.append(dists.argmin(dim=-1))
         indices = torch.cat(all_indices)
         return self.codebook[indices], indices
@@ -234,12 +271,24 @@ class E8ShellCodebook:
         obj = object.__new__(type(self))
         obj.codebook = small_cb.to(self.device)
         obj.codebook_norms = (obj.codebook ** 2).sum(-1)
+        obj.codebook_half = obj.codebook.half()
+        obj.codebook_half_t = obj.codebook_half.T.contiguous()
+        obj.codebook_norms_half = obj.codebook_norms.half()
         obj.codesz = self.DIM
         obj.device = self.device
         obj.opt_scale = obj._compute_opt_scale()
         obj.resid_scale = 1.0  # not used for small codebook
         obj.CODEBOOK_SIZE = n_entries
         return obj
+
+    @classmethod
+    def build(cls, device='cpu', verbose=True):
+        """Fast constructor: load from bundled file if available, else enumerate."""
+        if os.path.exists(_BUNDLED_CODEBOOK):
+            if verbose:
+                print(f"E8ShellCodebook: loading from {_BUNDLED_CODEBOOK}")
+            return cls.load(_BUNDLED_CODEBOOK, device=device)
+        return cls(device=device, verbose=verbose)
 
     def to(self, device):
         """Move codebook tensors to a device. Returns a new instance."""

@@ -29,10 +29,9 @@ def block_LDL(H: torch.Tensor, block_size: int = 8) -> Tuple[torch.Tensor, torch
     D = DL @ DL.permute(0, 2, 1)
 
     DL_inv = torch.linalg.inv(DL)
-    L = L_chol.reshape(n, m, b).clone()
-    for i in range(m):
-        L[:, i, :] = L[:, i, :] @ DL_inv[i]
-    L = L.reshape(n, n)
+    # L_chol reshaped: (n, m, b). Multiply each block column by DL_inv[i].
+    # L[:, i, :] @ DL_inv[i] for all i simultaneously via einsum.
+    L = torch.einsum('nib,ibj->nij', L_chol.reshape(n, m, b), DL_inv).reshape(n, n)
 
     return L, D
 
