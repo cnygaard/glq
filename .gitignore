@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets / credentials
+*.pem
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Infrastructure (not published)
+infra/
+
+# Cloned repos (local development only)
+GPTQModel/
+QuIP/
+bsq-vit/
+llm-compressor/
+quip-sharp/
+transformers/
+vllm/
+
+# Model outputs
+smollm2-*/
+*-glq-*/
+
+# Logs and results
+*.log
+*.out
+
+# Misc
+.claude/
+research.txt
+results.txt
+compass_artifact_*

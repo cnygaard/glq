@@ -5,8 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "glq"
 version = "0.1.0"
+description = "E8 lattice codebook quantization for LLM weights"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.0"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+cuda = ["triton", "fast-hadamard-transform"]
+quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepiece"]
+
+[project.scripts]
+glq-quantize = "glq.quantize_model:main"
 
 [tool.setuptools.packages.find]
 include = ["glq*"]
+
+[tool.setuptools.package-data]
+glq = ["*.pt"]

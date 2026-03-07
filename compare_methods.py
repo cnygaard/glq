@@ -717,7 +717,7 @@ def main():
         proc = subprocess.run(
             [sys.executable, "-u", script_path,
              "--run", method, str(bits), str(gs), result_file],
-            timeout=1800,
+            timeout=3600,
         )
 
         if os.path.exists(result_file):
@@ -737,7 +737,8 @@ def main():
 
     # Print comparison table
     print(f"\n\n{'='*80}")
-    print(f"  COMPARISON: SmolLM2-360M on WikiText-2  (GPU: {torch.cuda.get_device_name()})")
+    model_short = MODEL_ID.split("/")[-1]
+    print(f"  COMPARISON: {model_short} on WikiText-2  (GPU: {torch.cuda.get_device_name()})")
     print(f"  (Linear weight params: {n_params:,})")
     print(f"{'='*80}")
     hdr = f"{'Method':<18} {'Size(MB)':>9} {'Eff.BPW':>8} {'PPL':>10} {'GPU MB':>8} {'Time(s)':>8}"
