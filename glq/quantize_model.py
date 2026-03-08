@@ -119,6 +119,11 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
     W_f = W.float().to(dev)
     H_f = H.float().to(dev)
 
+    # Dampen Hessian diagonal for numerical stability
+    damp = 0.01 * torch.mean(torch.diag(H_f))
+    diag = torch.arange(H_f.shape[-1], device=dev)
+    H_f[diag, diag] += damp
+
     rht = RHT(m, n, device=dev)
     W_tilde = rht.transform_weights(W_f)
     H_tilde = rht.transform_hessian(H_f)
