@@ -69,6 +69,20 @@ quantize(
 )
 ```
 
+### Loading a quantized model
+
+```python
+import glq.hf_integration  # registers GLQ with transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("./smollm2-glq-2bpw", device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("./smollm2-glq-2bpw")
+
+inputs = tokenizer("The capital of France is", return_tensors="pt").to(model.device)
+output = model.generate(**inputs, max_new_tokens=50)
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+```
+
 ### Bit widths
 
 | BPW | Encoding | Overhead |
