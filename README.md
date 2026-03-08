@@ -48,8 +48,8 @@ Triton (for the fused codebook kernel) is bundled with PyTorch on CUDA and will 
 
 ```bash
 glq-quantize \
-    --model HuggingFaceTB/SmolLM3-3B-Base \
-    --output ./smollm3-glq-2bpw \
+    --model HuggingFaceTB/SmolLM2-360M \
+    --output ./smollm2-glq-2bpw \
     --bpw 2 \
     --nsamples 128 \
     --device cuda
@@ -61,8 +61,8 @@ glq-quantize \
 from glq import quantize
 
 quantize(
-    model_name="HuggingFaceTB/SmolLM3-3B-Base",
-    output_dir="./smollm3-glq-2bpw",
+    model_name="HuggingFaceTB/SmolLM2-360M",
+    output_dir="./smollm2-glq-2bpw",
     bpw=2,
     nsamples=128,
     device="cuda",
