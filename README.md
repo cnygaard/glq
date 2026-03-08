@@ -30,17 +30,17 @@ GLQ uses a single global scale per layer rather than per-group scales, so effect
 
 ## Install
 
+Requires Python 3.10+ and PyTorch 2.0+. Install PyTorch first ([pytorch.org](https://pytorch.org/get-started/locally/)), then:
+
 ```bash
+# Core package (codebook + quantization):
+pip install 'glq[quantize] @ git+https://github.com/cnygaard/glq.git'
+
+# Or minimal install (no transformers/datasets):
 pip install git+https://github.com/cnygaard/glq.git
-
-# For GPU acceleration (Triton codebook kernel):
-pip install git+https://github.com/cnygaard/glq.git#egg=glq[cuda]
-
-# With quantization dependencies (transformers, datasets, etc.):
-pip install git+https://github.com/cnygaard/glq.git#egg=glq[quantize]
 ```
 
-Requires Python 3.10+ and PyTorch 2.0+.
+Triton (for the fused codebook kernel) is bundled with PyTorch on CUDA and will be used automatically.
 
 ## Quickstart
 
