@@ -25,8 +25,8 @@ def _load_artifacts_into_layer(layer, artifacts, codebook, codebook2=None):
     layer.SV.copy_(artifacts['SV'])
     layer.Wscale.copy_(artifacts['Wscale'])
     if 'Qidxs2' in artifacts:
-        layer.Qidxs2 = artifacts['Qidxs2']
-        layer.inv_resid_scale = artifacts['inv_resid_scale']
+        layer.Qidxs2.copy_(artifacts['Qidxs2'])
+        layer.inv_resid_scale.copy_(artifacts['inv_resid_scale'])
     layer.set_codebook(codebook, codebook2=codebook2)
 
 

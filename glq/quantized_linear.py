@@ -48,9 +48,10 @@ class E8RHTLinear(nn.Module):
         self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
         self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
 
-        # Optional 3/4bpw two-stage buffers
-        self.register_buffer('Qidxs2', None)
-        self.register_buffer('inv_resid_scale', None)
+        # Two-stage buffers for 3/4bpw (always allocated so state_dict loading works)
+        self.register_buffer('Qidxs2', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
+        self.register_buffer('inv_resid_scale', torch.zeros((), dtype=torch.float32))
+        self._has_stage2 = False  # set True when loaded with actual two-stage data
 
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=torch.float16))
@@ -65,6 +66,12 @@ class E8RHTLinear(nn.Module):
         """Attach the shared E8ShellCodebook(s) (called after weight loading)."""
         self.codebook = codebook
         self.codebook2 = codebook2
+        # Detect two-stage from inv_resid_scale (non-zero means 3/4bpw data was loaded)
+        self._has_stage2 = (
+            codebook2 is not None
+            and self.inv_resid_scale is not None
+            and self.inv_resid_scale.abs().item() > 0
+        )
 
     def _ensure_codebook_device(self):
         """Move codebook(s) to match Qidxs device (lazy, once)."""
@@ -94,15 +101,16 @@ class E8RHTLinear(nn.Module):
         x_rht = fast_hadamard_transform(x_pad * sv.unsqueeze(0))
 
         # Dequant + matmul in RHT domain
+        has_stage2 = self._has_stage2
         if x_rht.is_cuda and _triton_available:
             from .inference_kernel import glq_dequant_matmul
-            cb2_tensor = self.codebook2.codebook_half if self.codebook2 is not None else None
-            inv_rs = self.inv_resid_scale.item() if self.inv_resid_scale is not None else 0.0
+            cb2_tensor = self.codebook2.codebook_half if has_stage2 else None
+            inv_rs = self.inv_resid_scale.item() if has_stage2 else 0.0
             y_rht = glq_dequant_matmul(
                 x_rht, self.Qidxs,
                 self.codebook.codebook_half,
                 self.Wscale.item(),
-                Qidxs2=self.Qidxs2,
+                Qidxs2=self.Qidxs2 if has_stage2 else None,
                 codebook2=cb2_tensor,
                 inv_resid_scale=inv_rs,
             )
@@ -110,7 +118,7 @@ class E8RHTLinear(nn.Module):
             # Fallback: materialize W then matmul
             W_rht = self.codebook.decode(self.Qidxs.long().reshape(-1))
             W_rht = W_rht.reshape(self.m_pad, self.n_pad)
-            if self.Qidxs2 is not None and self.codebook2 is not None:
+            if has_stage2:
                 W_rht2 = self.codebook2.decode(self.Qidxs2.long().reshape(-1))
                 W_rht2 = W_rht2.reshape(self.m_pad, self.n_pad)
                 W_rht = W_rht + W_rht2 * self.inv_resid_scale.item()
@@ -135,7 +143,7 @@ class E8RHTLinear(nn.Module):
         self._ensure_codebook_device()
         W_rht = self.codebook.decode(self.Qidxs.long().reshape(-1))
         W_rht = W_rht.reshape(self.m_pad, self.n_pad)
-        if self.Qidxs2 is not None and self.codebook2 is not None:
+        if self._has_stage2:
             W_rht2 = self.codebook2.decode(self.Qidxs2.long().reshape(-1))
             W_rht2 = W_rht2.reshape(self.m_pad, self.n_pad)
             W_rht = W_rht + W_rht2 * self.inv_resid_scale.item()

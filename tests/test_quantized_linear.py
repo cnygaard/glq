@@ -44,10 +44,12 @@ class TestConstruction:
         layer = E8RHTLinear(32, 16, bias=False)
         assert layer.bias is None
 
-    def test_optional_buffers_none_by_default(self):
+    def test_stage2_buffers_zero_by_default(self):
         layer = E8RHTLinear(32, 16)
-        assert layer.Qidxs2 is None
-        assert layer.inv_resid_scale is None
+        assert layer.Qidxs2.shape == layer.Qidxs.shape
+        assert layer.Qidxs2.abs().max() == 0
+        assert layer.inv_resid_scale.item() == 0.0
+        assert layer._has_stage2 is False
 
     def test_extra_repr(self):
         layer = E8RHTLinear(48, 32)
@@ -168,16 +170,21 @@ class TestForward:
         torch.testing.assert_close(y1, y2)
 
 
+def _setup_two_stage(layer, codebook2, K2=256):
+    """Helper: fill Qidxs2/inv_resid_scale then call set_codebook to detect stage2."""
+    m_pad, n_blocks = layer.Qidxs.shape
+    layer.Qidxs2.copy_(torch.randint(0, K2, (m_pad, n_blocks), dtype=torch.int32).to(torch.int16))
+    layer.inv_resid_scale.fill_(1.0 / layer.codebook.resid_scale if layer.codebook else 1.0)
+
+
 class TestTwoStage:
     def test_3bpw_forward(self, codebook, codebook_small):
         """3bpw forward with secondary codebook."""
         layer = E8RHTLinear(64, 32)
+        layer.set_codebook(codebook)
+        layer.inv_resid_scale.fill_(1.0 / codebook.resid_scale)
+        _setup_two_stage(layer, codebook_small, K2=256)
         layer.set_codebook(codebook, codebook2=codebook_small)
-
-        # Set up two-stage buffers
-        m_pad, n_blocks = layer.Qidxs.shape
-        layer.Qidxs2 = torch.randint(0, 256, (m_pad, n_blocks), dtype=torch.int16)
-        layer.inv_resid_scale = torch.tensor(1.0 / codebook.resid_scale, dtype=torch.float32)
 
         x = torch.randn(4, 64)
         y = layer(x)
@@ -186,11 +193,9 @@ class TestTwoStage:
     def test_3bpw_dequantize(self, codebook, codebook_small):
         """3bpw dequantize returns correct shape."""
         layer = E8RHTLinear(64, 32)
+        layer.set_codebook(codebook)
+        _setup_two_stage(layer, codebook_small, K2=256)
         layer.set_codebook(codebook, codebook2=codebook_small)
-
-        m_pad, n_blocks = layer.Qidxs.shape
-        layer.Qidxs2 = torch.randint(0, 256, (m_pad, n_blocks), dtype=torch.int16)
-        layer.inv_resid_scale = torch.tensor(1.0 / codebook.resid_scale, dtype=torch.float32)
 
         W = layer.dequantize()
         assert W.shape == (32, 64)
@@ -198,11 +203,9 @@ class TestTwoStage:
     def test_4bpw_forward(self, codebook):
         """4bpw uses full codebook for both stages."""
         layer = E8RHTLinear(64, 32)
+        layer.set_codebook(codebook)
+        _setup_two_stage(layer, codebook, K2=65536)
         layer.set_codebook(codebook, codebook2=codebook)
-
-        m_pad, n_blocks = layer.Qidxs.shape
-        layer.Qidxs2 = torch.randint(0, 65536, (m_pad, n_blocks), dtype=torch.int32).to(torch.int16)
-        layer.inv_resid_scale = torch.tensor(1.0 / codebook.resid_scale, dtype=torch.float32)
 
         x = torch.randn(4, 64)
         y = layer(x)
@@ -211,11 +214,9 @@ class TestTwoStage:
     def test_two_stage_forward_matches_dequantize(self, codebook, codebook_small):
         """Two-stage forward(x) should match x @ dequantize().T."""
         layer = E8RHTLinear(64, 32)
+        layer.set_codebook(codebook)
+        _setup_two_stage(layer, codebook_small, K2=256)
         layer.set_codebook(codebook, codebook2=codebook_small)
-
-        m_pad, n_blocks = layer.Qidxs.shape
-        layer.Qidxs2 = torch.randint(0, 256, (m_pad, n_blocks), dtype=torch.int16)
-        layer.inv_resid_scale = torch.tensor(1.0 / codebook.resid_scale, dtype=torch.float32)
 
         x = torch.randn(8, 64)
         y_forward = layer(x).float()

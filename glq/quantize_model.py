@@ -161,6 +161,9 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
 
     if bpw == 2:
         artifacts['Qidxs'] = result['indices'].to(torch.int16)
+        # Always include two-stage buffers (zeros for 2bpw) so state_dict matches
+        artifacts['Qidxs2'] = torch.zeros_like(artifacts['Qidxs'])
+        artifacts['inv_resid_scale'] = torch.tensor(0.0, dtype=torch.float32)
     else:
         artifacts['Qidxs'] = result['indices1'].to(torch.int16)
         artifacts['Qidxs2'] = result['indices2'].to(torch.int16)
