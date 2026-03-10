@@ -104,9 +104,17 @@ class GLQQuantizer(HfQuantizer):
         if codebook is None:
             codebook = E8ShellCodebook(device='cpu', verbose=False)
 
+        # Secondary codebook for 3/4bpw
+        bpw = getattr(self.quantization_config, 'bpw', 2)
+        codebook2 = None
+        if bpw == 3:
+            codebook2 = codebook.make_small(256)
+        elif bpw == 4:
+            codebook2 = codebook
+
         for module in model.modules():
             if isinstance(module, E8RHTLinear):
-                module.set_codebook(codebook)
+                module.set_codebook(codebook, codebook2=codebook2)
 
         return model
 

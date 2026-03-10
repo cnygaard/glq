@@ -134,6 +134,11 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
 
     if bpw == 2:
         result = quantize_ldlq_codebook(W_pad, H_pad, codebook, tune_iters=tune_iters)
+    elif bpw == 3:
+        codebook_small = codebook.make_small(256)
+        result = quantize_ldlq_codebook_2stage(
+            W_pad, H_pad, codebook, codebook_small,
+            resid_scale=codebook.resid_scale, tune_iters=tune_iters)
     else:
         result = quantize_ldlq_codebook_2stage(
             W_pad, H_pad, codebook, codebook,
@@ -149,11 +154,18 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
 
     # Artifacts for saving (these go into safetensors)
     artifacts = {
-        'Qidxs': result['indices'].to(torch.int16),  # (m_pad, n_pad/8)
         'SU': rht.su.half(),                           # (m_pad,)
         'SV': rht.sv.half(),                           # (n_pad,)
         'Wscale': torch.tensor(result['Wscale'], dtype=torch.float32),  # scalar
     }
+
+    if bpw == 2:
+        artifacts['Qidxs'] = result['indices'].to(torch.int16)
+    else:
+        artifacts['Qidxs'] = result['indices1'].to(torch.int16)
+        artifacts['Qidxs2'] = result['indices2'].to(torch.int16)
+        artifacts['inv_resid_scale'] = torch.tensor(
+            1.0 / result['resid_scale'], dtype=torch.float32)
 
     metrics = {'sqnr': sqnr, 'bpw': result['bpw'], 'Wscale': result['Wscale']}
     return W_hat, artifacts, metrics
@@ -421,8 +433,8 @@ def main():
                         help="HuggingFace model ID or local path")
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory for quantized model")
-    parser.add_argument("--bpw", type=int, default=2, choices=[2, 4],
-                        help="Bits per weight (2 or 4)")
+    parser.add_argument("--bpw", type=int, default=2, choices=[2, 3, 4],
+                        help="Bits per weight (2, 3, or 4)")
     parser.add_argument("--tune-iters", type=int, default=0,
                         help="LDLQ refinement iterations")
     parser.add_argument("--nsamples", type=int, default=16,
