@@ -27,10 +27,10 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | QuIP+GPTQ 4-bit | 4.75 | 12.06 | 1.05x |
 | GLQ 3-bit | 3.00 | 13.38 | 1.17x |
 | QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x |
-| GLQ 2-bit | 2.00 | 18.29 | 1.59x |
+| GLQ 2-bit | 2.00 | 17.70 | 1.54x |
 | GPTQ 3-bit | 9.48 | 18.61 | 1.62x |
 
-GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (18.29) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.82) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
+GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (17.70) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.82) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
 
 ## How it works
 
