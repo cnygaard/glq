@@ -62,6 +62,10 @@ class E8RHTLinear(nn.Module):
         self.codebook = None
         self.codebook2 = None
 
+        # Cached scalar values (set in set_codebook, avoids GPU→CPU sync per forward)
+        self._wscale_float = 1.0
+        self._inv_rs_float = 0.0
+
     def set_codebook(self, codebook, codebook2=None):
         """Attach the shared E8ShellCodebook(s) (called after weight loading)."""
         self.codebook = codebook
@@ -72,6 +76,9 @@ class E8RHTLinear(nn.Module):
             and self.inv_resid_scale is not None
             and self.inv_resid_scale.abs().item() > 0
         )
+        # Cache scalar values to avoid GPU→CPU sync on every forward pass
+        self._wscale_float = self.Wscale.item()
+        self._inv_rs_float = self.inv_resid_scale.item() if self._has_stage2 else 0.0
 
     def _ensure_codebook_device(self):
         """Move codebook(s) to match Qidxs device (lazy, once)."""
@@ -105,14 +112,13 @@ class E8RHTLinear(nn.Module):
         if x_rht.is_cuda and _triton_available:
             from .inference_kernel import glq_dequant_matmul
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else None
-            inv_rs = self.inv_resid_scale.item() if has_stage2 else 0.0
             y_rht = glq_dequant_matmul(
                 x_rht, self.Qidxs,
                 self.codebook.codebook_half,
-                self.Wscale.item(),
+                self._wscale_float,
                 Qidxs2=self.Qidxs2 if has_stage2 else None,
                 codebook2=cb2_tensor,
-                inv_resid_scale=inv_rs,
+                inv_resid_scale=self._inv_rs_float,
             )
         else:
             # Fallback: materialize W then matmul
