@@ -18,6 +18,21 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | QuIP+GPTQ 3-bit | 3.70 | 1423 | 9.30 | 1.18x |
 | GLQ 2-bit | 2.00 | 769 | 11.35 | 1.44x |
 
+**Mistral-7B-v0.3** on WikiText-2 (16 calibration samples, NVIDIA A10G):
+
+| Method | BPW | Perplexity | vs bf16 | GPU MB | tok/s |
+|--------|-----|------------|---------|--------|-------|
+| bf16 | 16 | 4.20 | 1.00x | 14505 | 28.1 |
+| GLQ 3-bit | 3 | 4.41 | 1.05x | 4436 | 9.7 |
+
+**Llama-3.2-3B** on WikiText-2 (16 calibration samples, NVIDIA A10G):
+
+| Method | BPW | Perplexity | vs bf16 | GPU MB | tok/s |
+|--------|-----|------------|---------|--------|-------|
+| bf16 | 16 | 6.17 | 1.00x | 6137 | 37.6 |
+| GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 | 10.8 |
+| GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 | 11.0 |
+
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA A10G):
 
 | Method | Eff. BPW | Perplexity | vs bf16 |

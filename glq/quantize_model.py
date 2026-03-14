@@ -213,16 +213,18 @@ def quantize(
     cfg = AutoConfig.from_pretrained(model_name)
     arch = cfg.architectures[0] if cfg.architectures else ""
 
+    # Always load to CPU — layers are moved to GPU one at a time during
+    # quantization so that large models (7B+) don't OOM.
     if "Mistral3" in arch:
         from transformers import Mistral3ForConditionalGeneration
         model = Mistral3ForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=dtype, device_map="auto" if device == "cuda" else "cpu",
+            model_name, torch_dtype=dtype, device_map="cpu",
             low_cpu_mem_usage=True,
         )
         text_model = model.model.language_model
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype, device_map="auto" if device == "cuda" else "cpu",
+            model_name, torch_dtype=dtype, device_map="cpu",
             low_cpu_mem_usage=True,
         )
         text_model = model
@@ -251,6 +253,12 @@ def quantize(
     rotary_emb = get_rotary_emb(text_model)
     n_layers = len(decoder_layers)
 
+    # Move only embedding and rotary to GPU (small tensors)
+    if device == "cuda":
+        embed.to(device)
+        if rotary_emb is not None:
+            rotary_emb.to(device)
+
     # Embed calibration data
     print(f"\nEmbedding calibration data ...")
     hidden_states = []
@@ -265,6 +273,8 @@ def quantize(
 
     for layer_idx in range(n_layers):
         layer = decoder_layers[layer_idx]
+        if device == "cuda":
+            layer.to(device)
         t_layer = time.perf_counter()
         print(f"\n--- Layer {layer_idx}/{n_layers-1} ---")
 
@@ -343,6 +353,10 @@ def quantize(
                 new_hidden.append(out[0] if isinstance(out, tuple) else out)
         hidden_states = torch.cat(new_hidden, dim=0)
 
+        # Move layer back to CPU to free GPU memory for next layer
+        if device == "cuda":
+            layer.to("cpu")
+
         dt_layer = time.perf_counter() - t_layer
         elapsed = time.perf_counter() - t_start
         remaining = elapsed / (layer_idx + 1) * (n_layers - layer_idx - 1)
@@ -362,6 +376,13 @@ def quantize(
     print(f"{'='*60}")
 
     # ---- Save ----
+    # Move everything back to CPU for saving
+    if device == "cuda":
+        embed.to("cpu")
+        if rotary_emb is not None:
+            rotary_emb.to("cpu")
+        torch.cuda.empty_cache()
+
     print(f"\nSaving to {output_dir} ...")
 
     # 1. Build state dict: quantized layers get Qidxs/SU/SV/Wscale,
