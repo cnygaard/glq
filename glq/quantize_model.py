@@ -398,13 +398,27 @@ def quantize(
             state_dict[f"{layer_prefix}.{key}"] = tensor.cpu()
 
     # Add non-quantized parameters (everything that's NOT a quantized linear's weight)
-    for name, param in model.named_parameters():
-        # Check if this param belongs to a quantized linear
-        # e.g. "model.layers.0.self_attn.q_proj.weight" -> prefix "model.layers.0.self_attn.q_proj"
-        param_prefix = name.rsplit(".", 1)[0] if "." in name else ""
+    # For multimodal wrappers (e.g. Mistral3), text_model is the backbone
+    # (Ministral3Model) whose params lack the "model." prefix that the
+    # CausalLM checkpoint format expects.  Add the prefix so keys match the
+    # quantized artifact keys (which use "model.layers.{idx}.{name}").
+    is_wrapped = text_model is not model
+    key_prefix = "model." if is_wrapped else ""
+    for name, param in text_model.named_parameters():
+        full_name = f"{key_prefix}{name}"
+        param_prefix = full_name.rsplit(".", 1)[0] if "." in full_name else ""
         if param_prefix in quantized_prefixes:
             continue  # skip — replaced by Qidxs/SU/SV/Wscale
-        state_dict[name] = param.data.cpu()
+        state_dict[full_name] = param.data.cpu()
+
+    # For wrapped models, also save lm_head (lives on the outer model)
+    # Skip if tied to embed_tokens (config.tie_word_embeddings handles it).
+    if is_wrapped and hasattr(model, "lm_head"):
+        embed_key = f"{key_prefix}embed_tokens.weight"
+        lm_w = model.lm_head.weight
+        tied = embed_key in state_dict and lm_w.data_ptr() == state_dict[embed_key].data_ptr()
+        if not tied:
+            state_dict["lm_head.weight"] = lm_w.data.cpu()
 
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
@@ -412,7 +426,17 @@ def quantize(
     codebook.save(os.path.join(output_dir, "e8_codebook.pt"))
 
     # 3. Save config.json with quantization_config
-    config_dict = cfg.to_dict()
+    # For multimodal wrappers (e.g. Mistral3), save the *text model's* config
+    # so that AutoModelForCausalLM can load the quantized checkpoint directly.
+    save_cfg = text_model.config if is_wrapped else cfg
+    config_dict = save_cfg.to_dict()
+    if is_wrapped:
+        # Resolve the CausalLM architecture from the text config so that
+        # AutoModelForCausalLM can instantiate the correct model class.
+        from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
+        causal_cls = MODEL_FOR_CAUSAL_LM_MAPPING.get(type(save_cfg), None)
+        if causal_cls is not None:
+            config_dict["architectures"] = [causal_cls.__name__]
     config_dict["quantization_config"] = {
         "quant_method": "glq",
         "codebook": "e8_shell",
