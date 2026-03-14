@@ -254,7 +254,8 @@ def quantize(
     n_layers = len(decoder_layers)
 
     # Move only embedding and rotary to GPU (small tensors)
-    if device == "cuda":
+    use_gpu = str(device).startswith("cuda")
+    if use_gpu:
         embed.to(device)
         if rotary_emb is not None:
             rotary_emb.to(device)
@@ -273,7 +274,7 @@ def quantize(
 
     for layer_idx in range(n_layers):
         layer = decoder_layers[layer_idx]
-        if device == "cuda":
+        if use_gpu:
             layer.to(device)
         t_layer = time.perf_counter()
         print(f"\n--- Layer {layer_idx}/{n_layers-1} ---")
@@ -334,7 +335,7 @@ def quantize(
 
             del H
             gc.collect()
-            if device == "cuda":
+            if use_gpu:
                 torch.cuda.empty_cache()
 
         # Forward calibration through quantized layer
@@ -354,7 +355,7 @@ def quantize(
         hidden_states = torch.cat(new_hidden, dim=0)
 
         # Move layer back to CPU to free GPU memory for next layer
-        if device == "cuda":
+        if use_gpu:
             layer.to("cpu")
 
         dt_layer = time.perf_counter() - t_layer
@@ -365,7 +366,7 @@ def quantize(
               f"ETA: {remaining/60:.1f}m remaining")
 
         gc.collect()
-        if device == "cuda":
+        if use_gpu:
             torch.cuda.empty_cache()
 
     total_time = time.perf_counter() - t_start
@@ -377,7 +378,7 @@ def quantize(
 
     # ---- Save ----
     # Move everything back to CPU for saving
-    if device == "cuda":
+    if use_gpu:
         embed.to("cpu")
         if rotary_emb is not None:
             rotary_emb.to("cpu")

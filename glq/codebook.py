@@ -186,7 +186,7 @@ class E8ShellCodebook:
     def _quantize_triton(self, x):
         """Fused codebook NN via Triton kernel (no intermediate distance matrix)."""
         from .codebook_kernel import triton_codebook_nn
-        indices = triton_codebook_nn(x, self.codebook, self.codebook_norms)
+        indices = triton_codebook_nn(x, self.codebook_half, self.codebook_norms)
         return self.codebook[indices], indices
 
     def _quantize_pytorch(self, x, _batch_size=16384):

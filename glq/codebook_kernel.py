@@ -1,7 +1,7 @@
 """Triton fused codebook nearest-neighbour kernel.
 
 Fuses matmul + argmin to avoid materializing the (batch, K) distance matrix.
-For K=65536, D=8: reduces memory traffic by ~60000x vs naive matmul+argmin.
+Uses row-tiling (BLOCK_N rows per program) + D→16 zero-padding for Tensor Core.
 """
 
 import torch
@@ -13,92 +13,103 @@ import triton.language as tl
 def _codebook_nn_kernel(
     x_ptr,          # (N, D) input vectors, fp16
     cb_ptr,         # (K, D) codebook vectors, fp16
-    cb_norms_ptr,   # (K,) precomputed ||c||^2, fp16
+    cb_norms_ptr,   # (K,) precomputed ||c||^2, fp32
     idx_ptr,        # (N,) output indices, int32
     N,              # number of input vectors
-    D: tl.constexpr,              # dimension (8)
+    D: tl.constexpr,              # actual dimension (8)
     K,              # codebook size (65536)
     stride_x_n,     # x stride along N dim
     stride_cb_k,    # codebook stride along K dim
-    BLOCK_K: tl.constexpr = 256,  # tile size over codebook
+    BLOCK_N: tl.constexpr,   # tile size over input rows
+    BLOCK_K: tl.constexpr,   # tile size over codebook
+    D_PAD: tl.constexpr,     # padded dimension for Tensor Core (16)
 ):
-    """Find nearest codebook vector for each input row.
+    """Find nearest codebook vector for a tile of BLOCK_N input rows.
 
-    dist(x, c) = ||x||^2 - 2*x.c + ||c||^2
-    Since ||x||^2 is constant per row, argmin(dist) = argmin(-2*x.c + ||c||^2).
+    Tiles BLOCK_N rows per program so the codebook is read once per tile
+    instead of once per row, reducing L2 traffic by BLOCK_N×.
+    D is zero-padded to D_PAD=16 to enable fp16 Tensor Core mma.m16n8k16.
     """
     pid = tl.program_id(0)
-    row = pid
-    if row >= N:
-        return
+    n_start = pid * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offsets < N
+    d_offsets = tl.arange(0, D_PAD)
+    d_mask = d_offsets < D
 
-    # Load x[row, :] — D=8 fits entirely in registers
-    x_offsets = tl.arange(0, D)
-    x_vec = tl.load(x_ptr + row * stride_x_n + x_offsets).to(tl.float32)
+    # Load x tile: (BLOCK_N, D_PAD), zero-padded beyond D
+    x_tile = tl.load(
+        x_ptr + n_offsets[:, None] * stride_x_n + d_offsets[None, :],
+        mask=n_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.float16)
 
-    best_dist = float('inf')
-    best_idx = 0
+    best_dist = tl.full((BLOCK_N,), float('inf'), dtype=tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), dtype=tl.int32)
 
-    # Tile over codebook
     for k_start in range(0, K, BLOCK_K):
-        k_range = k_start + tl.arange(0, BLOCK_K)
-        mask = k_range < K
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < K
 
-        # Load codebook block: (BLOCK_K, D)
-        # cb_ptr[k, d] = cb_ptr + k * stride_cb_k + d
-        cb_block = tl.load(
-            cb_ptr + k_range[:, None] * stride_cb_k + x_offsets[None, :],
-            mask=mask[:, None],
+        # Load codebook tile: (BLOCK_K, D_PAD), zero-padded
+        cb_tile = tl.load(
+            cb_ptr + k_offsets[:, None] * stride_cb_k + d_offsets[None, :],
+            mask=k_mask[:, None] & d_mask[None, :],
             other=0.0,
+        ).to(tl.float16)
+
+        # Load precomputed norms: (BLOCK_K,)
+        cb_norms = tl.load(
+            cb_norms_ptr + k_offsets, mask=k_mask, other=float('inf'),
         ).to(tl.float32)
 
-        # Load precomputed norms
-        cb_norms = tl.load(cb_norms_ptr + k_range, mask=mask, other=float('inf')).to(tl.float32)
+        # Tensor Core dot: (BLOCK_N, D_PAD) @ (D_PAD, BLOCK_K) -> (BLOCK_N, BLOCK_K)
+        dots = tl.dot(x_tile, tl.trans(cb_tile))
 
-        # Dot products: (BLOCK_K,)
-        dots = tl.sum(cb_block * x_vec[None, :], axis=1)
+        # Distance: -2*dot + ||c||^2
+        dists = -2.0 * dots + cb_norms[None, :]
 
-        # Distance: -2*dot + ||c||^2 (skip ||x||^2, constant)
-        dists = -2.0 * dots + cb_norms
+        # Per-row argmin over this tile
+        local_min_val = tl.min(dists, axis=1)
+        local_min_idx = tl.argmin(dists, axis=1)
 
-        # Running argmin
-        local_min_val = tl.min(dists)
-        if local_min_val < best_dist:
-            local_min_idx = tl.argmin(dists, axis=0)
-            best_dist = local_min_val
-            best_idx = k_start + local_min_idx
+        # Update running best
+        update = local_min_val < best_dist
+        best_dist = tl.where(update, local_min_val, best_dist)
+        best_idx = tl.where(update, (local_min_idx + k_start).to(tl.int32), best_idx)
 
-    tl.store(idx_ptr + row, best_idx)
+    tl.store(idx_ptr + n_offsets, best_idx, mask=n_mask)
 
 
 def triton_codebook_nn(x: torch.Tensor, codebook: torch.Tensor,
-                       codebook_norms: torch.Tensor) -> torch.Tensor:
+                       codebook_norms: torch.Tensor,
+                       _block_n: int = 32, _block_k: int = 256) -> torch.Tensor:
     """Find nearest codebook vector for each row of x.
 
     Args:
         x: (N, D) input vectors (any dtype, converted to fp16)
         codebook: (K, D) codebook vectors (any dtype, converted to fp16)
-        codebook_norms: (K,) precomputed ||c||^2 (any dtype, converted to fp16)
+        codebook_norms: (K,) precomputed ||c||^2
 
     Returns:
         indices: (N,) int32 indices into codebook
     """
     N, D = x.shape
     K = codebook.shape[0]
-    assert codebook.shape[1] == D
-    assert codebook_norms.shape[0] == K
+    D_PAD = 16  # pad D=8 to 16 for Tensor Core mma.m16n8k16
 
     x_half = x.half().contiguous()
     cb_half = codebook.half().contiguous()
-    cb_norms_half = codebook_norms.half().contiguous()
+    cb_norms_f32 = codebook_norms.float().contiguous()
 
     indices = torch.empty(N, dtype=torch.int32, device=x.device)
 
-    grid = (N,)
+    grid = ((N + _block_n - 1) // _block_n,)
     _codebook_nn_kernel[grid](
-        x_half, cb_half, cb_norms_half, indices,
+        x_half, cb_half, cb_norms_f32, indices,
         N, D, K,
         x_half.stride(0), cb_half.stride(0),
+        BLOCK_N=_block_n, BLOCK_K=_block_k, D_PAD=D_PAD,
     )
 
     return indices.long()

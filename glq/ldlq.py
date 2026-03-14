@@ -77,14 +77,21 @@ def quantize_ldlq_codebook(
     hatWr = torch.zeros_like(Wr)
     all_indices = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
 
+    # Optimization: FP16 L for feedback matmul (Tensor Core), incremental residual
+    use_fp16 = torch.device(device).type == 'cuda'
+    L_half = L.half() if use_fp16 else L
+    R = Wr.clone()  # residual = Wr - hatWr, initially just Wr
+
     for k in reversed(range(num_blocks)):
         kb, ke = k * b, (k + 1) * b
         if ke < n:
-            feedback = (Wr[:, ke:] - hatWr[:, ke:]) @ L[ke:, kb:ke]
+            R_tail = R[:, ke:].half() if use_fp16 else R[:, ke:]
+            feedback = (R_tail @ L_half[ke:, kb:ke]).float()
         else:
             feedback = 0.0
         WXWX = Wr[:, kb:ke] + feedback
         hatWr[:, kb:ke], all_indices[:, k] = codebook.quantize(WXWX)
+        R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
 
     for _ in range(tune_iters):
         for k in reversed(range(num_blocks)):
@@ -160,10 +167,16 @@ def quantize_ldlq_codebook_2stage(
     all_indices1 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
     all_indices2 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
 
+    # Optimization: FP16 L for feedback matmul (Tensor Core), incremental residual
+    use_fp16 = torch.device(device).type == 'cuda'
+    L_half = L.half() if use_fp16 else L
+    R = Wr.clone()  # residual = Wr - hatWr, initially just Wr
+
     for k in reversed(range(num_blocks)):
         kb, ke = k * b, (k + 1) * b
         if ke < n:
-            feedback = (Wr[:, ke:] - hatWr[:, ke:]) @ L[ke:, kb:ke]
+            R_tail = R[:, ke:].half() if use_fp16 else R[:, ke:]
+            feedback = (R_tail @ L_half[ke:, kb:ke]).float()
         else:
             feedback = 0.0
         target = Wr[:, kb:ke] + feedback
@@ -176,6 +189,7 @@ def quantize_ldlq_codebook_2stage(
         all_indices2[:, k] = idx2
 
         hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
+        R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
 
     for _ in range(tune_iters):
         for k in reversed(range(num_blocks)):
