@@ -8,15 +8,15 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 
 **SmolLM3-3B-Base** on WikiText-2 (128 calibration samples, NVIDIA A10G):
 
-| Method | Eff. BPW | Size (MB) | Perplexity | vs bf16 |
-|--------|----------|-----------|------------|---------|
-| bf16 | 16.00 | 6150 | 7.90 | 1.00x |
-| GLQ 4-bit | 4.00 | 1538 | 8.11 | 1.03x |
-| AWQ 4-bit | 5.60 | 2152 | 8.15 | 1.03x |
-| QuIP+GPTQ 4-bit | 4.76 | 1829 | 8.17 | 1.03x |
-| GLQ 3-bit | 3.00 | 1153 | 8.91 | 1.13x |
-| QuIP+GPTQ 3-bit | 3.70 | 1423 | 9.30 | 1.18x |
-| GLQ 2-bit | 2.00 | 769 | 11.35 | 1.44x |
+| Method | Eff. BPW | Size (MB) | Perplexity | vs bf16 | GPU MB | tok/s |
+|--------|----------|-----------|------------|---------|--------|-------|
+| bf16 | 16.00 | 6150 | 7.90 | 1.00x | 6151 | 33.9 |
+| GLQ 4-bit | 4.00 | 1538 | 8.11 | 1.03x | - | - |
+| AWQ 4-bit | 5.60 | 2152 | 8.15 | 1.03x | - | - |
+| QuIP+GPTQ 4-bit | 4.76 | 1829 | 8.17 | 1.03x | - | - |
+| GLQ 3-bit | 3.00 | 1153 | 8.91 | 1.13x | - | - |
+| QuIP+GPTQ 3-bit | 3.70 | 1423 | 9.30 | 1.18x | - | - |
+| GLQ 2-bit | 2.00 | 769 | 11.35 | 1.44x | 2540 | 13.4 |
 
 **Mistral-7B-v0.3** on WikiText-2 (16 calibration samples, NVIDIA A10G):
 
@@ -42,15 +42,15 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA A10G):
 
-| Method | Eff. BPW | Perplexity | vs bf16 |
-|--------|----------|------------|---------|
-| bf16 baseline | 16.00 | 11.48 | 1.00x |
-| GLQ 4-bit | 4.00 | 11.82 | 1.03x |
-| QuIP+GPTQ 4-bit | 4.75 | 12.06 | 1.05x |
-| GLQ 3-bit | 3.00 | 13.38 | 1.17x |
-| QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x |
-| GLQ 2-bit | 2.00 | 17.70 | 1.54x |
-| GPTQ 3-bit | 9.48 | 18.61 | 1.62x |
+| Method | Eff. BPW | Perplexity | vs bf16 | GPU MB | tok/s |
+|--------|----------|------------|---------|--------|-------|
+| bf16 baseline | 16.00 | 11.48 | 1.00x | 724 | 37.6 |
+| GLQ 4-bit | 4.00 | 11.82 | 1.03x | - | - |
+| QuIP+GPTQ 4-bit | 4.75 | 12.06 | 1.05x | - | - |
+| GLQ 3-bit | 3.00 | 13.38 | 1.17x | - | - |
+| QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x | - | - |
+| GLQ 2-bit | 2.00 | 17.70 | 1.54x | 356 | 15.5 |
+| GPTQ 3-bit | 9.48 | 18.61 | 1.62x | - | - |
 
 GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (17.70) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.82) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
 
@@ -186,17 +186,18 @@ Instead of the naive approach (decode all indices into a dense bf16 matrix, then
 
 1. Iterates over `N/8` codebook blocks per output row
 2. Loads int16 indices from HBM and gathers 8-element vectors from the L2-cached codebook
-3. Accumulates rank-8 outer products between input columns and codebook vectors
+3. Accumulates dot products (matvec) or Tensor Core matmuls (prefill) against the gathered codebook vectors
 4. Applies the global scale factor and writes the output
 
 This means GPU memory holds only the compressed indices (2 bytes per 8 weights) rather than the full fp16 weight matrix (16 bytes per 8 weights) — an 8x reduction at 2 bpw.
 
-### Two kernel variants
+### Kernel variants
 
-- **Matmul kernel** (`_glq_dequant_matmul_kernel`): For batch sizes > 4 (prefill). Tiles over both batch and output dimensions.
-- **Matvec kernel** (`_glq_dequant_matvec_kernel`): For batch sizes 1-4 (autoregressive decode). Optimized for the memory-bound single-token case.
+- **Tensor Core matmul kernel** (`_glq_dequant_matmul_tc_kernel`): For batch sizes >= 2 (prefill). Processes pairs of codebook blocks to form K=16 tiles for `tl.dot` (mma.m16n8k16 Tensor Core instructions). Autotuned over BLOCK_B and BLOCK_M.
+- **Matvec kernel** (`_glq_dequant_matvec_kernel`): For B=1 (autoregressive decode). Autotuned over BLOCK_M and num_warps for the memory-bound single-token case.
+- **Fused RHT kernels** (`_input_rht_kernel`, `_output_rht_kernel`): Fuse pad + sign vector + Fast Hadamard Transform into single kernel launches, eliminating per-layer Python overhead.
 
-Both kernels support two-stage RVQ for 3/4 bpw via a `HAS_STAGE2` compile-time constant.
+All kernels support two-stage RVQ for 3/4 bpw via a `HAS_STAGE2` compile-time constant.
 
 ### Using the kernel directly
 

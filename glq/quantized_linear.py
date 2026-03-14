@@ -1,15 +1,103 @@
 """E8RHTLinear — quantized linear layer with E8 shell codebook + RHT."""
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .hadamard import fast_hadamard_transform
 
 try:
-    import triton  # noqa: F401
+    import triton
+    import triton.language as tl
     _triton_available = True
 except ImportError:
     _triton_available = False
+
+
+# ────────────────────────────────────────────────────────────────
+# Fused RHT kernels: pad+SV+FHT and FHT+SU+unpad in one launch
+# ────────────────────────────────────────────────────────────────
+
+if _triton_available:
+
+    @triton.jit
+    def _input_rht_kernel(
+        x_ptr,          # (B, in_features) fp16/fp32 input
+        sv_ptr,         # (n_pad,) fp16 sign vector
+        out_ptr,        # (B, n_pad) fp32 output — x_rht
+        in_features,
+        stride_x,       # x.stride(0)
+        rsqrt_n,        # 1 / sqrt(n_pad)
+        N: tl.constexpr,
+        LOG_N: tl.constexpr,
+    ):
+        """Fused pad + SV multiply + FHT in one kernel launch.
+
+        Replaces: x.float() -> F.pad -> * SV -> FHT -> x_rht
+        """
+        row = tl.program_id(0)
+        offs = tl.arange(0, N)
+        base = out_ptr + row * N
+
+        # Load x with zero-padding beyond in_features, cast to fp32
+        x = tl.load(x_ptr + row * stride_x + offs,
+                     mask=offs < in_features, other=0.0).to(tl.float32)
+
+        # Apply SV signs
+        sv = tl.load(sv_ptr + offs).to(tl.float32)
+        x = x * sv
+
+        # FHT butterfly stages (in-place via global memory + barrier)
+        for k in tl.static_range(LOG_N):
+            tl.store(base + offs, x)
+            tl.debug_barrier()
+            x_partner = tl.load(base + (offs ^ (1 << k)))
+            lo = (offs & (1 << k)) == 0
+            x = tl.where(lo, x + x_partner, x_partner - x)
+
+        # Store normalized result
+        tl.store(base + offs, x * rsqrt_n)
+
+    @triton.jit
+    def _output_rht_kernel(
+        y_rht_ptr,      # (B, m_pad) fp32 input — y_rht from dequant
+        su_ptr,         # (m_pad,) fp16 sign vector
+        out_ptr,        # (B, out_features) output in target dtype
+        out_features,
+        stride_y,       # y_rht.stride(0)
+        stride_out,     # out.stride(0)
+        rsqrt_m,        # 1 / sqrt(m_pad)
+        OUTPUT_FP16: tl.constexpr,
+        M: tl.constexpr,
+        LOG_M: tl.constexpr,
+    ):
+        """Fused FHT + SU multiply + unpad + cast in one kernel launch.
+
+        Replaces: FHT(y_rht) -> * SU -> [:, :out_features] -> .to(dtype)
+        """
+        row = tl.program_id(0)
+        offs = tl.arange(0, M)
+        base = y_rht_ptr + row * stride_y
+
+        # Load y_rht
+        x = tl.load(base + offs)
+
+        # FHT butterfly stages
+        for k in tl.static_range(LOG_M):
+            tl.store(base + offs, x)
+            tl.debug_barrier()
+            x_partner = tl.load(base + (offs ^ (1 << k)))
+            lo = (offs & (1 << k)) == 0
+            x = tl.where(lo, x + x_partner, x_partner - x)
+
+        # Normalize, apply SU, and store with unpadding + dtype cast
+        su = tl.load(su_ptr + offs).to(tl.float32)
+        x = x * rsqrt_m * su
+        mask = offs < out_features
+        if OUTPUT_FP16:
+            tl.store(out_ptr + row * stride_out + offs, x.to(tl.float16), mask=mask)
+        else:
+            tl.store(out_ptr + row * stride_out + offs, x, mask=mask)
 
 
 class E8RHTLinear(nn.Module):
@@ -99,13 +187,27 @@ class E8RHTLinear(nn.Module):
 
         shape = x.shape
         x = x.reshape(-1, self.in_features)
+        B = x.shape[0]
         dtype = x.dtype
+        use_fused = x.is_cuda and _triton_available and B <= 64
 
         # Transform input to RHT domain
-        x_f = x.float()
-        x_pad = F.pad(x_f, (0, self.n_pad - self.in_features))
-        sv = self.SV.float()
-        x_rht = fast_hadamard_transform(x_pad * sv.unsqueeze(0))
+        if use_fused:
+            n_pad = self.n_pad
+            log_n = int(math.log2(n_pad))
+            x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
+            _input_rht_kernel[(B,)](
+                x, self.SV, x_rht,
+                self.in_features, x.stride(0),
+                1.0 / math.sqrt(n_pad),
+                N=n_pad, LOG_N=log_n,
+                num_warps=8,
+            )
+        else:
+            x_f = x.float()
+            x_pad = F.pad(x_f, (0, self.n_pad - self.in_features))
+            sv = self.SV.float()
+            x_rht = fast_hadamard_transform(x_pad * sv.unsqueeze(0))
 
         # Dequant + matmul in RHT domain
         has_stage2 = self._has_stage2
@@ -131,14 +233,29 @@ class E8RHTLinear(nn.Module):
             y_rht = x_rht @ W_rht.T * self.Wscale.float()
 
         # Inverse RHT on output: y = y_rht @ Had_m @ diag(SU)
-        su = self.SU.float()
-        y = fast_hadamard_transform(y_rht) * su.unsqueeze(0)
-        y = y[:, :self.out_features]
+        if use_fused:
+            m_pad = self.m_pad
+            log_m = int(math.log2(m_pad))
+            output_fp16 = (dtype == torch.float16)
+            y = torch.empty(B, self.out_features, dtype=dtype, device=x.device)
+            _output_rht_kernel[(B,)](
+                y_rht, self.SU, y,
+                self.out_features, y_rht.stride(0), y.stride(0),
+                1.0 / math.sqrt(m_pad),
+                OUTPUT_FP16=output_fp16,
+                M=m_pad, LOG_M=log_m,
+                num_warps=8,
+            )
+            if self.bias is not None:
+                y = y + self.bias.unsqueeze(0).to(dtype)
+        else:
+            su = self.SU.float()
+            y = fast_hadamard_transform(y_rht) * su.unsqueeze(0)
+            y = y[:, :self.out_features]
+            if self.bias is not None:
+                y = y + self.bias.float().unsqueeze(0)
+            y = y.to(dtype)
 
-        if self.bias is not None:
-            y = y + self.bias.float().unsqueeze(0)
-
-        y = y.to(dtype)
         return y.reshape(*shape[:-1], self.out_features)
 
     def dequantize(self) -> torch.Tensor:
