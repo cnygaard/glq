@@ -142,3 +142,45 @@ class TestE8ShellCodebook:
         mse_1stage = ((x - dec1) ** 2).mean().item()
         mse_rvq = ((x - dec_rvq) ** 2).mean().item()
         assert mse_rvq < mse_1stage
+
+    def test_quantize_large_batch(self, codebook):
+        """Large batch (> _batch_size=16384) should use batched loop."""
+        x = torch.randn(20000, 8) * codebook.opt_scale
+        decoded, indices = codebook._quantize_pytorch(x, _batch_size=16384)
+        assert decoded.shape == (20000, 8)
+        assert indices.shape == (20000,)
+        # All indices should be valid
+        assert indices.min() >= 0
+        assert indices.max() < codebook.CODEBOOK_SIZE
+
+    def test_decode_rvq(self, codebook):
+        """decode_rvq should match manual two-stage decode."""
+        idx1 = torch.tensor([0, 100, 65535])
+        idx2 = torch.tensor([50, 200, 1000])
+        result = codebook.decode_rvq(idx1, idx2)
+        expected = codebook.codebook[idx1] + codebook.codebook[idx2] / codebook.resid_scale
+        torch.testing.assert_close(result, expected)
+
+
+class TestEnumerateEmpty:
+    def test_negative_norm_returns_empty(self):
+        """max_norm_sq < 0 should return empty tensors."""
+        G, _ = e8_basis()
+        coords, norms = enumerate_short_vectors(G, max_norm_sq=-0.01)
+        assert coords.shape[0] == 0
+        assert norms.shape[0] == 0
+
+
+class TestVerboseOutput:
+    def test_build_verbose(self, capsys):
+        """build(verbose=True) prints loading message."""
+        E8ShellCodebook.build(device="cpu", verbose=True)
+        captured = capsys.readouterr()
+        assert "E8ShellCodebook" in captured.out
+
+    def test_init_verbose(self, capsys):
+        """__init__(verbose=True) prints enumeration progress."""
+        E8ShellCodebook(device="cpu", verbose=True)
+        captured = capsys.readouterr()
+        assert "enumerating" in captured.out
+        assert "entries" in captured.out

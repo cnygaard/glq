@@ -146,3 +146,28 @@ class TestQuantizeLDLQ2Stage:
         r2 = quantize_ldlq_codebook(W, H, cb)
         r4 = quantize_ldlq_codebook_2stage(W, H, cb, cb, resid_scale=cb.resid_scale)
         assert r4["quant_mse"] < r2["quant_mse"]
+
+    def test_2stage_tune_iters_runs(self, codebooks):
+        """2-stage with tune_iters=2 should succeed."""
+        cb, cb_small = codebooks
+        torch.manual_seed(42)
+        W = torch.randn(4, 32)
+        A = torch.randn(32, 32)
+        H = A @ A.T + 0.1 * torch.eye(32)
+        result = quantize_ldlq_codebook_2stage(
+            W, H, cb, cb_small, resid_scale=cb.resid_scale, tune_iters=2)
+        assert result["tune_iters"] == 2
+        assert result["proxy_loss"] >= 0
+
+    def test_2stage_tune_reduces_proxy_loss(self, codebooks):
+        """Refinement iterations should not increase proxy loss in 2-stage."""
+        cb, cb_small = codebooks
+        torch.manual_seed(42)
+        W = torch.randn(8, 64)
+        A = torch.randn(64, 64)
+        H = A @ A.T + 0.1 * torch.eye(64)
+        r0 = quantize_ldlq_codebook_2stage(
+            W, H, cb, cb_small, resid_scale=cb.resid_scale, tune_iters=0)
+        r2 = quantize_ldlq_codebook_2stage(
+            W, H, cb, cb_small, resid_scale=cb.resid_scale, tune_iters=2)
+        assert r2["proxy_loss"] <= r0["proxy_loss"] * 1.01

@@ -25,6 +25,11 @@ quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepi
 [project.scripts]
 glq-quantize = "glq.quantize_model:main"
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests that download models / take >30s (deselect with '-m \"not slow\"')",
+]
+
 [tool.setuptools.packages.find]
 include = ["glq*"]
 

@@ -78,3 +78,22 @@ class TestRHT:
         x = torch.randn(5, 48)
         x_t = rht.transform_input(x)
         assert x_t.shape == (5, 64)
+
+    def test_inverse_transform_output_shape(self):
+        """inverse_transform_output truncates to m_orig."""
+        rht = RHT(7, 32, device="cpu")
+        y = torch.randn(3, rht.m_pad)  # padded dimension
+        y_out = rht.inverse_transform_output(y)
+        assert y_out.shape == (3, 7)
+
+    def test_inverse_transform_output_roundtrip(self):
+        """transform_weights → matmul → inverse_transform_output recovers shape."""
+        m, n = 10, 48
+        rht = RHT(m, n, device="cpu")
+        W = torch.randn(m, n)
+        W_t = rht.transform_weights(W)
+        # Simulate forward: x_t @ W_t.T gives (batch, m_pad)
+        x_t = torch.randn(4, rht.n_pad)
+        y_rht = x_t @ W_t.T
+        y_out = rht.inverse_transform_output(y_rht)
+        assert y_out.shape == (4, m)
