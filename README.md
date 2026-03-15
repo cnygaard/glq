@@ -32,6 +32,13 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | bf16 | 16 | 5.91 | 1.00x | 7348 | 37.0 |
 | GLQ 3-bit | 3 | 6.47 | 1.09x | 3788 | 11.4 |
 
+**Nemotron-3-Nano-30B** (hybrid Mamba-Attention-MoE) on WikiText-2 (16 calibration samples, NVIDIA A10G):
+
+| Method | BPW | Perplexity | vs bf16 |
+|--------|-----|------------|---------|
+| bf16 | 16 | 7.72 | 1.00x |
+| GLQ 3-bit | 3 | 8.09 | 1.05x |
+
 **Llama-3.2-3B** on WikiText-2 (16 calibration samples, NVIDIA A10G):
 
 | Method | BPW | Perplexity | vs bf16 | GPU MB | tok/s |
@@ -114,13 +121,16 @@ All CLI options:
 
 ```
 glq-quantize --help
-  --model        HuggingFace model ID or local path (required)
-  --output       Output directory for quantized model (required)
-  --bpw          Bits per weight: 2, 3, or 4 (default: 2)
-  --tune-iters   LDLQ refinement iterations (default: 0)
-  --nsamples     Calibration samples from WikiText-2 (default: 16)
-  --seqlen       Calibration sequence length (default: 2048)
-  --device       cuda or cpu (default: cuda)
+  --model              HuggingFace model ID or local path (required)
+  --output             Output directory for quantized model (required)
+  --bpw                Bits per weight: 2, 3, or 4 (default: 2)
+  --tune-iters         LDLQ refinement iterations (default: 0)
+  --nsamples           Calibration samples from WikiText-2 (default: 16)
+  --seqlen             Calibration sequence length (default: 2048)
+  --device             cuda or cpu (default: cuda)
+  --trust-remote-code  Allow custom model code from HF Hub
+  --streaming          Load weights layer-by-layer from safetensors
+                       (for models exceeding system RAM)
 ```
 
 #### Python API

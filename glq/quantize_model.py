@@ -77,30 +77,100 @@ def pad_hessian(H, block_size=8):
     return H
 
 
+# ---- model profiles ----
+# Each profile encapsulates architecture-specific paths for layer access,
+# embedding access, state dict key prefix, and forward kwargs.
+
+_MODEL_PROFILES = {
+    'NemotronHForCausalLM': {
+        'layers_attr': 'backbone.layers',
+        'embed_attr': 'backbone.embeddings',
+        'rotary_attr': None,       # no global rotary embedding
+        'sd_prefix': 'backbone.layers',
+        'trust_remote_code': True,
+        'forward_kwargs': 'nemotron_h',
+    },
+}
+
+_DEFAULT_PROFILE = {
+    'layers_attr': None,   # use heuristic
+    'embed_attr': None,    # use heuristic
+    'rotary_attr': None,   # use heuristic
+    'sd_prefix': 'model.layers',
+    'trust_remote_code': False,
+    'forward_kwargs': 'default',
+}
+
+
+def _detect_profile(config):
+    """Detect model profile from config architecture."""
+    arch = (config.architectures or [""])[0] if hasattr(config, 'architectures') else ""
+    return _MODEL_PROFILES.get(arch, _DEFAULT_PROFILE)
+
+
+def _resolve_attr(obj, dotted_path):
+    """Resolve 'a.b.c' to obj.a.b.c."""
+    for part in dotted_path.split('.'):
+        obj = getattr(obj, part)
+    return obj
+
+
 # ---- model structure helpers ----
 
-def get_decoder_layers(text_model):
+def get_decoder_layers(text_model, profile=None):
+    if profile and profile.get('layers_attr'):
+        return _resolve_attr(text_model, profile['layers_attr'])
     if hasattr(text_model, 'layers'):
         return text_model.layers
     if hasattr(text_model, 'model') and hasattr(text_model.model, 'layers'):
         return text_model.model.layers
+    if hasattr(text_model, 'backbone') and hasattr(text_model.backbone, 'layers'):
+        return text_model.backbone.layers
     raise ValueError("Cannot find transformer layers")
 
 
-def get_embed(text_model):
+def get_embed(text_model, profile=None):
+    if profile and profile.get('embed_attr'):
+        return _resolve_attr(text_model, profile['embed_attr'])
     if hasattr(text_model, 'embed_tokens'):
         return text_model.embed_tokens
     if hasattr(text_model, 'model') and hasattr(text_model.model, 'embed_tokens'):
         return text_model.model.embed_tokens
+    # NemotronH and similar use 'embeddings' instead of 'embed_tokens'
+    if hasattr(text_model, 'embeddings'):
+        return text_model.embeddings
+    if hasattr(text_model, 'model') and hasattr(text_model.model, 'embeddings'):
+        return text_model.model.embeddings
     raise ValueError("Cannot find embedding layer")
 
 
-def get_rotary_emb(text_model):
+def get_rotary_emb(text_model, profile=None):
+    if profile and profile.get('rotary_attr'):
+        return _resolve_attr(text_model, profile['rotary_attr'])
+    if profile and profile.get('rotary_attr') is None and profile.get('layers_attr'):
+        # Profile explicitly says no rotary (e.g. NemotronH)
+        return None
     if hasattr(text_model, 'rotary_emb'):
         return text_model.rotary_emb
     if hasattr(text_model, 'model') and hasattr(text_model.model, 'rotary_emb'):
         return text_model.model.rotary_emb
     return None
+
+
+def _build_forward_kwargs(profile, h, rotary_emb):
+    """Build layer forward kwargs based on model profile."""
+    seq_len = h.shape[1]
+    cache_position = torch.arange(seq_len, device=h.device)
+
+    if profile.get('forward_kwargs') == 'nemotron_h':
+        return dict(cache_params=None, cache_position=cache_position)
+
+    position_ids = cache_position.unsqueeze(0)
+    kwargs = dict(position_ids=position_ids, cache_position=cache_position,
+                  use_cache=False)
+    if rotary_emb is not None:
+        kwargs['position_embeddings'] = rotary_emb(h, position_ids=position_ids)
+    return kwargs
 
 
 # ---- per-layer quantization ----
@@ -132,17 +202,32 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
     W_pad, _, _ = pad_to_multiple(W_tilde, 8)
     H_pad = pad_hessian(H_tilde, 8)
 
-    if bpw == 2:
-        result = quantize_ldlq_codebook(W_pad, H_pad, codebook, tune_iters=tune_iters)
-    elif bpw == 3:
-        codebook_small = codebook.make_small(256)
-        result = quantize_ldlq_codebook_2stage(
-            W_pad, H_pad, codebook, codebook_small,
-            resid_scale=codebook.resid_scale, tune_iters=tune_iters)
-    else:
-        result = quantize_ldlq_codebook_2stage(
-            W_pad, H_pad, codebook, codebook,
-            resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+    def _run_ldlq(W_p, H_p):
+        if bpw == 2:
+            return quantize_ldlq_codebook(W_p, H_p, codebook, tune_iters=tune_iters)
+        elif bpw == 3:
+            codebook_small = codebook.make_small(256)
+            return quantize_ldlq_codebook_2stage(
+                W_p, H_p, codebook, codebook_small,
+                resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+        else:
+            return quantize_ldlq_codebook_2stage(
+                W_p, H_p, codebook, codebook,
+                resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+
+    # 3-tier Cholesky error handling for sparse/degenerate Hessians
+    # (e.g. MoE experts with few calibration tokens)
+    try:
+        result = _run_ldlq(W_pad, H_pad)
+    except torch._C._LinAlgError:
+        heavy_damp = 0.1 * torch.mean(torch.diag(H_pad)).clamp(min=1e-6)
+        diag_idx = torch.arange(H_pad.shape[0], device=dev)
+        H_pad[diag_idx, diag_idx] += heavy_damp
+        try:
+            result = _run_ldlq(W_pad, H_pad)
+        except torch._C._LinAlgError:
+            H_pad = torch.eye(H_pad.shape[0], device=dev, dtype=torch.float32)
+            result = _run_ldlq(W_pad, H_pad)
 
     # Dequantize for error propagation
     W_hat_tilde = result['W_hat'][:, :n_tilde]
@@ -176,6 +261,48 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
 
 # ---- main quantization pipeline ----
 
+def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
+    """Load all tensors for a single layer from sharded safetensors."""
+    from collections import defaultdict
+    from safetensors import safe_open
+
+    prefix = f"{sd_prefix}.{layer_idx}."
+    layer_keys = [k for k in weight_map if k.startswith(prefix)]
+
+    state = {}
+    shard_to_keys = defaultdict(list)
+    for key in layer_keys:
+        shard_to_keys[weight_map[key]].append(key)
+
+    for shard, keys in shard_to_keys.items():
+        with safe_open(shard_paths[shard], framework="pt") as f:
+            for key in keys:
+                local_key = key[len(prefix):]
+                state[local_key] = f.get_tensor(key)
+
+    return state
+
+
+def _load_tensor_from_shards(weight_map, shard_paths, key):
+    """Load a single tensor from sharded safetensors."""
+    from safetensors import safe_open
+    shard = weight_map[key]
+    with safe_open(shard_paths[shard], framework="pt") as f:
+        return f.get_tensor(key)
+
+
+def _find_hf_snapshot(model_id):
+    """Auto-detect snapshot dir from HF cache for a model ID."""
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    cache_name = "models--" + model_id.replace("/", "--")
+    snap_dir = os.path.join(hf_home, "hub", cache_name, "snapshots")
+    if os.path.isdir(snap_dir):
+        entries = os.listdir(snap_dir)
+        if entries:
+            return os.path.join(snap_dir, entries[0])
+    return None
+
+
 def quantize(
     model_name: str,
     output_dir: str,
@@ -185,6 +312,8 @@ def quantize(
     seqlen: int = 2048,
     device: str = "cuda",
     dtype=torch.bfloat16,
+    trust_remote_code: bool = False,
+    streaming: bool = False,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -198,6 +327,9 @@ def quantize(
         seqlen: calibration sequence length
         device: 'cuda' or 'cpu'
         dtype: model dtype for loading
+        trust_remote_code: allow custom model code from HF Hub
+        streaming: load weights from safetensors one layer at a time
+            (required for models that exceed system RAM)
     """
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
@@ -205,32 +337,80 @@ def quantize(
 
     print(f"GLQ Quantization: {model_name} -> {output_dir}")
     print(f"  bpw={bpw}, tune_iters={tune_iters}, nsamples={nsamples}")
+    if streaming:
+        print(f"  streaming=True (layer-by-layer safetensors loading)")
 
-    # ---- Load model ----
-    print(f"\nLoading model ...")
-    t0 = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    cfg = AutoConfig.from_pretrained(model_name)
+    # ---- Load config and detect profile ----
+    cfg = AutoConfig.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code)
+    profile = _detect_profile(cfg)
     arch = cfg.architectures[0] if cfg.architectures else ""
 
-    # Always load to CPU — layers are moved to GPU one at a time during
-    # quantization so that large models (7B+) don't OOM.
-    if "Mistral3" in arch:
-        from transformers import Mistral3ForConditionalGeneration
-        model = Mistral3ForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=dtype, device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
-        text_model = model.model.language_model
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype, device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
-        text_model = model
+    # Apply config fixups (e.g. NemotronH needs _attn_implementation="eager")
+    if profile.get('forward_kwargs') == 'nemotron_h':
+        cfg._attn_implementation = "eager"
 
-    n_params = sum(p.numel() for p in text_model.parameters()) / 1e9
-    print(f"  {n_params:.2f}B params in {time.perf_counter() - t0:.1f}s")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # ---- Load model or prepare streaming ----
+    print(f"\nLoading model ...")
+    t0 = time.perf_counter()
+
+    model = None
+    text_model = None
+    weight_map = None
+    shard_paths = None
+    BlockClass = None
+
+    if streaming:
+        # Streaming mode: don't load model into RAM. Instead, instantiate
+        # on meta device to discover the block class, then load weights
+        # one layer at a time from safetensors.
+        with torch.device("meta"):
+            _model = AutoModelForCausalLM.from_config(
+                cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+        if profile.get('layers_attr'):
+            _layers = _resolve_attr(_model, profile['layers_attr'])
+        else:
+            _layers = get_decoder_layers(_model, profile)
+        BlockClass = type(_layers[0])
+        n_layers = len(_layers)
+        del _model, _layers
+
+        # Load safetensors index
+        model_dir = _find_hf_snapshot(model_name)
+        if model_dir is None:
+            raise FileNotFoundError(
+                f"Model not found in HF cache. Run: "
+                f"huggingface-cli download {model_name}")
+        idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        shard_files = sorted(set(weight_map.values()))
+        shard_paths = {s: os.path.join(model_dir, s) for s in shard_files}
+        n_params = len(weight_map)
+        print(f"  Streaming from {model_dir} ({n_params} tensors)")
+    else:
+        # Standard mode: load full model to CPU
+        if "Mistral3" in arch:
+            from transformers import Mistral3ForConditionalGeneration
+            model = Mistral3ForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=dtype, device_map="cpu",
+                low_cpu_mem_usage=True,
+                trust_remote_code=trust_remote_code,
+            )
+            text_model = model.model.language_model
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype=dtype, device_map="cpu",
+                low_cpu_mem_usage=True,
+                trust_remote_code=trust_remote_code,
+            )
+            text_model = model
+
+        n_params_f = sum(p.numel() for p in text_model.parameters()) / 1e9
+        print(f"  {n_params_f:.2f}B params in {time.perf_counter() - t0:.1f}s")
 
     # ---- Calibration data ----
     print(f"\nLoading calibration data ...")
@@ -247,18 +427,30 @@ def quantize(
     print(f"\nBuilding E8 shell codebook ...")
     codebook = E8ShellCodebook(device=device)
 
-    # ---- Layer-by-layer quantization ----
-    decoder_layers = get_decoder_layers(text_model)
-    embed = get_embed(text_model)
-    rotary_emb = get_rotary_emb(text_model)
-    n_layers = len(decoder_layers)
-
-    # Move only embedding and rotary to GPU (small tensors)
+    # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
-    if use_gpu:
-        embed.to(device)
-        if rotary_emb is not None:
-            rotary_emb.to(device)
+    sd_prefix = profile['sd_prefix']
+    rotary_emb = None
+
+    if streaming:
+        # Load embedding from safetensors
+        embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
+        embed_key = f"{embed_attr}.weight"
+        embed_weight = _load_tensor_from_shards(weight_map, shard_paths, embed_key)
+        vocab_size = embed_weight.shape[0]
+        hidden_size = embed_weight.shape[1]
+        embed = nn.Embedding(vocab_size, hidden_size, _weight=embed_weight)
+        if use_gpu:
+            embed.to(device)
+    else:
+        decoder_layers = get_decoder_layers(text_model, profile)
+        embed = get_embed(text_model, profile)
+        rotary_emb = get_rotary_emb(text_model, profile)
+        n_layers = len(decoder_layers)
+        if use_gpu:
+            embed.to(device)
+            if rotary_emb is not None:
+                rotary_emb.to(device)
 
     # Embed calibration data
     print(f"\nEmbedding calibration data ...")
@@ -268,16 +460,33 @@ def quantize(
             hidden_states.append(embed(calib_ids[i:i+1].to(device)))
     hidden_states = torch.cat(hidden_states, dim=0)
 
+    if streaming:
+        del embed, embed_weight
+        gc.collect()
+        if use_gpu:
+            torch.cuda.empty_cache()
+
     all_artifacts = {}  # layer_name -> {Qidxs, SU, SV, Wscale}
     all_sqnr = []
     t_start = time.perf_counter()
 
     for layer_idx in range(n_layers):
-        layer = decoder_layers[layer_idx]
-        if use_gpu:
-            layer.to(device)
         t_layer = time.perf_counter()
         print(f"\n--- Layer {layer_idx}/{n_layers-1} ---")
+
+        if streaming:
+            layer_state = _load_layer_state(
+                weight_map, shard_paths, layer_idx, sd_prefix)
+            layer = BlockClass(cfg, layer_idx)
+            layer.load_state_dict(layer_state, strict=False)
+            del layer_state
+            if use_gpu:
+                layer.to(device, dtype=dtype)
+            layer.eval()
+        else:
+            layer = decoder_layers[layer_idx]
+            if use_gpu:
+                layer.to(device)
 
         # Collect linear sublayers
         linears = {}
@@ -294,19 +503,24 @@ def quantize(
         with torch.no_grad():
             for i in range(hidden_states.shape[0]):
                 h = hidden_states[i:i+1]
-                seq_len = h.shape[1]
-                cache_position = torch.arange(seq_len, device=h.device)
-                position_ids = cache_position.unsqueeze(0)
-                kwargs = dict(position_ids=position_ids, cache_position=cache_position,
-                              use_cache=False)
-                if rotary_emb is not None:
-                    kwargs['position_embeddings'] = rotary_emb(h, position_ids=position_ids)
+                kwargs = _build_forward_kwargs(profile, h, rotary_emb)
                 layer(h, **kwargs)
 
-        # Quantize each linear
+        # Finalize Hessians to CPU to free GPU for quantization
+        hessians = {}
         for name, cap in captures.items():
             H = cap.finalize()
-            if H is None:
+            if H is not None:
+                hessians[name] = H.cpu()
+                del H
+        del captures
+        gc.collect()
+        if use_gpu:
+            torch.cuda.empty_cache()
+
+        # Quantize each linear
+        for name in linears:
+            if name not in hessians:
                 print(f"  {name}: no activations, skipping")
                 continue
 
@@ -318,44 +532,54 @@ def quantize(
                 continue
 
             t0 = time.perf_counter()
+            H_gpu = hessians[name].to(device)
             W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
-                W, H, codebook, bpw=bpw, tune_iters=tune_iters)
+                W, H_gpu, codebook, bpw=bpw, tune_iters=tune_iters)
+            del H_gpu
             dt = time.perf_counter() - t0
 
             # Store artifacts with full layer path
-            layer_prefix = f"model.layers.{layer_idx}.{name}"
-            all_artifacts[layer_prefix] = artifacts
+            layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
+            all_artifacts[layer_prefix] = {
+                k: v.cpu() for k, v in artifacts.items()}
 
             # Replace weight for error propagation to next layer
             mod.weight.data = W_hat.to(dtype=mod.weight.dtype, device=mod.weight.device)
             all_sqnr.append(metrics['sqnr'])
 
-            print(f"  {name:30s} {str(tuple(W.shape)):20s} "
-                  f"SQNR={metrics['sqnr']:5.1f}dB  Ws={metrics['Wscale']:.3f}  {dt:.1f}s")
+            # Compact output for MoE expert layers
+            if '.experts.' in name and 'shared' not in name:
+                parts = name.split('experts.')[1].split('.')
+                expert_num = int(parts[0])
+                proj = parts[-1]
+                if expert_num % 16 == 0 or expert_num == 127:
+                    print(f"  expert.{expert_num}.{proj:10s} "
+                          f"{str(tuple(W.shape)):20s} "
+                          f"SQNR={metrics['sqnr']:5.1f}dB  {dt:.1f}s")
+            else:
+                print(f"  {name:30s} {str(tuple(W.shape)):20s} "
+                      f"SQNR={metrics['sqnr']:5.1f}dB  "
+                      f"Ws={metrics['Wscale']:.3f}  {dt:.1f}s")
 
-            del H
             gc.collect()
             if use_gpu:
                 torch.cuda.empty_cache()
+
+        del hessians
 
         # Forward calibration through quantized layer
         new_hidden = []
         with torch.no_grad():
             for i in range(hidden_states.shape[0]):
                 h = hidden_states[i:i+1]
-                seq_len = h.shape[1]
-                cache_position = torch.arange(seq_len, device=h.device)
-                position_ids = cache_position.unsqueeze(0)
-                kwargs = dict(position_ids=position_ids, cache_position=cache_position,
-                              use_cache=False)
-                if rotary_emb is not None:
-                    kwargs['position_embeddings'] = rotary_emb(h, position_ids=position_ids)
+                kwargs = _build_forward_kwargs(profile, h, rotary_emb)
                 out = layer(h, **kwargs)
                 new_hidden.append(out[0] if isinstance(out, tuple) else out)
         hidden_states = torch.cat(new_hidden, dim=0)
 
-        # Move layer back to CPU to free GPU memory for next layer
-        if use_gpu:
+        if streaming:
+            del layer
+        elif use_gpu:
             layer.to("cpu")
 
         dt_layer = time.perf_counter() - t_layer
@@ -377,18 +601,17 @@ def quantize(
     print(f"{'='*60}")
 
     # ---- Save ----
-    # Move everything back to CPU for saving
-    if use_gpu:
-        embed.to("cpu")
-        if rotary_emb is not None:
-            rotary_emb.to("cpu")
-        torch.cuda.empty_cache()
+    if not streaming:
+        if use_gpu:
+            embed.to("cpu")
+            if rotary_emb is not None:
+                rotary_emb.to("cpu")
+            torch.cuda.empty_cache()
 
     print(f"\nSaving to {output_dir} ...")
 
-    # 1. Build state dict: quantized layers get Qidxs/SU/SV/Wscale,
-    #    non-quantized params (embeddings, lm_head, layernorms) keep original tensors
     from safetensors.torch import save_file
+    from safetensors import safe_open
 
     quantized_prefixes = set(all_artifacts.keys())
     state_dict = {}
@@ -398,28 +621,33 @@ def quantize(
         for key, tensor in arts.items():
             state_dict[f"{layer_prefix}.{key}"] = tensor.cpu()
 
-    # Add non-quantized parameters (everything that's NOT a quantized linear's weight)
-    # For multimodal wrappers (e.g. Mistral3), text_model is the backbone
-    # (Ministral3Model) whose params lack the "model." prefix that the
-    # CausalLM checkpoint format expects.  Add the prefix so keys match the
-    # quantized artifact keys (which use "model.layers.{idx}.{name}").
-    is_wrapped = text_model is not model
-    key_prefix = "model." if is_wrapped else ""
-    for name, param in text_model.named_parameters():
-        full_name = f"{key_prefix}{name}"
-        param_prefix = full_name.rsplit(".", 1)[0] if "." in full_name else ""
-        if param_prefix in quantized_prefixes:
-            continue  # skip — replaced by Qidxs/SU/SV/Wscale
-        state_dict[full_name] = param.data.cpu()
+    if streaming:
+        # Stream non-quantized parameters from source safetensors
+        for key in weight_map:
+            param_prefix = key.rsplit(".", 1)[0] if "." in key else ""
+            if param_prefix in quantized_prefixes:
+                continue
+            state_dict[key] = _load_tensor_from_shards(
+                weight_map, shard_paths, key)
+    else:
+        # Add non-quantized parameters from loaded model
+        is_wrapped = text_model is not model
+        key_prefix = "model." if is_wrapped else ""
+        for name, param in text_model.named_parameters():
+            full_name = f"{key_prefix}{name}"
+            param_prefix = full_name.rsplit(".", 1)[0] if "." in full_name else ""
+            if param_prefix in quantized_prefixes:
+                continue
+            state_dict[full_name] = param.data.cpu()
 
-    # For wrapped models, also save lm_head (lives on the outer model)
-    # Skip if tied to embed_tokens (config.tie_word_embeddings handles it).
-    if is_wrapped and hasattr(model, "lm_head"):
-        embed_key = f"{key_prefix}embed_tokens.weight"
-        lm_w = model.lm_head.weight
-        tied = embed_key in state_dict and lm_w.data_ptr() == state_dict[embed_key].data_ptr()
-        if not tied:
-            state_dict["lm_head.weight"] = lm_w.data.cpu()
+        # For wrapped models, also save lm_head
+        if is_wrapped and hasattr(model, "lm_head"):
+            embed_key = f"{key_prefix}embed_tokens.weight"
+            lm_w = model.lm_head.weight
+            tied = (embed_key in state_dict
+                    and lm_w.data_ptr() == state_dict[embed_key].data_ptr())
+            if not tied:
+                state_dict["lm_head.weight"] = lm_w.data.cpu()
 
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
@@ -427,13 +655,14 @@ def quantize(
     codebook.save(os.path.join(output_dir, "e8_codebook.pt"))
 
     # 3. Save config.json with quantization_config
-    # For multimodal wrappers (e.g. Mistral3), save the *text model's* config
-    # so that AutoModelForCausalLM can load the quantized checkpoint directly.
-    save_cfg = text_model.config if is_wrapped else cfg
+    if not streaming:
+        is_wrapped = text_model is not model
+        save_cfg = text_model.config if is_wrapped else cfg
+    else:
+        save_cfg = cfg
+        is_wrapped = False
     config_dict = save_cfg.to_dict()
     if is_wrapped:
-        # Resolve the CausalLM architecture from the text config so that
-        # AutoModelForCausalLM can instantiate the correct model class.
         from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
         causal_cls = MODEL_FOR_CAUSAL_LM_MAPPING.get(type(save_cfg), None)
         if causal_cls is not None:
@@ -444,6 +673,8 @@ def quantize(
         "codesz": 8,
         "bpw": bpw,
     }
+    if trust_remote_code:
+        config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
 
@@ -492,6 +723,11 @@ def main():
                         help="Calibration sequence length")
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu"])
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="Allow custom model code from HF Hub")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Load weights layer-by-layer from safetensors "
+                             "(for models exceeding system RAM)")
     args = parser.parse_args()
 
     quantize(
@@ -502,6 +738,8 @@ def main():
         nsamples=args.nsamples,
         seqlen=args.seqlen,
         device=args.device,
+        trust_remote_code=args.trust_remote_code,
+        streaming=args.streaming,
     )
 
 

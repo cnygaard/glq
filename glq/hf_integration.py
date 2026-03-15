@@ -31,20 +31,25 @@ class GLQConfig(QuantizationConfigMixin):
         codebook: str = "e8_shell",
         codesz: int = 8,
         bpw: int = 2,
+        trust_remote_code: bool = False,
         **kwargs,
     ):
         self.quant_method = "glq"
         self.codebook = codebook
         self.codesz = codesz
         self.bpw = bpw
+        self.trust_remote_code = trust_remote_code
 
     def to_dict(self):
-        return {
+        d = {
             "quant_method": self.quant_method,
             "codebook": self.codebook,
             "codesz": self.codesz,
             "bpw": self.bpw,
         }
+        if self.trust_remote_code:
+            d["trust_remote_code"] = True
+        return d
 
 
 MODULES_TO_NOT_CONVERT = ["lm_head"]
