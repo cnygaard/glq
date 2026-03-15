@@ -154,10 +154,26 @@ class E8RHTLinear(nn.Module):
         self._wscale_float = 1.0
         self._inv_rs_float = 0.0
 
+    @property
+    def weight(self):
+        """Proxy so code checking weight.device works (e.g. Mamba).
+
+        Returns a zero-element tensor on the same device as the quantized
+        weights, without allocating any real memory.
+        """
+        return torch.empty(0, dtype=torch.float16, device=self.Qidxs.device)
+
     def set_codebook(self, codebook, codebook2=None):
         """Attach the shared E8ShellCodebook(s) (called after weight loading)."""
         self.codebook = codebook
         self.codebook2 = codebook2
+        # Skip scalar caching for meta tensors (offloaded layers);
+        # values will be resolved lazily in forward() if needed.
+        if self.Wscale.device.type == "meta":
+            self._has_stage2 = codebook2 is not None
+            self._wscale_float = None
+            self._inv_rs_float = None
+            return
         # Detect two-stage from inv_resid_scale (non-zero means 3/4bpw data was loaded)
         self._has_stage2 = (
             codebook2 is not None
@@ -184,6 +200,15 @@ class E8RHTLinear(nn.Module):
         3. FHT on y_rht, apply SU signs, unpad → inverse RHT on output
         """
         self._ensure_codebook_device()
+        # Lazy-resolve cached scalars (for layers that were on meta at set_codebook time)
+        if self._wscale_float is None:
+            self._wscale_float = self.Wscale.item()
+            self._has_stage2 = (
+                self.codebook2 is not None
+                and self.inv_resid_scale is not None
+                and self.inv_resid_scale.abs().item() > 0
+            )
+            self._inv_rs_float = self.inv_resid_scale.item() if self._has_stage2 else 0.0
 
         shape = x.shape
         x = x.reshape(-1, self.in_features)
