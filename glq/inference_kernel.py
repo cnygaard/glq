@@ -9,6 +9,8 @@ For 3/4bpw: W[i, j:j+8] = cb1[idx1[i, j//8]] + cb2[idx2[i, j//8]] * inv_resid_sc
 Kernels:
   _glq_dequant_matvec_kernel: B=1 decode (autotuned BLOCK_M)
   _glq_dequant_matmul_tc_kernel: B>=2 prefill (Tensor Core tl.dot with K=16)
+  _splitk_matvec_kernel: B=1 split-K for small grids (more CTAs → better SM util)
+  _splitk_matmul_tc_kernel: B>=2 split-K Tensor Core variant
 """
 
 import torch
@@ -252,6 +254,217 @@ if _triton_available:
             mask=b_mask[:, None] & m_mask[None, :],
         )
 
+    # ────────────────────────────────────────────────────────────────
+    # Split-K matvec (B=1) — distributes N reduction across CTAs
+    # ────────────────────────────────────────────────────────────────
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 64}, num_warps=8, num_stages=2),
+            triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
+        ],
+        key=['M', 'BLOCKS_PER_SPLIT'],
+    )
+    @triton.jit
+    def _splitk_matvec_kernel(
+        x_ptr,
+        qidxs_ptr,
+        codebook_ptr,
+        y_ptr,
+        qidxs2_ptr,
+        codebook2_ptr,
+        inv_resid_scale,
+        M,
+        N_BLOCKS,
+        Wscale,
+        stride_q_m,
+        stride_q_k,
+        stride_cb_k,
+        stride_q2_m,
+        stride_q2_k,
+        stride_cb2_k,
+        HAS_STAGE2: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCKS_PER_SPLIT: tl.constexpr,
+    ):
+        """Split-K dequant+matvec: each CTA processes BLOCKS_PER_SPLIT blocks,
+        atomicAdds partial sums. Grid: (M/BLOCK_M, ceil(N_BLOCKS/BPS))."""
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        m_start = pid_m * BLOCK_M
+        m_range = m_start + tl.arange(0, BLOCK_M)
+        m_mask = m_range < M
+
+        j_start = pid_k * BLOCKS_PER_SPLIT
+        d_range = tl.arange(0, 8)
+        acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+        for j_off in tl.static_range(BLOCKS_PER_SPLIT):
+            j = j_start + j_off
+            j_mask = j < N_BLOCKS
+
+            x_vec = tl.load(x_ptr + j * 8 + d_range,
+                            mask=j_mask, other=0.0).to(tl.float32)
+
+            indices = tl.load(
+                qidxs_ptr + m_range * stride_q_m + j * stride_q_k,
+                mask=m_mask & j_mask, other=0,
+            )
+            indices = (indices.to(tl.int32) & 0xFFFF)
+
+            cb_vecs = tl.load(
+                codebook_ptr + indices[:, None] * stride_cb_k + d_range[None, :],
+                mask=m_mask[:, None] & j_mask, other=0.0,
+            ).to(tl.float32)
+
+            if HAS_STAGE2:
+                indices2 = tl.load(
+                    qidxs2_ptr + m_range * stride_q2_m + j * stride_q2_k,
+                    mask=m_mask & j_mask, other=0,
+                )
+                indices2 = (indices2.to(tl.int32) & 0xFFFF)
+                cb_vecs2 = tl.load(
+                    codebook2_ptr + indices2[:, None] * stride_cb2_k + d_range[None, :],
+                    mask=m_mask[:, None] & j_mask, other=0.0,
+                ).to(tl.float32)
+                cb_vecs = cb_vecs + cb_vecs2 * inv_resid_scale
+
+            acc += tl.sum(cb_vecs * x_vec[None, :], axis=1)
+
+        tl.atomic_add(y_ptr + m_range, acc * Wscale, mask=m_mask)
+
+    # ────────────────────────────────────────────────────────────────
+    # Split-K Tensor Core matmul (B>=2) — 3D grid
+    # ────────────────────────────────────────────────────────────────
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_B': 16, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
+        ],
+        key=['B', 'M', 'BLOCKS_PER_SPLIT'],
+    )
+    @triton.jit
+    def _splitk_matmul_tc_kernel(
+        x_ptr,
+        qidxs_ptr,
+        codebook_ptr,
+        y_ptr,
+        qidxs2_ptr,
+        codebook2_ptr,
+        inv_resid_scale,
+        B,
+        M,
+        N,
+        N_BLOCKS,
+        Wscale,
+        stride_x_b,
+        stride_q_m,
+        stride_q_k,
+        stride_cb_k,
+        stride_q2_m,
+        stride_q2_k,
+        stride_cb2_k,
+        stride_y_b,
+        HAS_STAGE2: tl.constexpr,
+        BLOCK_B: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCKS_PER_SPLIT: tl.constexpr,
+    ):
+        """Split-K dequant+matmul with Tensor Cores.
+        Grid: (B/BLOCK_B, M/BLOCK_M, ceil(N_BLOCKS/BPS))."""
+        pid_b = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_k = tl.program_id(2)
+
+        b_start = pid_b * BLOCK_B
+        m_start = pid_m * BLOCK_M
+
+        b_range = b_start + tl.arange(0, BLOCK_B)
+        m_range = m_start + tl.arange(0, BLOCK_M)
+        b_mask = b_range < B
+        m_mask = m_range < M
+
+        j_start = pid_k * BLOCKS_PER_SPLIT
+        acc = tl.zeros((BLOCK_B, BLOCK_M), dtype=tl.float32)
+
+        d16 = tl.arange(0, 16)
+        is_hi = d16 >= 8
+        d_local = tl.where(is_hi, d16 - 8, d16)
+
+        # Process pairs of blocks for K=16 TC tiles
+        for pair_off in tl.static_range(BLOCKS_PER_SPLIT // 2):
+            j = j_start + pair_off * 2
+            j_valid = j < N_BLOCKS
+
+            x_tile = tl.load(
+                x_ptr + b_range[:, None] * stride_x_b + (j * 8 + d16[None, :]),
+                mask=b_mask[:, None] & ((j * 8 + d16[None, :]) < N) & j_valid,
+                other=0.0,
+            ).to(tl.float16)
+
+            idx0 = (tl.load(
+                qidxs_ptr + m_range * stride_q_m + j * stride_q_k,
+                mask=m_mask & j_valid, other=0,
+            ).to(tl.int32) & 0xFFFF)
+
+            j1_valid = (j + 1) < N_BLOCKS
+            idx1 = (tl.load(
+                qidxs_ptr + m_range * stride_q_m + (j + 1) * stride_q_k,
+                mask=m_mask & j1_valid, other=0,
+            ).to(tl.int32) & 0xFFFF)
+
+            idx_sel = tl.where(is_hi[None, :], idx1[:, None], idx0[:, None])
+            w_tile = tl.load(
+                codebook_ptr + idx_sel * stride_cb_k + d_local[None, :],
+                mask=m_mask[:, None],
+                other=0.0,
+            ).to(tl.float16)
+
+            if HAS_STAGE2:
+                idx2_0 = (tl.load(
+                    qidxs2_ptr + m_range * stride_q2_m + j * stride_q2_k,
+                    mask=m_mask & j_valid, other=0,
+                ).to(tl.int32) & 0xFFFF)
+
+                idx2_1 = (tl.load(
+                    qidxs2_ptr + m_range * stride_q2_m + (j + 1) * stride_q2_k,
+                    mask=m_mask & j1_valid, other=0,
+                ).to(tl.int32) & 0xFFFF)
+
+                idx2_sel = tl.where(is_hi[None, :], idx2_1[:, None], idx2_0[:, None])
+                w2_tile = tl.load(
+                    codebook2_ptr + idx2_sel * stride_cb2_k + d_local[None, :],
+                    mask=m_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+
+                w_tile = (w_tile.to(tl.float32) + w2_tile * inv_resid_scale).to(tl.float16)
+
+            acc += tl.dot(x_tile, tl.trans(w_tile))
+
+        # 2D atomic add
+        scaled = acc * Wscale
+        addrs = b_range[:, None] * stride_y_b + m_range[None, :]
+        tl.atomic_add(y_ptr + addrs, scaled, mask=b_mask[:, None] & m_mask[None, :])
+
+
+# Cached SM count to avoid repeated GPU queries
+_num_sms: int = 0
+_BLOCKS_PER_SPLIT = 64
+
+
+def _get_num_sms(device) -> int:
+    global _num_sms
+    if _num_sms == 0:
+        _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return _num_sms
+
 
 def glq_dequant_matmul(
     x: torch.Tensor,
@@ -263,6 +476,9 @@ def glq_dequant_matmul(
     inv_resid_scale: float = 0.0,
 ) -> torch.Tensor:
     """Fused dequant+matmul: Y = X @ dequant(Qidxs)^T * Wscale.
+
+    Auto-selects split-K variant when the grid is too small to saturate
+    the GPU's SMs, giving up to 2.5x speedup on undersaturated shapes.
 
     Args:
         x: (B, N) input activations
@@ -299,53 +515,80 @@ def glq_dequant_matmul(
         q2 = Qidxs
         cb2 = cb
 
-    y = torch.empty(B, M, dtype=torch.float32, device=x.device)
-
+    # Decide whether to use split-K based on estimated grid saturation.
+    # BLOCK_M=64 is typical for both matvec and TC paths.
+    num_sms = _get_num_sms(x.device)
+    block_m_est = 64
     if B == 1:
-        # Matvec path — autotuned BLOCK_M
+        est_grid = triton.cdiv(M, block_m_est)
+    else:
+        block_b_est = 32
+        est_grid = triton.cdiv(B, block_b_est) * triton.cdiv(M, block_m_est)
+
+    use_splitk = (est_grid < num_sms) and (N_BLOCKS >= _BLOCKS_PER_SPLIT)
+
+    if use_splitk:
+        # Split-K: zero-init output for atomic accumulation
+        y = torch.zeros(B, M, dtype=torch.float32, device=x.device)
+        bps = _BLOCKS_PER_SPLIT
+
+        if B == 1:
+            n_splits = triton.cdiv(N_BLOCKS, bps)
+            grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), n_splits)
+            _splitk_matvec_kernel[grid](
+                x_fp16[0],
+                Qidxs, cb, y[0],
+                q2, cb2, inv_resid_scale,
+                M, N_BLOCKS, Wscale,
+                Qidxs.stride(0), Qidxs.stride(1), cb.stride(0),
+                q2.stride(0), q2.stride(1), cb2.stride(0),
+                HAS_STAGE2=has_stage2,
+                BLOCKS_PER_SPLIT=bps,
+            )
+        else:
+            # Ensure bps is even for K=16 TC pairing
+            bps_even = bps if bps % 2 == 0 else bps - 1
+            n_splits = triton.cdiv(N_BLOCKS, bps_even)
+            grid = lambda meta: (
+                triton.cdiv(B, meta['BLOCK_B']),
+                triton.cdiv(M, meta['BLOCK_M']),
+                n_splits,
+            )
+            _splitk_matmul_tc_kernel[grid](
+                x_fp16, Qidxs, cb, y,
+                q2, cb2, inv_resid_scale,
+                B, M, N, N_BLOCKS, Wscale,
+                x_fp16.stride(0),
+                Qidxs.stride(0), Qidxs.stride(1), cb.stride(0),
+                q2.stride(0), q2.stride(1), cb2.stride(0),
+                y.stride(0),
+                HAS_STAGE2=has_stage2,
+                BLOCKS_PER_SPLIT=bps_even,
+            )
+    elif B == 1:
+        # Original matvec path
+        y = torch.empty(B, M, dtype=torch.float32, device=x.device)
         grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']),)
         _glq_dequant_matvec_kernel[grid](
             x_fp16[0],
-            Qidxs,
-            cb,
-            y[0],
-            q2,
-            cb2,
-            inv_resid_scale,
-            M,
-            N_BLOCKS,
-            Wscale,
-            Qidxs.stride(0),
-            Qidxs.stride(1),
-            cb.stride(0),
-            q2.stride(0),
-            q2.stride(1),
-            cb2.stride(0),
+            Qidxs, cb, y[0],
+            q2, cb2, inv_resid_scale,
+            M, N_BLOCKS, Wscale,
+            Qidxs.stride(0), Qidxs.stride(1), cb.stride(0),
+            q2.stride(0), q2.stride(1), cb2.stride(0),
             HAS_STAGE2=has_stage2,
         )
     else:
-        # Tensor Core matmul path — tl.dot with K=16
+        # Original TC matmul path
+        y = torch.empty(B, M, dtype=torch.float32, device=x.device)
         grid = lambda meta: (triton.cdiv(B, meta['BLOCK_B']), triton.cdiv(M, meta['BLOCK_M']))
         _glq_dequant_matmul_tc_kernel[grid](
-            x_fp16,
-            Qidxs,
-            cb,
-            y,
-            q2,
-            cb2,
-            inv_resid_scale,
-            B,
-            M,
-            N,
-            N_BLOCKS,
-            Wscale,
+            x_fp16, Qidxs, cb, y,
+            q2, cb2, inv_resid_scale,
+            B, M, N, N_BLOCKS, Wscale,
             x_fp16.stride(0),
-            Qidxs.stride(0),
-            Qidxs.stride(1),
-            cb.stride(0),
-            q2.stride(0),
-            q2.stride(1),
-            cb2.stride(0),
+            Qidxs.stride(0), Qidxs.stride(1), cb.stride(0),
+            q2.stride(0), q2.stride(1), cb2.stride(0),
             y.stride(0),
             HAS_STAGE2=has_stage2,
         )
