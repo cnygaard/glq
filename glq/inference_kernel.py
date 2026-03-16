@@ -453,6 +453,149 @@ if _triton_available:
         addrs = b_range[:, None] * stride_y_b + m_range[None, :]
         tl.atomic_add(y_ptr + addrs, scaled, mask=b_mask[:, None] & m_mask[None, :])
 
+    # ────────────────────────────────────────────────────────────────
+    # Packed uint32 split-K matvec (B=1) — 4x less L2 traffic
+    # E8 codebook coords are {-3,-2.5,...,2.5,3} = (nibble-6)*0.5
+    # Pack 8 nibbles into 1 uint32: 16B gather → 4B gather
+    # ────────────────────────────────────────────────────────────────
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 64}, num_warps=8, num_stages=2),
+            triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
+        ],
+        key=['M', 'BLOCKS_PER_SPLIT'],
+    )
+    @triton.jit
+    def _packed_splitk_matvec_kernel(
+        x_ptr,
+        qidxs_ptr,
+        packed_cb_ptr,
+        y_ptr,
+        M,
+        N_BLOCKS,
+        Wscale,
+        stride_q_m,
+        stride_q_k,
+        BLOCK_M: tl.constexpr,
+        BLOCKS_PER_SPLIT: tl.constexpr,
+    ):
+        """Split-K matvec with packed uint32 codebook (4B per entry vs 16B)."""
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        m_start = pid_m * BLOCK_M
+        m_range = m_start + tl.arange(0, BLOCK_M)
+        m_mask = m_range < M
+
+        j_start = pid_k * BLOCKS_PER_SPLIT
+        d_range = tl.arange(0, 8)
+        shifts = d_range * 4
+        acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+        for j_off in tl.static_range(BLOCKS_PER_SPLIT):
+            j = j_start + j_off
+            j_mask = j < N_BLOCKS
+
+            x_vec = tl.load(x_ptr + j * 8 + d_range,
+                            mask=j_mask, other=0.0).to(tl.float32)
+
+            indices = tl.load(
+                qidxs_ptr + m_range * stride_q_m + j * stride_q_k,
+                mask=m_mask & j_mask, other=0,
+            )
+            indices = (indices.to(tl.int32) & 0xFFFF)
+
+            packed = tl.load(packed_cb_ptr + indices,
+                             mask=m_mask & j_mask, other=0)
+            nibbles = (packed[:, None] >> shifts[None, :]) & 0xF
+            cb_vecs = nibbles.to(tl.float32) * 0.5 - 3.0
+
+            acc += tl.sum(cb_vecs * x_vec[None, :], axis=1)
+
+        tl.atomic_add(y_ptr + m_range, acc * Wscale, mask=m_mask)
+
+    # ────────────────────────────────────────────────────────────────
+    # Packed uint32 split-K TC matmul (B>=2)
+    # ────────────────────────────────────────────────────────────────
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_B': 16, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
+        ],
+        key=['B', 'M', 'BLOCKS_PER_SPLIT'],
+    )
+    @triton.jit
+    def _packed_splitk_matmul_tc_kernel(
+        x_ptr,
+        qidxs_ptr,
+        packed_cb_ptr,
+        y_ptr,
+        B, M, N, N_BLOCKS, Wscale,
+        stride_x_b, stride_q_m, stride_q_k, stride_y_b,
+        BLOCK_B: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCKS_PER_SPLIT: tl.constexpr,
+    ):
+        """Split-K TC matmul with packed uint32 codebook."""
+        pid_b = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_k = tl.program_id(2)
+
+        b_start = pid_b * BLOCK_B
+        m_start = pid_m * BLOCK_M
+
+        b_range = b_start + tl.arange(0, BLOCK_B)
+        m_range = m_start + tl.arange(0, BLOCK_M)
+        b_mask = b_range < B
+        m_mask = m_range < M
+
+        j_start = pid_k * BLOCKS_PER_SPLIT
+        acc = tl.zeros((BLOCK_B, BLOCK_M), dtype=tl.float32)
+
+        d16 = tl.arange(0, 16)
+        is_hi = d16 >= 8
+        d_local = tl.where(is_hi, d16 - 8, d16)
+        shifts = d_local * 4
+
+        for pair_off in tl.static_range(BLOCKS_PER_SPLIT // 2):
+            j = j_start + pair_off * 2
+            j_valid = j < N_BLOCKS
+
+            x_tile = tl.load(
+                x_ptr + b_range[:, None] * stride_x_b + (j * 8 + d16[None, :]),
+                mask=b_mask[:, None] & ((j * 8 + d16[None, :]) < N) & j_valid,
+                other=0.0,
+            ).to(tl.float16)
+
+            idx0 = (tl.load(
+                qidxs_ptr + m_range * stride_q_m + j * stride_q_k,
+                mask=m_mask & j_valid, other=0,
+            ).to(tl.int32) & 0xFFFF)
+
+            j1_valid = (j + 1) < N_BLOCKS
+            idx1 = (tl.load(
+                qidxs_ptr + m_range * stride_q_m + (j + 1) * stride_q_k,
+                mask=m_mask & j1_valid, other=0,
+            ).to(tl.int32) & 0xFFFF)
+
+            packed0 = tl.load(packed_cb_ptr + idx0, mask=m_mask & j_valid, other=0)
+            packed1 = tl.load(packed_cb_ptr + idx1, mask=m_mask & j1_valid, other=0)
+            packed_sel = tl.where(is_hi[None, :], packed1[:, None], packed0[:, None])
+            nibbles = (packed_sel >> shifts[None, :]) & 0xF
+            w_tile = (nibbles.to(tl.float32) * 0.5 - 3.0).to(tl.float16)
+
+            acc += tl.dot(x_tile, tl.trans(w_tile))
+
+        scaled = acc * Wscale
+        addrs = b_range[:, None] * stride_y_b + m_range[None, :]
+        tl.atomic_add(y_ptr + addrs, scaled, mask=b_mask[:, None] & m_mask[None, :])
+
 
 # Cached SM count to avoid repeated GPU queries
 _num_sms: int = 0
@@ -474,11 +617,13 @@ def glq_dequant_matmul(
     Qidxs2: torch.Tensor = None,
     codebook2: torch.Tensor = None,
     inv_resid_scale: float = 0.0,
+    codebook_packed: torch.Tensor = None,
 ) -> torch.Tensor:
     """Fused dequant+matmul: Y = X @ dequant(Qidxs)^T * Wscale.
 
-    Auto-selects split-K variant when the grid is too small to saturate
-    the GPU's SMs, giving up to 2.5x speedup on undersaturated shapes.
+    Auto-selects the fastest kernel variant based on shape and GPU:
+    - Split-K when grid undersaturates SMs (1.5-2.4x speedup)
+    - Packed uint32 codebook for small matrices (additional 1.3x speedup)
 
     Args:
         x: (B, N) input activations
@@ -488,6 +633,7 @@ def glq_dequant_matmul(
         Qidxs2: (M, N//8) secondary indices for 3/4bpw, or None
         codebook2: (K2, 8) secondary codebook for 3/4bpw, or None
         inv_resid_scale: 1.0 / resid_scale for 3/4bpw
+        codebook_packed: (K,) uint32 packed codebook, or None
 
     Returns:
         Y: (B, M) output in fp32
@@ -527,7 +673,49 @@ def glq_dequant_matmul(
 
     use_splitk = (est_grid < num_sms) and (N_BLOCKS >= _BLOCKS_PER_SPLIT)
 
-    if use_splitk:
+    # Packed uint32 helps when total gather volume is small (ALU decode
+    # cost must be less than the L2 bandwidth savings). Threshold: M*N_BLOCKS <= 2M.
+    # Only for 2bpw (no 2-stage support in packed kernels).
+    _PACKED_MAX_ELEMENTS = 2 * 1024 * 1024
+    use_packed = (
+        use_splitk
+        and codebook_packed is not None
+        and not has_stage2
+        and M * N_BLOCKS <= _PACKED_MAX_ELEMENTS
+    )
+
+    if use_packed:
+        # Packed split-K path: 4B gather instead of 16B
+        y = torch.zeros(B, M, dtype=torch.float32, device=x.device)
+        bps = _BLOCKS_PER_SPLIT
+        cb_packed = codebook_packed.contiguous()
+
+        if B == 1:
+            n_splits = triton.cdiv(N_BLOCKS, bps)
+            grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), n_splits)
+            _packed_splitk_matvec_kernel[grid](
+                x_fp16[0], Qidxs, cb_packed, y[0],
+                M, N_BLOCKS, Wscale,
+                Qidxs.stride(0), Qidxs.stride(1),
+                BLOCKS_PER_SPLIT=bps,
+            )
+        else:
+            bps_even = bps if bps % 2 == 0 else bps - 1
+            n_splits = triton.cdiv(N_BLOCKS, bps_even)
+            grid = lambda meta: (
+                triton.cdiv(B, meta['BLOCK_B']),
+                triton.cdiv(M, meta['BLOCK_M']),
+                n_splits,
+            )
+            _packed_splitk_matmul_tc_kernel[grid](
+                x_fp16, Qidxs, cb_packed, y,
+                B, M, N, N_BLOCKS, Wscale,
+                x_fp16.stride(0),
+                Qidxs.stride(0), Qidxs.stride(1),
+                y.stride(0),
+                BLOCKS_PER_SPLIT=bps_even,
+            )
+    elif use_splitk:
         # Split-K: zero-init output for atomic accumulation
         y = torch.zeros(B, M, dtype=torch.float32, device=x.device)
         bps = _BLOCKS_PER_SPLIT

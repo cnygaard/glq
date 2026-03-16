@@ -99,6 +99,22 @@ def enumerate_short_vectors(G, max_norm_sq):
     return coords, norms_sq
 
 
+def _pack_codebook(codebook: torch.Tensor) -> torch.Tensor:
+    """Pack E8 codebook (K, 8) float into (K,) uint32.
+
+    Each coordinate is one of 13 values: {-3, -2.5, ..., 2.5, 3} = (code-6)*0.5
+    where code ∈ [0, 12] fits in 4 bits. Pack 8 nibbles into one uint32.
+    Decode: val_i = ((packed >> (4*i)) & 0xF) * 0.5 - 3.0
+    """
+    codes = (codebook * 2.0).round().long() + 6  # map [-3,3] → [0,12]
+    codes = codes.clamp(0, 15)  # safety clamp to 4-bit range
+    packed = torch.zeros(codebook.shape[0], dtype=torch.int32,
+                         device=codebook.device)
+    for i in range(8):
+        packed = packed | (codes[:, i].int() << (4 * i))
+    return packed
+
+
 class E8ShellCodebook:
     """
     Finite codebook from E8 lattice shells 0-6.
@@ -151,6 +167,7 @@ class E8ShellCodebook:
         self.codebook_half = self.codebook.half()
         self.codebook_half_t = self.codebook_half.T.contiguous()
         self.codebook_norms_half = self.codebook_norms.half()
+        self.codebook_packed = _pack_codebook(self.codebook).to(device)
         self.codesz = self.DIM
         self.device = device
 
@@ -171,6 +188,7 @@ class E8ShellCodebook:
         obj.codebook_half = obj.codebook.half()
         obj.codebook_half_t = obj.codebook_half.T.contiguous()
         obj.codebook_norms_half = obj.codebook_norms.half()
+        obj.codebook_packed = _pack_codebook(obj.codebook).to(device)
         obj.codesz = cls.DIM
         obj.device = device
         obj.opt_scale = opt_scale if opt_scale is not None else obj._compute_opt_scale()
@@ -274,6 +292,7 @@ class E8ShellCodebook:
         obj.codebook_half = obj.codebook.half()
         obj.codebook_half_t = obj.codebook_half.T.contiguous()
         obj.codebook_norms_half = obj.codebook_norms.half()
+        obj.codebook_packed = _pack_codebook(obj.codebook).to(self.device)
         obj.codesz = self.DIM
         obj.device = self.device
         obj.opt_scale = obj._compute_opt_scale()
