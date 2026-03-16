@@ -17,6 +17,7 @@ import gc
 import json
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,27 @@ import torch.nn as nn
 from .codebook import E8ShellCodebook
 from .rht import RHT
 from .ldlq import quantize_ldlq_codebook, quantize_ldlq_codebook_2stage
+
+
+# ---- parallel worker state ----
+
+_worker_codebook = None
+
+
+def _init_worker(cb_tensor, cb_opt_scale, cb_resid_scale, n_threads):
+    """Initialize codebook in each worker process (called once per worker)."""
+    global _worker_codebook
+    torch.set_num_threads(n_threads)
+    _worker_codebook = E8ShellCodebook.from_precomputed(
+        cb_tensor, cb_opt_scale, cb_resid_scale, device='cpu')
+
+
+def _quantize_sublayer(args):
+    """Worker function: quantize one sublayer."""
+    name, W, H, bpw, tune_iters = args
+    W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
+        W, H, _worker_codebook, bpw=bpw, tune_iters=tune_iters)
+    return name, W_hat, {k: v.cpu() for k, v in artifacts.items()}, metrics
 
 
 # ---- Hessian capture ----
@@ -291,16 +313,10 @@ def _load_tensor_from_shards(weight_map, shard_paths, key):
         return f.get_tensor(key)
 
 
-def _find_hf_snapshot(model_id):
-    """Auto-detect snapshot dir from HF cache for a model ID."""
-    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-    cache_name = "models--" + model_id.replace("/", "--")
-    snap_dir = os.path.join(hf_home, "hub", cache_name, "snapshots")
-    if os.path.isdir(snap_dir):
-        entries = os.listdir(snap_dir)
-        if entries:
-            return os.path.join(snap_dir, entries[0])
-    return None
+def _download_snapshot(model_id):
+    """Download model and return snapshot directory path."""
+    from huggingface_hub import snapshot_download
+    return snapshot_download(model_id)
 
 
 def quantize(
@@ -314,6 +330,7 @@ def quantize(
     dtype=torch.bfloat16,
     trust_remote_code: bool = False,
     streaming: bool = False,
+    workers: int = 0,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -330,6 +347,8 @@ def quantize(
         trust_remote_code: allow custom model code from HF Hub
         streaming: load weights from safetensors one layer at a time
             (required for models that exceed system RAM)
+        workers: parallel workers for CPU quantization
+            (0=auto, 1=sequential, ignored on GPU)
     """
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
@@ -377,20 +396,24 @@ def quantize(
         n_layers = len(_layers)
         del _model, _layers
 
-        # Load safetensors index
-        model_dir = _find_hf_snapshot(model_name)
-        if model_dir is None:
-            raise FileNotFoundError(
-                f"Model not found in HF cache. Run: "
-                f"huggingface-cli download {model_name}")
+        # Download model (if needed) and build weight map
+        model_dir = _download_snapshot(model_name)
         idx_path = os.path.join(model_dir, "model.safetensors.index.json")
-        with open(idx_path) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
-        shard_files = sorted(set(weight_map.values()))
-        shard_paths = {s: os.path.join(model_dir, s) for s in shard_files}
-        n_params = len(weight_map)
-        print(f"  Streaming from {model_dir} ({n_params} tensors)")
+        single_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.exists(idx_path):
+            with open(idx_path) as f:
+                index = json.load(f)
+            weight_map = index["weight_map"]
+            shard_files = sorted(set(weight_map.values()))
+            shard_paths = {s: os.path.join(model_dir, s) for s in shard_files}
+        elif os.path.exists(single_path):
+            from safetensors import safe_open
+            with safe_open(single_path, framework="pt") as sf:
+                weight_map = {k: "model.safetensors" for k in sf.keys()}
+            shard_paths = {"model.safetensors": single_path}
+        else:
+            raise FileNotFoundError(f"No safetensors found in {model_dir}")
+        print(f"  Streaming from {model_dir} ({len(weight_map)} tensors)")
     else:
         # Standard mode: load full model to CPU
         if "Mistral3" in arch:
@@ -470,6 +493,19 @@ def quantize(
     all_sqnr = []
     t_start = time.perf_counter()
 
+    # ---- Set up parallel worker pool for CPU quantization ----
+    pool = None
+    if not use_gpu and workers != 1:
+        n_workers = workers if workers > 0 else min(os.cpu_count() or 1, 16)
+        n_threads = max(1, (os.cpu_count() or 1) // n_workers)
+        pool = ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker,
+            initargs=(codebook.codebook.cpu(), codebook.opt_scale,
+                      codebook.resid_scale, n_threads),
+        )
+        print(f"  Using {n_workers} parallel workers for CPU quantization")
+
     for layer_idx in range(n_layers):
         t_layer = time.perf_counter()
         print(f"\n--- Layer {layer_idx}/{n_layers-1} ---")
@@ -518,52 +554,79 @@ def quantize(
         if use_gpu:
             torch.cuda.empty_cache()
 
-        # Quantize each linear
+        # Quantize each linear sublayer
+        # Filter to quantizable sublayers
+        quant_names = []
         for name in linears:
             if name not in hessians:
                 print(f"  {name}: no activations, skipping")
                 continue
-
-            mod = linears[name]
-            W = mod.weight.data
-
-            if W.shape[1] < 8:
-                print(f"  {name}: in={W.shape[1]} < 8, skipping")
+            if linears[name].weight.data.shape[1] < 8:
+                print(f"  {name}: in={linears[name].weight.data.shape[1]} < 8, skipping")
                 continue
+            quant_names.append(name)
 
+        if pool is not None and len(quant_names) > 1:
+            # Parallel quantization (CPU only)
+            tasks = [
+                (name, linears[name].weight.data.clone(),
+                 hessians[name], bpw, tune_iters)
+                for name in quant_names
+            ]
             t0 = time.perf_counter()
-            H_gpu = hessians[name].to(device)
-            W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
-                W, H_gpu, codebook, bpw=bpw, tune_iters=tune_iters)
-            del H_gpu
-            dt = time.perf_counter() - t0
+            results = list(pool.map(_quantize_sublayer, tasks))
+            dt_batch = time.perf_counter() - t0
 
-            # Store artifacts with full layer path
-            layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
-            all_artifacts[layer_prefix] = {
-                k: v.cpu() for k, v in artifacts.items()}
+            for name, W_hat, artifacts, metrics in results:
+                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
+                all_artifacts[layer_prefix] = artifacts
+                linears[name].weight.data = W_hat.to(
+                    dtype=linears[name].weight.dtype,
+                    device=linears[name].weight.device)
+                all_sqnr.append(metrics['sqnr'])
 
-            # Replace weight for error propagation to next layer
-            mod.weight.data = W_hat.to(dtype=mod.weight.dtype, device=mod.weight.device)
-            all_sqnr.append(metrics['sqnr'])
+            # Print summary
+            n_done = len(results)
+            avg = sum(r[3]['sqnr'] for r in results) / n_done if n_done else 0
+            print(f"  {n_done} sublayers in {dt_batch:.1f}s (parallel) "
+                  f"avg SQNR={avg:.1f}dB")
+        else:
+            # Sequential quantization (GPU or single-worker)
+            for name in quant_names:
+                mod = linears[name]
+                W = mod.weight.data
 
-            # Compact output for MoE expert layers
-            if '.experts.' in name and 'shared' not in name:
-                parts = name.split('experts.')[1].split('.')
-                expert_num = int(parts[0])
-                proj = parts[-1]
-                if expert_num % 16 == 0 or expert_num == 127:
-                    print(f"  expert.{expert_num}.{proj:10s} "
-                          f"{str(tuple(W.shape)):20s} "
-                          f"SQNR={metrics['sqnr']:5.1f}dB  {dt:.1f}s")
-            else:
-                print(f"  {name:30s} {str(tuple(W.shape)):20s} "
-                      f"SQNR={metrics['sqnr']:5.1f}dB  "
-                      f"Ws={metrics['Wscale']:.3f}  {dt:.1f}s")
+                t0 = time.perf_counter()
+                H_gpu = hessians[name].to(device)
+                W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
+                    W, H_gpu, codebook, bpw=bpw, tune_iters=tune_iters)
+                del H_gpu
+                dt = time.perf_counter() - t0
 
-            gc.collect()
-            if use_gpu:
-                torch.cuda.empty_cache()
+                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
+                all_artifacts[layer_prefix] = {
+                    k: v.cpu() for k, v in artifacts.items()}
+
+                mod.weight.data = W_hat.to(dtype=mod.weight.dtype,
+                                           device=mod.weight.device)
+                all_sqnr.append(metrics['sqnr'])
+
+                if '.experts.' in name and 'shared' not in name:
+                    parts = name.split('experts.')[1].split('.')
+                    expert_num = int(parts[0])
+                    proj = parts[-1]
+                    if expert_num % 16 == 0 or expert_num == 127:
+                        print(f"  expert.{expert_num}.{proj:10s} "
+                              f"{str(tuple(W.shape)):20s} "
+                              f"SQNR={metrics['sqnr']:5.1f}dB  {dt:.1f}s")
+                else:
+                    print(f"  {name:30s} {str(tuple(W.shape)):20s} "
+                          f"SQNR={metrics['sqnr']:5.1f}dB  "
+                          f"Ws={metrics['Wscale']:.3f}  {dt:.1f}s")
+
+                gc.collect()
+                if use_gpu:
+                    torch.cuda.empty_cache()
 
         del hessians
 
@@ -592,6 +655,9 @@ def quantize(
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
+
+    if pool is not None:
+        pool.shutdown()
 
     total_time = time.perf_counter() - t_start
     avg_sqnr = sum(all_sqnr) / len(all_sqnr) if all_sqnr else 0
@@ -728,6 +794,9 @@ def main():
     parser.add_argument("--streaming", action="store_true",
                         help="Load weights layer-by-layer from safetensors "
                              "(for models exceeding system RAM)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Parallel workers for CPU quantization "
+                             "(0=auto, 1=sequential, ignored on GPU)")
     args = parser.parse_args()
 
     quantize(
@@ -740,6 +809,7 @@ def main():
         device=args.device,
         trust_remote_code=args.trust_remote_code,
         streaming=args.streaming,
+        workers=args.workers,
     )
 
 

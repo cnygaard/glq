@@ -184,6 +184,60 @@ class E8RHTLinear(nn.Module):
         self._wscale_float = self.Wscale.item()
         self._inv_rs_float = self.inv_resid_scale.item() if self._has_stage2 else 0.0
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        """Pad unpadded tensors back to power-of-2 dimensions on load."""
+        for suffix in ('Qidxs', 'Qidxs2'):
+            key = prefix + suffix
+            if key in state_dict:
+                t = state_dict[key]
+                target = (self.m_pad, self.n_pad // 8)
+                if t.shape[0] < target[0] or t.shape[1] < target[1]:
+                    padded = torch.zeros(target, dtype=t.dtype, device=t.device)
+                    padded[:t.shape[0], :t.shape[1]] = t
+                    state_dict[key] = padded
+        su_key = prefix + 'SU'
+        if su_key in state_dict and state_dict[su_key].shape[0] < self.m_pad:
+            t = state_dict[su_key]
+            padded = torch.ones(self.m_pad, dtype=t.dtype, device=t.device)
+            padded[:t.shape[0]] = t
+            state_dict[su_key] = padded
+        sv_key = prefix + 'SV'
+        if sv_key in state_dict and state_dict[sv_key].shape[0] < self.n_pad:
+            t = state_dict[sv_key]
+            padded = torch.ones(self.n_pad, dtype=t.dtype, device=t.device)
+            padded[:t.shape[0]] = t
+            state_dict[sv_key] = padded
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs)
+
+    def _pad_if_needed(self):
+        """Pad buffers to power-of-2 dims if loaded at unpadded size.
+
+        Handles accelerate dispatch (which bypasses load_state_dict).
+        Called once on first forward; a no-op if already padded.
+        """
+        if self.Qidxs.shape[0] == self.m_pad:
+            return
+        dev = self.Qidxs.device
+        target = (self.m_pad, self.n_pad // 8)
+        for name in ('Qidxs', 'Qidxs2'):
+            old = getattr(self, name)
+            if old.shape[0] < target[0] or old.shape[1] < target[1]:
+                new = torch.zeros(target, dtype=old.dtype, device='cpu')
+                new[:old.shape[0], :old.shape[1]] = old.cpu()
+                self.register_buffer(name, new.to(dev))
+        if self.SU.shape[0] < self.m_pad:
+            new = torch.ones(self.m_pad, dtype=self.SU.dtype, device='cpu')
+            new[:self.SU.shape[0]] = self.SU.cpu()
+            self.register_buffer('SU', new.to(dev))
+        if self.SV.shape[0] < self.n_pad:
+            new = torch.ones(self.n_pad, dtype=self.SV.dtype, device='cpu')
+            new[:self.SV.shape[0]] = self.SV.cpu()
+            self.register_buffer('SV', new.to(dev))
+        torch.cuda.empty_cache()
+
     def _ensure_codebook_device(self):
         """Move codebook(s) to match Qidxs device (lazy, once)."""
         if self.codebook is not None and self.codebook.codebook.device != self.Qidxs.device:
@@ -199,6 +253,7 @@ class E8RHTLinear(nn.Module):
         2. Fused dequant+matmul in RHT domain (Triton) or decode+matmul (fallback)
         3. FHT on y_rht, apply SU signs, unpad → inverse RHT on output
         """
+        self._pad_if_needed()
         self._ensure_codebook_device()
         # Lazy-resolve cached scalars (for layers that were on meta at set_codebook time)
         if self._wscale_float is None:
@@ -288,6 +343,7 @@ class E8RHTLinear(nn.Module):
         Full weight dequantization for debugging/validation.
         Returns (out_features, in_features) dense weight matrix.
         """
+        self._pad_if_needed()
         self._ensure_codebook_device()
         W_rht = self.codebook.decode(self.Qidxs.long().reshape(-1))
         W_rht = W_rht.reshape(self.m_pad, self.n_pad)
