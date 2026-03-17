@@ -673,15 +673,14 @@ def glq_dequant_matmul(
 
     use_splitk = (est_grid < num_sms) and (N_BLOCKS >= _BLOCKS_PER_SPLIT)
 
-    # Packed uint32 helps when total gather volume is small (ALU decode
-    # cost must be less than the L2 bandwidth savings). Threshold: M*N_BLOCKS <= 2M.
+    # Packed uint32 codebook: 4B gather instead of 16B.
+    # Benchmarks show packed is 2-6% faster across all shapes (ALU decode
+    # cost is negligible vs L2 bandwidth savings on L40S).
     # Only for 2bpw (no 2-stage support in packed kernels).
-    _PACKED_MAX_ELEMENTS = 2 * 1024 * 1024
     use_packed = (
         use_splitk
         and codebook_packed is not None
         and not has_stage2
-        and M * N_BLOCKS <= _PACKED_MAX_ELEMENTS
     )
 
     if use_packed:

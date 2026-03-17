@@ -60,6 +60,7 @@ def bench_kernel_sweep(shapes, batch_sizes, codebook, device="cuda"):
     results = []
     K = codebook.codebook.shape[0]
     cb_half = codebook.codebook_half.to(device)
+    cb_packed = codebook.codebook_packed.to(device)
 
     for M, N in shapes:
         m_pad = 1 << (M - 1).bit_length()
@@ -74,7 +75,9 @@ def bench_kernel_sweep(shapes, batch_sizes, codebook, device="cuda"):
             x_dense = torch.randn(B, N, device=device, dtype=torch.float16)
 
             glq_us = cuda_median_us(
-                lambda: glq_dequant_matmul(x, Qidxs, cb_half, Wscale))
+                lambda: glq_dequant_matmul(
+                    x, Qidxs, cb_half, Wscale,
+                    codebook_packed=cb_packed))
             dense_us = cuda_median_us(
                 lambda: x_dense @ W_dense.T)
 
@@ -219,79 +222,65 @@ def bench_model_prefill(model_dir_glq, model_id_bf16, batch_sizes,
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     results = []
+    input_ids_single = torch.randint(100, 10000, (1, seqlen), device=device)
 
-    # Load bf16 baseline
+    def _measure_model(model, batch_sizes, input_ids_single, n_runs):
+        """Time model prefill at each batch size, return (times_dict, mem_dict)."""
+        times, mems = {}, {}
+        for B in batch_sizes:
+            input_ids = input_ids_single.expand(B, -1).contiguous()
+            torch.cuda.reset_peak_memory_stats()
+            with torch.no_grad():
+                model(input_ids, use_cache=False)
+                torch.cuda.synchronize()
+                runs = []
+                for _ in range(n_runs):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    model(input_ids, use_cache=False)
+                    torch.cuda.synchronize()
+                    runs.append(time.perf_counter() - t0)
+            runs.sort()
+            times[B] = runs[len(runs) // 2]
+            mems[B] = torch.cuda.max_memory_allocated() / 1e6
+        return times, mems
+
+    # Measure bf16 first, then free it before loading GLQ
     print("  Loading bf16 baseline ...")
-    AutoTokenizer.from_pretrained(model_id_bf16)
     model_bf16 = AutoModelForCausalLM.from_pretrained(
         model_id_bf16, torch_dtype=torch.bfloat16, device_map=device)
     model_bf16.eval()
+    bf16_times, bf16_mems = _measure_model(
+        model_bf16, batch_sizes, input_ids_single, n_runs)
+    del model_bf16
+    torch.cuda.empty_cache()
 
-    # Load GLQ model
+    # Now load and measure GLQ with a clean GPU
     print("  Loading GLQ model ...")
     model_glq = AutoModelForCausalLM.from_pretrained(
         model_dir_glq, device_map=device)
     model_glq.eval()
-
-    # Create input tokens
-    input_ids_single = torch.randint(100, 10000, (1, seqlen), device=device)
+    glq_times, glq_mems = _measure_model(
+        model_glq, batch_sizes, input_ids_single, n_runs)
+    del model_glq
+    torch.cuda.empty_cache()
 
     for B in batch_sizes:
-        input_ids = input_ids_single.expand(B, -1).contiguous()
-
-        # Measure bf16 prefill
-        torch.cuda.reset_peak_memory_stats()
-        with torch.no_grad():
-            model_bf16(input_ids, use_cache=False)
-            torch.cuda.synchronize()
-
-            times_bf16 = []
-            for _ in range(n_runs):
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                model_bf16(input_ids, use_cache=False)
-                torch.cuda.synchronize()
-                times_bf16.append(time.perf_counter() - t0)
-
-        times_bf16.sort()
-        bf16_s = times_bf16[len(times_bf16) // 2]
-        bf16_toks = B * seqlen / bf16_s
-        bf16_mem = torch.cuda.max_memory_allocated() / 1e6
-
-        # Measure GLQ prefill
-        torch.cuda.reset_peak_memory_stats()
-        with torch.no_grad():
-            model_glq(input_ids, use_cache=False)
-            torch.cuda.synchronize()
-
-            times_glq = []
-            for _ in range(n_runs):
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                model_glq(input_ids, use_cache=False)
-                torch.cuda.synchronize()
-                times_glq.append(time.perf_counter() - t0)
-
-        times_glq.sort()
-        glq_s = times_glq[len(times_glq) // 2]
-        glq_toks = B * seqlen / glq_s
-        glq_mem = torch.cuda.max_memory_allocated() / 1e6
-
+        bf16_toks = B * seqlen / bf16_times[B]
+        glq_toks = B * seqlen / glq_times[B]
         ratio = glq_toks / bf16_toks
         results.append({
             "B": B,
             "glq_tok_s": round(glq_toks, 1),
             "bf16_tok_s": round(bf16_toks, 1),
             "speedup": round(ratio, 3),
-            "glq_mem_mb": round(glq_mem, 0),
-            "bf16_mem_mb": round(bf16_mem, 0),
+            "glq_mem_mb": round(glq_mems[B], 0),
+            "bf16_mem_mb": round(bf16_mems[B], 0),
         })
-        print(f"  B={B:3d}  GLQ={glq_toks:8.1f} tok/s ({glq_mem:6.0f} MB)  "
-              f"bf16={bf16_toks:8.1f} tok/s ({bf16_mem:6.0f} MB)  "
+        print(f"  B={B:3d}  GLQ={glq_toks:8.1f} tok/s ({glq_mems[B]:6.0f} MB)  "
+              f"bf16={bf16_toks:8.1f} tok/s ({bf16_mems[B]:6.0f} MB)  "
               f"speedup={ratio:.3f}x")
 
-    del model_bf16, model_glq
-    torch.cuda.empty_cache()
     return results
 
 
