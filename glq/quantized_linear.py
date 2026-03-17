@@ -186,7 +186,11 @@ class E8RHTLinear(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys, error_msgs):
-        """Pad unpadded tensors back to power-of-2 dimensions on load."""
+        """Pad unpadded tensors back to power-of-2 dimensions on load.
+
+        Also handles 2bpw models that omit Qidxs2/inv_resid_scale
+        (they default to zeros from __init__).
+        """
         for suffix in ('Qidxs', 'Qidxs2'):
             key = prefix + suffix
             if key in state_dict:
@@ -208,6 +212,15 @@ class E8RHTLinear(nn.Module):
             padded = torch.ones(self.n_pad, dtype=t.dtype, device=t.device)
             padded[:t.shape[0]] = t
             state_dict[sv_key] = padded
+        # 2bpw models omit Qidxs2 and inv_resid_scale to save disk space.
+        # Inject zero placeholders so super() doesn't report them as missing.
+        for suffix, default_fn in [
+            ('Qidxs2', lambda: torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16)),
+            ('inv_resid_scale', lambda: torch.zeros((), dtype=torch.float32)),
+        ]:
+            key = prefix + suffix
+            if key not in state_dict:
+                state_dict[key] = default_fn()
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata,
             strict, missing_keys, unexpected_keys, error_msgs)

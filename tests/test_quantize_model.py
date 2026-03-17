@@ -127,8 +127,7 @@ class TestWorkerFunctions:
 
         assert name == "test_layer"
         assert W_hat.shape == (16, 64)
-        assert set(artifacts.keys()) == {
-            'Qidxs', 'Qidxs2', 'SU', 'SV', 'Wscale', 'inv_resid_scale'}
+        assert set(artifacts.keys()) == {'Qidxs', 'SU', 'SV', 'Wscale'}
         assert all(v.device.type == 'cpu' for v in artifacts.values())
         assert metrics['sqnr'] > 0
 

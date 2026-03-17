@@ -56,11 +56,11 @@ class TestQuantizeLayer2bpw:
         W = torch.randn(8, 64)
         H = _random_psd(64)
         W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(W, H, codebook, bpw=2)
-        assert set(artifacts.keys()) == {'Qidxs', 'Qidxs2', 'inv_resid_scale', 'SU', 'SV', 'Wscale'}
+        assert set(artifacts.keys()) == {'Qidxs', 'SU', 'SV', 'Wscale'}
         assert set(metrics.keys()) == {'sqnr', 'bpw', 'Wscale'}
-        # 2bpw: Qidxs2 should be zeros, inv_resid_scale should be 0.0
-        assert artifacts['Qidxs2'].abs().max() == 0
-        assert artifacts['inv_resid_scale'].item() == 0.0
+        # 2bpw: no Qidxs2 or inv_resid_scale (omitted to save disk space)
+        assert 'Qidxs2' not in artifacts
+        assert 'inv_resid_scale' not in artifacts
 
     def test_artifact_dtypes(self, codebook):
         W = torch.randn(8, 64)
