@@ -47,19 +47,31 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 | 10.8 |
 | GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 | 11.0 |
 
-**SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA A10G):
+**SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
-| Method | Eff. BPW | Perplexity | vs bf16 | GPU MB | tok/s |
-|--------|----------|------------|---------|--------|-------|
-| bf16 baseline | 16.00 | 11.48 | 1.00x | 724 | 37.6 |
-| GLQ 4-bit | 4.00 | 11.82 | 1.03x | - | - |
-| QuIP+GPTQ 4-bit | 4.75 | 12.06 | 1.05x | - | - |
-| GLQ 3-bit | 3.00 | 13.38 | 1.17x | - | - |
-| QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x | - | - |
-| GLQ 2-bit | 2.00 | 17.70 | 1.54x | 356 | 15.5 |
-| GPTQ 3-bit | 9.48 | 18.61 | 1.62x | - | - |
+| Method | Eff. BPW | Perplexity | vs bf16 |
+|--------|----------|------------|---------|
+| bf16 baseline | 16.00 | 11.47 | 1.00x |
+| GLQ 4-bit | 4.00 | 11.77 | 1.03x |
+| QuIP+GPTQ 4-bit | 4.75 | 12.06 | 1.05x |
+| GLQ 3-bit | 3.00 | 13.16 | 1.15x |
+| QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x |
+| GLQ 2-bit | 2.00 | 17.94 | 1.56x |
+| GPTQ 3-bit | 9.48 | 18.61 | 1.62x |
 
-GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (17.70) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.82) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
+GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (17.94) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
+
+### Inference performance
+
+**SmolLM3-3B-Base** prefill throughput on NVIDIA L40S (seqlen=128):
+
+| Batch | GLQ tok/s | bf16 tok/s | Speedup | GLQ VRAM | bf16 VRAM |
+|-------|-----------|-----------|---------|----------|-----------|
+| 1 | 1,160 | 4,709 | 0.25x | 3,832 MB | 6,194 MB |
+| 4 | 3,060 | 18,845 | 0.16x | 4,185 MB | 6,294 MB |
+| 64 | 2,394 | 26,528 | 0.09x | 6,611 MB | 8,295 MB |
+
+GLQ compresses model weights from 6.2 GB to 2.5 GB (60% reduction). Runtime fp32 intermediates from the RHT add ~1.3 GB overhead, giving a net VRAM savings of ~38% at B=1. The throughput gap is due to codebook scatter-gather in the dequant kernel vs contiguous cuBLAS reads; closing this requires CUDA C kernels with warp shuffles and async prefetch.
 
 ## How it works
 
