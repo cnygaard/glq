@@ -47,6 +47,14 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 | 10.8 |
 | GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 | 11.0 |
 
+**SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (128 calibration samples, NVIDIA L40S):
+
+| Method | Eff. BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg |
+|--------|----------|-------|-------|-----------|------|------------|-----|
+| bf16 baseline | 16.00 | 0.489 | 0.782 | 0.563 | 0.779 | 0.678 | 0.658 |
+| GLQ 3-bit | 3.00 | 0.447 | 0.759 | 0.530 | 0.755 | 0.688 | 0.636 |
+| GLQ 2-bit | 2.00 | 0.371 | 0.710 | 0.464 | 0.724 | 0.647 | 0.583 |
+
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
 | Method | Eff. BPW | Perplexity | vs bf16 |
