@@ -260,12 +260,17 @@ if _triton_available:
 
     @triton.autotune(
         configs=[
+            triton.Config({'BLOCK_M': 32}, num_warps=2, num_stages=2),
+            triton.Config({'BLOCK_M': 32}, num_warps=2, num_stages=4),
             triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_M': 64}, num_warps=8, num_stages=2),
             triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
         ],
         key=['M', 'BLOCKS_PER_SPLIT'],
+        reset_to_zero=['y_ptr'],
     )
     @triton.jit
     def _splitk_matvec_kernel(
@@ -343,11 +348,15 @@ if _triton_available:
     @triton.autotune(
         configs=[
             triton.Config({'BLOCK_B': 16, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 16, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
         ],
         key=['B', 'M', 'BLOCKS_PER_SPLIT'],
+        reset_to_zero=['y_ptr'],
     )
     @triton.jit
     def _splitk_matmul_tc_kernel(
@@ -461,12 +470,17 @@ if _triton_available:
 
     @triton.autotune(
         configs=[
+            triton.Config({'BLOCK_M': 32}, num_warps=2, num_stages=2),
+            triton.Config({'BLOCK_M': 32}, num_warps=2, num_stages=4),
             triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_M': 64}, num_warps=8, num_stages=2),
             triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
         ],
         key=['M', 'BLOCKS_PER_SPLIT'],
+        reset_to_zero=['y_ptr'],
     )
     @triton.jit
     def _packed_splitk_matvec_kernel(
@@ -524,11 +538,15 @@ if _triton_available:
     @triton.autotune(
         configs=[
             triton.Config({'BLOCK_B': 16, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 16, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
         ],
         key=['B', 'M', 'BLOCKS_PER_SPLIT'],
+        reset_to_zero=['y_ptr'],
     )
     @triton.jit
     def _packed_splitk_matmul_tc_kernel(
