@@ -204,8 +204,22 @@ class E8ShellCodebook:
     def _quantize_triton(self, x):
         """Fused codebook NN via Triton kernel (no intermediate distance matrix)."""
         from .codebook_kernel import triton_codebook_nn
-        indices = triton_codebook_nn(x, self.codebook_half, self.codebook_norms)
+        # Pass pre-converted fp16 codebook and fp32 norms to avoid per-call copies
+        indices = triton_codebook_nn(
+            x, self.codebook_half, self.codebook_norms)
         return self.codebook[indices], indices
+
+    def quantize_fast(self, x_half, decoded_out=None, idx_out=None):
+        """Fast quantize with fused NN+decode: x must be fp16 CUDA.
+
+        Returns (decoded_fp16, indices_i64).
+        Used by the LDLQ inner loop where we control dtypes.
+        Pre-allocated buffers can be passed to avoid per-call allocation.
+        """
+        from .codebook_kernel import triton_codebook_nn_decode
+        return triton_codebook_nn_decode(
+            x_half, self.codebook_half, self.codebook_norms,
+            decoded_out=decoded_out, idx_out=idx_out)
 
     def _quantize_pytorch(self, x, _batch_size=16384):
         """Batched fp16 matmul + argmin fallback."""

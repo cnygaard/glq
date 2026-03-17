@@ -77,21 +77,46 @@ def quantize_ldlq_codebook(
     hatWr = torch.zeros_like(Wr)
     all_indices = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
 
-    # Optimization: FP16 L for feedback matmul (Tensor Core), incremental residual
-    use_fp16 = torch.device(device).type == 'cuda'
-    L_half = L.half() if use_fp16 else L
-    R = Wr.clone()  # residual = Wr - hatWr, initially just Wr
+    use_cuda = torch.device(device).type == 'cuda'
+    if use_cuda:
+        # Keep everything in fp16 to avoid per-block dtype conversions.
+        # L_half for feedback matmul (Tensor Core), R_half tracks residual.
+        L_half = L.half()
+        Wr_half = Wr.half()
+        R_half = Wr_half.clone()
+        hatWr_half = torch.zeros_like(Wr_half)
+        # Pre-allocate reusable buffers to avoid per-block allocation
+        WXWX_buf = torch.empty(m, b, dtype=torch.float16, device=device)
+        dec_buf = torch.empty(m, b, dtype=torch.float16, device=device)
+        idx_buf = torch.empty(m, dtype=torch.int64, device=device)
 
-    for k in reversed(range(num_blocks)):
-        kb, ke = k * b, (k + 1) * b
-        if ke < n:
-            R_tail = R[:, ke:].half() if use_fp16 else R[:, ke:]
-            feedback = (R_tail @ L_half[ke:, kb:ke]).float()
-        else:
-            feedback = 0.0
-        WXWX = Wr[:, kb:ke] + feedback
-        hatWr[:, kb:ke], all_indices[:, k] = codebook.quantize(WXWX)
-        R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
+        for k in reversed(range(num_blocks)):
+            kb, ke = k * b, (k + 1) * b
+            if ke < n:
+                torch.mm(R_half[:, ke:], L_half[ke:, kb:ke], out=WXWX_buf)
+                WXWX_buf.add_(Wr_half[:, kb:ke])
+            else:
+                WXWX_buf.copy_(Wr_half[:, kb:ke])
+            # Fused NN + decode: single kernel, no separate gather
+            codebook.quantize_fast(WXWX_buf,
+                                   decoded_out=dec_buf, idx_out=idx_buf)
+            all_indices[:, k] = idx_buf
+            hatWr_half[:, kb:ke] = dec_buf
+            R_half[:, kb:ke] = Wr_half[:, kb:ke] - dec_buf
+
+        # Recover fp32 hatWr for downstream use
+        hatWr = hatWr_half.float()
+    else:
+        R = Wr.clone()
+        for k in reversed(range(num_blocks)):
+            kb, ke = k * b, (k + 1) * b
+            if ke < n:
+                feedback = R[:, ke:] @ L[ke:, kb:ke]
+            else:
+                feedback = 0.0
+            WXWX = Wr[:, kb:ke] + feedback
+            hatWr[:, kb:ke], all_indices[:, k] = codebook.quantize(WXWX)
+            R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
 
     for _ in range(tune_iters):
         for k in reversed(range(num_blocks)):
@@ -167,29 +192,68 @@ def quantize_ldlq_codebook_2stage(
     all_indices1 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
     all_indices2 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
 
-    # Optimization: FP16 L for feedback matmul (Tensor Core), incremental residual
-    use_fp16 = torch.device(device).type == 'cuda'
-    L_half = L.half() if use_fp16 else L
-    R = Wr.clone()  # residual = Wr - hatWr, initially just Wr
+    use_cuda = torch.device(device).type == 'cuda'
+    if use_cuda:
+        L_half = L.half()
+        Wr_half = Wr.half()
+        R_half = Wr_half.clone()
+        hatWr_half = torch.zeros_like(Wr_half)
+        # Pre-allocate reusable buffers
+        target_buf = torch.empty(m, b, dtype=torch.float16, device=device)
+        resid_buf = torch.empty(m, b, dtype=torch.float16, device=device)
+        dec1_buf = torch.empty(m, b, dtype=torch.float16, device=device)
+        dec2_buf = torch.empty(m, b, dtype=torch.float16, device=device)
+        idx1_buf = torch.empty(m, dtype=torch.int64, device=device)
+        idx2_buf = torch.empty(m, dtype=torch.int64, device=device)
+        resid_scale_half = torch.tensor(resid_scale, dtype=torch.float16,
+                                        device=device)
+        inv_resid_scale_half = torch.tensor(1.0 / resid_scale,
+                                            dtype=torch.float16, device=device)
 
-    for k in reversed(range(num_blocks)):
-        kb, ke = k * b, (k + 1) * b
-        if ke < n:
-            R_tail = R[:, ke:].half() if use_fp16 else R[:, ke:]
-            feedback = (R_tail @ L_half[ke:, kb:ke]).float()
-        else:
-            feedback = 0.0
-        target = Wr[:, kb:ke] + feedback
+        for k in reversed(range(num_blocks)):
+            kb, ke = k * b, (k + 1) * b
+            if ke < n:
+                torch.mm(R_half[:, ke:], L_half[ke:, kb:ke], out=target_buf)
+                target_buf.add_(Wr_half[:, kb:ke])
+            else:
+                target_buf.copy_(Wr_half[:, kb:ke])
 
-        dec1, idx1 = codebook1.quantize(target)
-        all_indices1[:, k] = idx1
+            # Fused NN + decode for stage 1
+            codebook1.quantize_fast(target_buf,
+                                    decoded_out=dec1_buf, idx_out=idx1_buf)
+            all_indices1[:, k] = idx1_buf
 
-        residual = target - dec1
-        dec2, idx2 = codebook2.quantize(residual * resid_scale)
-        all_indices2[:, k] = idx2
+            torch.sub(target_buf, dec1_buf, out=resid_buf)
+            resid_buf.mul_(resid_scale_half)
 
-        hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
-        R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
+            # Fused NN + decode for stage 2
+            codebook2.quantize_fast(resid_buf,
+                                    decoded_out=dec2_buf, idx_out=idx2_buf)
+            all_indices2[:, k] = idx2_buf
+
+            hatWr_half[:, kb:ke] = dec1_buf + dec2_buf * inv_resid_scale_half
+            R_half[:, kb:ke] = Wr_half[:, kb:ke] - hatWr_half[:, kb:ke]
+
+        hatWr = hatWr_half.float()
+    else:
+        R = Wr.clone()
+        for k in reversed(range(num_blocks)):
+            kb, ke = k * b, (k + 1) * b
+            if ke < n:
+                feedback = R[:, ke:] @ L[ke:, kb:ke]
+            else:
+                feedback = 0.0
+            target = Wr[:, kb:ke] + feedback
+
+            dec1, idx1 = codebook1.quantize(target)
+            all_indices1[:, k] = idx1
+
+            residual = target - dec1
+            dec2, idx2 = codebook2.quantize(residual * resid_scale)
+            all_indices2[:, k] = idx2
+
+            hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
+            R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
 
     for _ in range(tune_iters):
         for k in reversed(range(num_blocks)):
