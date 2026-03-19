@@ -727,6 +727,7 @@ def quantize(
         save_cfg = cfg
         is_wrapped = False
     config_dict = save_cfg.to_dict()
+    config_dict["use_cache"] = True  # Restore KV cache for inference
     if is_wrapped:
         from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
         causal_cls = MODEL_FOR_CAUSAL_LM_MAPPING.get(type(save_cfg), None)

@@ -130,7 +130,7 @@ if _triton_available:
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=4),
         ],
-        key=['B', 'M', 'N_BLOCKS'],
+        key=['M', 'N_BLOCKS'],
     )
     @triton.jit
     def _glq_dequant_matmul_tc_kernel(
@@ -355,7 +355,7 @@ if _triton_available:
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
         ],
-        key=['B', 'M', 'BLOCKS_PER_SPLIT'],
+        key=['M', 'BLOCKS_PER_SPLIT'],
         reset_to_zero=['y_ptr'],
     )
     @triton.jit
@@ -545,7 +545,7 @@ if _triton_available:
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
             triton.Config({'BLOCK_B': 32, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
         ],
-        key=['B', 'M', 'BLOCKS_PER_SPLIT'],
+        key=['M', 'BLOCKS_PER_SPLIT'],
         reset_to_zero=['y_ptr'],
     )
     @triton.jit

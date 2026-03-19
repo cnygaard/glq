@@ -55,6 +55,17 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | GLQ 3-bit | 3.00 | 0.447 | 0.759 | 0.530 | 0.755 | 0.688 | 0.636 |
 | GLQ 2-bit | 2.00 | 0.371 | 0.710 | 0.464 | 0.724 | 0.647 | 0.583 |
 
+**SmolLM3-3B-Base** 4-bit method comparison (acc_norm where available, 128 calibration samples, NVIDIA L40S):
+
+| Method | Eff. BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg | tok/s | VRAM |
+|--------|----------|-------|-------|-----------|------|------------|-----|-------|------|
+| bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 | 30.8 | 5,875 MB |
+| AutoRound W4 | 4.50 | 0.532 | 0.797 | 0.748 | 0.781 | 0.661 | 0.704 | — | — |
+| GPTQ W4A16 | 4.50 | 0.538 | 0.785 | 0.740 | 0.781 | 0.648 | 0.698 | 8.5† | 7,487 MB |
+| GLQ 4-bit | 4.00 | — | — | — | — | — | — | 12.7 | 5,044 MB |
+
+AutoRound retains 99.3% of bf16 accuracy, GPTQ retains 98.5%. Both use group_size=128 (effective ~4.5 bpw with group scales). GLQ uses a single global scale per layer (exactly 4.0 bpw). Decode tok/s measured at B=1, seqlen=1 steady-state on NVIDIA L40S. †GPTQ without compiled CUDA dequant kernels (auto-gptq/gptqmodel); native kernels would be faster.
+
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
 | Method | Eff. BPW | Perplexity | vs bf16 |
