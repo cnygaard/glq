@@ -47,13 +47,15 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 | 10.8 |
 | GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 | 11.0 |
 
-**SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (128 calibration samples, NVIDIA L40S):
+**SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (acc_norm where available, 128 calibration samples, NVIDIA L40S):
 
 | Method | Eff. BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg |
 |--------|----------|-------|-------|-----------|------|------------|-----|
-| bf16 baseline | 16.00 | 0.489 | 0.782 | 0.563 | 0.779 | 0.678 | 0.658 |
+| bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 |
 | GLQ 3-bit | 3.00 | 0.447 | 0.759 | 0.530 | 0.755 | 0.688 | 0.636 |
-| GLQ 2-bit | 2.00 | 0.371 | 0.710 | 0.464 | 0.724 | 0.647 | 0.583 |
+| GLQ 2-bit | 2.00 | 0.415 | 0.679 | 0.634 | 0.730 | 0.660 | 0.623 |
+
+GLQ 2-bit retains 87.9% of bf16 accuracy at 8x compression (exactly 2.00 effective bpw, no group scales).
 
 **SmolLM3-3B-Base** 4-bit method comparison (acc_norm where available, 128 calibration samples, NVIDIA L40S):
 
@@ -62,9 +64,9 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 | 30.8 | 5,875 MB |
 | AutoRound W4 | 4.50 | 0.532 | 0.797 | 0.748 | 0.781 | 0.661 | 0.704 | — | — |
 | GPTQ W4A16 | 4.50 | 0.538 | 0.785 | 0.740 | 0.781 | 0.648 | 0.698 | 8.5† | 7,487 MB |
-| GLQ 4-bit | 4.00 | — | — | — | — | — | — | 12.7 | 5,044 MB |
+| GLQ 4-bit | 4.00 | 0.522 | 0.776 | 0.746 | 0.780 | 0.672 | 0.699 | 14.0 | 5,044 MB |
 
-AutoRound retains 99.3% of bf16 accuracy, GPTQ retains 98.5%. Both use group_size=128 (effective ~4.5 bpw with group scales). GLQ uses a single global scale per layer (exactly 4.0 bpw). Decode tok/s measured at B=1, seqlen=1 steady-state on NVIDIA L40S. †GPTQ without compiled CUDA dequant kernels (auto-gptq/gptqmodel); native kernels would be faster.
+GLQ 4-bit retains 98.6% of bf16 accuracy at exactly 4.00 effective bpw (no group scales). AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw). Decode tok/s at B=1 steady-state on NVIDIA L40S. †GPTQ without compiled CUDA dequant kernels (auto-gptq/gptqmodel); native kernels would be faster.
 
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
