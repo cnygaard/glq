@@ -59,10 +59,11 @@ Mixed-precision models use `--bpw <target> --min-bpw 2 --max-bpw 4` to automatic
 | Method | Eff. BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg |
 |--------|----------|-------|-------|-----------|------|------------|-----|
 | bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 |
+| GLQ 3.5-bit mixed | 3.50 | 0.497 | 0.777 | 0.735 | 0.769 | 0.668 | 0.685 |
 | GLQ 3-bit | 3.00 | 0.447 | 0.759 | 0.530 | 0.755 | 0.688 | 0.636 |
 | GLQ 2-bit | 2.00 | 0.415 | 0.679 | 0.634 | 0.730 | 0.660 | 0.623 |
 
-GLQ 2-bit retains 87.9% of bf16 accuracy at 8x compression (exactly 2.00 effective bpw, no group scales).
+GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy at 4.6x compression. WinoGrande holds perfectly (0.668 = bf16). GLQ 2-bit retains 87.9% at 8x compression.
 
 **SmolLM3-3B-Base** 4-bit method comparison (acc_norm where available, 128 calibration samples, NVIDIA L40S):
 
