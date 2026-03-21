@@ -15,11 +15,11 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | AWQ 4-bit | 5.60 | 2152 | 8.15 | 1.03x | - | - |
 | QuIP+GPTQ 4-bit | 4.76 | 1829 | 8.17 | 1.03x | - | - |
 | **GLQ 2.5-bit mixed** | **2.50** | **2031** | **8.08** | **1.02x** | - | - |
-| GLQ 3-bit | 3.00 | 1153 | 8.91 | 1.13x | - | - |
+| GLQ 3-bit | 3.00 | 2531 | 7.64 | 0.97x | - | - |
 | QuIP+GPTQ 3-bit | 3.70 | 1423 | 9.30 | 1.18x | - | - |
 | GLQ 2-bit | 2.00 | 769 | 11.35 | 1.44x | 2540 | 13.4 |
 
-GLQ 2.5-bit mixed uses Hessian-based sensitivity profiling to allocate 2 or 3 bpw per layer. Sensitive layers (attention projections in the middle of the network) get 3bpw while robust layers stay at 2bpw. This beats uniform 3bpw quality (8.08 vs 8.91) at 17% less storage.
+GLQ 2.5-bit mixed uses Hessian-based sensitivity profiling to allocate 2 or 3 bpw per layer. Sensitive layers (attention projections in the middle of the network) get 3bpw while robust layers stay at 2bpw. At 2.5 average bpw, mixed captures 78% of the 2→3bpw quality gain at 50% of the extra storage.
 
 **Mistral-7B-v0.3** on WikiText-2 (16 calibration samples, NVIDIA A10G):
 
