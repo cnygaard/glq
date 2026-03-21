@@ -709,25 +709,20 @@ def glq_dequant_matmul(
         q2 = Qidxs
         cb2 = cb
 
-    # CUDA C kernel: B=1 decode (2.7-3× faster than Triton)
-    # B>1: Triton TC is faster (fused matmul with mma.m16n8k16)
-    # CUDA C TC (wmma) available as fallback when Triton unavailable
-    if B == 1 and _try_load_cuda_ext():
+    # CUDA C kernels: B=1 split-K matvec, B>1 inline PTX TC (mma.m16n8k16)
+    # Both 2.7-3.3× faster than Triton
+    if _try_load_cuda_ext():
         _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
         _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
-        y = _glq_cuda.glq_dequant_matvec_cuda(
-            x_fp16[0], Qidxs, cb, Wscale,
-            q2 if has_stage2 else _empty_i16,
-            cb2 if has_stage2 else _empty_f16,
-            inv_resid_scale if has_stage2 else 0.0,
-        )
-        return y.unsqueeze(0)  # (M,) → (1, M)
-
-    if not _triton_available:
-        # No Triton: use CUDA C TC (wmma) for B>1 if available
-        if _try_load_cuda_ext():
-            _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
-            _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
+        if B == 1:
+            y = _glq_cuda.glq_dequant_matvec_cuda(
+                x_fp16[0], Qidxs, cb, Wscale,
+                q2 if has_stage2 else _empty_i16,
+                cb2 if has_stage2 else _empty_f16,
+                inv_resid_scale if has_stage2 else 0.0,
+            )
+            return y.unsqueeze(0)  # (M,) → (1, M)
+        else:
             y = _glq_cuda.glq_dequant_matmul_cuda(
                 x_fp16, Qidxs, cb, Wscale,
                 q2 if has_stage2 else _empty_i16,

@@ -13,7 +13,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <mma.h>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -233,29 +232,35 @@ glq_matvec_splitk_kernel(
 
 
 /* ─────────────────────────────────────────────────────────────────────
- * Tensor Core matmul kernel (B>=2) — wmma API
+ * Tensor Core matmul kernel (B>=2) — inline PTX mma.m16n8k16
  *
  * Y(B×M) = X(B×N) @ dequant(W)^T(N×M) * Wscale
  *
- * Uses nvcuda::wmma with m16n8k16 tiles:
- *   A = X tile (16 batch rows × 16 input dims = 2 codebook blocks)
- *   B = W tile (16 input dims × 8 output rows, from codebook gather)
- *   C = accumulated Y tile (16 × 8)
+ * Direct register loading — no shared memory staging needed.
+ * Each thread loads its specific codebook and x elements directly
+ * into the mma register layout per the PTX ISA spec:
  *
- * Codebook vectors are gathered into shared memory as contiguous tiles,
- * then loaded into wmma fragments. This avoids manual mma register layout.
+ * groupID = laneid / 4  (0..7, selects output row for B and batch pair for A)
+ * tid_g   = laneid % 4  (0..3, selects k-pair within each register)
  *
- * Grid: 3D (ceil(B/16), ceil(M/8), ceil(N_BLOCKS/TC_BPS))
- * Block: (32, WARPS) — one warp per 16×8 output tile
- * Shared memory: per-warp staging for W tile (8×16 = 256 bytes)
+ * B fragment: thread loads from ONE output row (m_start + groupID)
+ *   reg0 = {cb[idx_j][2*tid_g], cb[idx_j][2*tid_g+1]}
+ *   reg1 = {cb[idx_j1][2*tid_g], cb[idx_j1][2*tid_g+1]}
+ *
+ * A fragment: thread loads from TWO batch rows (groupID, groupID+8)
+ *   reg0 = {x[b+groupID,   j*8+2*tid_g],     x[b+groupID,   j*8+2*tid_g+1]}
+ *   reg1 = {x[b+groupID+8, j*8+2*tid_g],     x[b+groupID+8, j*8+2*tid_g+1]}
+ *   reg2 = {x[b+groupID,   (j+1)*8+2*tid_g], x[b+groupID,   (j+1)*8+2*tid_g+1]}
+ *   reg3 = {x[b+groupID+8, (j+1)*8+2*tid_g], x[b+groupID+8, (j+1)*8+2*tid_g+1]}
+ *
+ * Output: z0..z3 map to Y[b+groupID, m+2*tid_g], Y[b+groupID, m+2*tid_g+1],
+ *         Y[b+groupID+8, m+2*tid_g], Y[b+groupID+8, m+2*tid_g+1]
+ *
+ * Grid: 3D (ceil(B/16), ceil(M/(8*WARPS)), ceil(N_BLOCKS/TC_BPS))
+ * Block: (32, WARPS)
  * ───────────────────────────────────────────────────────────────────── */
 
-using namespace nvcuda;
-
-#define TC_BPS 64  // blocks per split for TC kernel
-#define WMMA_M 16
-#define WMMA_N 8
-#define WMMA_K 16
+#define TC_BPS 64
 
 template <bool HAS_STAGE2>
 __global__ void __launch_bounds__(256, 2)
@@ -272,13 +277,15 @@ glq_matmul_tc_kernel(
     int M,
     int N,
     int N_BLOCKS,
-    int stride_x                        // x.stride(0) in half elements
+    int stride_x
 ) {
     const int warp_id = threadIdx.y;
     const int lane_id = threadIdx.x;
+    const int groupID = lane_id >> 2;           // 0..7
+    const int tid_g = lane_id & 3;              // 0..3
 
-    int b_start = blockIdx.x * WMMA_M;           // batch tile
-    int m_start = (blockIdx.y * blockDim.y + warp_id) * WMMA_N;  // output tile
+    int b_start = blockIdx.x * 16;
+    int m_start = (blockIdx.y * blockDim.y + warp_id) * 8;
     int k_split = blockIdx.z;
 
     if (b_start >= B_dim || m_start >= M) return;
@@ -286,92 +293,103 @@ glq_matmul_tc_kernel(
     int j_start = k_split * TC_BPS;
     int j_end = min(j_start + TC_BPS, N_BLOCKS);
 
-    // Shared memory for staging tiles (per-warp: 16×16 for X, 8×16 for W)
-    // Each warp gets its own slice to avoid inter-warp conflicts
-    extern __shared__ half smem[];
-    half* x_tile = smem + warp_id * (WMMA_M * WMMA_K + WMMA_N * WMMA_K);
-    half* w_tile = x_tile + WMMA_M * WMMA_K;
+    // Accumulators
+    float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
 
-    // Accumulator fragment
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-    wmma::fill_fragment(acc_frag, 0.0f);
+    // Pre-compute row indices
+    int b_row0 = b_start + groupID;       // batch row for this thread (top half)
+    int b_row1 = b_start + groupID + 8;   // batch row (bottom half)
+    int m_row = m_start + groupID;        // output row for B fragment
+    bool b0_valid = (b_row0 < B_dim);
+    bool b1_valid = (b_row1 < B_dim);
+    bool m_valid = (m_row < M);
+    int k_elem = tid_g * 2;              // k-position pair: 0,2,4,6
 
-    // Iterate over K in steps of 16 (= 2 codebook blocks of 8)
     for (int j = j_start; j < j_end; j += 2) {
         bool j1_valid = (j + 1 < N_BLOCKS);
 
-        // ---- Stage X tile (16×16) into shared memory ----
-        // 32 threads cooperatively load 16 rows × 16 cols = 256 elements
-        // Each thread loads 256/32 = 8 elements
-        for (int i = lane_id; i < WMMA_M * WMMA_K; i += 32) {
-            int row = i / WMMA_K;
-            int col = i % WMMA_K;
-            int b_row = b_start + row;
-            int block_idx = col / 8;  // 0 for block j, 1 for block j+1
-            int elem = col % 8;
-            int global_j = j + block_idx;
-
-            half val = __float2half(0.0f);
-            if (b_row < B_dim && (block_idx == 0 || j1_valid)) {
-                val = x[b_row * stride_x + global_j * 8 + elem];
-            }
-            x_tile[row * WMMA_K + col] = val;
+        // ---- B fragment: codebook gather for output row m_row ----
+        uint16_t idx_j = 0, idx_j1 = 0;
+        if (m_valid) {
+            idx_j = (uint16_t)qidxs[m_row * N_BLOCKS + j];
+            if (j1_valid) idx_j1 = (uint16_t)qidxs[m_row * N_BLOCKS + j + 1];
         }
 
-        // ---- Stage W tile (8×16) into shared memory ----
-        // W is transposed: we need W^T, so w_tile[n][k] = codebook[idx_n][k]
-        // For wmma col-major B: w_tile stored as (K=16, N=8) column-major
-        // = w_tile[k * 8 + n]
-        for (int i = lane_id; i < WMMA_N * WMMA_K; i += 32) {
-            int k = i / WMMA_N;   // k dimension (0..15)
-            int n = i % WMMA_N;   // output row (0..7)
-            int block_idx = k / 8;
-            int elem = k % 8;
-            int global_j = j + block_idx;
-            int out_row = m_start + n;
+        half bv0 = m_valid ? codebook[idx_j * 8 + k_elem]     : __float2half(0.0f);
+        half bv1 = m_valid ? codebook[idx_j * 8 + k_elem + 1] : __float2half(0.0f);
+        half bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
+        half bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
 
-            half val = __float2half(0.0f);
-            if (out_row < M && (block_idx == 0 || j1_valid)) {
-                uint16_t idx = (uint16_t)qidxs[out_row * N_BLOCKS + global_j];
-                val = codebook[idx * 8 + elem];
-
-                if (HAS_STAGE2) {
-                    uint16_t idx2 = (uint16_t)qidxs2[out_row * N_BLOCKS + global_j];
-                    val = __float2half(__half2float(val) +
-                        __half2float(codebook2[idx2 * 8 + elem]) * inv_resid_scale);
-                }
+        if (HAS_STAGE2 && m_valid) {
+            uint16_t idx2_j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
+            bv0 = __float2half(__half2float(bv0) + __half2float(codebook2[idx2_j * 8 + k_elem]) * inv_resid_scale);
+            bv1 = __float2half(__half2float(bv1) + __half2float(codebook2[idx2_j * 8 + k_elem + 1]) * inv_resid_scale);
+            if (j1_valid) {
+                uint16_t idx2_j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
+                bv2 = __float2half(__half2float(bv2) + __half2float(codebook2[idx2_j1 * 8 + k_elem]) * inv_resid_scale);
+                bv3 = __float2half(__half2float(bv3) + __half2float(codebook2[idx2_j1 * 8 + k_elem + 1]) * inv_resid_scale);
             }
-            w_tile[k * WMMA_N + n] = val;
         }
 
-        __syncwarp();
+        __half2 b_h0 = __halves2half2(bv0, bv1);
+        __half2 b_h1 = __halves2half2(bv2, bv3);
+        uint32_t b_reg0 = *reinterpret_cast<uint32_t*>(&b_h0);
+        uint32_t b_reg1 = *reinterpret_cast<uint32_t*>(&b_h1);
 
-        // ---- Load fragments and execute wmma ----
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+        // ---- A fragment: x values from 2 batch rows ----
+        // Block j: x[b_row, j*8 + k_elem], x[b_row, j*8 + k_elem + 1]
+        int x_off_j = j * 8 + k_elem;
+        int x_off_j1 = (j + 1) * 8 + k_elem;
 
-        wmma::load_matrix_sync(a_frag, x_tile, WMMA_K);    // row-major, ldm=16
-        wmma::load_matrix_sync(b_frag, w_tile, WMMA_N);    // col-major, ldm=8
+        half av0 = b0_valid ? x[b_row0 * stride_x + x_off_j]     : __float2half(0.0f);
+        half av1 = b0_valid ? x[b_row0 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half av2 = b1_valid ? x[b_row1 * stride_x + x_off_j]     : __float2half(0.0f);
+        half av3 = b1_valid ? x[b_row1 * stride_x + x_off_j + 1] : __float2half(0.0f);
 
-        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        half av4 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half av5 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+        half av6 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half av7 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+
+        __half2 a_h0 = __halves2half2(av0, av1);
+        __half2 a_h1 = __halves2half2(av2, av3);
+        __half2 a_h2 = __halves2half2(av4, av5);
+        __half2 a_h3 = __halves2half2(av6, av7);
+
+        uint32_t a_reg0 = *reinterpret_cast<uint32_t*>(&a_h0);
+        uint32_t a_reg1 = *reinterpret_cast<uint32_t*>(&a_h1);
+        uint32_t a_reg2 = *reinterpret_cast<uint32_t*>(&a_h2);
+        uint32_t a_reg3 = *reinterpret_cast<uint32_t*>(&a_h3);
+
+        // ---- mma.sync.aligned.m16n8k16 ----
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " { %0, %1, %2, %3 },"
+            " { %4, %5, %6, %7 },"
+            " { %8, %9 },"
+            " { %0, %1, %2, %3 };"
+            : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+            : "r"(a_reg0), "r"(a_reg1), "r"(a_reg2), "r"(a_reg3),
+              "r"(b_reg0), "r"(b_reg1)
+        );
     }
 
-    // ---- Store output tile via atomicAdd (for split-K) ----
-    // Stage accumulator to shared memory, then atomicAdd to global
-    float* out_tile = reinterpret_cast<float*>(x_tile);  // reuse smem
-    wmma::store_matrix_sync(out_tile, acc_frag, WMMA_N, wmma::mem_row_major);
-    __syncwarp();
+    // ---- Write output: z0..z3 → Y[b_row, m_col] ----
+    // z0 = Y[b_row0, m_start + 2*tid_g]
+    // z1 = Y[b_row0, m_start + 2*tid_g + 1]
+    // z2 = Y[b_row1, m_start + 2*tid_g]
+    // z3 = Y[b_row1, m_start + 2*tid_g + 1]
+    int m_col0 = m_start + tid_g * 2;
+    int m_col1 = m_col0 + 1;
 
-    // Each thread writes its portion
-    for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-        int row = i / WMMA_N;
-        int col = i % WMMA_N;
-        int b_row = b_start + row;
-        int m_col = m_start + col;
-        if (b_row < B_dim && m_col < M) {
-            atomicAdd(&output[b_row * M + m_col], out_tile[row * WMMA_N + col] * wscale);
-        }
-    }
+    if (b0_valid && m_col0 < M)
+        atomicAdd(&output[b_row0 * M + m_col0], z0 * wscale);
+    if (b0_valid && m_col1 < M)
+        atomicAdd(&output[b_row0 * M + m_col1], z1 * wscale);
+    if (b1_valid && m_col0 < M)
+        atomicAdd(&output[b_row1 * M + m_col0], z2 * wscale);
+    if (b1_valid && m_col1 < M)
+        atomicAdd(&output[b_row1 * M + m_col1], z3 * wscale);
 }
 
 
@@ -663,24 +681,22 @@ torch::Tensor glq_dequant_matmul_cuda(
     }
 
     // Use TC kernel: single launch for all B rows
-    int b_tiles = (B_dim + WMMA_M - 1) / WMMA_M;
-    int m_tiles = (M + WMMA_N - 1) / WMMA_N;
-    int m_tiles_per_block = WARPS;  // each warp handles one m-tile
+    // mma.m16n8k16: each warp handles a 16×8 output tile
+    int b_tiles = (B_dim + 15) / 16;       // batch tiles (m=16)
+    int m_tiles = (M + 7) / 8;             // output row tiles (n=8)
+    int m_tiles_per_block = WARPS;
     int k_splits = (N_BLOCKS + TC_BPS - 1) / TC_BPS;
 
     dim3 tc_grid(b_tiles, (m_tiles + m_tiles_per_block - 1) / m_tiles_per_block, k_splits);
     dim3 tc_block(32, WARPS);
-    // Shared memory: per-warp (WMMA_M*WMMA_K + WMMA_N*WMMA_K) * sizeof(half) + output staging
-    int smem_per_warp = (WMMA_M * WMMA_K + WMMA_N * WMMA_K) * sizeof(half);
-    int total_smem = smem_per_warp * WARPS;
 
     if (has_stage2) {
-        glq_matmul_tc_kernel<true><<<tc_grid, tc_block, total_smem, stream>>>(
+        glq_matmul_tc_kernel<true><<<tc_grid, tc_block, 0, stream>>>(
             out_ptr, x_ptr, q_ptr, cb_ptr,
             q2_ptr, cb2_ptr, inv_resid_scale,
             wscale, B_dim, M, N, N_BLOCKS, N);
     } else {
-        glq_matmul_tc_kernel<false><<<tc_grid, tc_block, total_smem, stream>>>(
+        glq_matmul_tc_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
             out_ptr, x_ptr, q_ptr, cb_ptr,
             nullptr, nullptr, 0.0f,
             wscale, B_dim, M, N, N_BLOCKS, N);
