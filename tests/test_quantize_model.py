@@ -231,9 +231,13 @@ class TestParallelIntegration:
             seq_results.append(metrics['sqnr'])
 
         # Parallel via worker pool (H is serialized → fresh copy per worker)
+        # Use 'spawn' context to avoid fork+CUDA deadlock when pytest has
+        # initialized CUDA in earlier tests.
+        import multiprocessing
         n_threads = max(1, (os.cpu_count() or 1) // 2)
         with ProcessPoolExecutor(
             max_workers=2,
+            mp_context=multiprocessing.get_context('spawn'),
             initializer=_init_worker,
             initargs=(codebook.codebook.cpu(), codebook.opt_scale,
                       codebook.resid_scale, n_threads),

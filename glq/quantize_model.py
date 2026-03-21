@@ -524,10 +524,12 @@ def quantize(
     # ---- Set up parallel worker pool for CPU quantization ----
     pool = None
     if not use_gpu and workers != 1:
+        import multiprocessing
         n_workers = workers if workers > 0 else min(os.cpu_count() or 1, 16)
         n_threads = max(1, (os.cpu_count() or 1) // n_workers)
         pool = ProcessPoolExecutor(
             max_workers=n_workers,
+            mp_context=multiprocessing.get_context('spawn'),
             initializer=_init_worker,
             initargs=(codebook.codebook.cpu(), codebook.opt_scale,
                       codebook.resid_scale, n_threads),
