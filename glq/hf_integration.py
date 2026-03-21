@@ -98,6 +98,12 @@ class GLQQuantizer(HfQuantizer):
             import logging
             logging.getLogger(__name__).warning(
                 "GLQ: no nn.Linear modules found to replace")
+        # Suppress MISSING warnings for Qidxs2/inv_resid_scale on 2bpw layers.
+        # These are omitted from checkpoint to save disk; _load_from_state_dict
+        # injects zero defaults. The pattern matches any layer's optional buffers.
+        ignore = model._keys_to_ignore_on_load_missing or []
+        ignore.extend(["Qidxs2", "inv_resid_scale"])
+        model._keys_to_ignore_on_load_missing = ignore
         return model
 
     def _process_model_after_weight_loading(self, model, **kwargs):

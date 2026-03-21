@@ -136,10 +136,11 @@ class E8RHTLinear(nn.Module):
         self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
         self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
 
-        # Two-stage buffers for 3/4bpw (always allocated so state_dict loading works)
+        # Two-stage buffers for 3/4bpw (always registered; 2bpw layers leave as zeros).
+        # HF load report may show MISSING for 2bpw layers — this is expected and harmless.
         self.register_buffer('Qidxs2', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
         self.register_buffer('inv_resid_scale', torch.zeros((), dtype=torch.float32))
-        self._has_stage2 = False  # set True when loaded with actual two-stage data
+        self._has_stage2 = False
 
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=torch.float16))
