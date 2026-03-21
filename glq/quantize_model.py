@@ -276,7 +276,8 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
         artifacts['inv_resid_scale'] = torch.tensor(
             1.0 / result['resid_scale'], dtype=torch.float32)
 
-    metrics = {'sqnr': sqnr, 'bpw': result['bpw'], 'Wscale': result['Wscale']}
+    metrics = {'sqnr': sqnr, 'bpw': result['bpw'], 'Wscale': result['Wscale'],
+               'proxy_loss': result['proxy_loss']}
     return W_hat, artifacts, metrics
 
 
@@ -321,7 +322,7 @@ def _download_snapshot(model_id):
 def quantize(
     model_name: str,
     output_dir: str,
-    bpw: int = 2,
+    bpw=2,
     tune_iters: int = 0,
     nsamples: int = 16,
     seqlen: int = 2048,
@@ -337,7 +338,9 @@ def quantize(
     Args:
         model_name: HF model ID or local path
         output_dir: where to save quantized model
-        bpw: bits per weight (2 or 4)
+        bpw: bits per weight. int (2,3,4) for uniform, float (e.g. 2.5)
+            for mixed-precision auto-allocation, or dict for explicit
+            per-layer assignment {layer_prefix: bpw}.
         tune_iters: LDLQ refinement passes
         nsamples: calibration samples from WikiText-2
         seqlen: calibration sequence length
@@ -353,8 +356,26 @@ def quantize(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"GLQ Quantization: {model_name} -> {output_dir}")
-    print(f"  bpw={bpw}, tune_iters={tune_iters}, nsamples={nsamples}")
+    # Parse bpw: int (uniform), float (mixed-precision target), or dict (explicit)
+    if isinstance(bpw, dict):
+        bpw_map = bpw
+        mixed_precision = True
+        avg_target = None
+        print(f"GLQ Quantization: {model_name} -> {output_dir}")
+        print(f"  mixed-precision (explicit map), tune_iters={tune_iters}, nsamples={nsamples}")
+    elif isinstance(bpw, float) and not float(bpw).is_integer():
+        avg_target = bpw
+        mixed_precision = True
+        bpw_map = None  # will be computed after profiling pass
+        print(f"GLQ Quantization: {model_name} -> {output_dir}")
+        print(f"  target avg bpw={avg_target}, tune_iters={tune_iters}, nsamples={nsamples}")
+    else:
+        bpw = int(bpw)
+        mixed_precision = False
+        bpw_map = None
+        avg_target = None
+        print(f"GLQ Quantization: {model_name} -> {output_dir}")
+        print(f"  bpw={bpw}, tune_iters={tune_iters}, nsamples={nsamples}")
     if streaming:
         print(f"  streaming=True (layer-by-layer safetensors loading)")
 
@@ -490,6 +511,7 @@ def quantize(
 
     all_artifacts = {}  # layer_name -> {Qidxs, SU, SV, Wscale}
     all_sqnr = []
+    all_proxy_losses = {}  # layer_prefix -> proxy_loss (for sensitivity profiling)
     t_start = time.perf_counter()
 
     # ---- Set up parallel worker pool for CPU quantization ----
@@ -595,20 +617,29 @@ def quantize(
                 mod = linears[name]
                 W = mod.weight.data
 
+                # Determine bpw for this sublayer
+                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
+                if bpw_map is not None:
+                    sub_bpw = bpw_map.get(layer_prefix, bpw_map.get('default', 2))
+                elif mixed_precision:
+                    sub_bpw = 2  # profiling pass: quantize at min bpw
+                else:
+                    sub_bpw = bpw
+
                 t0 = time.perf_counter()
                 H_gpu = hessians[name].to(device)
                 W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
-                    W, H_gpu, codebook, bpw=bpw, tune_iters=tune_iters)
+                    W, H_gpu, codebook, bpw=sub_bpw, tune_iters=tune_iters)
                 del H_gpu
                 dt = time.perf_counter() - t0
 
-                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
                 all_artifacts[layer_prefix] = {
                     k: v.cpu() for k, v in artifacts.items()}
 
                 mod.weight.data = W_hat.to(dtype=mod.weight.dtype,
                                            device=mod.weight.device)
                 all_sqnr.append(metrics['sqnr'])
+                all_proxy_losses[layer_prefix] = metrics['proxy_loss']
 
                 if '.experts.' in name and 'shared' not in name:
                     parts = name.split('experts.')[1].split('.')
@@ -619,9 +650,10 @@ def quantize(
                               f"{str(tuple(W.shape)):20s} "
                               f"SQNR={metrics['sqnr']:5.1f}dB  {dt:.1f}s")
                 else:
+                    bpw_label = f"{sub_bpw}b" if mixed_precision else ""
                     print(f"  {name:30s} {str(tuple(W.shape)):20s} "
                           f"SQNR={metrics['sqnr']:5.1f}dB  "
-                          f"Ws={metrics['Wscale']:.3f}  {dt:.1f}s")
+                          f"Ws={metrics['Wscale']:.3f}  {bpw_label}  {dt:.1f}s")
 
                 gc.collect()
                 if use_gpu:
@@ -657,6 +689,29 @@ def quantize(
 
     if pool is not None:
         pool.shutdown()
+
+    # Mixed-precision auto-allocation: if avg_target was set and no bpw_map,
+    # we just completed a 2bpw profiling pass. Compute allocation and report.
+    if avg_target is not None and bpw_map is None:
+        from .sensitivity import allocate_bpw, print_allocation_summary
+        layer_sizes = {}
+        for prefix, arts in all_artifacts.items():
+            qidxs = arts['Qidxs']
+            m, n_blocks = qidxs.shape
+            layer_sizes[prefix] = m * n_blocks * 8  # n_weights
+        bpw_map = allocate_bpw(all_proxy_losses, layer_sizes, avg_target)
+        print_allocation_summary(bpw_map, layer_sizes, all_proxy_losses)
+
+        # Save the allocation as a JSON for use with --bpw-map
+        alloc_path = os.path.join(output_dir, "bpw_allocation.json")
+        with open(alloc_path, "w") as f:
+            json.dump(bpw_map, f, indent=2)
+        print(f"\nSaved bpw allocation to {alloc_path}")
+        print(f"Re-run with --bpw-map {alloc_path} to quantize with mixed precision.")
+
+        total_time = time.perf_counter() - t_start
+        print(f"\nProfiling pass completed in {total_time/60:.1f}m")
+        return 0
 
     total_time = time.perf_counter() - t_start
     avg_sqnr = sum(all_sqnr) / len(all_sqnr) if all_sqnr else 0
@@ -733,12 +788,26 @@ def quantize(
         causal_cls = MODEL_FOR_CAUSAL_LM_MAPPING.get(type(save_cfg), None)
         if causal_cls is not None:
             config_dict["architectures"] = [causal_cls.__name__]
+    # Compute effective average bpw
+    if bpw_map is not None:
+        total_w = sum(
+            all_artifacts[p]['Qidxs'].shape[0] * all_artifacts[p]['Qidxs'].shape[1] * 8
+            for p in all_artifacts)
+        total_bits = sum(
+            bpw_map.get(p, 2) * all_artifacts[p]['Qidxs'].shape[0] * all_artifacts[p]['Qidxs'].shape[1] * 8
+            for p in all_artifacts)
+        effective_bpw = round(total_bits / total_w, 2) if total_w > 0 else 2
+    else:
+        effective_bpw = bpw
+
     config_dict["quantization_config"] = {
         "quant_method": "glq",
         "codebook": "e8_shell",
         "codesz": 8,
-        "bpw": bpw,
+        "bpw": effective_bpw,
     }
+    if bpw_map is not None:
+        config_dict["quantization_config"]["layer_bpw"] = bpw_map
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:
@@ -749,7 +818,7 @@ def quantize(
         "quant_method": "glq",
         "codebook": "e8_shell",
         "codesz": 8,
-        "bpw": bpw,
+        "bpw": effective_bpw,
         "tune_iters": tune_iters,
         "nsamples": nsamples,
         "seqlen": seqlen,
@@ -779,8 +848,12 @@ def main():
                         help="HuggingFace model ID or local path")
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory for quantized model")
-    parser.add_argument("--bpw", type=int, default=2, choices=[2, 3, 4],
-                        help="Bits per weight (2, 3, or 4)")
+    parser.add_argument("--bpw", type=float, default=2,
+                        help="Bits per weight: 2, 3, 4 (uniform) or "
+                             "fractional like 2.5 (auto mixed-precision)")
+    parser.add_argument("--bpw-map", type=str, default=None,
+                        help="JSON file with per-layer bpw assignment "
+                             "(overrides --bpw)")
     parser.add_argument("--tune-iters", type=int, default=0,
                         help="LDLQ refinement iterations")
     parser.add_argument("--nsamples", type=int, default=16,
@@ -799,10 +872,19 @@ def main():
                              "(0=auto, 1=sequential, ignored on GPU)")
     args = parser.parse_args()
 
+    # Determine bpw: explicit map, fractional target, or uniform int
+    if args.bpw_map:
+        with open(args.bpw_map) as f:
+            bpw_arg = json.load(f)
+    elif args.bpw != int(args.bpw):
+        bpw_arg = args.bpw  # fractional → auto mixed-precision
+    else:
+        bpw_arg = int(args.bpw)
+
     quantize(
         model_name=args.model,
         output_dir=args.output,
-        bpw=args.bpw,
+        bpw=bpw_arg,
         tune_iters=args.tune_iters,
         nsamples=args.nsamples,
         seqlen=args.seqlen,

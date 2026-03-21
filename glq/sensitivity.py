@@ -1,0 +1,86 @@
+"""Per-layer sensitivity profiling and bit-width allocation for mixed-precision GLQ."""
+
+from __future__ import annotations
+
+
+def allocate_bpw(
+    sensitivities: dict[str, float],
+    layer_sizes: dict[str, int],
+    target_avg_bpw: float,
+    min_bpw: int = 2,
+    max_bpw: int = 4,
+) -> dict[str, int]:
+    """Allocate per-layer bpw to minimize total proxy loss within a bit budget.
+
+    Uses greedy marginal-gain: layers with highest proxy_loss per weight
+    get upgraded first (they benefit most from extra bits).
+
+    Args:
+        sensitivities: {layer_name: proxy_loss_at_min_bpw}
+        layer_sizes: {layer_name: m * n (number of weights)}
+        target_avg_bpw: target average bits per weight (e.g. 2.5)
+        min_bpw: minimum per-layer bpw (default 2)
+        max_bpw: maximum per-layer bpw (default 4)
+
+    Returns:
+        {layer_name: bpw} assignment
+    """
+    allowed = sorted({b for b in (2, 3, 4) if min_bpw <= b <= max_bpw})
+    if not allowed:
+        raise ValueError(f"No valid bpw in [{min_bpw}, {max_bpw}]")
+
+    total_weights = sum(layer_sizes.values())
+    budget = target_avg_bpw * total_weights
+
+    # Start everything at the minimum
+    base = allowed[0]
+    allocation = {name: base for name in sensitivities}
+    current_bits = base * total_weights
+
+    # For each step up in bpw, greedily upgrade highest-sensitivity layers
+    for prev_bpw, next_bpw in zip(allowed, allowed[1:]):
+        extra_bits_per_weight = next_bpw - prev_bpw
+        # Rank candidates by sensitivity density (proxy_loss / n_weights)
+        candidates = [
+            (sensitivities[name] / layer_sizes[name], name, layer_sizes[name])
+            for name in allocation
+            if allocation[name] == prev_bpw
+        ]
+        candidates.sort(reverse=True)
+
+        for _, name, n_weights in candidates:
+            cost = extra_bits_per_weight * n_weights
+            if current_bits + cost <= budget:
+                allocation[name] = next_bpw
+                current_bits += cost
+
+    return allocation
+
+
+def print_allocation_summary(
+    allocation: dict[str, int],
+    layer_sizes: dict[str, int],
+    sensitivities: dict[str, float] | None = None,
+):
+    """Print a summary of the bpw allocation."""
+    total_weights = sum(layer_sizes.values())
+    total_bits = sum(allocation[n] * layer_sizes[n] for n in allocation)
+    avg_bpw = total_bits / total_weights
+
+    by_bpw = {}
+    for name, bpw in allocation.items():
+        by_bpw.setdefault(bpw, []).append(name)
+
+    print(f"\nBit allocation summary:")
+    print(f"  Average bpw: {avg_bpw:.3f}")
+    print(f"  Total weights: {total_weights:,}")
+    for bpw in sorted(by_bpw):
+        n_layers = len(by_bpw[bpw])
+        n_weights = sum(layer_sizes[n] for n in by_bpw[bpw])
+        print(f"  {bpw}bpw: {n_layers} sublayers ({n_weights:,} weights, {n_weights/total_weights:.1%})")
+
+    if sensitivities:
+        print(f"\n  Top 10 most sensitive (highest proxy_loss density):")
+        ranked = sorted(sensitivities.items(), key=lambda x: x[1] / layer_sizes[x[0]], reverse=True)
+        for name, loss in ranked[:10]:
+            print(f"    {allocation[name]}bpw  {loss:.4e}  {name}")

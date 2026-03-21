@@ -30,7 +30,8 @@ class GLQConfig(QuantizationConfigMixin):
         self,
         codebook: str = "e8_shell",
         codesz: int = 8,
-        bpw: int = 2,
+        bpw=2,
+        layer_bpw: dict = None,
         trust_remote_code: bool = False,
         **kwargs,
     ):
@@ -38,6 +39,7 @@ class GLQConfig(QuantizationConfigMixin):
         self.codebook = codebook
         self.codesz = codesz
         self.bpw = bpw
+        self.layer_bpw = layer_bpw
         self.trust_remote_code = trust_remote_code
 
     def to_dict(self):
@@ -47,6 +49,8 @@ class GLQConfig(QuantizationConfigMixin):
             "codesz": self.codesz,
             "bpw": self.bpw,
         }
+        if self.layer_bpw:
+            d["layer_bpw"] = self.layer_bpw
         if self.trust_remote_code:
             d["trust_remote_code"] = True
         return d
@@ -110,12 +114,21 @@ class GLQQuantizer(HfQuantizer):
             codebook = E8ShellCodebook(device='cpu', verbose=False)
 
         # Secondary codebook for 3/4bpw
-        bpw = getattr(self.quantization_config, 'bpw', 2)
+        # For mixed-precision models, use the max bpw to build the largest
+        # codebook2 needed. Each E8RHTLinear auto-detects its actual bpw
+        # from inv_resid_scale (zero = 2bpw, non-zero = 3/4bpw).
+        layer_bpw = getattr(self.quantization_config, 'layer_bpw', None)
+        global_bpw = getattr(self.quantization_config, 'bpw', 2)
+        if layer_bpw:
+            max_bpw = max(layer_bpw.values())
+        else:
+            max_bpw = int(global_bpw) if isinstance(global_bpw, (int, float)) else 2
+
         codebook2 = None
-        if bpw == 3:
-            codebook2 = codebook.make_small(256)
-        elif bpw == 4:
+        if max_bpw >= 4:
             codebook2 = codebook
+        elif max_bpw >= 3:
+            codebook2 = codebook.make_small(256)
 
         for module in model.modules():
             if isinstance(module, E8RHTLinear):
