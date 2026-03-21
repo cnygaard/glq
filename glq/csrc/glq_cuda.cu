@@ -469,6 +469,95 @@ torch::Tensor glq_dequant_matvec_cuda(
 }
 
 
+torch::Tensor glq_dequant_matmul_cuda(
+    torch::Tensor x,           // (B, N) fp16
+    torch::Tensor qidxs,       // (M, N_BLOCKS) int16
+    torch::Tensor codebook,    // (65536, 8) fp16
+    float wscale,
+    torch::Tensor qidxs2,      // (M, N_BLOCKS) int16 or empty
+    torch::Tensor codebook2,   // (K2, 8) fp16 or empty
+    float inv_resid_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(qidxs);
+    CHECK_INPUT(codebook);
+
+    int B_dim = x.size(0);
+    int N = x.size(1);
+    int M = qidxs.size(0);
+    int N_BLOCKS = qidxs.size(1);
+
+    at::DeviceGuard guard(x.device());
+    // Output: (B, M) fp32, zeroed for atomicAdd
+    auto output = torch::zeros({B_dim, M}, torch::dtype(torch::kFloat32).device(x.device()));
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, x.get_device());
+    int num_sms = prop.multiProcessorCount;
+
+    const int WARPS = 8;
+    const int rows_per_block = ROWS_PER_WARP * WARPS;
+    dim3 block(32, WARPS);
+
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
+
+    int m_blocks = (M + rows_per_block - 1) / rows_per_block;
+    bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT);
+
+    const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
+    const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
+    const int16_t* q_ptr = qidxs.data_ptr<int16_t>();
+    float* out_ptr = output.data_ptr<float>();
+
+    const int16_t* q2_ptr = has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr;
+    const half* cb2_ptr = has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+
+    if (has_stage2) {
+        CHECK_INPUT(qidxs2);
+        CHECK_INPUT(codebook2);
+    }
+
+    // Launch B matvec kernels (pipelined on same stream)
+    for (int b = 0; b < B_dim; b++) {
+        const half* x_b = x_ptr + b * N;
+        float* out_b = out_ptr + b * M;
+
+        if (use_splitk) {
+            int k_splits = (N_BLOCKS + BLOCKS_PER_SPLIT - 1) / BLOCKS_PER_SPLIT;
+            dim3 grid(m_blocks, k_splits);
+
+            if (has_stage2) {
+                glq_matvec_splitk_kernel<true><<<grid, block, 0, stream>>>(
+                    out_b, x_b, q_ptr, cb_ptr,
+                    q2_ptr, cb2_ptr, inv_resid_scale,
+                    wscale, M, N_BLOCKS);
+            } else {
+                glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
+                    out_b, x_b, q_ptr, cb_ptr,
+                    nullptr, nullptr, 0.0f,
+                    wscale, M, N_BLOCKS);
+            }
+        } else {
+            dim3 grid(num_sms);
+            if (has_stage2) {
+                glq_matvec_kernel<true><<<grid, block, 0, stream>>>(
+                    out_b, x_b, q_ptr, cb_ptr,
+                    q2_ptr, cb2_ptr, inv_resid_scale,
+                    wscale, M, N_BLOCKS);
+            } else {
+                glq_matvec_kernel<false><<<grid, block, 0, stream>>>(
+                    out_b, x_b, q_ptr, cb_ptr,
+                    nullptr, nullptr, 0.0f,
+                    wscale, M, N_BLOCKS);
+            }
+        }
+    }
+
+    return output;
+}
+
+
 torch::Tensor glq_dequant_matvec_packed_cuda(
     torch::Tensor x,
     torch::Tensor qidxs,

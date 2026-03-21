@@ -709,17 +709,27 @@ def glq_dequant_matmul(
         q2 = Qidxs
         cb2 = cb
 
-    # CUDA C kernel: 2.7-3.0× faster than Triton for B=1 decode
-    if B == 1 and _try_load_cuda_ext():
+    # CUDA C kernel: primary path when available (all B values)
+    if _try_load_cuda_ext():
         _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
         _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
-        y = _glq_cuda.glq_dequant_matvec_cuda(
-            x_fp16[0], Qidxs, cb, Wscale,
-            q2 if has_stage2 else _empty_i16,
-            cb2 if has_stage2 else _empty_f16,
-            inv_resid_scale if has_stage2 else 0.0,
-        )
-        return y.unsqueeze(0)  # (M,) → (1, M)
+        if B == 1:
+            y = _glq_cuda.glq_dequant_matvec_cuda(
+                x_fp16[0], Qidxs, cb, Wscale,
+                q2 if has_stage2 else _empty_i16,
+                cb2 if has_stage2 else _empty_f16,
+                inv_resid_scale if has_stage2 else 0.0,
+            )
+            return y.unsqueeze(0)  # (M,) → (1, M)
+        else:
+            # Batched: B separate matvec launches (pipelined on CUDA stream)
+            y = _glq_cuda.glq_dequant_matmul_cuda(
+                x_fp16, Qidxs, cb, Wscale,
+                q2 if has_stage2 else _empty_i16,
+                cb2 if has_stage2 else _empty_f16,
+                inv_resid_scale if has_stage2 else 0.0,
+            )
+            return y  # (B, M)
 
     if not _triton_available:
         return _fallback_dequant_matmul(
