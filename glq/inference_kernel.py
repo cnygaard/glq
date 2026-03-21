@@ -709,9 +709,9 @@ def glq_dequant_matmul(
         q2 = Qidxs
         cb2 = cb
 
-    # CUDA C kernel: B=1 decode path (2.7-3× faster than Triton)
-    # B>1 prefill: Triton TC is faster (single fused launch vs B separate matvecs)
-    # CUDA C batched is only used as fallback when Triton is unavailable.
+    # CUDA C kernel: B=1 decode (2.7-3× faster than Triton)
+    # B>1: Triton TC is faster (fused matmul with mma.m16n8k16)
+    # CUDA C TC (wmma) available as fallback when Triton unavailable
     if B == 1 and _try_load_cuda_ext():
         _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
         _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
@@ -724,7 +724,7 @@ def glq_dequant_matmul(
         return y.unsqueeze(0)  # (M,) → (1, M)
 
     if not _triton_available:
-        # No Triton: use CUDA C batched matvec for B>1 if available
+        # No Triton: use CUDA C TC (wmma) for B>1 if available
         if _try_load_cuda_ext():
             _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
             _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
