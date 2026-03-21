@@ -505,3 +505,183 @@ torch::Tensor glq_dequant_matvec_packed_cuda(
 
     return output;
 }
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Shared-memory Fast Hadamard Transform (FHT)
+ *
+ * Replaces the Triton _input_rht_kernel and _output_rht_kernel which
+ * use global memory barriers (store→debug_barrier→load per butterfly
+ * stage). Shared memory eliminates global round-trips: ~5ns per access
+ * vs ~100-200ns, reducing FHT from ~28-36μs to ~3-5μs.
+ *
+ * Grid: (B,) — one block per batch row
+ * Block: min(n_pad, 1024) threads
+ * Shared memory: n_pad * sizeof(float) bytes (dynamically allocated)
+ * ───────────────────────────────────────────────────────────────────── */
+
+__global__ void glq_input_rht_kernel(
+    const half* __restrict__ x,      // (B, in_features) fp16 input
+    const half* __restrict__ sv,     // (n_pad,) fp16 sign vector
+    float* __restrict__ out,         // (B, n_pad) fp32 output (x_rht)
+    int in_features,
+    int stride_x,                    // x.stride(0) in elements
+    float rsqrt_n,                   // 1.0 / sqrt(n_pad)
+    int n_pad,
+    int log_n
+) {
+    // Double-buffered shared memory: read from one, write to the other
+    extern __shared__ float smem[];  // 2 * n_pad floats
+    float* buf_a = smem;
+    float* buf_b = smem + n_pad;
+
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    // Step 1: Load x with zero-padding, multiply by SV signs → buf_a
+    for (int i = tid; i < n_pad; i += n_threads) {
+        float x_val = (i < in_features) ? __half2float(x[b * stride_x + i]) : 0.0f;
+        float s = __half2float(sv[i]);
+        buf_a[i] = x_val * s;
+    }
+    __syncthreads();
+
+    // Step 2: FHT butterfly stages with double buffering
+    float* src = buf_a;
+    float* dst = buf_b;
+    for (int k = 0; k < log_n; k++) {
+        for (int i = tid; i < n_pad; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float my_val = src[i];
+            float partner_val = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        // Swap buffers
+        float* tmp = src; src = dst; dst = tmp;
+    }
+
+    // Step 3: Normalize and store (result is in src after last swap)
+    for (int i = tid; i < n_pad; i += n_threads) {
+        out[b * n_pad + i] = src[i] * rsqrt_n;
+    }
+}
+
+
+__global__ void glq_output_rht_kernel(
+    const float* __restrict__ y_rht, // (B, m_pad) fp32 input
+    const half* __restrict__ su,     // (m_pad,) fp16 sign vector
+    half* __restrict__ out,          // (B, out_features) fp16 output
+    int out_features,
+    int m_pad,
+    int log_m,
+    float rsqrt_m                    // 1.0 / sqrt(m_pad)
+) {
+    extern __shared__ float smem[];
+    float* buf_a = smem;
+    float* buf_b = smem + m_pad;
+
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    // Step 1: Load y_rht into buf_a
+    for (int i = tid; i < m_pad; i += n_threads) {
+        buf_a[i] = y_rht[b * m_pad + i];
+    }
+    __syncthreads();
+
+    // Step 2: FHT butterfly stages with double buffering
+    float* src = buf_a;
+    float* dst = buf_b;
+    for (int k = 0; k < log_m; k++) {
+        for (int i = tid; i < m_pad; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float my_val = src[i];
+            float partner_val = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        float* tmp = src; src = dst; dst = tmp;
+    }
+
+    // Step 3: Normalize, apply SU signs, unpad, cast to fp16
+    for (int i = tid; i < out_features; i += n_threads) {
+        float val = src[i] * rsqrt_m;
+        float s = __half2float(su[i]);
+        out[b * out_features + i] = __float2half(val * s);
+    }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * RHT host wrappers
+ * ───────────────────────────────────────────────────────────────────── */
+
+void glq_input_rht_cuda(
+    torch::Tensor x,        // (B, in_features) fp16
+    torch::Tensor sv,       // (n_pad,) fp16
+    torch::Tensor out,      // (B, n_pad) fp32 — pre-allocated
+    int in_features,
+    int stride_x,
+    float rsqrt_n,
+    int n_pad,
+    int log_n
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(sv);
+
+    int B = x.size(0);
+    int threads = min(n_pad, 1024);
+    int smem = 2 * n_pad * sizeof(float);  // double-buffered
+
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    // Request extended shared memory if needed (>48KB)
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(glq_input_rht_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
+
+    glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+        (const half*)x.data_ptr<c10::Half>(),
+        (const half*)sv.data_ptr<c10::Half>(),
+        out.data_ptr<float>(),
+        in_features, stride_x, rsqrt_n, n_pad, log_n
+    );
+}
+
+
+void glq_output_rht_cuda(
+    torch::Tensor y_rht,    // (B, m_pad) fp32
+    torch::Tensor su,       // (m_pad,) fp16
+    torch::Tensor out,      // (B, out_features) fp16 — pre-allocated
+    int out_features,
+    int m_pad,
+    int log_m,
+    float rsqrt_m
+) {
+    CHECK_INPUT(y_rht);
+    CHECK_INPUT(su);
+
+    int B = y_rht.size(0);
+    int threads = min(m_pad, 1024);
+    int smem = 2 * m_pad * sizeof(float);  // double-buffered
+
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(glq_output_rht_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
+
+    glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+        y_rht.data_ptr<float>(),
+        (const half*)su.data_ptr<c10::Half>(),
+        (half*)out.data_ptr<c10::Half>(),
+        out_features, m_pad, log_m, rsqrt_m
+    );
+}

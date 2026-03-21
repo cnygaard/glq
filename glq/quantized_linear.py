@@ -289,13 +289,21 @@ class E8RHTLinear(nn.Module):
             n_pad = self.n_pad
             log_n = int(math.log2(n_pad))
             x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
-            _input_rht_kernel[(B,)](
-                x, self.SV, x_rht,
-                self.in_features, x.stride(0),
-                1.0 / math.sqrt(n_pad),
-                N=n_pad, LOG_N=log_n,
-                num_warps=8,
-            )
+            # CUDA C shared-memory FHT for n_pad <= 8192 (128KB double-buffer limit)
+            from . import inference_kernel as _ik
+            if n_pad <= 8192 and _ik._try_load_cuda_ext():
+                _ik._glq_cuda.glq_input_rht_cuda(
+                    x.half().contiguous(), self.SV, x_rht,
+                    self.in_features, self.in_features,
+                    1.0 / math.sqrt(n_pad), n_pad, log_n)
+            else:
+                _input_rht_kernel[(B,)](
+                    x, self.SV, x_rht,
+                    self.in_features, x.stride(0),
+                    1.0 / math.sqrt(n_pad),
+                    N=n_pad, LOG_N=log_n,
+                    num_warps=8,
+                )
         else:
             x_f = x.float()
             x_pad = F.pad(x_f, (0, self.n_pad - self.in_features))
@@ -331,16 +339,26 @@ class E8RHTLinear(nn.Module):
         if use_fused:
             m_pad = self.m_pad
             log_m = int(math.log2(m_pad))
-            output_fp16 = (dtype == torch.float16)
-            y = torch.empty(B, self.out_features, dtype=dtype, device=x.device)
-            _output_rht_kernel[(B,)](
-                y_rht, self.SU, y,
-                self.out_features, y_rht.stride(0), y.stride(0),
-                1.0 / math.sqrt(m_pad),
-                OUTPUT_FP16=output_fp16,
-                M=m_pad, LOG_M=log_m,
-                num_warps=8,
-            )
+            # CUDA C shared-memory FHT for m_pad <= 8192
+            if m_pad <= 8192 and _ik._try_load_cuda_ext():
+                y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
+                _ik._glq_cuda.glq_output_rht_cuda(
+                    y_rht, self.SU, y,
+                    self.out_features, m_pad, log_m,
+                    1.0 / math.sqrt(m_pad))
+                if dtype != torch.float16:
+                    y = y.to(dtype)
+            else:
+                output_fp16 = (dtype == torch.float16)
+                y = torch.empty(B, self.out_features, dtype=dtype, device=x.device)
+                _output_rht_kernel[(B,)](
+                    y_rht, self.SU, y,
+                    self.out_features, y_rht.stride(0), y.stride(0),
+                    1.0 / math.sqrt(m_pad),
+                    OUTPUT_FP16=output_fp16,
+                    M=m_pad, LOG_M=log_m,
+                    num_warps=8,
+                )
             if self.bias is not None:
                 y = y + self.bias.unsqueeze(0).to(dtype)
         else:

@@ -22,9 +22,34 @@ torch::Tensor glq_dequant_matvec_packed_cuda(
     float wscale
 );
 
+void glq_input_rht_cuda(
+    torch::Tensor x,
+    torch::Tensor sv,
+    torch::Tensor out,
+    int in_features,
+    int stride_x,
+    float rsqrt_n,
+    int n_pad,
+    int log_n
+);
+
+void glq_output_rht_cuda(
+    torch::Tensor y_rht,
+    torch::Tensor su,
+    torch::Tensor out,
+    int out_features,
+    int m_pad,
+    int log_m,
+    float rsqrt_m
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
           "GLQ dequant+matvec B=1 (CUDA)");
     m.def("glq_dequant_matvec_packed_cuda", &glq_dequant_matvec_packed_cuda,
           "GLQ dequant+matvec B=1 packed codebook (CUDA)");
+    m.def("glq_input_rht_cuda", &glq_input_rht_cuda,
+          "GLQ input RHT (pad+SV+FHT) shared-memory (CUDA)");
+    m.def("glq_output_rht_cuda", &glq_output_rht_cuda,
+          "GLQ output RHT (FHT+SU+unpad) shared-memory (CUDA)");
 }
