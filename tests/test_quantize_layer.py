@@ -57,7 +57,7 @@ class TestQuantizeLayer2bpw:
         H = _random_psd(64)
         W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(W, H, codebook, bpw=2)
         assert set(artifacts.keys()) == {'Qidxs', 'SU', 'SV', 'Wscale'}
-        assert set(metrics.keys()) == {'sqnr', 'bpw', 'Wscale'}
+        assert set(metrics.keys()) == {'sqnr', 'bpw', 'Wscale', 'proxy_loss'}
         # 2bpw: no Qidxs2 or inv_resid_scale (omitted to save disk space)
         assert 'Qidxs2' not in artifacts
         assert 'inv_resid_scale' not in artifacts
