@@ -23,6 +23,36 @@ try:
 except ImportError:
     _triton_available = False
 
+# CUDA C extension: loaded lazily on first B=1 call to avoid 30s JIT penalty on import
+_glq_cuda = None
+_cuda_ext_available = None  # None = not tried, True/False = result
+
+
+def _try_load_cuda_ext():
+    """Lazy-load the CUDA C dequant kernel. Returns True if available."""
+    global _cuda_ext_available, _glq_cuda
+    if _cuda_ext_available is not None:
+        return _cuda_ext_available
+    try:
+        import os
+        from torch.utils.cpp_extension import load as _load_ext
+        _csrc = os.path.join(os.path.dirname(__file__), 'csrc')
+        cu_file = os.path.join(_csrc, 'glq_cuda.cu')
+        cpp_file = os.path.join(_csrc, 'glq_bindings.cpp')
+        if not os.path.exists(cu_file):
+            _cuda_ext_available = False
+            return False
+        _glq_cuda = _load_ext(
+            'glq_cuda',
+            sources=[cu_file, cpp_file],
+            extra_cuda_cflags=['-O3', '--use_fast_math'],
+            verbose=False,
+        )
+        _cuda_ext_available = True
+    except Exception:
+        _cuda_ext_available = False
+    return _cuda_ext_available
+
 
 if _triton_available:
 
@@ -656,7 +686,7 @@ def glq_dequant_matmul(
     Returns:
         Y: (B, M) output in fp32
     """
-    if not _triton_available or not x.is_cuda:
+    if not x.is_cuda or (not _triton_available and not _try_load_cuda_ext()):
         return _fallback_dequant_matmul(
             x, Qidxs, codebook, Wscale, Qidxs2, codebook2, inv_resid_scale
         )
@@ -678,6 +708,23 @@ def glq_dequant_matmul(
         # Dummy pointers (won't be accessed when HAS_STAGE2=False)
         q2 = Qidxs
         cb2 = cb
+
+    # CUDA C kernel: 2.7-3.0× faster than Triton for B=1 decode
+    if B == 1 and _try_load_cuda_ext():
+        _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
+        _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
+        y = _glq_cuda.glq_dequant_matvec_cuda(
+            x_fp16[0], Qidxs, cb, Wscale,
+            q2 if has_stage2 else _empty_i16,
+            cb2 if has_stage2 else _empty_f16,
+            inv_resid_scale if has_stage2 else 0.0,
+        )
+        return y.unsqueeze(0)  # (M,) → (1, M)
+
+    if not _triton_available:
+        return _fallback_dequant_matmul(
+            x, Qidxs, codebook, Wscale, Qidxs2, codebook2, inv_resid_scale
+        )
 
     # Decide whether to use split-K based on estimated grid saturation.
     # BLOCK_M=64 is typical for both matvec and TC paths.
