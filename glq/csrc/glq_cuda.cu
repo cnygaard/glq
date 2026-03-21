@@ -765,44 +765,75 @@ __global__ void glq_input_rht_kernel(
     int stride_x,                    // x.stride(0) in elements
     float rsqrt_n,                   // 1.0 / sqrt(n_pad)
     int n_pad,
-    int log_n
+    int log_n,
+    int use_single_buffer            // 1 if smem too small for double-buffer
 ) {
-    // Double-buffered shared memory: read from one, write to the other
-    extern __shared__ float smem[];  // 2 * n_pad floats
-    float* buf_a = smem;
-    float* buf_b = smem + n_pad;
+    extern __shared__ float smem[];
 
     int b = blockIdx.x;
     int tid = threadIdx.x;
     int n_threads = blockDim.x;
 
-    // Step 1: Load x with zero-padding, multiply by SV signs → buf_a
+    // Step 1: Load x with zero-padding, multiply by SV signs
+    float* buf = smem;
     for (int i = tid; i < n_pad; i += n_threads) {
         float x_val = (i < in_features) ? __half2float(x[b * stride_x + i]) : 0.0f;
         float s = __half2float(sv[i]);
-        buf_a[i] = x_val * s;
+        buf[i] = x_val * s;
     }
     __syncthreads();
 
-    // Step 2: FHT butterfly stages with double buffering
-    float* src = buf_a;
-    float* dst = buf_b;
-    for (int k = 0; k < log_n; k++) {
-        for (int i = tid; i < n_pad; i += n_threads) {
-            int partner = i ^ (1 << k);
-            float my_val = src[i];
-            float partner_val = src[partner];
-            bool lo = (i & (1 << k)) == 0;
-            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+    // Step 2: FHT butterfly stages
+    if (use_single_buffer) {
+        // Single-buffer: read all elements into registers, sync, write back.
+        // n_pad=16384, n_threads=1024 → 16 elements per thread in registers.
+        float reg[16];  // max elements per thread
+        int elems_per_thread = n_pad / n_threads;
+
+        for (int k = 0; k < log_n; k++) {
+            // Phase 1: all threads read and compute into registers
+            for (int e = 0; e < elems_per_thread; e++) {
+                int i = tid + e * n_threads;
+                int partner = i ^ (1 << k);
+                float my_val = buf[i];
+                float partner_val = buf[partner];
+                bool lo = (i & (1 << k)) == 0;
+                reg[e] = lo ? (my_val + partner_val) : (partner_val - my_val);
+            }
+            __syncthreads();
+            // Phase 2: write registers back to shared memory
+            for (int e = 0; e < elems_per_thread; e++) {
+                int i = tid + e * n_threads;
+                buf[i] = reg[e];
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        // Swap buffers
-        float* tmp = src; src = dst; dst = tmp;
+    } else {
+        // Double-buffer: ping-pong between buf_a and buf_b
+        float* buf_b = smem + n_pad;
+        float* src = buf;
+        float* dst = buf_b;
+        for (int k = 0; k < log_n; k++) {
+            for (int i = tid; i < n_pad; i += n_threads) {
+                int partner = i ^ (1 << k);
+                float my_val = src[i];
+                float partner_val = src[partner];
+                bool lo = (i & (1 << k)) == 0;
+                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+            }
+            __syncthreads();
+            float* tmp = src; src = dst; dst = tmp;
+        }
+        // If odd number of stages, result is in buf_b — copy to buf
+        if (log_n % 2 == 1) {
+            for (int i = tid; i < n_pad; i += n_threads) buf[i] = buf_b[i];
+            __syncthreads();
+        }
     }
 
-    // Step 3: Normalize and store (result is in src after last swap)
+    // Step 3: Normalize and store
     for (int i = tid; i < n_pad; i += n_threads) {
-        out[b * n_pad + i] = src[i] * rsqrt_n;
+        out[b * n_pad + i] = buf[i] * rsqrt_n;
     }
 }
 
@@ -814,40 +845,65 @@ __global__ void glq_output_rht_kernel(
     int out_features,
     int m_pad,
     int log_m,
-    float rsqrt_m                    // 1.0 / sqrt(m_pad)
+    float rsqrt_m,                   // 1.0 / sqrt(m_pad)
+    int use_single_buffer
 ) {
     extern __shared__ float smem[];
-    float* buf_a = smem;
-    float* buf_b = smem + m_pad;
+    float* buf = smem;
 
     int b = blockIdx.x;
     int tid = threadIdx.x;
     int n_threads = blockDim.x;
 
-    // Step 1: Load y_rht into buf_a
+    // Step 1: Load y_rht
     for (int i = tid; i < m_pad; i += n_threads) {
-        buf_a[i] = y_rht[b * m_pad + i];
+        buf[i] = y_rht[b * m_pad + i];
     }
     __syncthreads();
 
-    // Step 2: FHT butterfly stages with double buffering
-    float* src = buf_a;
-    float* dst = buf_b;
-    for (int k = 0; k < log_m; k++) {
-        for (int i = tid; i < m_pad; i += n_threads) {
-            int partner = i ^ (1 << k);
-            float my_val = src[i];
-            float partner_val = src[partner];
-            bool lo = (i & (1 << k)) == 0;
-            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+    // Step 2: FHT butterfly stages
+    if (use_single_buffer) {
+        float reg[16];
+        int elems_per_thread = m_pad / n_threads;
+        for (int k = 0; k < log_m; k++) {
+            for (int e = 0; e < elems_per_thread; e++) {
+                int i = tid + e * n_threads;
+                int partner = i ^ (1 << k);
+                float my_val = buf[i];
+                float partner_val = buf[partner];
+                bool lo = (i & (1 << k)) == 0;
+                reg[e] = lo ? (my_val + partner_val) : (partner_val - my_val);
+            }
+            __syncthreads();
+            for (int e = 0; e < elems_per_thread; e++) {
+                buf[tid + e * n_threads] = reg[e];
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        float* tmp = src; src = dst; dst = tmp;
+    } else {
+        float* buf_b = smem + m_pad;
+        float* src = buf;
+        float* dst = buf_b;
+        for (int k = 0; k < log_m; k++) {
+            for (int i = tid; i < m_pad; i += n_threads) {
+                int partner = i ^ (1 << k);
+                float my_val = src[i];
+                float partner_val = src[partner];
+                bool lo = (i & (1 << k)) == 0;
+                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+            }
+            __syncthreads();
+            float* tmp = src; src = dst; dst = tmp;
+        }
+        if (log_m % 2 == 1) {
+            for (int i = tid; i < m_pad; i += n_threads) buf[i] = buf_b[i];
+            __syncthreads();
+        }
     }
 
     // Step 3: Normalize, apply SU signs, unpad, cast to fp16
     for (int i = tid; i < out_features; i += n_threads) {
-        float val = src[i] * rsqrt_m;
+        float val = buf[i] * rsqrt_m;
         float s = __half2float(su[i]);
         out[b * out_features + i] = __float2half(val * s);
     }
@@ -873,11 +929,14 @@ void glq_input_rht_cuda(
 
     int B = x.size(0);
     int threads = min(n_pad, 1024);
-    int smem = 2 * n_pad * sizeof(float);  // double-buffered
+    int double_buf_smem = 2 * n_pad * sizeof(float);
+    int single_buf_smem = n_pad * sizeof(float);
+    // Use single-buffer if double doesn't fit in 96KB extended smem
+    int use_single = (double_buf_smem > 96 * 1024) ? 1 : 0;
+    int smem = use_single ? single_buf_smem : double_buf_smem;
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
-    // Request extended shared memory if needed (>48KB)
     if (smem > 48 * 1024) {
         cudaFuncSetAttribute(glq_input_rht_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -887,7 +946,7 @@ void glq_input_rht_cuda(
         (const half*)x.data_ptr<c10::Half>(),
         (const half*)sv.data_ptr<c10::Half>(),
         out.data_ptr<float>(),
-        in_features, stride_x, rsqrt_n, n_pad, log_n
+        in_features, stride_x, rsqrt_n, n_pad, log_n, use_single
     );
 }
 
@@ -906,7 +965,10 @@ void glq_output_rht_cuda(
 
     int B = y_rht.size(0);
     int threads = min(m_pad, 1024);
-    int smem = 2 * m_pad * sizeof(float);  // double-buffered
+    int double_buf_smem = 2 * m_pad * sizeof(float);
+    int single_buf_smem = m_pad * sizeof(float);
+    int use_single = (double_buf_smem > 96 * 1024) ? 1 : 0;
+    int smem = use_single ? single_buf_smem : double_buf_smem;
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
@@ -919,6 +981,6 @@ void glq_output_rht_cuda(
         y_rht.data_ptr<float>(),
         (const half*)su.data_ptr<c10::Half>(),
         (half*)out.data_ptr<c10::Half>(),
-        out_features, m_pad, log_m, rsqrt_m
+        out_features, m_pad, log_m, rsqrt_m, use_single
     );
 }
