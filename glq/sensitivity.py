@@ -37,22 +37,33 @@ def allocate_bpw(
     allocation = {name: base for name in sensitivities}
     current_bits = base * total_weights
 
-    # For each step up in bpw, greedily upgrade highest-sensitivity layers
-    for prev_bpw, next_bpw in zip(allowed, allowed[1:]):
-        extra_bits_per_weight = next_bpw - prev_bpw
-        # Rank candidates by sensitivity density (proxy_loss / n_weights)
-        candidates = [
-            (sensitivities[name] / layer_sizes[name], name, layer_sizes[name])
-            for name in allocation
-            if allocation[name] == prev_bpw
-        ]
-        candidates.sort(reverse=True)
+    # Greedy: repeatedly pick the upgrade (layer, target_bpw) with best
+    # sensitivity-per-bit, considering all possible jumps (2→3, 2→4, 3→4).
+    while True:
+        best_gain = -1
+        best_name = None
+        best_target = None
+        best_cost = 0
 
-        for _, name, n_weights in candidates:
-            cost = extra_bits_per_weight * n_weights
-            if current_bits + cost <= budget:
-                allocation[name] = next_bpw
-                current_bits += cost
+        for name in allocation:
+            cur = allocation[name]
+            for target_bpw in allowed:
+                if target_bpw <= cur:
+                    continue
+                extra = (target_bpw - cur) * layer_sizes[name]
+                if current_bits + extra > budget:
+                    continue
+                gain = sensitivities[name] / extra  # proxy_loss per bit
+                if gain > best_gain:
+                    best_gain = gain
+                    best_name = name
+                    best_target = target_bpw
+                    best_cost = extra
+
+        if best_name is None:
+            break
+        allocation[best_name] = best_target
+        current_bits += best_cost
 
     return allocation
 

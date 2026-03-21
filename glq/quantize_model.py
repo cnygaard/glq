@@ -323,6 +323,8 @@ def quantize(
     model_name: str,
     output_dir: str,
     bpw=2,
+    min_bpw: int = None,
+    max_bpw: int = None,
     tune_iters: int = 0,
     nsamples: int = 16,
     seqlen: int = 2048,
@@ -357,18 +359,23 @@ def quantize(
     os.makedirs(output_dir, exist_ok=True)
 
     # Parse bpw: int (uniform), float (mixed-precision target), or dict (explicit)
+    # Mixed-precision is triggered by: fractional bpw, explicit map, or min/max range
+    has_range = (min_bpw is not None or max_bpw is not None)
     if isinstance(bpw, dict):
         bpw_map = bpw
         mixed_precision = True
         avg_target = None
         print(f"GLQ Quantization: {model_name} -> {output_dir}")
         print(f"  mixed-precision (explicit map), tune_iters={tune_iters}, nsamples={nsamples}")
-    elif isinstance(bpw, float) and not float(bpw).is_integer():
-        avg_target = bpw
+    elif has_range or (isinstance(bpw, float) and not float(bpw).is_integer()):
+        avg_target = float(bpw)
+        min_bpw = min_bpw if min_bpw is not None else 2
+        max_bpw = max_bpw if max_bpw is not None else 4
         mixed_precision = True
         bpw_map = None  # will be computed after profiling pass
         print(f"GLQ Quantization: {model_name} -> {output_dir}")
-        print(f"  target avg bpw={avg_target}, tune_iters={tune_iters}, nsamples={nsamples}")
+        print(f"  target avg bpw={avg_target}, range [{min_bpw}, {max_bpw}], "
+              f"tune_iters={tune_iters}, nsamples={nsamples}")
     else:
         bpw = int(bpw)
         mixed_precision = False
@@ -699,7 +706,8 @@ def quantize(
             qidxs = arts['Qidxs']
             m, n_blocks = qidxs.shape
             layer_sizes[prefix] = m * n_blocks * 8  # n_weights
-        bpw_map = allocate_bpw(all_proxy_losses, layer_sizes, avg_target)
+        bpw_map = allocate_bpw(all_proxy_losses, layer_sizes, avg_target,
+                              min_bpw=min_bpw, max_bpw=max_bpw)
         print_allocation_summary(bpw_map, layer_sizes, all_proxy_losses)
 
         # Save the allocation as a JSON for use with --bpw-map
@@ -854,6 +862,12 @@ def main():
     parser.add_argument("--bpw-map", type=str, default=None,
                         help="JSON file with per-layer bpw assignment "
                              "(overrides --bpw)")
+    parser.add_argument("--min-bpw", type=int, default=None, choices=[2, 3, 4],
+                        help="Minimum per-layer bpw for mixed-precision "
+                             "(triggers auto-allocation)")
+    parser.add_argument("--max-bpw", type=int, default=None, choices=[2, 3, 4],
+                        help="Maximum per-layer bpw for mixed-precision "
+                             "(triggers auto-allocation)")
     parser.add_argument("--tune-iters", type=int, default=0,
                         help="LDLQ refinement iterations")
     parser.add_argument("--nsamples", type=int, default=16,
@@ -885,6 +899,8 @@ def main():
         model_name=args.model,
         output_dir=args.output,
         bpw=bpw_arg,
+        min_bpw=args.min_bpw,
+        max_bpw=args.max_bpw,
         tune_iters=args.tune_iters,
         nsamples=args.nsamples,
         seqlen=args.seqlen,
