@@ -158,18 +158,29 @@ glq-quantize \
     --device cuda
 ```
 
-For large models (30B+), use `--streaming` to load one layer at a time instead of the full model. This keeps memory constant at ~1 layer size instead of scaling with model size:
+Mixed-precision quantization uses a two-pass workflow. Pass 1 profiles each layer's sensitivity at 2bpw and computes the optimal per-layer bit allocation. Pass 2 quantizes with the allocation:
 
 ```bash
-# Large model quantization with streaming (constant memory)
+# Pass 1: profile sensitivity and compute allocation (outputs bpw_allocation.json)
+glq-quantize \
+    --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 \
+    --output ./nemotron-30b-profile \
+    --bpw 3.5 --min-bpw 2 --max-bpw 4 \
+    --nsamples 128 \
+    --streaming --trust-remote-code
+
+# Pass 2: quantize with the per-layer allocation
 glq-quantize \
     --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 \
     --output ./nemotron-30b-glq-3.5bpw \
-    --bpw 3.5 --min-bpw 2 --max-bpw 4 \
+    --bpw-map ./nemotron-30b-profile/bpw_allocation.json \
     --nsamples 128 \
-    --streaming \
-    --trust-remote-code
+    --streaming --trust-remote-code
 ```
+
+The allocator assigns more bits to sensitive layers (attention K/V projections in the middle of the network) and fewer to robust layers, achieving better quality than uniform quantization at the same average bpw.
+
+For large models (30B+), use `--streaming` to load one layer at a time instead of the full model. This keeps memory constant at ~1 layer size instead of scaling with model size.
 
 All CLI options:
 
