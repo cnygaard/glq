@@ -158,6 +158,19 @@ glq-quantize \
     --device cuda
 ```
 
+For large models (30B+), use `--streaming` to load one layer at a time instead of the full model. This keeps memory constant at ~1 layer size instead of scaling with model size:
+
+```bash
+# Large model quantization with streaming (constant memory)
+glq-quantize \
+    --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 \
+    --output ./nemotron-30b-glq-3.5bpw \
+    --bpw 3.5 --min-bpw 2 --max-bpw 4 \
+    --nsamples 128 \
+    --streaming \
+    --trust-remote-code
+```
+
 All CLI options:
 
 ```
