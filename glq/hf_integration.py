@@ -32,6 +32,7 @@ class GLQConfig(QuantizationConfigMixin):
         codesz: int = 8,
         bpw=2,
         layer_bpw: dict = None,
+        kv_cache_bits: int = 16,
         trust_remote_code: bool = False,
         **kwargs,
     ):
@@ -40,6 +41,7 @@ class GLQConfig(QuantizationConfigMixin):
         self.codesz = codesz
         self.bpw = bpw
         self.layer_bpw = layer_bpw
+        self.kv_cache_bits = kv_cache_bits
         self.trust_remote_code = trust_remote_code
 
     def to_dict(self):
@@ -51,6 +53,8 @@ class GLQConfig(QuantizationConfigMixin):
         }
         if self.layer_bpw:
             d["layer_bpw"] = self.layer_bpw
+        if self.kv_cache_bits != 16:
+            d["kv_cache_bits"] = self.kv_cache_bits
         if self.trust_remote_code:
             d["trust_remote_code"] = True
         return d
@@ -139,6 +143,13 @@ class GLQQuantizer(HfQuantizer):
         for module in model.modules():
             if isinstance(module, E8RHTLinear):
                 module.set_codebook(codebook, codebook2=codebook2)
+
+        # INT8 KV cache: attach factory so model.generate() uses it
+        kv_bits = getattr(self.quantization_config, 'kv_cache_bits', 16)
+        if kv_bits == 8:
+            from .kv_cache import GLQQuantizedCache
+            config = model.config
+            model._glq_kv_cache_factory = lambda: GLQQuantizedCache(config)
 
         return model
 

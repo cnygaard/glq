@@ -239,6 +239,25 @@ The `import glq.hf_integration` line registers GLQ as a quantization method with
 
 On CUDA, inference automatically uses the fused Triton kernel. On CPU, it falls back to dequantize-then-matmul.
 
+### INT8 KV cache
+
+For long-context inference, GLQ provides an optional INT8 quantized KV cache that halves the memory used by keys and values. This is especially useful for large models at long sequence lengths where the KV cache dominates VRAM (e.g. 30B model at 4K+ context).
+
+```python
+import glq.hf_integration
+from glq.kv_cache import GLQQuantizedCache
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("./smollm2-glq-4bpw", device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("./smollm2-glq-4bpw")
+
+cache = GLQQuantizedCache(model.config)
+inputs = tokenizer("The capital of France is", return_tensors="pt").to(model.device)
+output = model.generate(**inputs, max_new_tokens=200, past_key_values=cache)
+```
+
+The INT8 cache uses per-channel absmax quantization with no external dependencies (pure PyTorch). Recent tokens are kept in full precision (configurable via `residual_length`) while older tokens are quantized to INT8, following the [KIVI](https://arxiv.org/abs/2402.02750) approach. Requires transformers >= 4.45.
+
 ### Bit widths
 
 | BPW | Encoding | Bits per 8 weights | Storage |
@@ -318,6 +337,7 @@ glq/
   quantized_linear.py  # E8RHTLinear: drop-in nn.Linear replacement
   inference_kernel.py  # Fused Triton dequant+matmul kernels
   hf_integration.py    # HuggingFace Transformers integration
+  kv_cache.py          # INT8 quantized KV cache (optional)
 ```
 
 ## Acknowledgments

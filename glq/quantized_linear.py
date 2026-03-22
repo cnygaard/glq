@@ -289,8 +289,10 @@ class E8RHTLinear(nn.Module):
         B = x.shape[0]
         dtype = x.dtype
         use_fused = x.is_cuda and _triton_available and B <= 64
+        _nvtx = torch.cuda.nvtx if x.is_cuda else None
 
         # Transform input to RHT domain
+        if _nvtx: _nvtx.range_push("input_rht")
         if use_fused:
             n_pad = self.n_pad
             log_n = int(math.log2(n_pad))
@@ -316,7 +318,10 @@ class E8RHTLinear(nn.Module):
             sv = self.SV.float()
             x_rht = fast_hadamard_transform(x_pad * sv.unsqueeze(0))
 
+        if _nvtx: _nvtx.range_pop()  # input_rht
+
         # Dequant + matmul in RHT domain
+        if _nvtx: _nvtx.range_push("dequant_matmul")
         has_stage2 = self._has_stage2
         if x_rht.is_cuda and _triton_available:
             from .inference_kernel import glq_dequant_matmul
@@ -341,7 +346,10 @@ class E8RHTLinear(nn.Module):
                 W_rht = W_rht + W_rht2 * self.inv_resid_scale.item()
             y_rht = x_rht @ W_rht.T * self.Wscale.float()
 
+        if _nvtx: _nvtx.range_pop()  # dequant_matmul
+
         # Inverse RHT on output: y = y_rht @ Had_m @ diag(SU)
+        if _nvtx: _nvtx.range_push("output_rht")
         if use_fused:
             m_pad = self.m_pad
             log_m = int(math.log2(m_pad))
@@ -374,6 +382,8 @@ class E8RHTLinear(nn.Module):
             if self.bias is not None:
                 y = y + self.bias.float().unsqueeze(0)
             y = y.to(dtype)
+
+        if _nvtx: _nvtx.range_pop()  # output_rht
 
         return y.reshape(*shape[:-1], self.out_features)
 
