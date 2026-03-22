@@ -323,8 +323,21 @@ class E8ShellCodebook:
             return cls.load(_BUNDLED_CODEBOOK, device=device)
         return cls(device=device, verbose=verbose)
 
+    def _move_to_device(self, device):
+        """Move all tensors in-place, preserving object identity for sharing."""
+        device = torch.device(device)
+        if self.codebook.device == device:
+            return
+        self.codebook = self.codebook.to(device)
+        self.codebook_half = self.codebook.half()
+        self.codebook_half_t = self.codebook_half.T.contiguous()
+        if hasattr(self, 'codebook_packed') and self.codebook_packed is not None:
+            self.codebook_packed = self.codebook_packed.to(device)
+
     def to(self, device):
-        """Move codebook tensors to a device. Returns a new instance."""
+        """Move codebook tensors to a device. Returns self if already there."""
+        if self.codebook.device == torch.device(device):
+            return self
         return self.from_precomputed(
             self.codebook, self.opt_scale, self.resid_scale, device=device)
 

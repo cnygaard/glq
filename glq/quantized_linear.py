@@ -253,11 +253,16 @@ class E8RHTLinear(nn.Module):
         torch.cuda.empty_cache()
 
     def _ensure_codebook_device(self):
-        """Move codebook(s) to match Qidxs device (lazy, once)."""
+        """Move codebook(s) to match Qidxs device (lazy, once).
+
+        Uses in-place device move to preserve sharing across modules.
+        All E8RHTLinear modules share the same codebook object, so moving
+        it once moves it for all.
+        """
         if self.codebook is not None and self.codebook.codebook.device != self.Qidxs.device:
-            self.codebook = self.codebook.to(self.Qidxs.device)
+            self.codebook._move_to_device(self.Qidxs.device)
         if self.codebook2 is not None and self.codebook2.codebook.device != self.Qidxs.device:
-            self.codebook2 = self.codebook2.to(self.Qidxs.device)
+            self.codebook2._move_to_device(self.Qidxs.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
