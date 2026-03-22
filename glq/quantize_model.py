@@ -621,52 +621,78 @@ def quantize(
             print(f"  {n_done} sublayers in {dt_batch:.1f}s (parallel) "
                   f"avg SQNR={avg:.1f}dB")
         else:
-            # Sequential quantization (GPU or single-worker)
-            for name in quant_names:
+            # Split into experts (parallelizable) and non-experts (sequential)
+            expert_names = [n for n in quant_names
+                           if '.experts.' in n and 'shared' not in n]
+            non_expert_names = [n for n in quant_names if n not in expert_names]
+
+            def _quantize_one(name):
+                """Quantize a single sublayer. Returns (name, W_hat, artifacts, metrics)."""
                 mod = linears[name]
                 W = mod.weight.data
-
-                # Determine bpw for this sublayer
                 layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
                 if bpw_map is not None:
                     sub_bpw = bpw_map.get(layer_prefix, bpw_map.get('default', 2))
                 elif mixed_precision:
-                    sub_bpw = 2  # profiling pass: quantize at min bpw
+                    sub_bpw = 2
                 else:
                     sub_bpw = bpw
-
-                t0 = time.perf_counter()
                 H_gpu = hessians[name].to(device)
                 W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
                     W, H_gpu, codebook, bpw=sub_bpw, tune_iters=tune_iters)
                 del H_gpu
-                dt = time.perf_counter() - t0
+                artifacts_cpu = {k: v.cpu() for k, v in artifacts.items()}
+                return name, W_hat, artifacts_cpu, metrics
 
-                all_artifacts[layer_prefix] = {
-                    k: v.cpu() for k, v in artifacts.items()}
-
+            def _collect_result(name, W_hat, artifacts_cpu, metrics):
+                """Store result from a quantized sublayer."""
+                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
+                all_artifacts[layer_prefix] = artifacts_cpu
+                mod = linears[name]
                 mod.weight.data = W_hat.to(dtype=mod.weight.dtype,
                                            device=mod.weight.device)
                 all_sqnr.append(metrics['sqnr'])
                 all_proxy_losses[layer_prefix] = metrics['proxy_loss']
 
-                if '.experts.' in name and 'shared' not in name:
-                    parts = name.split('experts.')[1].split('.')
-                    expert_num = int(parts[0])
-                    proj = parts[-1]
-                    if expert_num % 16 == 0 or expert_num == 127:
-                        print(f"  expert.{expert_num}.{proj:10s} "
-                              f"{str(tuple(W.shape)):20s} "
-                              f"SQNR={metrics['sqnr']:5.1f}dB  {dt:.1f}s")
-                else:
-                    bpw_label = f"{sub_bpw}b" if mixed_precision else ""
-                    print(f"  {name:30s} {str(tuple(W.shape)):20s} "
-                          f"SQNR={metrics['sqnr']:5.1f}dB  "
-                          f"Ws={metrics['Wscale']:.3f}  {bpw_label}  {dt:.1f}s")
-
+            # Non-experts: sequential (few, large, may share GPU resources)
+            for name in non_expert_names:
+                t0 = time.perf_counter()
+                name, W_hat, artifacts_cpu, metrics = _quantize_one(name)
+                _collect_result(name, W_hat, artifacts_cpu, metrics)
+                dt = time.perf_counter() - t0
+                sub_bpw_label = ""
+                if mixed_precision:
+                    lp = f"{sd_prefix}.{layer_idx}.{name}"
+                    sub_bpw_label = f"{bpw_map.get(lp, 2) if bpw_map else 2}b"
+                print(f"  {name:30s} {str(tuple(linears[name].weight.shape)):20s} "
+                      f"SQNR={metrics['sqnr']:5.1f}dB  "
+                      f"Ws={metrics['Wscale']:.3f}  {sub_bpw_label}  {dt:.1f}s")
                 gc.collect()
                 if use_gpu:
                     torch.cuda.empty_cache()
+
+            # Experts: parallel via ThreadPoolExecutor + CUDA streams
+            if expert_names:
+                from concurrent.futures import ThreadPoolExecutor
+                n_parallel = min(8, len(expert_names))
+                t0_experts = time.perf_counter()
+
+                with ThreadPoolExecutor(max_workers=n_parallel) as expert_pool:
+                    futures = {}
+                    for name in expert_names:
+                        f = expert_pool.submit(_quantize_one, name)
+                        futures[f] = name
+
+                    expert_sqnrs = []
+                    for f in futures:
+                        name, W_hat, artifacts_cpu, metrics = f.result()
+                        _collect_result(name, W_hat, artifacts_cpu, metrics)
+                        expert_sqnrs.append(metrics['sqnr'])
+
+                dt_experts = time.perf_counter() - t0_experts
+                avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
+                print(f"  {len(expert_names)} experts in {dt_experts:.1f}s "
+                      f"({n_parallel} parallel) avg SQNR={avg_sqnr:.1f}dB")
 
         del hessians
 
