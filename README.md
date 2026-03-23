@@ -27,17 +27,10 @@ Mixed-precision models use `--bpw <target> --min-bpw 2 --max-bpw 4` to automatic
 
 **Mistral-7B-v0.3** on WikiText-2 (16 calibration samples, NVIDIA A10G):
 
-| Method | BPW | Perplexity | vs bf16 | GPU MB | tok/s |
-|--------|-----|------------|---------|--------|-------|
-| bf16 | 16 | 4.20 | 1.00x | 14505 | 28.1 |
-| GLQ 3-bit | 3 | 4.41 | 1.05x | 4436 | 9.7 |
-
-**Ministral-3-3B-Base-2512** on WikiText-2 (16 calibration samples, NVIDIA A10G):
-
-| Method | BPW | Perplexity | vs bf16 | GPU MB | tok/s |
-|--------|-----|------------|---------|--------|-------|
-| bf16 | 16 | 5.91 | 1.00x | 7348 | 37.0 |
-| GLQ 3-bit | 3 | 6.47 | 1.09x | 3788 | 11.4 |
+| Method | BPW | Perplexity | vs bf16 | GPU MB |
+|--------|-----|------------|---------|--------|
+| bf16 | 16 | 4.20 | 1.00x | 14505 |
+| GLQ 3-bit | 3 | 4.41 | 1.05x | 4436 |
 
 **Nemotron-3-Nano-30B** (hybrid Mamba-Attention-MoE) on WikiText-2 (16 calibration samples, NVIDIA A10G):
 
@@ -48,11 +41,11 @@ Mixed-precision models use `--bpw <target> --min-bpw 2 --max-bpw 4` to automatic
 
 **Llama-3.2-3B** on WikiText-2 (16 calibration samples, NVIDIA A10G):
 
-| Method | BPW | Perplexity | vs bf16 | GPU MB | tok/s |
-|--------|-----|------------|---------|--------|-------|
-| bf16 | 16 | 6.17 | 1.00x | 6137 | 37.6 |
-| GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 | 10.8 |
-| GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 | 11.0 |
+| Method | BPW | Perplexity | vs bf16 | GPU MB |
+|--------|-----|------------|---------|--------|
+| bf16 | 16 | 6.17 | 1.00x | 6137 |
+| GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 |
+| GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 |
 
 **SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (acc_norm where available, 128 calibration samples, NVIDIA L40S):
 
@@ -72,9 +65,9 @@ GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy at 4.6x compression. WinoGrande
 | bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 | 30.8 | 5,875 MB |
 | AutoRound W4 | 4.50 | 0.532 | 0.797 | 0.748 | 0.781 | 0.661 | 0.704 | — | — |
 | GPTQ W4A16 | 4.50 | 0.538 | 0.785 | 0.740 | 0.781 | 0.648 | 0.698 | 8.5† | 7,487 MB |
-| GLQ 4-bit | 4.00 | 0.522 | 0.776 | 0.746 | 0.780 | 0.672 | 0.699 | 14.0 | 5,044 MB |
+| GLQ 4-bit | 4.00 | 0.522 | 0.776 | 0.746 | 0.780 | 0.672 | 0.699 | — | 5,044 MB |
 
-GLQ 4-bit retains 98.6% of bf16 accuracy at exactly 4.00 effective bpw (no group scales). AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw). Decode tok/s at B=1 steady-state on NVIDIA L40S. †GPTQ without compiled CUDA dequant kernels (auto-gptq/gptqmodel); native kernels would be faster.
+GLQ 4-bit retains 98.6% of bf16 accuracy at exactly 4.00 effective bpw (no group scales). AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw).
 
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
@@ -92,15 +85,14 @@ GLQ uses a single global scale per layer rather than per-group scales, so effect
 
 ### Inference performance
 
-**SmolLM3-3B-Base** prefill throughput on NVIDIA L40S (seqlen=128):
+**SmolLM3-3B-Base** decode throughput on NVIDIA L40S (B=1, single-token generation):
 
-| Batch | GLQ tok/s | bf16 tok/s | Speedup | GLQ VRAM | bf16 VRAM |
-|-------|-----------|-----------|---------|----------|-----------|
-| 1 | 1,160 | 4,709 | 0.25x | 3,832 MB | 6,194 MB |
-| 4 | 3,060 | 18,845 | 0.16x | 4,185 MB | 6,294 MB |
-| 64 | 2,394 | 26,528 | 0.09x | 6,611 MB | 8,295 MB |
+| Mode | GLQ 3.5bpw | bf16 | GLQ / bf16 |
+|------|-----------|------|------------|
+| Eager | 17 tok/s | 40 tok/s | 42% |
+| CUDA graph | 38 tok/s | 40 tok/s | 95% |
 
-GLQ compresses model weights from 6.2 GB to 2.5 GB (60% reduction). Runtime fp32 intermediates from the RHT add ~1.3 GB overhead, giving a net VRAM savings of ~38% at B=1. The throughput gap is due to codebook scatter-gather in the dequant kernel vs contiguous cuBLAS reads; closing this requires CUDA C kernels with warp shuffles and async prefetch.
+With CUDA graph capture (`glq.cuda_graph.CUDAGraphWrapper`), SmolLM3-3B decode reaches 95% of bf16 throughput at 4.6x compression. Larger models are slower: Nemotron-30B (MoE, 6004 quantized sublayers) runs at ~0.7 tok/s on L40S. Without CUDA graphs, Python dispatch overhead between kernel launches accounts for ~60% of wall-clock time (measured via nsys profiling).
 
 ## How it works
 
@@ -110,7 +102,7 @@ GLQ compresses model weights from 6.2 GB to 2.5 GB (60% reduction). Runtime fp32
 
 3. **LDLQ error feedback**: Block-LDL decomposition of the Hessian drives a sequential quantization sweep (like GPTQ but over 8-dim blocks instead of scalar columns). Quantization error from each block propagates forward to correct subsequent blocks.
 
-4. **Fused Triton inference kernel**: On CUDA, a custom Triton kernel reads codebook indices directly from HBM and gathers from the L2-cached codebook (65536 x 8 fp16 = 1 MB) without ever materializing the full weight matrix. This provides real GPU memory savings proportional to the compression ratio.
+4. **Fused inference kernels**: On CUDA, custom CUDA C and Triton kernels read codebook indices directly from HBM and gather from the L2-cached codebook (65536 x 8 fp16 = 1 MB) without ever materializing the full weight matrix. The CUDA C path uses inline PTX Tensor Core instructions (B>=2) and split-K matvec with warp shuffles (B=1). This provides real GPU memory savings proportional to the compression ratio.
 
 ## Install
 
@@ -237,7 +229,7 @@ The `import glq.hf_integration` line registers GLQ as a quantization method with
 3. Loads the quantized weights (codebook indices + sign vectors)
 4. Builds the E8 codebook and attaches it to all quantized layers
 
-On CUDA, inference automatically uses the fused Triton kernel. On CPU, it falls back to dequantize-then-matmul.
+On CUDA, inference automatically uses CUDA C kernels (with Triton as fallback). On CPU, it falls back to dequantize-then-matmul.
 
 ### INT8 KV cache
 
@@ -270,9 +262,9 @@ All bit widths use a single global scale per layer (no group-size parameter), so
 
 For 3/4 bpw, GLQ uses a two-stage residual vector quantization (RVQ): the primary codebook (65536 entries) encodes the bulk of the weight, and a secondary codebook (256 entries for 3 bpw, 65536 for 4 bpw) encodes the residual error scaled by a learned factor.
 
-## Triton inference kernel
+## Inference kernels
 
-The fused Triton kernel (`glq/inference_kernel.py`) is the core of GLQ's inference performance. It computes `Y = X @ dequant(W)^T` without materializing the full weight matrix.
+GLQ provides CUDA C and Triton kernel implementations (`glq/inference_kernel.py`, `glq/csrc/glq_cuda.cu`) that compute `Y = X @ dequant(W)^T` without materializing the full weight matrix.
 
 ### How it works
 
@@ -287,11 +279,12 @@ This means GPU memory holds only the compressed indices (2 bytes per 8 weights) 
 
 ### Kernel variants
 
-- **Tensor Core matmul kernel** (`_glq_dequant_matmul_tc_kernel`): For batch sizes >= 2 (prefill). Processes pairs of codebook blocks to form K=16 tiles for `tl.dot` (mma.m16n8k16 Tensor Core instructions). Autotuned over BLOCK_B and BLOCK_M.
-- **Matvec kernel** (`_glq_dequant_matvec_kernel`): For B=1 (autoregressive decode). Autotuned over BLOCK_M and num_warps for the memory-bound single-token case.
-- **Fused RHT kernels** (`_input_rht_kernel`, `_output_rht_kernel`): Fuse pad + sign vector + Fast Hadamard Transform into single kernel launches, eliminating per-layer Python overhead.
+- **CUDA C Tensor Core kernel** (`glq_matmul_tc_kernel`): For batch sizes >= 2 (prefill). Uses inline PTX `mma.sync.aligned.m16n8k16` with direct codebook-to-register loading — no shared memory staging. 3-5x faster than Triton TC for prefill.
+- **CUDA C split-K matvec** (`glq_matvec_splitk_kernel`): For B=1 (autoregressive decode). 4 rows per warp with `__shfl_xor_sync` reduction, 2D grid for K-split parallelism. 2.7x faster than Triton matvec.
+- **CUDA C shared-memory FHT** (`glq_input_rht_kernel`, `glq_output_rht_kernel`): Double-buffered butterfly stages in shared memory for the Hadamard transform. 1.6-3x faster than Triton FHT.
+- **Triton fallback kernels**: Used when CUDA C extension is unavailable (no ninja) or for dimensions exceeding shared memory limits (n_pad > 8192).
 
-All kernels support two-stage RVQ for 3/4 bpw via a `HAS_STAGE2` compile-time constant.
+All kernels support two-stage RVQ for 3/4 bpw via a `HAS_STAGE2` compile-time constant. The CUDA C path is selected automatically when available; Triton is the fallback.
 
 ### Using the kernel directly
 
@@ -335,9 +328,11 @@ glq/
   ldlq.py              # Block-LDL quantization with error feedback
   quantize_model.py    # Full model quantization pipeline + CLI
   quantized_linear.py  # E8RHTLinear: drop-in nn.Linear replacement
-  inference_kernel.py  # Fused Triton dequant+matmul kernels
+  inference_kernel.py  # Dispatch + Triton fallback kernels
+  csrc/glq_cuda.cu     # CUDA C kernels (split-K matvec, TC matmul, FHT)
   hf_integration.py    # HuggingFace Transformers integration
   kv_cache.py          # INT8 quantized KV cache (optional)
+  cuda_graph.py        # CUDA graph wrapper for B=1 decode (2.3x speedup)
 ```
 
 ## Acknowledgments
