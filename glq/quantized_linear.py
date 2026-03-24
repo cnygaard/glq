@@ -297,9 +297,9 @@ class E8RHTLinear(nn.Module):
             n_pad = self.n_pad
             log_n = int(math.log2(n_pad))
             x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
-            # CUDA C shared-memory FHT for n_pad <= 8192 (128KB double-buffer limit)
+            # CUDA C shared-memory FHT (double-buffer ≤8192, single-buffer ≤16384)
             from . import inference_kernel as _ik
-            if n_pad <= 8192 and _ik._try_load_cuda_ext():
+            if n_pad <= 16384 and _ik._try_load_cuda_ext():
                 _ik._glq_cuda.glq_input_rht_cuda(
                     x.half().contiguous(), self.SV, x_rht,
                     self.in_features, self.in_features,
@@ -353,8 +353,8 @@ class E8RHTLinear(nn.Module):
         if use_fused:
             m_pad = self.m_pad
             log_m = int(math.log2(m_pad))
-            # CUDA C shared-memory FHT for m_pad <= 8192
-            if m_pad <= 8192 and _ik._try_load_cuda_ext():
+            # CUDA C shared-memory FHT (double-buffer ≤8192, single-buffer ≤16384)
+            if m_pad <= 16384 and _ik._try_load_cuda_ext():
                 y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
                 _ik._glq_cuda.glq_output_rht_cuda(
                     y_rht, self.SU, y,
