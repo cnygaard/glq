@@ -90,7 +90,7 @@ GLQ uses a single global scale per layer rather than per-group scales, so effect
 | Mode | GLQ 3.5bpw | bf16 | GLQ / bf16 |
 |------|-----------|------|------------|
 | Eager (default) | 18 tok/s | 40 tok/s | 45% |
-| CUDA graph | 42 tok/s | 40 tok/s | 105% |
+| CUDA graph | 44 tok/s | 40 tok/s | 110% |
 
 With CUDA graph capture, GLQ decode **exceeds bf16 throughput** at 4.6x compression because the smaller quantized weights require less DRAM bandwidth. Larger models are slower: Nemotron-30B (MoE, 6004 quantized sublayers) runs at ~0.7 tok/s on L40S.
 
@@ -110,7 +110,7 @@ wrapper = CUDAGraphWrapper(model)
 
 # First call captures the graph; subsequent calls replay it
 input_ids = tokenizer("Hello", return_tensors="pt").input_ids[:, -1:].to(model.device)
-logits = wrapper(input_ids)  # 42 tok/s vs 18 tok/s eager
+logits = wrapper(input_ids)  # 44 tok/s vs 18 tok/s eager
 ```
 
 The wrapper automatically falls back to eager execution for variable shapes (prefill, batch>1) or calls with extra kwargs (past_key_values, attention_mask). It only accelerates the fixed-shape B=1 seqlen=1 decode path.
