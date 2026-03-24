@@ -723,6 +723,12 @@ def glq_dequant_matmul(
             )
             return y.unsqueeze(0)  # (M,) → (1, M)
         else:
+            # Use packed TC kernel for 2bpw (no stage2) when packed codebook available
+            if not has_stage2 and codebook_packed is not None:
+                y = _glq_cuda.glq_dequant_matmul_packed_cuda(
+                    x_fp16, Qidxs, codebook_packed, Wscale,
+                )
+                return y
             y = _glq_cuda.glq_dequant_matmul_cuda(
                 x_fp16, Qidxs, cb, Wscale,
                 q2 if has_stage2 else _empty_i16,

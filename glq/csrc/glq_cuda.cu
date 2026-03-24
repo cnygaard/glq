@@ -423,6 +423,118 @@ glq_matmul_tc_kernel(
 
 
 /* ─────────────────────────────────────────────────────────────────────
+ * Packed TC matmul kernel (B>=2) — uint32 codebook, 2bpw only
+ *
+ * Same mma.m16n8k16 layout as glq_matmul_tc_kernel but gathers from
+ * packed uint32 codebook (4 bytes vs 16 bytes per entry = 4× less BW).
+ * Decode: nibble = (packed >> (i*4)) & 0xF; val = nibble * 0.5 - 3.0
+ * ───────────────────────────────────────────────────────────────────── */
+
+__global__ void __launch_bounds__(256, 2)
+glq_matmul_tc_packed_kernel(
+    float* __restrict__ output,
+    const half* __restrict__ x,
+    const int16_t* __restrict__ qidxs,
+    const uint32_t* __restrict__ codebook_packed,
+    float wscale,
+    int B_dim, int M, int N, int N_BLOCKS, int stride_x, int bps
+) {
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int groupID = lane_id >> 2;
+    const int tid_g = lane_id & 3;
+
+    int b_start = blockIdx.x * 16;
+    int m_start = (blockIdx.y * blockDim.y + warp_id) * 8;
+    int k_split = blockIdx.z;
+
+    if (b_start >= B_dim || m_start >= M) return;
+
+    int j_start = k_split * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
+
+    float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
+
+    int b_row0 = b_start + groupID;
+    int b_row1 = b_start + groupID + 8;
+    int m_row = m_start + groupID;
+    bool b0_valid = (b_row0 < B_dim);
+    bool b1_valid = (b_row1 < B_dim);
+    bool m_valid = (m_row < M);
+    int k_elem = tid_g * 2;
+
+    for (int j = j_start; j < j_end; j += 2) {
+        bool j1_valid = (j + 1 < N_BLOCKS);
+
+        // B fragment: packed codebook gather + nibble decode
+        uint16_t idx_j = 0, idx_j1 = 0;
+        if (m_valid) {
+            idx_j = (uint16_t)qidxs[m_row * N_BLOCKS + j];
+            if (j1_valid) idx_j1 = (uint16_t)qidxs[m_row * N_BLOCKS + j + 1];
+        }
+
+        uint32_t packed_j = m_valid ? codebook_packed[idx_j] : 0;
+        uint32_t packed_j1 = (m_valid && j1_valid) ? codebook_packed[idx_j1] : 0;
+
+        half bv0 = __float2half(((packed_j >> (k_elem * 4)) & 0xF) * 0.5f - 3.0f);
+        half bv1 = __float2half(((packed_j >> ((k_elem + 1) * 4)) & 0xF) * 0.5f - 3.0f);
+        half bv2 = __float2half(((packed_j1 >> (k_elem * 4)) & 0xF) * 0.5f - 3.0f);
+        half bv3 = __float2half(((packed_j1 >> ((k_elem + 1) * 4)) & 0xF) * 0.5f - 3.0f);
+
+        __half2 b_h0 = __halves2half2(bv0, bv1);
+        __half2 b_h1 = __halves2half2(bv2, bv3);
+        uint32_t b_reg0 = *reinterpret_cast<uint32_t*>(&b_h0);
+        uint32_t b_reg1 = *reinterpret_cast<uint32_t*>(&b_h1);
+
+        // A fragment: x values from 2 batch rows
+        int x_off_j = j * 8 + k_elem;
+        int x_off_j1 = (j + 1) * 8 + k_elem;
+
+        half a00 = b0_valid ? x[b_row0 * stride_x + x_off_j]     : __float2half(0.0f);
+        half a01 = b0_valid ? x[b_row0 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half a10 = b1_valid ? x[b_row1 * stride_x + x_off_j]     : __float2half(0.0f);
+        half a11 = b1_valid ? x[b_row1 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half a02 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half a03 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+        half a12 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half a13 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+
+        __half2 ah0 = __halves2half2(a00, a01);
+        __half2 ah1 = __halves2half2(a10, a11);
+        __half2 ah2 = __halves2half2(a02, a03);
+        __half2 ah3 = __halves2half2(a12, a13);
+        uint32_t a_reg0 = *reinterpret_cast<uint32_t*>(&ah0);
+        uint32_t a_reg1 = *reinterpret_cast<uint32_t*>(&ah1);
+        uint32_t a_reg2 = *reinterpret_cast<uint32_t*>(&ah2);
+        uint32_t a_reg3 = *reinterpret_cast<uint32_t*>(&ah3);
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " { %0, %1, %2, %3 },"
+            " { %4, %5, %6, %7 },"
+            " { %8, %9 },"
+            " { %0, %1, %2, %3 };"
+            : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+            : "r"(a_reg0), "r"(a_reg1), "r"(a_reg2), "r"(a_reg3),
+              "r"(b_reg0), "r"(b_reg1)
+        );
+    }
+
+    int m_col0 = m_start + tid_g * 2;
+    int m_col1 = m_col0 + 1;
+
+    if (b0_valid && m_col0 < M)
+        atomicAdd(&output[b_row0 * M + m_col0], z0 * wscale);
+    if (b0_valid && m_col1 < M)
+        atomicAdd(&output[b_row0 * M + m_col1], z1 * wscale);
+    if (b1_valid && m_col0 < M)
+        atomicAdd(&output[b_row1 * M + m_col0], z2 * wscale);
+    if (b1_valid && m_col1 < M)
+        atomicAdd(&output[b_row1 * M + m_col1], z3 * wscale);
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
  * Split-K Packed variant
  * ───────────────────────────────────────────────────────────────────── */
 
@@ -788,6 +900,58 @@ torch::Tensor glq_dequant_matvec_packed_cuda(
         qidxs.data_ptr<int16_t>(),
         (const uint32_t*)codebook_packed.data_ptr<int32_t>(),
         wscale, M, N_BLOCKS
+    );
+
+    return output;
+}
+
+
+torch::Tensor glq_dequant_matmul_packed_cuda(
+    torch::Tensor x,               // (B, N) fp16
+    torch::Tensor qidxs,           // (M, N_BLOCKS) int16
+    torch::Tensor codebook_packed, // (65536,) uint32
+    float wscale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(qidxs);
+    CHECK_INPUT(codebook_packed);
+
+    int B_dim = x.size(0);
+    int N = x.size(1);
+    int M = qidxs.size(0);
+    int N_BLOCKS = qidxs.size(1);
+
+    at::DeviceGuard guard(x.device());
+    auto output = torch::zeros({B_dim, M}, torch::dtype(torch::kFloat32).device(x.device()));
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, x.get_device());
+    int num_sms = prop.multiProcessorCount;
+
+    const int WARPS = 8;
+    dim3 tc_block(32, WARPS);
+
+    int b_tiles = (B_dim + 15) / 16;
+    int m_tiles = (M + 7) / 8;
+    int m_grid = (m_tiles + WARPS - 1) / WARPS;
+
+    int bps = TC_BPS_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    int total_ctas = b_tiles * m_grid * k_splits;
+    if (total_ctas < num_sms * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
+
+    dim3 tc_grid(b_tiles, m_grid, k_splits);
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    glq_matmul_tc_packed_kernel<<<tc_grid, tc_block, 0, stream>>>(
+        output.data_ptr<float>(),
+        (const half*)x.data_ptr<c10::Half>(),
+        qidxs.data_ptr<int16_t>(),
+        (const uint32_t*)codebook_packed.data_ptr<int32_t>(),
+        wscale, B_dim, M, N, N_BLOCKS, N, bps
     );
 
     return output;
