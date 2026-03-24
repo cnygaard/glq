@@ -148,7 +148,7 @@ __global__ void glq_matvec_kernel(
  * More CTAs in flight = more L2 requests = better latency hiding.
  * ───────────────────────────────────────────────────────────────────── */
 
-#define BLOCKS_PER_SPLIT 64
+#define BLOCKS_PER_SPLIT_DEFAULT 64
 
 template <bool HAS_STAGE2>
 __global__ void __launch_bounds__(256, 2)
@@ -162,7 +162,8 @@ glq_matvec_splitk_kernel(
     float inv_resid_scale,
     float wscale,
     int M,
-    int N_BLOCKS
+    int N_BLOCKS,
+    int bps                             // blocks per split (adaptive)
 ) {
     const int warp_id = threadIdx.y;
     const int lane_id = threadIdx.x;
@@ -175,8 +176,8 @@ glq_matvec_splitk_kernel(
     int my_row = base_row + row_in_warp;
     bool valid = (my_row < M);
 
-    int j_start = blockIdx.y * BLOCKS_PER_SPLIT;
-    int j_end = min(j_start + BLOCKS_PER_SPLIT, N_BLOCKS);
+    int j_start = blockIdx.y * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
 
     float acc = 0.0f;
 
@@ -260,7 +261,7 @@ glq_matvec_splitk_kernel(
  * Block: (32, WARPS)
  * ───────────────────────────────────────────────────────────────────── */
 
-#define TC_BPS 64
+#define TC_BPS_DEFAULT 64
 
 template <bool HAS_STAGE2>
 __global__ void __launch_bounds__(256, 2)
@@ -277,7 +278,8 @@ glq_matmul_tc_kernel(
     int M,
     int N,
     int N_BLOCKS,
-    int stride_x
+    int stride_x,
+    int bps                             // blocks per K-split (adaptive)
 ) {
     const int warp_id = threadIdx.y;
     const int lane_id = threadIdx.x;
@@ -290,8 +292,8 @@ glq_matmul_tc_kernel(
 
     if (b_start >= B_dim || m_start >= M) return;
 
-    int j_start = k_split * TC_BPS;
-    int j_end = min(j_start + TC_BPS, N_BLOCKS);
+    int j_start = k_split * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
 
     // Accumulators
     float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
@@ -416,8 +418,8 @@ glq_matvec_splitk_packed_kernel(
     int my_row = base_row + row_in_warp;
     bool valid = (my_row < M);
 
-    int j_start = blockIdx.y * BLOCKS_PER_SPLIT;
-    int j_end = min(j_start + BLOCKS_PER_SPLIT, N_BLOCKS);
+    int j_start = blockIdx.y * BLOCKS_PER_SPLIT_DEFAULT;
+    int j_end = min(j_start + BLOCKS_PER_SPLIT_DEFAULT, N_BLOCKS);
 
     float acc = 0.0f;
 
@@ -570,10 +572,18 @@ torch::Tensor glq_dequant_matvec_cuda(
 
     // Always use split-K: it handles all cases well (large M just gets k_splits=1)
     int m_blocks = (M + rows_per_block - 1) / rows_per_block;
-    bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT);
+    bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT_DEFAULT);
 
     if (use_splitk) {
-        int k_splits = (N_BLOCKS + BLOCKS_PER_SPLIT - 1) / BLOCKS_PER_SPLIT;
+        // Adaptive BPS: shrink BPS when grid is undersaturated to create more CTAs
+        int bps = BLOCKS_PER_SPLIT_DEFAULT;
+        int k_splits = (N_BLOCKS + bps - 1) / bps;
+        int total_ctas = m_blocks * k_splits;
+        if (total_ctas < num_sms * 2 && bps > 16) {
+            // Grid too small — halve BPS to double K-splits
+            bps = max(16, bps / 2);
+            k_splits = (N_BLOCKS + bps - 1) / bps;
+        }
         dim3 grid(m_blocks, k_splits);
 
         if (has_stage2) {
@@ -587,7 +597,7 @@ torch::Tensor glq_dequant_matvec_cuda(
                 qidxs2.data_ptr<int16_t>(),
                 (const half*)codebook2.data_ptr<c10::Half>(),
                 inv_resid_scale,
-                wscale, M, N_BLOCKS
+                wscale, M, N_BLOCKS, bps
             );
         } else {
             glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
@@ -596,7 +606,7 @@ torch::Tensor glq_dequant_matvec_cuda(
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
                 nullptr, nullptr, 0.0f,
-                wscale, M, N_BLOCKS
+                wscale, M, N_BLOCKS, bps
             );
         }
     } else {
@@ -665,7 +675,7 @@ torch::Tensor glq_dequant_matmul_cuda(
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
 
     int m_blocks = (M + rows_per_block - 1) / rows_per_block;
-    bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT);
+    bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT_DEFAULT);
 
     const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
     const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
@@ -685,21 +695,30 @@ torch::Tensor glq_dequant_matmul_cuda(
     int b_tiles = (B_dim + 15) / 16;       // batch tiles (m=16)
     int m_tiles = (M + 7) / 8;             // output row tiles (n=8)
     int m_tiles_per_block = WARPS;
-    int k_splits = (N_BLOCKS + TC_BPS - 1) / TC_BPS;
+    int m_grid = (m_tiles + m_tiles_per_block - 1) / m_tiles_per_block;
 
-    dim3 tc_grid(b_tiles, (m_tiles + m_tiles_per_block - 1) / m_tiles_per_block, k_splits);
+    // Adaptive BPS: shrink when grid is undersaturated
+    int bps = TC_BPS_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    int total_ctas = b_tiles * m_grid * k_splits;
+    if (total_ctas < num_sms * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
+
+    dim3 tc_grid(b_tiles, m_grid, k_splits);
     dim3 tc_block(32, WARPS);
 
     if (has_stage2) {
         glq_matmul_tc_kernel<true><<<tc_grid, tc_block, 0, stream>>>(
             out_ptr, x_ptr, q_ptr, cb_ptr,
             q2_ptr, cb2_ptr, inv_resid_scale,
-            wscale, B_dim, M, N, N_BLOCKS, N);
+            wscale, B_dim, M, N, N_BLOCKS, N, bps);
     } else {
         glq_matmul_tc_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
             out_ptr, x_ptr, q_ptr, cb_ptr,
             nullptr, nullptr, 0.0f,
-            wscale, B_dim, M, N, N_BLOCKS, N);
+            wscale, B_dim, M, N, N_BLOCKS, N, bps);
     }
 
     return output;
