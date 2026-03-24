@@ -89,10 +89,31 @@ GLQ uses a single global scale per layer rather than per-group scales, so effect
 
 | Mode | GLQ 3.5bpw | bf16 | GLQ / bf16 |
 |------|-----------|------|------------|
-| Eager | 17 tok/s | 40 tok/s | 42% |
-| CUDA graph | 38 tok/s | 40 tok/s | 95% |
+| Eager (default) | 18 tok/s | 40 tok/s | 45% |
+| CUDA graph | 42 tok/s | 40 tok/s | 105% |
 
-With CUDA graph capture (`glq.cuda_graph.CUDAGraphWrapper`), SmolLM3-3B decode reaches 95% of bf16 throughput at 4.6x compression. Larger models are slower: Nemotron-30B (MoE, 6004 quantized sublayers) runs at ~0.7 tok/s on L40S. Without CUDA graphs, Python dispatch overhead between kernel launches accounts for ~60% of wall-clock time (measured via nsys profiling).
+With CUDA graph capture, GLQ decode **exceeds bf16 throughput** at 4.6x compression because the smaller quantized weights require less DRAM bandwidth. Larger models are slower: Nemotron-30B (MoE, 6004 quantized sublayers) runs at ~0.7 tok/s on L40S.
+
+#### CUDA graph acceleration
+
+CUDA graphs eliminate Python dispatch overhead between kernel launches (~60% of eager wall-clock time). The `CUDAGraphWrapper` captures a B=1 single-token forward pass and replays it without CPU involvement:
+
+```python
+import glq.hf_integration
+from glq.cuda_graph import CUDAGraphWrapper
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("./smollm2-glq-4bpw", device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("./smollm2-glq-4bpw")
+
+wrapper = CUDAGraphWrapper(model)
+
+# First call captures the graph; subsequent calls replay it
+input_ids = tokenizer("Hello", return_tensors="pt").input_ids[:, -1:].to(model.device)
+logits = wrapper(input_ids)  # 42 tok/s vs 18 tok/s eager
+```
+
+The wrapper automatically falls back to eager execution for variable shapes (prefill, batch>1) or calls with extra kwargs (past_key_values, attention_mask). It only accelerates the fixed-shape B=1 seqlen=1 decode path.
 
 ## How it works
 
