@@ -233,7 +233,7 @@ class E8ShellCodebook:
 
         if x.shape[0] <= _batch_size:
             xq = x.half() if use_half else x
-            dots = xq @ cb_t
+            dots = xq @ cb_t.to(xq.dtype)
             dists = -2.0 * dots + cb_norms
             indices = dists.argmin(dim=-1)
             return self.codebook[indices], indices
