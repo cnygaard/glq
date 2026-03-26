@@ -13,6 +13,7 @@ class GLQvLLMConfig(QuantizationConfig):
     """vLLM quantization config for GLQ (E8 lattice codebook + RHT)."""
 
     def __init__(self, bpw: int = 2, layer_bpw: dict | None = None):
+        super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
 
