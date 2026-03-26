@@ -2,7 +2,10 @@
 
 Keeps compressed GLQ indices (Qidxs, SU, SV) in GPU memory.
 Dequant on-the-fly in apply() using GLQ's CUDA C and Triton kernels.
-This gives both vLLM inference speed AND GLQ VRAM compression.
+
+Supports:
+- Standard linear layers (ColumnParallel, RowParallel, Replicated)
+- Fused QKV layers (QKVParallelLinear) — per-shard GLQ buffers
 """
 
 import math
@@ -40,7 +43,6 @@ def _ensure_codebook(device, max_bpw: int = 2):
     elif max_bpw >= 3:
         cb2 = cb.make_small(256)
 
-    # Move to GPU
     cb._move_to_device(device)
     if cb2 is not None and cb2 is not cb:
         cb2._move_to_device(device)
@@ -51,8 +53,9 @@ def _ensure_codebook(device, max_bpw: int = 2):
     return cb, cb2
 
 
+# --- Standalone helpers (no vLLM dependency, for testing) ---
+
 def _get_codebook():
-    """Get primary codebook on CPU (for testing/dequant)."""
     cb_path = os.path.join(os.path.dirname(__file__), "..", "glq", "e8_codebook.pt")
     if os.path.exists(cb_path):
         return E8ShellCodebook.load(cb_path, device="cpu")
@@ -60,7 +63,6 @@ def _get_codebook():
 
 
 def _get_codebook2(bpw: int):
-    """Get secondary codebook on CPU (for testing/dequant)."""
     cb = _get_codebook()
     if bpw >= 4:
         return cb
@@ -79,32 +81,114 @@ def dequantize_glq_weight(
 
     m_pad, n_blocks = Qidxs.shape
     n_pad = n_blocks * 8
-
     W_rht = codebook.decode(Qidxs.long().reshape(-1)).reshape(m_pad, n_pad).float()
-
     if Qidxs2 is not None and inv_resid_scale != 0.0 and codebook2 is not None:
         W_rht2 = codebook2.decode(Qidxs2.long().reshape(-1)).reshape(m_pad, n_pad).float()
         W_rht = W_rht + W_rht2 * inv_resid_scale
-
     W_rht = W_rht * Wscale.float()
-
-    # Inverse RHT (must match E8RHTLinear.dequantize exactly)
     W = fast_hadamard_transform(W_rht.clone())
     W = W * SV.float().unsqueeze(0)
     W = fast_hadamard_transform(W.T.clone()).T
     W = W * SU.float().unsqueeze(1)
-
     if out_features is not None and in_features is not None:
         W = W[:out_features, :in_features]
-
     return W.half()
+
+
+# --- GLQ buffer helpers ---
+
+def _glq_pad(n):
+    """Next power of 2."""
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
+def _register_glq_buffers(layer, prefix, out_size, in_size):
+    """Register one set of GLQ compressed buffers on the layer."""
+    m_pad = _glq_pad(out_size)
+    n_pad = _glq_pad(in_size)
+    n_blocks = n_pad // 8
+    p = prefix
+    setattr(layer, f'Qidxs{p}', torch.nn.Parameter(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16), requires_grad=False))
+    setattr(layer, f'SU{p}', torch.nn.Parameter(
+        torch.ones(m_pad, dtype=torch.float16), requires_grad=False))
+    setattr(layer, f'SV{p}', torch.nn.Parameter(
+        torch.ones(n_pad, dtype=torch.float16), requires_grad=False))
+    setattr(layer, f'Wscale{p}', torch.nn.Parameter(
+        torch.ones((), dtype=torch.float32), requires_grad=False))
+    setattr(layer, f'Qidxs2{p}', torch.nn.Parameter(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16), requires_grad=False))
+    setattr(layer, f'inv_resid_scale{p}', torch.nn.Parameter(
+        torch.zeros((), dtype=torch.float32), requires_grad=False))
+    return m_pad, n_pad
+
+
+def _glq_apply_single(x, layer, prefix, cb, cb2, device):
+    """Run input RHT → dequant+matmul → output RHT for one set of GLQ buffers."""
+    dtype = x.dtype
+    Qidxs = getattr(layer, f'Qidxs{prefix}')
+    SU = getattr(layer, f'SU{prefix}')
+    SV = getattr(layer, f'SV{prefix}')
+    wscale = getattr(layer, f'_glq_wscale{prefix}')
+    has_stage2 = getattr(layer, f'_glq_has_stage2{prefix}')
+    inv_rs = getattr(layer, f'_glq_inv_rs{prefix}')
+    m_pad = getattr(layer, f'_glq_m_pad{prefix}')
+    n_pad = getattr(layer, f'_glq_n_pad{prefix}')
+    log_n = getattr(layer, f'_glq_log_n{prefix}')
+    log_m = getattr(layer, f'_glq_log_m{prefix}')
+    out_features = getattr(layer, f'_glq_out{prefix}')
+    in_features = getattr(layer, f'_glq_in{prefix}')
+
+    B = x.shape[0]
+
+    # Input RHT
+    x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
+    if n_pad <= 16384 and _glq_cuda is not None:
+        _glq_cuda.glq_input_rht_cuda(
+            x.half().contiguous(), SV, x_rht,
+            in_features, in_features,
+            1.0 / math.sqrt(n_pad), n_pad, log_n)
+    else:
+        from glq.quantized_linear import _input_rht_kernel
+        _input_rht_kernel[(B,)](
+            x, SV, x_rht, in_features, x.stride(0),
+            1.0 / math.sqrt(n_pad), N=n_pad, LOG_N=log_n, num_warps=8)
+
+    # Dequant + matmul
+    cb_packed = getattr(cb, 'codebook_packed', None)
+    Qidxs2 = getattr(layer, f'Qidxs2{prefix}') if has_stage2 else None
+    cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
+
+    y_rht = glq_dequant_matmul(
+        x_rht, Qidxs, cb.codebook_half, wscale,
+        Qidxs2=Qidxs2, codebook2=cb2_half,
+        inv_resid_scale=inv_rs, codebook_packed=cb_packed)
+
+    # Output RHT
+    if m_pad <= 16384 and _glq_cuda is not None:
+        y = torch.empty(B, out_features, dtype=torch.float16, device=device)
+        _glq_cuda.glq_output_rht_cuda(
+            y_rht, SU, y, out_features, m_pad,
+            log_m, 1.0 / math.sqrt(m_pad))
+        if dtype != torch.float16:
+            y = y.to(dtype)
+    else:
+        from glq.quantized_linear import _output_rht_kernel
+        output_fp16 = (dtype == torch.float16)
+        y = torch.empty(B, out_features, dtype=dtype, device=device)
+        _output_rht_kernel[(B,)](
+            y_rht, SU, y, out_features, y_rht.stride(0), y.stride(0),
+            1.0 / math.sqrt(m_pad),
+            OUTPUT_FP16=output_fp16, M=m_pad, LOG_M=log_m, num_warps=8)
+
+    return y
 
 
 class GLQLinearMethod(LinearMethodBase):
     """GLQ fused dequant+matmul linear method for vLLM.
 
     Weights stay compressed (int16 indices + sign vectors).
-    apply() does: input RHT → fused dequant+matmul → output RHT.
+    Supports standard linear layers AND fused QKV (per-shard buffers).
     """
 
     def __init__(self, quant_config, bpw: int = 2):
@@ -121,53 +205,76 @@ class GLQLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        output_size_per_partition = sum(output_partition_sizes)
-
-        m_pad = 1 << (output_size_per_partition - 1).bit_length()
-        n_pad = 1 << (input_size_per_partition - 1).bit_length()
-        n_blocks = n_pad // 8
-
-        # Store dims for apply()
-        layer.glq_out_features = output_size_per_partition
+        is_fused = len(output_partition_sizes) > 1
+        layer.glq_is_fused = is_fused
         layer.glq_in_features = input_size_per_partition
-        layer.glq_m_pad = m_pad
-        layer.glq_n_pad = n_pad
         layer.glq_bpw = self.bpw
 
-        # Compressed weight buffers — names match safetensor keys
-        layer.Qidxs = torch.nn.Parameter(
-            torch.zeros(m_pad, n_blocks, dtype=torch.int16), requires_grad=False)
-        layer.SU = torch.nn.Parameter(
-            torch.ones(m_pad, dtype=torch.float16), requires_grad=False)
-        layer.SV = torch.nn.Parameter(
-            torch.ones(n_pad, dtype=torch.float16), requires_grad=False)
-        layer.Wscale = torch.nn.Parameter(
-            torch.ones((), dtype=torch.float32), requires_grad=False)
-        layer.Qidxs2 = torch.nn.Parameter(
-            torch.zeros(m_pad, n_blocks, dtype=torch.int16), requires_grad=False)
-        layer.inv_resid_scale = torch.nn.Parameter(
-            torch.zeros((), dtype=torch.float32), requires_grad=False)
+        if is_fused:
+            # Fused QKV: register per-shard GLQ buffers
+            layer.glq_shard_sizes = output_partition_sizes
+            layer.glq_num_shards = len(output_partition_sizes)
+            for i, out_sz in enumerate(output_partition_sizes):
+                suffix = f'_s{i}'
+                m_pad, n_pad = _register_glq_buffers(
+                    layer, suffix, out_sz, input_size_per_partition)
+                setattr(layer, f'_glq_out{suffix}', out_sz)
+                setattr(layer, f'_glq_in{suffix}', input_size_per_partition)
+                setattr(layer, f'_glq_m_pad{suffix}', m_pad)
+                setattr(layer, f'_glq_n_pad{suffix}', n_pad)
+        else:
+            # Standard: single set of GLQ buffers (no suffix)
+            out_sz = sum(output_partition_sizes)
+            layer.glq_out_features = out_sz
+            m_pad, n_pad = _register_glq_buffers(
+                layer, '', out_sz, input_size_per_partition)
+            layer.glq_m_pad = m_pad
+            layer.glq_n_pad = n_pad
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Set up codebook and cache scalars. NO dequantization."""
-        device = layer.Qidxs.device
+        device = next(layer.parameters()).device
         bpw = getattr(layer, 'glq_bpw', 2)
 
         # Ensure shared codebook is on the right device
-        inv_rs = layer.inv_resid_scale.item()
-        has_stage2 = inv_rs != 0.0
-        max_bpw = bpw if has_stage2 else 2
+        # Determine max_bpw across all shards
+        max_bpw = 2
+        if getattr(layer, 'glq_is_fused', False):
+            for i in range(layer.glq_num_shards):
+                inv_rs = getattr(layer, f'inv_resid_scale_s{i}').item()
+                if inv_rs != 0.0:
+                    max_bpw = max(max_bpw, bpw)
+        else:
+            inv_rs = layer.inv_resid_scale.item()
+            if inv_rs != 0.0:
+                max_bpw = bpw
+
         _ensure_codebook(device, max_bpw=max_bpw)
-
-        # Cache scalars to avoid .item() calls in hot path
-        layer.glq_wscale = layer.Wscale.item()
-        layer.glq_has_stage2 = has_stage2
-        layer.glq_inv_rs = inv_rs
-        layer.glq_log_n = int(math.log2(layer.glq_n_pad))
-        layer.glq_log_m = int(math.log2(layer.glq_m_pad))
-
-        # Ensure CUDA extension is loaded
         _try_load_cuda_ext()
+
+        # Cache scalars for all shards
+        if getattr(layer, 'glq_is_fused', False):
+            for i in range(layer.glq_num_shards):
+                suffix = f'_s{i}'
+                inv_rs = getattr(layer, f'inv_resid_scale{suffix}').item()
+                setattr(layer, f'_glq_wscale{suffix}', getattr(layer, f'Wscale{suffix}').item())
+                setattr(layer, f'_glq_has_stage2{suffix}', inv_rs != 0.0)
+                setattr(layer, f'_glq_inv_rs{suffix}', inv_rs)
+                setattr(layer, f'_glq_log_n{suffix}',
+                        int(math.log2(getattr(layer, f'_glq_n_pad{suffix}'))))
+                setattr(layer, f'_glq_log_m{suffix}',
+                        int(math.log2(getattr(layer, f'_glq_m_pad{suffix}'))))
+        else:
+            inv_rs = layer.inv_resid_scale.item()
+            layer._glq_wscale = layer.Wscale.item()
+            layer._glq_has_stage2 = inv_rs != 0.0
+            layer._glq_inv_rs = inv_rs
+            layer._glq_m_pad = layer.glq_m_pad
+            layer._glq_n_pad = layer.glq_n_pad
+            layer._glq_log_n = int(math.log2(layer.glq_n_pad))
+            layer._glq_log_m = int(math.log2(layer.glq_m_pad))
+            layer._glq_out = layer.glq_out_features
+            layer._glq_in = layer.glq_in_features
 
     def apply(
         self,
@@ -175,68 +282,26 @@ class GLQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        dtype = x.dtype
         orig_shape = x.shape
-        x = x.reshape(-1, layer.glq_in_features)
-        B = x.shape[0]
-        n_pad = layer.glq_n_pad
-        m_pad = layer.glq_m_pad
-        log_n = layer.glq_log_n
-        log_m = layer.glq_log_m
         in_features = layer.glq_in_features
-        out_features = layer.glq_out_features
-
-        # --- 1. Input RHT: pad + SV signs + FHT ---
-        x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
-        if n_pad <= 16384 and _glq_cuda is not None:
-            _glq_cuda.glq_input_rht_cuda(
-                x.half().contiguous(), layer.SV, x_rht,
-                in_features, in_features,
-                1.0 / math.sqrt(n_pad), n_pad, log_n)
-        else:
-            from glq.quantized_linear import _input_rht_kernel
-            _input_rht_kernel[(B,)](
-                x, layer.SV, x_rht,
-                in_features, x.stride(0),
-                1.0 / math.sqrt(n_pad),
-                N=n_pad, LOG_N=log_n, num_warps=8)
-
-        # --- 2. Fused dequant+matmul in RHT domain ---
+        x = x.reshape(-1, in_features)
+        device = x.device
         cb, cb2 = _codebook, _codebook2_small
-        has_stage2 = layer.glq_has_stage2
-        cb_packed = getattr(cb, 'codebook_packed', None)
 
-        y_rht = glq_dequant_matmul(
-            x_rht, layer.Qidxs,
-            cb.codebook_half,
-            layer.glq_wscale,
-            Qidxs2=layer.Qidxs2 if has_stage2 else None,
-            codebook2=cb2.codebook_half if has_stage2 and cb2 is not None else None,
-            inv_resid_scale=layer.glq_inv_rs,
-            codebook_packed=cb_packed,
-        )
-
-        # --- 3. Output RHT: FHT + SU signs + unpad ---
-        if m_pad <= 16384 and _glq_cuda is not None:
-            y = torch.empty(B, out_features, dtype=torch.float16, device=x.device)
-            _glq_cuda.glq_output_rht_cuda(
-                y_rht, layer.SU, y,
-                out_features, m_pad, log_m,
-                1.0 / math.sqrt(m_pad))
-            if dtype != torch.float16:
-                y = y.to(dtype)
+        if getattr(layer, 'glq_is_fused', False):
+            # Fused QKV: dequant each shard, concatenate
+            shard_outputs = []
+            for i in range(layer.glq_num_shards):
+                y_shard = _glq_apply_single(x, layer, f'_s{i}', cb, cb2, device)
+                shard_outputs.append(y_shard)
+            y = torch.cat(shard_outputs, dim=-1)
+            out_features = sum(layer.glq_shard_sizes)
         else:
-            from glq.quantized_linear import _output_rht_kernel
-            output_fp16 = (dtype == torch.float16)
-            y = torch.empty(B, out_features, dtype=dtype, device=x.device)
-            _output_rht_kernel[(B,)](
-                y_rht, layer.SU, y,
-                out_features, y_rht.stride(0), y.stride(0),
-                1.0 / math.sqrt(m_pad),
-                OUTPUT_FP16=output_fp16,
-                M=m_pad, LOG_M=log_m, num_warps=8)
+            # Standard: single dequant
+            y = _glq_apply_single(x, layer, '', cb, cb2, device)
+            out_features = layer.glq_out_features
 
         if bias is not None:
-            y = y + bias.unsqueeze(0).to(dtype)
+            y = y + bias.unsqueeze(0).to(y.dtype)
 
         return y.reshape(*orig_shape[:-1], out_features)
