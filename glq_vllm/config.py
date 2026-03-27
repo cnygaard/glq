@@ -38,11 +38,18 @@ class GLQvLLMConfig(QuantizationConfig):
             layer_bpw=config.get("layer_bpw", None),
         )
 
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> GLQLinearMethod | None:
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):
-            # Determine per-layer bpw
             bpw = self.layer_bpw.get(prefix, self.bpw)
             return GLQLinearMethod(self, bpw=bpw)
+
+        # FusedMoE layers — lazy import to avoid circular deps
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+            if isinstance(layer, FusedMoE):
+                from .fused_moe_method import GLQFusedMoEMethod
+                return GLQFusedMoEMethod(self)
+        except ImportError:
+            pass
+
         return None
