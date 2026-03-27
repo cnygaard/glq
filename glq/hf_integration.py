@@ -105,7 +105,7 @@ class GLQQuantizer(HfQuantizer):
         # Suppress MISSING warnings for Qidxs2/inv_resid_scale on 2bpw layers.
         # These are omitted from checkpoint to save disk; _load_from_state_dict
         # injects zero defaults. The pattern matches any layer's optional buffers.
-        ignore = model._keys_to_ignore_on_load_missing or []
+        ignore = getattr(model, '_keys_to_ignore_on_load_missing', None) or []
         ignore.extend(["Qidxs2", "inv_resid_scale"])
         model._keys_to_ignore_on_load_missing = ignore
         return model
