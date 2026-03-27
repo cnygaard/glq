@@ -18,7 +18,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from glq.codebook import E8ShellCodebook
 from glq.hadamard import fast_hadamard_transform
 
-from .linear_method import _ensure_codebook, _glq_pad
+from .linear_method import _ensure_codebook, _glq_pad, _make_glq_param
 
 
 def _dequant_expert_weight(Qidxs, SU, SV, Wscale, cb, out_features, in_features,
@@ -97,46 +97,34 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         layer.glq_n_pad_w2 = n_pad_w2
 
         # w13 compressed buffers
-        layer.w13_Qidxs = nn.Parameter(
-            torch.zeros(num_experts, m_pad_w13, n_blocks_w13, dtype=torch.int16),
-            requires_grad=False)
-        layer.w13_SU = nn.Parameter(
-            torch.ones(num_experts, m_pad_w13, dtype=torch.float16),
-            requires_grad=False)
-        layer.w13_SV = nn.Parameter(
-            torch.ones(n_pad_w13, dtype=torch.float16),
-            requires_grad=False)
-        layer.w13_Wscale = nn.Parameter(
-            torch.ones(num_experts, dtype=torch.float32),
-            requires_grad=False)
+        layer.w13_Qidxs = _make_glq_param(
+            torch.zeros(num_experts, m_pad_w13, n_blocks_w13, dtype=torch.int16))
+        layer.w13_SU = _make_glq_param(
+            torch.ones(num_experts, m_pad_w13, dtype=torch.float16))
+        layer.w13_SV = _make_glq_param(
+            torch.ones(n_pad_w13, dtype=torch.float16))
+        layer.w13_Wscale = _make_glq_param(
+            torch.ones(num_experts, dtype=torch.float32))
 
         # w2 compressed buffers
-        layer.w2_Qidxs = nn.Parameter(
-            torch.zeros(num_experts, m_pad_w2, n_blocks_w2, dtype=torch.int16),
-            requires_grad=False)
-        layer.w2_SU = nn.Parameter(
-            torch.ones(num_experts, m_pad_w2, dtype=torch.float16),
-            requires_grad=False)
-        layer.w2_SV = nn.Parameter(
-            torch.ones(n_pad_w2, dtype=torch.float16),
-            requires_grad=False)
-        layer.w2_Wscale = nn.Parameter(
-            torch.ones(num_experts, dtype=torch.float32),
-            requires_grad=False)
+        layer.w2_Qidxs = _make_glq_param(
+            torch.zeros(num_experts, m_pad_w2, n_blocks_w2, dtype=torch.int16))
+        layer.w2_SU = _make_glq_param(
+            torch.ones(num_experts, m_pad_w2, dtype=torch.float16))
+        layer.w2_SV = _make_glq_param(
+            torch.ones(n_pad_w2, dtype=torch.float16))
+        layer.w2_Wscale = _make_glq_param(
+            torch.ones(num_experts, dtype=torch.float32))
 
         # Stage 2 buffers (3/4bpw)
-        layer.w13_Qidxs2 = nn.Parameter(
-            torch.zeros(num_experts, m_pad_w13, n_blocks_w13, dtype=torch.int16),
-            requires_grad=False)
-        layer.w13_inv_resid_scale = nn.Parameter(
-            torch.zeros(num_experts, dtype=torch.float32),
-            requires_grad=False)
-        layer.w2_Qidxs2 = nn.Parameter(
-            torch.zeros(num_experts, m_pad_w2, n_blocks_w2, dtype=torch.int16),
-            requires_grad=False)
-        layer.w2_inv_resid_scale = nn.Parameter(
-            torch.zeros(num_experts, dtype=torch.float32),
-            requires_grad=False)
+        layer.w13_Qidxs2 = _make_glq_param(
+            torch.zeros(num_experts, m_pad_w13, n_blocks_w13, dtype=torch.int16))
+        layer.w13_inv_resid_scale = _make_glq_param(
+            torch.zeros(num_experts, dtype=torch.float32))
+        layer.w2_Qidxs2 = _make_glq_param(
+            torch.zeros(num_experts, m_pad_w2, n_blocks_w2, dtype=torch.int16))
+        layer.w2_inv_resid_scale = _make_glq_param(
+            torch.zeros(num_experts, dtype=torch.float32))
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Ensure codebook is on device."""

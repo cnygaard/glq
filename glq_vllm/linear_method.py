@@ -104,24 +104,44 @@ def _glq_pad(n):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def _glq_weight_loader(param, loaded_weight, *args, **kwargs):
+    """GLQ weight loader — handles per-expert loading and shape mismatches."""
+    expert_id = kwargs.get('expert_id')
+    if expert_id is not None and param.data.dim() >= 1:
+        # MoE expert: loaded_weight is one expert's data, copy into slot
+        param.data[expert_id].copy_(loaded_weight)
+        return True  # signal success for expert loading
+    if param.data.shape != loaded_weight.shape:
+        param.data = torch.empty_like(loaded_weight)
+    param.data.copy_(loaded_weight)
+    return True
+
+
+def _make_glq_param(tensor):
+    """Create nn.Parameter with GLQ weight_loader attached."""
+    p = torch.nn.Parameter(tensor, requires_grad=False)
+    p.weight_loader = _glq_weight_loader
+    return p
+
+
 def _register_glq_buffers(layer, prefix, out_size, in_size):
     """Register one set of GLQ compressed buffers on the layer."""
     m_pad = _glq_pad(out_size)
     n_pad = _glq_pad(in_size)
     n_blocks = n_pad // 8
     p = prefix
-    setattr(layer, f'Qidxs{p}', torch.nn.Parameter(
-        torch.zeros(m_pad, n_blocks, dtype=torch.int16), requires_grad=False))
-    setattr(layer, f'SU{p}', torch.nn.Parameter(
-        torch.ones(m_pad, dtype=torch.float16), requires_grad=False))
-    setattr(layer, f'SV{p}', torch.nn.Parameter(
-        torch.ones(n_pad, dtype=torch.float16), requires_grad=False))
-    setattr(layer, f'Wscale{p}', torch.nn.Parameter(
-        torch.ones((), dtype=torch.float32), requires_grad=False))
-    setattr(layer, f'Qidxs2{p}', torch.nn.Parameter(
-        torch.zeros(m_pad, n_blocks, dtype=torch.int16), requires_grad=False))
-    setattr(layer, f'inv_resid_scale{p}', torch.nn.Parameter(
-        torch.zeros((), dtype=torch.float32), requires_grad=False))
+    setattr(layer, f'Qidxs{p}', _make_glq_param(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+    setattr(layer, f'SU{p}', _make_glq_param(
+        torch.ones(m_pad, dtype=torch.float16)))
+    setattr(layer, f'SV{p}', _make_glq_param(
+        torch.ones(n_pad, dtype=torch.float16)))
+    setattr(layer, f'Wscale{p}', _make_glq_param(
+        torch.ones((), dtype=torch.float32)))
+    setattr(layer, f'Qidxs2{p}', _make_glq_param(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+    setattr(layer, f'inv_resid_scale{p}', _make_glq_param(
+        torch.zeros((), dtype=torch.float32)))
     return m_pad, n_pad
 
 
@@ -183,6 +203,20 @@ class GLQShardedParameter(BasevLLMParameter):
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         if len(self._shard_data) == 1:
             self._shard_data[0].copy_(loaded_weight)
+
+    @property
+    def weight_loader(self) -> Callable:
+        """Override BasevLLMParameter.weight_loader to return our shard router,
+        not the layer's weight_loader method."""
+        return self._glq_shard_loader
+
+    def _glq_shard_loader(self, param, loaded_weight, *args, **kwargs):
+        """Route to load_qkv_weight or load_merged_column_weight."""
+        shard_id = kwargs.get('shard_id') or (args[0] if args else None)
+        if shard_id is not None:
+            self.load_qkv_weight(loaded_weight, shard_id=shard_id, **{k: v for k, v in kwargs.items() if k != 'shard_id'})
+        else:
+            self.load_column_parallel_weight(loaded_weight)
 
     def get_shard(self, idx: int) -> torch.Tensor:
         return self._shard_data[idx]
