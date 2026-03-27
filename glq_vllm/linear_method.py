@@ -216,6 +216,8 @@ class GLQShardedParameter(BasevLLMParameter):
         shard_id = kwargs.get("shard_id")
         idx = self._shard_id_as_int(shard_id)
         if idx < len(self._shard_data):
+            if self._shard_data[idx].shape != loaded_weight.shape:
+                self._shard_data[idx] = torch.empty_like(loaded_weight)
             self._shard_data[idx].copy_(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
@@ -225,6 +227,8 @@ class GLQShardedParameter(BasevLLMParameter):
         else:
             idx = 0
         if idx < len(self._shard_data):
+            if self._shard_data[idx].shape != loaded_weight.shape:
+                self._shard_data[idx] = torch.empty_like(loaded_weight)
             self._shard_data[idx].copy_(loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
@@ -413,8 +417,8 @@ class GLQLinearMethod(LinearMethodBase):
                 output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
             layer.SU = GLQShardedParameter(
                 output_partition_sizes, 0, torch.float16, weight_loader=weight_loader)
-            layer.SV = torch.nn.Parameter(
-                torch.ones(n_pad, dtype=torch.float16), requires_grad=False)
+            layer.SV = _make_glq_param(
+                torch.ones(n_pad, dtype=torch.float16))
             layer.Wscale = GLQShardedParameter(
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
             layer.Qidxs2 = GLQShardedParameter(
