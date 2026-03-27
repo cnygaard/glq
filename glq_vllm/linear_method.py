@@ -135,12 +135,22 @@ class GLQShardedParameter(BasevLLMParameter):
     """
 
     def __new__(cls, shard_sizes, inner_dim, dtype, **kwargs):
-        data = torch.zeros(1, dtype=dtype)
+        # Allocate data with the TOTAL concatenated shape so vLLM's
+        # weight_loader shape assertions pass (param.data.shape check)
+        total_m = sum(_glq_pad(s) if s > 1 else 1 for s in shard_sizes)
+        if inner_dim > 0:
+            data = torch.zeros(total_m, inner_dim, dtype=dtype)
+        else:
+            data = torch.zeros(len(shard_sizes), dtype=dtype)
         return super().__new__(cls, data=data, **kwargs)
 
     def __init__(self, shard_sizes: list[int], inner_dim: int,
                  dtype: torch.dtype, weight_loader: Callable, **kwargs):
-        data = torch.zeros(1, dtype=dtype)
+        total_m = sum(_glq_pad(s) if s > 1 else 1 for s in shard_sizes)
+        if inner_dim > 0:
+            data = torch.zeros(total_m, inner_dim, dtype=dtype)
+        else:
+            data = torch.zeros(len(shard_sizes), dtype=dtype)
         super().__init__(data=data, weight_loader=weight_loader)
         self._shard_sizes = shard_sizes
         self._inner_dim = inner_dim

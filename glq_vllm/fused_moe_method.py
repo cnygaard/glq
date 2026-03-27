@@ -11,6 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
+
 from glq.codebook import E8ShellCodebook
 from glq.hadamard import fast_hadamard_transform
 
@@ -37,7 +41,7 @@ def _dequant_expert_weight(Qidxs, SU, SV, Wscale, cb, out_features, in_features,
     return W[:out_features, :in_features].half()
 
 
-class GLQFusedMoEMethod:
+class GLQFusedMoEMethod(FusedMoEMethodBase):
     """GLQ quantized FusedMoE method.
 
     Stores per-expert compressed GLQ buffers. On apply(), dequantizes
@@ -51,8 +55,12 @@ class GLQFusedMoEMethod:
     - w2_Qidxs, w2_SU, w2_SV, w2_Wscale: same pattern for down_proj
     """
 
-    def __init__(self, quant_config):
+    def __init__(self, quant_config, moe=None):
+        super().__init__(moe)
         self.quant_config = quant_config
+
+    def get_fused_moe_quant_config(self, layer):
+        return None
 
     def create_weights(
         self,

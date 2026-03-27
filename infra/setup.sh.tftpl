@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/glq-setup.log) 2>&1
+
+# Deep Learning AMI: NVIDIA drivers + CUDA pre-installed.
+# g5 instances have NVMe SSD at /opt/dlami/nvme (419 GB).
+# Root EBS is only 100 GB — use NVMe for everything large.
+
+NVME=/opt/dlami/nvme
+VENV=$NVME/venv
+HF_CACHE=$NVME/hf_cache
+
+echo "=== GLQ setup starting ==="
+
+apt-get update -qq && apt-get install -y -qq python3-venv > /dev/null 2>&1
+
+# Fix CUDA: DLAMI hardcodes older cuda paths in /etc/environment and /etc/profile.d/dlami.sh.
+# Replace them with /usr/local/cuda/bin so the symlink controls which version is used.
+ln -sfn /usr/local/cuda-12.9 /usr/local/cuda
+sed -i 's|/usr/local/cuda-[0-9.]*/bin:/usr/local/cuda-[0-9.]*/include:||g' /etc/environment
+sed -i 's|PATH="|PATH="/usr/local/cuda/bin:|' /etc/environment
+# Fix /etc/profile.d/dlami.sh which overrides PATH for login shells
+sed -i 's|/usr/local/cuda-[0-9.]*/bin:/usr/local/cuda-[0-9.]*/include||g' /etc/profile.d/dlami.sh 2>/dev/null || true
+sed -i 's|/usr/local/cuda-[0-9.]*/lib[^:]*:||g' /etc/profile.d/dlami.sh 2>/dev/null || true
+
+sudo -u ubuntu bash <<USERSCRIPT
+set -euo pipefail
+
+export PATH=/usr/local/cuda/bin:$PATH
+
+# Venv on NVMe
+python3 -m venv $VENV
+source $VENV/bin/activate
+
+# Core deps — vLLM 0.18 pins torch==2.10.0
+pip install -q pip --upgrade
+pip install -q vllm
+pip install -q 'glq[quantize]==${glq_version}' ninja
+pip install -q wheel
+# mamba-ssm pulls torch 2.11, then we pin back to 2.10+cu128
+# Build with CUDA_HOME matching torch's cu128
+export CUDA_HOME=/usr/local/cuda-12.8
+pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
+pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
+pip install -q torch==2.10.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+unset CUDA_HOME
+
+# HF cache on NVMe
+mkdir -p $HF_CACHE
+echo "export HF_HOME=$HF_CACHE" >> ~/.bashrc
+echo "source $VENV/bin/activate" >> ~/.bashrc
+
+echo "Setup complete" > /tmp/setup-done
+USERSCRIPT
+
+echo "=== GLQ setup done ==="

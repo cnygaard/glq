@@ -48,8 +48,8 @@ class GLQvLLMConfig(QuantizationConfig):
             from vllm.model_executor.layers.fused_moe.layer import FusedMoE
             if isinstance(layer, FusedMoE):
                 from .fused_moe_method import GLQFusedMoEMethod
-                return GLQFusedMoEMethod(self)
-        except ImportError:
+                return GLQFusedMoEMethod(self, moe=layer.moe_config)
+        except (ImportError, AttributeError):
             pass
 
         return None
