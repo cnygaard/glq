@@ -11,6 +11,12 @@ try:
 except (ImportError, ModuleNotFoundError):
     _HAS_VLLM = False
 
+try:
+    import transformers
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+
 requires_vllm = pytest.mark.skipif(not _HAS_VLLM, reason="vllm not installed")
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GPU required"
@@ -46,6 +52,9 @@ def test_glq_config_from_config():
 
 # ── Test 3: Dequant correctness (CPU, no vLLM server) ──────────────────
 
+@pytest.mark.skipif(
+    not _HAS_TRANSFORMERS, reason="transformers not installed"
+)
 def test_dequant_matches_hf():
     """dequantize_glq_weight must match E8RHTLinear.dequantize()."""
     import glq.hf_integration  # noqa: F401
