@@ -134,10 +134,12 @@ class GLQShardedParameter(BasevLLMParameter):
     because GLQ pads to power-of-2 and each shard has independent RHT).
     """
 
+    def __new__(cls, shard_sizes, inner_dim, dtype, **kwargs):
+        data = torch.zeros(1, dtype=dtype)
+        return super().__new__(cls, data=data, **kwargs)
+
     def __init__(self, shard_sizes: list[int], inner_dim: int,
                  dtype: torch.dtype, weight_loader: Callable, **kwargs):
-        # Store a small dummy tensor as the parameter data
-        # (vLLM requires Parameter to have .data)
         data = torch.zeros(1, dtype=dtype)
         super().__init__(data=data, weight_loader=weight_loader)
         self._shard_sizes = shard_sizes
