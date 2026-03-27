@@ -104,13 +104,40 @@ def _glq_pad(n):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+_dbg = [0]
 def _glq_weight_loader(param, loaded_weight, *args, **kwargs):
-    """GLQ weight loader — handles per-expert loading and shape mismatches."""
+    """GLQ weight loader — handles per-expert, shared, and standard params."""
     expert_id = kwargs.get('expert_id')
-    if expert_id is not None and param.data.dim() >= 1:
-        # MoE expert: loaded_weight is one expert's data, copy into slot
-        param.data[expert_id].copy_(loaded_weight)
-        return True  # signal success for expert loading
+    if False and _dbg[0] < 200:
+        _dbg[0] += 1
+        name = args[0] if args else "?"
+        print(f"  WL: expert_id={expert_id} param_dim={param.data.dim()} param_shape={list(param.data.shape)} "
+              f"weight_dim={loaded_weight.dim()} weight_shape={list(loaded_weight.shape)} name={name}", flush=True)
+    if expert_id is not None:
+        if param.data.dim() >= 2:
+            # Per-expert tensor (Qidxs 3D, SU 2D): index by expert_id
+            slot = param.data[expert_id]
+            if slot.shape != loaded_weight.shape:
+                new_shape = list(param.data.shape)
+                for d in range(loaded_weight.dim()):
+                    new_shape[d + 1] = loaded_weight.shape[d]
+                param.data = torch.zeros(new_shape, dtype=param.data.dtype,
+                                         device=param.data.device)
+            param.data[expert_id].copy_(loaded_weight)
+        elif param.data.dim() == 1 and loaded_weight.dim() == 0:
+            # Per-expert scalar (Wscale, inv_resid_scale): param is (num_experts,)
+            param.data[expert_id] = loaded_weight.item()
+        elif param.data.dim() == 1 and loaded_weight.dim() >= 1:
+            # Shared 1D param (SV): copy once on first expert
+            if expert_id == 0:
+                if param.data.shape != loaded_weight.shape:
+                    param.data = torch.empty_like(loaded_weight)
+                param.data.copy_(loaded_weight)
+        elif param.data.dim() == 0:
+            # Scalar param: just copy
+            param.data.copy_(loaded_weight)
+        return True
+    # Non-expert path: auto-resize and copy
     if param.data.shape != loaded_weight.shape:
         param.data = torch.empty_like(loaded_weight)
     param.data.copy_(loaded_weight)
