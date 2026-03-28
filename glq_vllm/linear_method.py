@@ -13,6 +13,7 @@ import os
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.parameter import BasevLLMParameter
 
@@ -449,9 +450,32 @@ class GLQLinearMethod(LinearMethodBase):
             layer.glq_n_pad = n_pad
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Set up codebook and cache scalars. NO dequantization."""
+        """Set up codebook and cache scalars. Dequant Mamba layers to dense."""
         device = next(layer.parameters()).device
         bpw = getattr(layer, 'glq_bpw', 2)
+
+        # Mamba layers: dequant to dense weight for compatibility
+        # (Mamba mixer overwrites weight_loader, causing weight loading conflict)
+        if (hasattr(layer, 'weight') and layer.weight.numel() == 1
+                and hasattr(layer, 'Qidxs') and not getattr(layer, 'glq_is_fused', False)):
+            from .dequant import dequantize_glq_weight, get_codebook, get_codebook2
+            cb = get_codebook()
+            inv_rs = layer.inv_resid_scale.item() if hasattr(layer, 'inv_resid_scale') else 0.0
+            cb2 = get_codebook2(4) if inv_rs != 0.0 else None
+            weight = dequantize_glq_weight(
+                layer.Qidxs.data.cpu(), layer.SU.data.cpu(), layer.SV.data.cpu(),
+                layer.Wscale.data.cpu(), cb,
+                Qidxs2=layer.Qidxs2.data.cpu() if inv_rs != 0.0 else None,
+                inv_resid_scale=inv_rs, codebook2=cb2,
+                out_features=layer.glq_out_features, in_features=layer.glq_in_features,
+            )
+            layer.weight = torch.nn.Parameter(weight.to(device), requires_grad=False)
+            layer._glq_use_dense = True
+            # Clean up GLQ buffers
+            for attr in ['Qidxs', 'SU', 'SV', 'Wscale', 'Qidxs2', 'inv_resid_scale']:
+                if hasattr(layer, attr):
+                    delattr(layer, attr)
+            return
 
         # Ensure shared codebook is on the right device
         # Determine max_bpw across all shards
@@ -514,6 +538,9 @@ class GLQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Mamba layers dequantized to dense — standard matmul
+        if getattr(layer, '_glq_use_dense', False):
+            return F.linear(x, layer.weight, bias)
         orig_shape = x.shape
         in_features = layer.glq_in_features
         x = x.reshape(-1, in_features)
