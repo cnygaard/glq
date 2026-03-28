@@ -170,20 +170,20 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dequant selected experts, apply MoE computation."""
-        from .linear_method import _codebook, _codebook2_small
+        from . import linear_method as _lm
 
-        cb = _codebook
-        cb2 = _codebook2_small
+        cb = _lm._codebook
+        cb2 = _lm._codebook2_small
         dtype = x.dtype
         device = x.device
 
         # x shape: (num_tokens, hidden_size)
         num_tokens, hidden = x.shape
         num_experts = layer.glq_num_experts
-        out_dim = layer.glq_hidden_size
+        out_dim = hidden  # output matches input hidden size
         inter_dim = layer.glq_intermediate_size
         w13_out = layer.glq_w13_out
         is_gated = layer.glq_is_gated
