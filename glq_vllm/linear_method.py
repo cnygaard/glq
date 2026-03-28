@@ -274,6 +274,12 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     """Run input RHT → dequant+matmul → output RHT for explicit tensors."""
     dtype = x.dtype
     B = x.shape[0]
+    # Ensure all tensors on device
+    Qidxs = Qidxs.to(device)
+    SU = SU.to(device)
+    SV = SV.to(device)
+    if Qidxs2 is not None:
+        Qidxs2 = Qidxs2.to(device)
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
@@ -319,9 +325,9 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 def _glq_apply_single(x, layer, prefix, cb, cb2, device):
     """Run input RHT → dequant+matmul → output RHT for one set of GLQ buffers."""
     dtype = x.dtype
-    Qidxs = getattr(layer, f'Qidxs{prefix}')
-    SU = getattr(layer, f'SU{prefix}')
-    SV = getattr(layer, f'SV{prefix}')
+    Qidxs = getattr(layer, f'Qidxs{prefix}').to(device)
+    SU = getattr(layer, f'SU{prefix}').to(device)
+    SV = getattr(layer, f'SV{prefix}').to(device)
     wscale = getattr(layer, f'_glq_wscale{prefix}')
     has_stage2 = getattr(layer, f'_glq_has_stage2{prefix}')
     inv_rs = getattr(layer, f'_glq_inv_rs{prefix}')
@@ -349,7 +355,7 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
 
     # Dequant + matmul
     cb_packed = getattr(cb, 'codebook_packed', None)
-    Qidxs2 = getattr(layer, f'Qidxs2{prefix}') if has_stage2 else None
+    Qidxs2 = getattr(layer, f'Qidxs2{prefix}').to(device) if has_stage2 else None
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
 
     y_rht = glq_dequant_matmul(
