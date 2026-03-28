@@ -185,6 +185,12 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
         _ensure_codebook(device, max_bpw=max_bpw)
 
+        # Remove weight_loader from params — no longer needed after loading,
+        # and function references prevent vLLM v1 serialization
+        for name, param in layer.named_parameters():
+            if hasattr(param, 'weight_loader'):
+                del param.weight_loader
+
     def apply(
         self,
         layer: nn.Module,

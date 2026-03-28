@@ -1,6 +1,11 @@
 """Tests for GLQ vLLM plugin — registration, correctness, VRAM, throughput."""
 
+import os
 import time
+
+# vLLM v1 serializes model state between processes; GLQ params have
+# function references (weight_loader) that aren't msgpack-serializable.
+os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 import pytest
 import torch

@@ -532,6 +532,12 @@ class GLQLinearMethod(LinearMethodBase):
             layer._glq_log_n = int(math.log2(layer._glq_n_pad))
             layer._glq_log_m = int(math.log2(layer._glq_m_pad))
 
+        # Remove weight_loader from params — no longer needed after loading,
+        # and function references prevent vLLM v1 serialization
+        for name, param in layer.named_parameters():
+            if hasattr(param, 'weight_loader'):
+                del param.weight_loader
+
     def apply(
         self,
         layer: torch.nn.Module,
