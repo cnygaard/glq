@@ -20,6 +20,9 @@ from glq.codebook import E8ShellCodebook
 from glq import inference_kernel as _ik
 from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext
 
+# Force Triton fallback for vLLM (CUDA C ext has context issues in vLLM subprocess)
+_VLLM_USE_TRITON = True
+
 
 # Shared codebook singleton — moved to GPU on first use
 _codebook = None
@@ -34,12 +37,9 @@ def _ensure_codebook(device, max_bpw: int = 2):
     if _codebook is not None and _codebook_device == device:
         # Upgrade codebook2 if a higher bpw layer is encountered later
         if max_bpw >= 3 and _codebook2_small is None:
-            if max_bpw >= 4:
-                _codebook2_small = _codebook
-            else:
-                _codebook2_small = _codebook.make_small(256)
-            if _codebook2_small is not _codebook:
-                _codebook2_small._move_to_device(device)
+            # Always use the full codebook for cb2 — 4bpw layers have
+            # indices up to 65535, 3bpw indices (0-255) are a valid subset
+            _codebook2_small = _codebook
         return _codebook, _codebook2_small
 
     cb_path = os.path.join(os.path.dirname(__file__), "..", "glq", "e8_codebook.pt")
@@ -48,11 +48,8 @@ def _ensure_codebook(device, max_bpw: int = 2):
     else:
         cb = E8ShellCodebook(device="cpu", verbose=False)
 
-    cb2 = None
-    if max_bpw >= 4:
-        cb2 = cb
-    elif max_bpw >= 3:
-        cb2 = cb.make_small(256)
+    # Always use full codebook for cb2 — supports both 3bpw and 4bpw
+    cb2 = cb if max_bpw >= 3 else None
 
     cb._move_to_device(device)
     if cb2 is not None and cb2 is not cb:
@@ -280,7 +277,7 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
-    if n_pad <= 16384 and _ik._glq_cuda is not None:
+    if n_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
         _ik._glq_cuda.glq_input_rht_cuda(
             x.half().contiguous(), SV, x_rht,
             in_features, in_features,
@@ -301,7 +298,7 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         inv_resid_scale=inv_rs, codebook_packed=cb_packed)
 
     # Output RHT
-    if m_pad <= 16384 and _ik._glq_cuda is not None:
+    if m_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
         _ik._glq_cuda.glq_output_rht_cuda(
             y_rht, SU, y, out_features, m_pad,
@@ -339,7 +336,7 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
-    if n_pad <= 16384 and _ik._glq_cuda is not None:
+    if n_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
         _ik._glq_cuda.glq_input_rht_cuda(
             x.half().contiguous(), SV, x_rht,
             in_features, in_features,
@@ -361,7 +358,7 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
         inv_resid_scale=inv_rs, codebook_packed=cb_packed)
 
     # Output RHT
-    if m_pad <= 16384 and _ik._glq_cuda is not None:
+    if m_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
         _ik._glq_cuda.glq_output_rht_cuda(
             y_rht, SU, y, out_features, m_pad,
