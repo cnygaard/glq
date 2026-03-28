@@ -38,7 +38,7 @@ def _dequant_expert_weight(Qidxs, SU, SV, Wscale, cb, out_features, in_features,
     W = fast_hadamard_transform(W.T.clone()).T
     W = W * SU.float().unsqueeze(1)
 
-    return W[:out_features, :in_features].half()
+    return W[:out_features, :in_features].half().contiguous()
 
 
 class GLQFusedMoEMethod(FusedMoEMethodBase):
@@ -74,7 +74,10 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         # w13 = gate_up_proj (or just up_proj for non-gated)
-        is_gated = getattr(layer, 'is_act_and_mul', True)
+        # Check FusedMoEConfig first, then layer attribute
+        is_gated = getattr(self.moe, 'is_act_and_mul', None)
+        if is_gated is None:
+            is_gated = getattr(layer, 'is_act_and_mul', False)
         w13_out = 2 * intermediate_size_per_partition if is_gated else intermediate_size_per_partition
         m_pad_w13 = _glq_pad(w13_out)
         n_pad_w13 = _glq_pad(hidden_size)
@@ -127,9 +130,30 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             torch.zeros(num_experts, dtype=torch.float32))
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Ensure codebook is on device."""
+        """Ensure codebook is on device. Update dims from actual loaded weights."""
         device = layer.w13_Qidxs.device
         bpw = getattr(self.quant_config, 'bpw', 2)
+
+        # Update dims from actual loaded weight shapes (auto-resize may have changed them)
+        if layer.w13_Qidxs.dim() == 3 and layer.w13_Qidxs.shape[1] > 0:
+            actual_m_w13 = layer.w13_Qidxs.shape[1]  # m_pad from loaded data
+            actual_n_blocks_w13 = layer.w13_Qidxs.shape[2]
+            # Detect gated vs non-gated from actual weight size
+            # If w13 m_pad is close to intermediate_size, it's non-gated (up_proj only)
+            # If w13 m_pad is close to 2*intermediate_size, it's gated (gate_up_proj)
+            layer.glq_w13_out = actual_m_w13
+            layer.glq_m_pad_w13 = actual_m_w13
+            layer.glq_n_pad_w13 = actual_n_blocks_w13 * 8
+            # Fix is_gated: if actual m_pad <= intermediate_size, it's non-gated
+            if actual_m_w13 <= layer.glq_intermediate_size:
+                layer.glq_is_gated = False
+        if layer.w2_Qidxs.dim() == 3 and layer.w2_Qidxs.shape[1] > 0:
+            actual_m_w2 = layer.w2_Qidxs.shape[1]
+            actual_n_blocks_w2 = layer.w2_Qidxs.shape[2]
+            layer.glq_hidden_size = actual_m_w2  # down_proj out = hidden
+            layer.glq_m_pad_w2 = actual_m_w2
+            layer.glq_n_pad_w2 = actual_n_blocks_w2 * 8
+            layer.glq_intermediate_size = actual_n_blocks_w2 * 8  # down_proj in = intermediate
 
         # Check if any expert has stage2
         max_bpw = 2
@@ -206,13 +230,13 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             )
 
             # MLP forward: w13 → activation → w2
-            h = F.linear(selected_tokens.to(w13.dtype), w13)
+            h = torch.mm(selected_tokens.to(w13.dtype), w13.T)
             if is_gated:
                 gate, up = h.chunk(2, dim=-1)
                 h = F.silu(gate) * up
             else:
                 h = F.silu(h)
-            h = F.linear(h, w2)
+            h = torch.mm(h, w2.T)
 
             # Accumulate weighted output
             output[token_mask] += h.to(dtype) * selected_weights.unsqueeze(-1)

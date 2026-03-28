@@ -348,6 +348,10 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
             1.0 / math.sqrt(n_pad), N=n_pad, LOG_N=log_n, num_warps=8)
 
     # Dequant + matmul
+    if not hasattr(_glq_apply_single, '_dbg'):
+        _glq_apply_single._dbg = True
+        print(f"  APPLY: B={B} Qidxs={Qidxs.shape} SU={SU.shape} SV={SV.shape} "
+              f"n_pad={n_pad} m_pad={m_pad} in={in_features} out={out_features}", flush=True)
     cb_packed = getattr(cb, 'codebook_packed', None)
     Qidxs2 = getattr(layer, f'Qidxs2{prefix}') if has_stage2 else None
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
@@ -427,7 +431,13 @@ class GLQLinearMethod(LinearMethodBase):
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
 
             layer.glq_n_pad = n_pad
-        else:
+
+        # Dummy weight param so vLLM code that accesses layer.weight
+        # (e.g. mamba_mixer2.py) doesn't crash during __init__
+        if not hasattr(layer, 'weight'):
+            layer.weight = _make_glq_param(torch.empty(1, dtype=params_dtype))
+
+        if not is_fused:
             # Standard: single set of GLQ buffers (no suffix)
             out_sz = sum(output_partition_sizes)
             layer.glq_out_features = out_sz
@@ -481,12 +491,20 @@ class GLQLinearMethod(LinearMethodBase):
             layer._glq_wscale = layer.Wscale.item()
             layer._glq_has_stage2 = inv_rs != 0.0
             layer._glq_inv_rs = inv_rs
-            layer._glq_m_pad = layer.glq_m_pad
-            layer._glq_n_pad = layer.glq_n_pad
-            layer._glq_log_n = int(math.log2(layer.glq_n_pad))
-            layer._glq_log_m = int(math.log2(layer.glq_m_pad))
-            layer._glq_out = layer.glq_out_features
-            layer._glq_in = layer.glq_in_features
+            # Update dims from actual loaded Qidxs shape (auto-resize may have changed them)
+            if hasattr(layer, 'Qidxs') and layer.Qidxs.dim() == 2:
+                layer._glq_m_pad = layer.Qidxs.shape[0]
+                layer._glq_n_pad = layer.Qidxs.shape[1] * 8
+                # out/in features = unpadded from original create_weights
+                layer._glq_out = layer.glq_out_features
+                layer._glq_in = layer.glq_in_features
+            else:
+                layer._glq_m_pad = layer.glq_m_pad
+                layer._glq_n_pad = layer.glq_n_pad
+                layer._glq_out = layer.glq_out_features
+                layer._glq_in = layer.glq_in_features
+            layer._glq_log_n = int(math.log2(layer._glq_n_pad))
+            layer._glq_log_m = int(math.log2(layer._glq_m_pad))
 
     def apply(
         self,
