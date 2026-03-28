@@ -540,7 +540,7 @@ class GLQLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         # Mamba layers dequantized to dense — standard matmul
         if getattr(layer, '_glq_use_dense', False):
-            return F.linear(x, layer.weight, bias)
+            return F.linear(x, layer.weight.to(x.dtype), bias)
         orig_shape = x.shape
         in_features = layer.glq_in_features
         x = x.reshape(-1, in_features)

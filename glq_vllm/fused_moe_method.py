@@ -21,6 +21,36 @@ from glq.hadamard import fast_hadamard_transform
 from .linear_method import _ensure_codebook, _glq_pad, _make_glq_param
 
 
+def _apply_activation(h, activation):
+    """Apply MoE activation function (gated or non-gated).
+
+    activation can be a string (vLLM 0.16) or MoEActivation enum (vLLM 0.18+).
+    """
+    act = activation.value if hasattr(activation, 'value') else str(activation) if activation else "silu"
+
+    # Gated activations: split input into gate and up projections
+    if act == "silu":
+        gate, up = h.chunk(2, dim=-1)
+        return F.silu(gate) * up
+    elif act == "gelu":
+        gate, up = h.chunk(2, dim=-1)
+        return F.gelu(gate) * up
+    elif act == "relu2":
+        gate, up = h.chunk(2, dim=-1)
+        return F.relu(gate).square() * up
+
+    # Non-gated activations
+    elif act == "silu_no_mul":
+        return F.silu(h)
+    elif act == "gelu_no_mul":
+        return F.gelu(h)
+    elif act == "relu2_no_mul":
+        return F.relu(h).square()
+
+    # Fallback
+    return F.silu(h)
+
+
 def _dequant_expert_weight(Qidxs, SU, SV, Wscale, cb, out_features, in_features,
                            Qidxs2=None, inv_rs=0.0, cb2=None):
     """Dequantize one expert's GLQ weight to dense fp16."""
@@ -177,7 +207,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         out_dim = hidden  # output matches input hidden size
         inter_dim = layer.glq_intermediate_size
         w13_out = layer.glq_w13_out
-        is_gated = layer.glq_is_gated
+        activation = getattr(layer, 'activation', None)
         topk = topk_ids.shape[1]
 
         # Output accumulator
@@ -222,11 +252,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
             # MLP forward: w13 → activation → w2
             h = torch.mm(selected_tokens.to(w13.dtype), w13.T)
-            if is_gated:
-                gate, up = h.chunk(2, dim=-1)
-                h = F.silu(gate) * up
-            else:
-                h = F.silu(h)
+            h = _apply_activation(h, activation)
             h = torch.mm(h, w2.T)
 
             # Accumulate weighted output
