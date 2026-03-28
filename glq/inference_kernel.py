@@ -34,7 +34,12 @@ def _try_load_cuda_ext():
     if _cuda_ext_available is not None:
         return _cuda_ext_available
     try:
-        import os
+        import os, shutil, sys
+        # Ensure ninja is in PATH (venv bin may not be in subprocess PATH)
+        if shutil.which('ninja') is None:
+            venv_bin = os.path.join(sys.prefix, 'bin')
+            if os.path.exists(os.path.join(venv_bin, 'ninja')):
+                os.environ['PATH'] = venv_bin + ':' + os.environ.get('PATH', '')
         from torch.utils.cpp_extension import load as _load_ext
         _csrc = os.path.join(os.path.dirname(__file__), 'csrc')
         cu_file = os.path.join(_csrc, 'glq_cuda.cu')

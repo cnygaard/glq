@@ -17,7 +17,8 @@ from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.parameter import BasevLLMParameter
 
 from glq.codebook import E8ShellCodebook
-from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext, _glq_cuda
+from glq import inference_kernel as _ik
+from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext
 
 
 # Shared codebook singleton — moved to GPU on first use
@@ -277,8 +278,8 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
-    if n_pad <= 16384 and _glq_cuda is not None:
-        _glq_cuda.glq_input_rht_cuda(
+    if n_pad <= 16384 and _ik._glq_cuda is not None:
+        _ik._glq_cuda.glq_input_rht_cuda(
             x.half().contiguous(), SV, x_rht,
             in_features, in_features,
             1.0 / math.sqrt(n_pad), n_pad, log_n)
@@ -298,9 +299,9 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         inv_resid_scale=inv_rs, codebook_packed=cb_packed)
 
     # Output RHT
-    if m_pad <= 16384 and _glq_cuda is not None:
+    if m_pad <= 16384 and _ik._glq_cuda is not None:
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
-        _glq_cuda.glq_output_rht_cuda(
+        _ik._glq_cuda.glq_output_rht_cuda(
             y_rht, SU, y, out_features, m_pad,
             log_m, 1.0 / math.sqrt(m_pad))
         if dtype != torch.float16:
@@ -336,8 +337,8 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
-    if n_pad <= 16384 and _glq_cuda is not None:
-        _glq_cuda.glq_input_rht_cuda(
+    if n_pad <= 16384 and _ik._glq_cuda is not None:
+        _ik._glq_cuda.glq_input_rht_cuda(
             x.half().contiguous(), SV, x_rht,
             in_features, in_features,
             1.0 / math.sqrt(n_pad), n_pad, log_n)
@@ -347,11 +348,12 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
             x, SV, x_rht, in_features, x.stride(0),
             1.0 / math.sqrt(n_pad), N=n_pad, LOG_N=log_n, num_warps=8)
 
-    # Dequant + matmul
-    if not hasattr(_glq_apply_single, '_dbg'):
-        _glq_apply_single._dbg = True
-        print(f"  APPLY: B={B} Qidxs={Qidxs.shape} SU={SU.shape} SV={SV.shape} "
-              f"n_pad={n_pad} m_pad={m_pad} in={in_features} out={out_features}", flush=True)
+    # Dequant + matmul — validate dimensions and devices
+    assert SV.shape[0] == n_pad, f"SV {SV.shape[0]} != n_pad {n_pad}"
+    assert SU.shape[0] == m_pad, f"SU {SU.shape[0]} != m_pad {m_pad}"
+    assert Qidxs.shape[0] == m_pad, f"Qidxs[0] {Qidxs.shape[0]} != m_pad {m_pad}"
+    assert Qidxs.shape[1] == n_pad // 8, f"Qidxs[1] {Qidxs.shape[1]} != n_blocks {n_pad//8}"
+    assert cb.codebook_half.device == x.device, f"codebook on {cb.codebook_half.device} but x on {x.device}"
     cb_packed = getattr(cb, 'codebook_packed', None)
     Qidxs2 = getattr(layer, f'Qidxs2{prefix}') if has_stage2 else None
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
@@ -362,9 +364,9 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
         inv_resid_scale=inv_rs, codebook_packed=cb_packed)
 
     # Output RHT
-    if m_pad <= 16384 and _glq_cuda is not None:
+    if m_pad <= 16384 and _ik._glq_cuda is not None:
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
-        _glq_cuda.glq_output_rht_cuda(
+        _ik._glq_cuda.glq_output_rht_cuda(
             y_rht, SU, y, out_features, m_pad,
             log_m, 1.0 / math.sqrt(m_pad))
         if dtype != torch.float16:
@@ -518,7 +520,12 @@ class GLQLinearMethod(LinearMethodBase):
         device = x.device
         cb, cb2 = _codebook, _codebook2_small
 
-        if getattr(layer, 'glq_is_fused', False):
+        is_fused = getattr(layer, 'glq_is_fused', False)
+        if not hasattr(layer, '_glq_apply_dbg'):
+            layer._glq_apply_dbg = True
+            print(f"  APPLY: type={type(layer).__name__} fused={is_fused} "
+                  f"in={in_features} Qidxs_type={type(getattr(layer, 'Qidxs', None)).__name__}", flush=True)
+        if is_fused:
             # Fused QKV: dequant each shard independently, concatenate
             shard_outputs = []
             for i in range(layer.glq_num_shards):
