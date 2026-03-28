@@ -28,10 +28,18 @@ _codebook_device = None
 
 
 def _ensure_codebook(device, max_bpw: int = 2):
-    """Lazy-load codebook and move to target device (once)."""
+    """Lazy-load codebook and move to target device. Upgrades cb2 if higher bpw needed."""
     global _codebook, _codebook2_small, _codebook_device
 
     if _codebook is not None and _codebook_device == device:
+        # Upgrade codebook2 if a higher bpw layer is encountered later
+        if max_bpw >= 3 and _codebook2_small is None:
+            if max_bpw >= 4:
+                _codebook2_small = _codebook
+            else:
+                _codebook2_small = _codebook.make_small(256)
+            if _codebook2_small is not _codebook:
+                _codebook2_small._move_to_device(device)
         return _codebook, _codebook2_small
 
     cb_path = os.path.join(os.path.dirname(__file__), "..", "glq", "e8_codebook.pt")
@@ -105,15 +113,9 @@ def _glq_pad(n):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
-_dbg = [0]
 def _glq_weight_loader(param, loaded_weight, *args, **kwargs):
     """GLQ weight loader — handles per-expert, shared, and standard params."""
     expert_id = kwargs.get('expert_id')
-    if False and _dbg[0] < 200:
-        _dbg[0] += 1
-        name = args[0] if args else "?"
-        print(f"  WL: expert_id={expert_id} param_dim={param.data.dim()} param_shape={list(param.data.shape)} "
-              f"weight_dim={loaded_weight.dim()} weight_shape={list(loaded_weight.shape)} name={name}", flush=True)
     if expert_id is not None:
         if param.data.dim() >= 2:
             # Per-expert tensor (Qidxs 3D, SU 2D): index by expert_id
@@ -348,12 +350,7 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
             x, SV, x_rht, in_features, x.stride(0),
             1.0 / math.sqrt(n_pad), N=n_pad, LOG_N=log_n, num_warps=8)
 
-    # Dequant + matmul — validate dimensions and devices
-    assert SV.shape[0] == n_pad, f"SV {SV.shape[0]} != n_pad {n_pad}"
-    assert SU.shape[0] == m_pad, f"SU {SU.shape[0]} != m_pad {m_pad}"
-    assert Qidxs.shape[0] == m_pad, f"Qidxs[0] {Qidxs.shape[0]} != m_pad {m_pad}"
-    assert Qidxs.shape[1] == n_pad // 8, f"Qidxs[1] {Qidxs.shape[1]} != n_blocks {n_pad//8}"
-    assert cb.codebook_half.device == x.device, f"codebook on {cb.codebook_half.device} but x on {x.device}"
+    # Dequant + matmul
     cb_packed = getattr(cb, 'codebook_packed', None)
     Qidxs2 = getattr(layer, f'Qidxs2{prefix}') if has_stage2 else None
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
@@ -520,12 +517,7 @@ class GLQLinearMethod(LinearMethodBase):
         device = x.device
         cb, cb2 = _codebook, _codebook2_small
 
-        is_fused = getattr(layer, 'glq_is_fused', False)
-        if not hasattr(layer, '_glq_apply_dbg'):
-            layer._glq_apply_dbg = True
-            print(f"  APPLY: type={type(layer).__name__} fused={is_fused} "
-                  f"in={in_features} Qidxs_type={type(getattr(layer, 'Qidxs', None)).__name__}", flush=True)
-        if is_fused:
+        if getattr(layer, 'glq_is_fused', False):
             # Fused QKV: dequant each shard independently, concatenate
             shard_outputs = []
             for i in range(layer.glq_num_shards):
