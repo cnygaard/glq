@@ -32,18 +32,17 @@ export PATH=/usr/local/cuda/bin:$PATH
 python3 -m venv $VENV
 source $VENV/bin/activate
 
-# Core deps — vLLM 0.18 pins torch==2.10.0
+# Core deps — vLLM 0.16 needs torch 2.9.1
 pip install -q pip --upgrade
-pip install -q vllm
-pip install -q 'glq[quantize]==${glq_version}' ninja
-pip install -q wheel
-# mamba-ssm pulls torch 2.11, then we pin back to 2.10+cu128
-# Build with CUDA_HOME matching torch's cu128
-export CUDA_HOME=/usr/local/cuda-12.8
+pip install -q vllm==0.16.0
+pip install -q 'glq[quantize]==${glq_version}' ninja wheel
+# mamba-ssm and causal-conv1d need CUDA_HOME for building
+export CUDA_HOME=/usr/local/cuda-12.9
 pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
 pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
-pip install -q torch==2.10.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 unset CUDA_HOME
+# Pin torch LAST — mamba-ssm may pull a newer version as a dependency
+pip install -q torch==2.9.1+cu128 torchvision==0.24.1+cu128 torchaudio==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128
 
 # HF cache on NVMe
 mkdir -p $HF_CACHE
