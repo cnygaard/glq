@@ -134,26 +134,17 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         device = layer.w13_Qidxs.device
         bpw = getattr(self.quant_config, 'bpw', 2)
 
-        # Update dims from actual loaded weight shapes (auto-resize may have changed them)
+        # Update PADDED dims from actual loaded weight shapes (auto-resize may have changed them)
+        # Keep unpadded dims (w13_out, hidden_size, intermediate_size) from create_weights
         if layer.w13_Qidxs.dim() == 3 and layer.w13_Qidxs.shape[1] > 0:
-            actual_m_w13 = layer.w13_Qidxs.shape[1]  # m_pad from loaded data
-            actual_n_blocks_w13 = layer.w13_Qidxs.shape[2]
-            # Detect gated vs non-gated from actual weight size
-            # If w13 m_pad is close to intermediate_size, it's non-gated (up_proj only)
-            # If w13 m_pad is close to 2*intermediate_size, it's gated (gate_up_proj)
-            layer.glq_w13_out = actual_m_w13
-            layer.glq_m_pad_w13 = actual_m_w13
-            layer.glq_n_pad_w13 = actual_n_blocks_w13 * 8
-            # Fix is_gated: if actual m_pad <= intermediate_size, it's non-gated
-            if actual_m_w13 <= layer.glq_intermediate_size:
+            layer.glq_m_pad_w13 = layer.w13_Qidxs.shape[1]
+            layer.glq_n_pad_w13 = layer.w13_Qidxs.shape[2] * 8
+            if layer.glq_m_pad_w13 <= layer.glq_intermediate_size:
                 layer.glq_is_gated = False
+                layer.glq_w13_out = layer.glq_intermediate_size
         if layer.w2_Qidxs.dim() == 3 and layer.w2_Qidxs.shape[1] > 0:
-            actual_m_w2 = layer.w2_Qidxs.shape[1]
-            actual_n_blocks_w2 = layer.w2_Qidxs.shape[2]
-            layer.glq_hidden_size = actual_m_w2  # down_proj out = hidden
-            layer.glq_m_pad_w2 = actual_m_w2
-            layer.glq_n_pad_w2 = actual_n_blocks_w2 * 8
-            layer.glq_intermediate_size = actual_n_blocks_w2 * 8  # down_proj in = intermediate
+            layer.glq_m_pad_w2 = layer.w2_Qidxs.shape[1]
+            layer.glq_n_pad_w2 = layer.w2_Qidxs.shape[2] * 8
 
         # Check if any expert has stage2
         max_bpw = 2
