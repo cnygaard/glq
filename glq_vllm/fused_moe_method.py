@@ -1,8 +1,9 @@
 """GLQ FusedMoE method for vLLM — compressed MoE expert weights.
 
 Stores per-expert GLQ compressed buffers (Qidxs, SU, SV, Wscale)
-as 3D tensors (num_experts, padded_dim, n_blocks). Dequantizes
-selected experts on-the-fly during apply().
+as 3D tensors (num_experts, padded_dim, n_blocks). Uses fused
+dequant+matmul CUDA kernels (same as non-MoE layers) for each
+active expert instead of materializing dense weights.
 """
 
 import math
@@ -15,10 +16,9 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
 
-from glq.codebook import E8ShellCodebook
-from glq.hadamard import fast_hadamard_transform
-
-from .linear_method import _ensure_codebook, _glq_pad, _make_glq_param
+from .linear_method import (
+    _ensure_codebook, _glq_pad, _make_glq_param, _glq_apply_shard,
+)
 
 
 def _apply_activation(h, activation):
@@ -51,31 +51,11 @@ def _apply_activation(h, activation):
     return F.silu(h)
 
 
-def _dequant_expert_weight(Qidxs, SU, SV, Wscale, cb, out_features, in_features,
-                           Qidxs2=None, inv_rs=0.0, cb2=None):
-    """Dequantize one expert's GLQ weight to dense fp16."""
-    m_pad, n_blocks = Qidxs.shape
-    n_pad = n_blocks * 8
-
-    W_rht = cb.decode(Qidxs.long().reshape(-1)).reshape(m_pad, n_pad).float()
-    if Qidxs2 is not None and inv_rs != 0.0 and cb2 is not None:
-        W_rht2 = cb2.decode(Qidxs2.long().reshape(-1)).reshape(m_pad, n_pad).float()
-        W_rht = W_rht + W_rht2 * inv_rs
-    W_rht = W_rht * Wscale.float()
-
-    W = fast_hadamard_transform(W_rht.clone())
-    W = W * SV.float().unsqueeze(0)
-    W = fast_hadamard_transform(W.T.clone()).T
-    W = W * SU.float().unsqueeze(1)
-
-    return W[:out_features, :in_features].half().contiguous()
-
-
 class GLQFusedMoEMethod(FusedMoEMethodBase):
     """GLQ quantized FusedMoE method.
 
-    Stores per-expert compressed GLQ buffers. On apply(), dequantizes
-    selected experts to dense and performs the MoE computation.
+    Stores per-expert compressed GLQ buffers. On apply(), uses fused
+    dequant+matmul CUDA kernels for active experts only.
 
     Weight naming convention (matches NemotronH expert_params_mapping):
     - w13_Qidxs: (num_experts, m_pad_w13, n_blocks) int16
@@ -160,12 +140,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             torch.zeros(num_experts, dtype=torch.float32))
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Ensure codebook is on device. Update dims from actual loaded weights."""
+        """Ensure codebook is on device. Cache per-expert metadata for fast apply()."""
         device = layer.w13_Qidxs.device
         bpw = getattr(self.quant_config, 'bpw', 2)
 
         # Update PADDED dims from actual loaded weight shapes (auto-resize may have changed them)
-        # Keep unpadded dims (w13_out, hidden_size, intermediate_size) from create_weights
         if layer.w13_Qidxs.dim() == 3 and layer.w13_Qidxs.shape[1] > 0:
             layer.glq_m_pad_w13 = layer.w13_Qidxs.shape[1]
             layer.glq_n_pad_w13 = layer.w13_Qidxs.shape[2] * 8
@@ -185,6 +164,18 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
         _ensure_codebook(device, max_bpw=max_bpw)
 
+        # Cache log2 values and per-expert scalars for fast apply()
+        layer.glq_log_n_w13 = int(math.log2(layer.glq_n_pad_w13))
+        layer.glq_log_m_w13 = int(math.log2(layer.glq_m_pad_w13))
+        layer.glq_log_n_w2 = int(math.log2(layer.glq_n_pad_w2))
+        layer.glq_log_m_w2 = int(math.log2(layer.glq_m_pad_w2))
+
+        n = layer.glq_num_experts
+        layer.glq_w13_wscale = [layer.w13_Wscale[i].item() for i in range(n)]
+        layer.glq_w2_wscale = [layer.w2_Wscale[i].item() for i in range(n)]
+        layer.glq_w13_inv_rs = [layer.w13_inv_resid_scale[i].item() for i in range(n)]
+        layer.glq_w2_inv_rs = [layer.w2_inv_resid_scale[i].item() for i in range(n)]
+
         # Remove weight_loader from params — no longer needed after loading,
         # and function references prevent vLLM v1 serialization
         for name, param in layer.named_parameters():
@@ -199,7 +190,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Dequant selected experts, apply MoE computation."""
+        """Fused dequant+matmul for active experts via CUDA kernels."""
         from . import linear_method as _lm
 
         cb = _lm._codebook
@@ -207,64 +198,65 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         dtype = x.dtype
         device = x.device
 
-        # x shape: (num_tokens, hidden_size)
         num_tokens, hidden = x.shape
-        num_experts = layer.glq_num_experts
-        out_dim = hidden  # output matches input hidden size
+        out_dim = hidden
         inter_dim = layer.glq_intermediate_size
         w13_out = layer.glq_w13_out
         activation = getattr(layer, 'activation', None)
-        topk = topk_ids.shape[1]
 
-        # Output accumulator
         output = torch.zeros(num_tokens, out_dim, dtype=dtype, device=device)
 
-        # Process each expert
-        for expert_idx in range(num_experts):
+        # Only iterate over active experts (typically top-2 out of 128)
+        active_experts = topk_ids.unique()
+
+        for expert_idx_t in active_experts:
+            expert_idx = expert_idx_t.item()
+
             # Find tokens assigned to this expert
             mask = (topk_ids == expert_idx)  # (num_tokens, topk)
-            token_mask = mask.any(dim=1)  # (num_tokens,)
+            token_mask = mask.any(dim=1)
+            expert_weights = (topk_weights * mask.float()).sum(dim=1)
+            selected_tokens = x[token_mask]
+            selected_weights = expert_weights[token_mask]
 
-            if not token_mask.any():
-                continue
-
-            # Get weights for selected tokens
-            # For each token, sum the topk_weights where this expert is selected
-            expert_weights = (topk_weights * mask.float()).sum(dim=1)  # (num_tokens,)
-            selected_tokens = x[token_mask]  # (n_selected, hidden)
-            selected_weights = expert_weights[token_mask]  # (n_selected,)
-
-            # Dequant w13 (gate_up_proj)
-            inv_rs_w13 = layer.w13_inv_resid_scale[expert_idx].item()
+            # w13: fused input RHT → dequant+matmul → output RHT
+            inv_rs_w13 = layer.glq_w13_inv_rs[expert_idx]
             has_s2_w13 = inv_rs_w13 != 0.0
-            w13 = _dequant_expert_weight(
-                layer.w13_Qidxs[expert_idx], layer.w13_SU[expert_idx],
-                layer.w13_SV, layer.w13_Wscale[expert_idx],
-                cb, w13_out, hidden,
+            h = _glq_apply_shard(
+                selected_tokens, device, cb, cb2,
+                Qidxs=layer.w13_Qidxs[expert_idx],
+                SU=layer.w13_SU[expert_idx],
+                SV=layer.w13_SV,
+                wscale=layer.glq_w13_wscale[expert_idx],
+                has_stage2=has_s2_w13,
+                inv_rs=inv_rs_w13,
                 Qidxs2=layer.w13_Qidxs2[expert_idx] if has_s2_w13 else None,
-                inv_rs=inv_rs_w13, cb2=cb2,
+                out_features=w13_out, in_features=hidden,
+                m_pad=layer.glq_m_pad_w13, n_pad=layer.glq_n_pad_w13,
+                log_n=layer.glq_log_n_w13, log_m=layer.glq_log_m_w13,
             )
 
-            # Dequant w2 (down_proj)
-            inv_rs_w2 = layer.w2_inv_resid_scale[expert_idx].item()
-            has_s2_w2 = inv_rs_w2 != 0.0
-            w2 = _dequant_expert_weight(
-                layer.w2_Qidxs[expert_idx], layer.w2_SU[expert_idx],
-                layer.w2_SV, layer.w2_Wscale[expert_idx],
-                cb, hidden, inter_dim,
-                Qidxs2=layer.w2_Qidxs2[expert_idx] if has_s2_w2 else None,
-                inv_rs=inv_rs_w2, cb2=cb2,
-            )
-
-            # MLP forward: w13 → activation → w2
-            h = torch.mm(selected_tokens.to(w13.dtype), w13.T)
             h = _apply_activation(h, activation)
-            h = torch.mm(h, w2.T)
 
-            # Accumulate weighted output
+            # w2: fused input RHT → dequant+matmul → output RHT
+            inv_rs_w2 = layer.glq_w2_inv_rs[expert_idx]
+            has_s2_w2 = inv_rs_w2 != 0.0
+            h = _glq_apply_shard(
+                h, device, cb, cb2,
+                Qidxs=layer.w2_Qidxs[expert_idx],
+                SU=layer.w2_SU[expert_idx],
+                SV=layer.w2_SV,
+                wscale=layer.glq_w2_wscale[expert_idx],
+                has_stage2=has_s2_w2,
+                inv_rs=inv_rs_w2,
+                Qidxs2=layer.w2_Qidxs2[expert_idx] if has_s2_w2 else None,
+                out_features=out_dim, in_features=inter_dim,
+                m_pad=layer.glq_m_pad_w2, n_pad=layer.glq_n_pad_w2,
+                log_n=layer.glq_log_n_w2, log_m=layer.glq_log_m_w2,
+            )
+
             output[token_mask] += h.to(dtype) * selected_weights.unsqueeze(-1)
 
-        # Handle shared experts if present
         if shared_experts_input is not None:
             return output, shared_experts_input
 

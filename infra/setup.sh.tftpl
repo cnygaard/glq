@@ -44,6 +44,8 @@ unset CUDA_HOME
 # Pin torch LAST — mamba-ssm may pull a newer version as a dependency
 pip install -q torch==2.9.1+cu128 torchvision==0.24.1+cu128 torchaudio==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128
 
+ln -sf /opt/dlami/nvme/venv/bin/ninja /usr/local/bin/ninja
+
 # HF cache on NVMe
 mkdir -p $HF_CACHE
 echo "export HF_HOME=$HF_CACHE" >> ~/.bashrc

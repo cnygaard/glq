@@ -535,8 +535,13 @@ class GLQLinearMethod(LinearMethodBase):
         # Remove weight_loader from params — no longer needed after loading,
         # and function references prevent vLLM v1 serialization
         for name, param in layer.named_parameters():
-            if hasattr(param, 'weight_loader'):
-                del param.weight_loader
+            try:
+                if hasattr(param, 'weight_loader') and not isinstance(
+                    type(param).__dict__.get('weight_loader'), property
+                ):
+                    del param.weight_loader
+            except (AttributeError, TypeError):
+                pass
 
     def apply(
         self,
