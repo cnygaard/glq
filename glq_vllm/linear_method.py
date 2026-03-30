@@ -21,8 +21,8 @@ from glq.codebook import E8ShellCodebook
 from glq import inference_kernel as _ik
 from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext
 
-# Force Triton fallback for vLLM (CUDA C ext has context issues in vLLM subprocess)
-_VLLM_USE_TRITON = True
+# CUDA C FHT kernels are 1.3-1.6× faster than Triton. JIT-compiled on first use.
+_VLLM_USE_TRITON = False
 
 
 # Shared codebook singleton — moved to GPU on first use
