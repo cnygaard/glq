@@ -44,7 +44,8 @@ def _ensure_registered():
     # -- 2. dequant_matmul: (B, N) fp16 → (B, M) fp32 --
     _glq_lib.define(
         "dequant_matmul(Tensor x, Tensor qidxs, Tensor codebook, float wscale, "
-        "Tensor qidxs2, Tensor codebook2, float inv_resid_scale) -> Tensor")
+        "Tensor qidxs2, Tensor codebook2, float inv_resid_scale, "
+        "Tensor codebook_abs) -> Tensor")
     _glq_lib.impl("dequant_matmul", cuda.glq_dequant_matmul_cuda, dispatch_key)
     _glq_lib._register_fake("dequant_matmul", _dequant_matmul_fake)
 
@@ -84,7 +85,7 @@ def _dequant_matvec_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resi
     return torch.empty(M, dtype=torch.float32, device=x.device)
 
 
-def _dequant_matmul_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resid_scale):
+def _dequant_matmul_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resid_scale, codebook_abs):
     B = x.shape[0]
     M = qidxs.shape[0]
     return torch.empty(B, M, dtype=torch.float32, device=x.device)

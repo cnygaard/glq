@@ -745,9 +745,9 @@ def glq_dequant_matmul(
             _cb2 = cb2 if has_stage2 else _empty_f16
             _irs = inv_resid_scale if has_stage2 else 0.0
             if _use_ops:
-                y = torch.ops.glq.dequant_matmul(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs)
+                y = torch.ops.glq.dequant_matmul(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _cb_abs)
             else:
-                y = _glq_cuda.glq_dequant_matmul_cuda(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs)
+                y = _glq_cuda.glq_dequant_matmul_cuda(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _cb_abs)
             return y
 
     # Decide whether to use split-K based on estimated grid saturation.

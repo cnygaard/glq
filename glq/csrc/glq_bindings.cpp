@@ -23,7 +23,8 @@ torch::Tensor glq_dequant_matmul_cuda(
     float wscale,
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor codebook_abs  // (256,) int32 for E8P, or empty for flat
 );
 
 torch::Tensor glq_dequant_matvec_packed_cuda(

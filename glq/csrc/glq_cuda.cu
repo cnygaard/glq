@@ -326,13 +326,13 @@ glq_matvec_splitk_kernel(
 
 #define TC_BPS_DEFAULT 64
 
-template <bool HAS_STAGE2>
+template <bool HAS_STAGE2, bool USE_E8P = false>
 __global__ void __launch_bounds__(256, 2)
 glq_matmul_tc_kernel(
     float* __restrict__ output,         // (B_dim, M) fp32, pre-zeroed
     const half* __restrict__ x,         // (B_dim, N) fp16 input
     const int16_t* __restrict__ qidxs,  // (M, N_BLOCKS) primary indices
-    const half* __restrict__ codebook,  // (65536, 8) fp16
+    const half* __restrict__ codebook,  // (65536, 8) fp16 [flat] or unused [E8P]
     const int16_t* __restrict__ qidxs2,
     const half* __restrict__ codebook2,
     float inv_resid_scale,
@@ -343,16 +343,30 @@ glq_matmul_tc_kernel(
     int N_BLOCKS,
     int stride_x,
     int bps,                            // blocks per K-split (adaptive)
-    int cb2_size                        // secondary codebook entries (0 if no stage2)
+    int cb2_size,                       // secondary codebook entries (0 if no stage2)
+    const uint32_t* __restrict__ codebook_abs  // (256,) uint32 [E8P] or nullptr
 ) {
-    // Stage small secondary codebook into shared memory (256 entries = 4KB)
-    extern __shared__ half smem_cb2[];
+    // Shared memory layout: E8P table (1KB) then optional cb2 (4KB)
+    extern __shared__ char smem_raw_tc[];
+    uint32_t* smem_e8p_tc = (uint32_t*)smem_raw_tc;
+    half* smem_cb2 = (half*)(smem_raw_tc + (USE_E8P ? 256 * sizeof(uint32_t) : 0));
+
+    int tid_flat = threadIdx.y * 32 + threadIdx.x;
+
+    if (USE_E8P) {
+        for (int i = tid_flat; i < 256; i += 256) {
+            smem_e8p_tc[i] = codebook_abs[i];
+        }
+    }
+
     if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
-        int tid_flat = threadIdx.y * 32 + threadIdx.x;  // 0..255
-        int total = cb2_size * 8;  // elements to load
+        int total = cb2_size * 8;
         for (int i = tid_flat; i < total; i += 256) {
             smem_cb2[i] = codebook2[i];
         }
+    }
+
+    if (USE_E8P || (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256)) {
         __syncthreads();
     }
 
@@ -392,10 +406,30 @@ glq_matmul_tc_kernel(
             if (j1_valid) idx_j1 = (uint16_t)qidxs[m_row * N_BLOCKS + j + 1];
         }
 
-        half bv0 = m_valid ? codebook[idx_j * 8 + k_elem]     : __float2half(0.0f);
-        half bv1 = m_valid ? codebook[idx_j * 8 + k_elem + 1] : __float2half(0.0f);
-        half bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
-        half bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
+        half bv0, bv1, bv2, bv3;
+        if (USE_E8P) {
+            // E8P decode: 2 elements from packed uint32 via ALU
+            if (m_valid) {
+                uint32_t packed_j = smem_e8p_tc[idx_j >> 8];
+                bv0 = __float2half(e8p_decode_elem(idx_j, packed_j, k_elem));
+                bv1 = __float2half(e8p_decode_elem(idx_j, packed_j, k_elem + 1));
+            } else {
+                bv0 = __float2half(0.0f); bv1 = __float2half(0.0f);
+            }
+            if (m_valid && j1_valid) {
+                uint32_t packed_j1 = smem_e8p_tc[idx_j1 >> 8];
+                bv2 = __float2half(e8p_decode_elem(idx_j1, packed_j1, k_elem));
+                bv3 = __float2half(e8p_decode_elem(idx_j1, packed_j1, k_elem + 1));
+            } else {
+                bv2 = __float2half(0.0f); bv3 = __float2half(0.0f);
+            }
+        } else {
+            // Flat codebook: direct fp16 gather from L2
+            bv0 = m_valid ? codebook[idx_j * 8 + k_elem]     : __float2half(0.0f);
+            bv1 = m_valid ? codebook[idx_j * 8 + k_elem + 1] : __float2half(0.0f);
+            bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
+            bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
+        }
 
         if (HAS_STAGE2 && m_valid) {
             // Use shared memory for small codebook2, global for large
@@ -853,43 +887,47 @@ torch::Tensor glq_dequant_matvec_cuda(
 torch::Tensor glq_dequant_matmul_cuda(
     torch::Tensor x,           // (B, N) fp16
     torch::Tensor qidxs,       // (M, N_BLOCKS) int16
-    torch::Tensor codebook,    // (65536, 8) fp16
+    torch::Tensor codebook,    // (65536, 8) fp16 [flat] or unused [E8P]
     float wscale,
     torch::Tensor qidxs2,      // (M, N_BLOCKS) int16 or empty
     torch::Tensor codebook2,   // (K2, 8) fp16 or empty
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor codebook_abs // (256,) int32 [E8P] or empty [flat]
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(qidxs);
-    CHECK_INPUT(codebook);
 
     int B_dim = x.size(0);
     int N = x.size(1);
     int M = qidxs.size(0);
     int N_BLOCKS = qidxs.size(1);
+    bool use_e8p = (codebook_abs.numel() == 256);
+
+    if (!use_e8p) {
+        CHECK_INPUT(codebook);
+    }
 
     at::DeviceGuard guard(x.device());
-    // Output: (B, M) fp32, zeroed for atomicAdd
     auto output = torch::zeros({B_dim, M}, torch::dtype(torch::kFloat32).device(x.device()));
 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, x.get_device());
-    int num_sms = prop.multiProcessorCount;
+    static int num_sms = 0;
+    if (num_sms == 0) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, x.get_device());
+        num_sms = prop.multiProcessorCount;
+    }
 
     const int WARPS = 8;
-    const int rows_per_block = ROWS_PER_WARP * WARPS;
     dim3 block(32, WARPS);
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
 
-    int m_blocks = (M + rows_per_block - 1) / rows_per_block;
-    bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT_DEFAULT);
-
     const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
-    const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
+    const half* cb_ptr = use_e8p ? nullptr : (const half*)codebook.data_ptr<c10::Half>();
     const int16_t* q_ptr = qidxs.data_ptr<int16_t>();
     float* out_ptr = output.data_ptr<float>();
+    const uint32_t* cb_abs_ptr = use_e8p ? (const uint32_t*)codebook_abs.data_ptr<int32_t>() : nullptr;
 
     const int16_t* q2_ptr = has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr;
     const half* cb2_ptr = has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
@@ -899,14 +937,11 @@ torch::Tensor glq_dequant_matmul_cuda(
         CHECK_INPUT(codebook2);
     }
 
-    // Use TC kernel: single launch for all B rows
-    // mma.m16n8k16: each warp handles a 16×8 output tile
-    int b_tiles = (B_dim + 15) / 16;       // batch tiles (m=16)
-    int m_tiles = (M + 7) / 8;             // output row tiles (n=8)
+    int b_tiles = (B_dim + 15) / 16;
+    int m_tiles = (M + 7) / 8;
     int m_tiles_per_block = WARPS;
     int m_grid = (m_tiles + m_tiles_per_block - 1) / m_tiles_per_block;
 
-    // Adaptive BPS: shrink when grid is undersaturated
     int bps = TC_BPS_DEFAULT;
     int k_splits = (N_BLOCKS + bps - 1) / bps;
     int total_ctas = b_tiles * m_grid * k_splits;
@@ -918,19 +953,33 @@ torch::Tensor glq_dequant_matmul_cuda(
     dim3 tc_grid(b_tiles, m_grid, k_splits);
     dim3 tc_block(32, WARPS);
 
-    if (has_stage2) {
-        int cb2_size = codebook2.size(0);
-        int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-        glq_matmul_tc_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
-            out_ptr, x_ptr, q_ptr, cb_ptr,
-            q2_ptr, cb2_ptr, inv_resid_scale,
-            wscale, B_dim, M, N, N_BLOCKS, N, bps, cb2_size);
+    int cb2_size = has_stage2 ? (int)codebook2.size(0) : 0;
+    auto smem_size = [&]() -> int {
+        int s = 0;
+        if (use_e8p) s += 256 * sizeof(uint32_t);
+        if (has_stage2 && cb2_size > 0 && cb2_size <= 256)
+            s += cb2_size * 8 * sizeof(half);
+        return s;
+    };
+    int smem = smem_size();
+
+    #define LAUNCH_TC(S2, E8P) \
+        glq_matmul_tc_kernel<S2, E8P><<<tc_grid, tc_block, smem, stream>>>( \
+            out_ptr, x_ptr, q_ptr, cb_ptr, \
+            S2 ? q2_ptr : nullptr, \
+            S2 ? cb2_ptr : nullptr, \
+            S2 ? inv_resid_scale : 0.0f, \
+            wscale, B_dim, M, N, N_BLOCKS, N, bps, cb2_size, cb_abs_ptr \
+        );
+
+    if (use_e8p) {
+        if (has_stage2) { LAUNCH_TC(true, true) }
+        else { LAUNCH_TC(false, true) }
     } else {
-        glq_matmul_tc_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
-            out_ptr, x_ptr, q_ptr, cb_ptr,
-            nullptr, nullptr, 0.0f,
-            wscale, B_dim, M, N, N_BLOCKS, N, bps, 0);
+        if (has_stage2) { LAUNCH_TC(true, false) }
+        else { LAUNCH_TC(false, false) }
     }
+    #undef LAUNCH_TC
 
     return output;
 }
