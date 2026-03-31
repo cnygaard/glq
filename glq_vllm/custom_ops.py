@@ -33,10 +33,11 @@ def _ensure_registered():
 
     cuda = _ik._glq_cuda
 
-    # -- 1. dequant_matvec: (N,) fp16 → (M,) fp32 --
+    # -- 1. dequant_matvec: (N,) fp16 → (M,) fp32, with optional E8P codebook_abs --
     _glq_lib.define(
         "dequant_matvec(Tensor x, Tensor qidxs, Tensor codebook, float wscale, "
-        "Tensor qidxs2, Tensor codebook2, float inv_resid_scale) -> Tensor")
+        "Tensor qidxs2, Tensor codebook2, float inv_resid_scale, "
+        "Tensor codebook_abs) -> Tensor")
     _glq_lib.impl("dequant_matvec", cuda.glq_dequant_matvec_cuda, dispatch_key)
     _glq_lib._register_fake("dequant_matvec", _dequant_matvec_fake)
 
@@ -78,7 +79,7 @@ def _ensure_registered():
 
 # --- Fake implementations for torch.compile tracing ---
 
-def _dequant_matvec_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resid_scale):
+def _dequant_matvec_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resid_scale, codebook_abs):
     M = qidxs.shape[0]
     return torch.empty(M, dtype=torch.float32, device=x.device)
 

@@ -312,11 +312,13 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     # Dequant + matmul (always through glq_dequant_matmul which handles dispatch)
     cb_packed = getattr(cb, 'codebook_packed', None)
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
+    cb_abs = getattr(cb, 'grid_packed_abs', None)
 
     y_rht = glq_dequant_matmul(
         x_rht, Qidxs, cb.codebook_half, wscale,
         Qidxs2=Qidxs2, codebook2=cb2_half,
-        inv_resid_scale=inv_rs, codebook_packed=cb_packed)
+        inv_resid_scale=inv_rs, codebook_packed=cb_packed,
+        codebook_abs=cb_abs)
 
     # Output RHT
     rsqrt_m = 1.0 / math.sqrt(m_pad)

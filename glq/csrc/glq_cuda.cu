@@ -2,12 +2,16 @@
  * GLQ CUDA dequant+matmul kernels
  *
  * Fused codebook-gather + matmul for E8 lattice quantized weights.
- * Each 8-weight block is stored as a 16-bit codebook index into a
- * 65536×8 fp16 codebook (2bpw). Optional second-stage residual
- * codebook adds 3/4bpw support.
  *
- * For the packed path, the codebook is compressed to 65536 uint32
- * entries (4 nibbles per half2 pair), reducing L2 gather traffic 4×.
+ * Two codebook formats:
+ *   1. Flat: 65536×8 fp16 (1MB, L2-resident) — legacy E8Shell models
+ *   2. E8P:  256 uint32 (1KB, staged in smem) — new E8P models
+ *
+ * E8P decode: 16-bit index = (abs_idx[8] | sign_mask[8])
+ *   - abs_idx indexes into 256-entry packed grid (8 nibbles per uint32)
+ *   - sign_mask: 7 sign bits + 1 parity bit (determines ±1/4 coset)
+ *   - Per-element: extract nibble → (nibble-8)*0.5 → apply sign → add coset
+ *   - All in registers/smem (~5ns vs L2 ~80ns for flat codebook)
  */
 
 #include <cuda.h>
@@ -23,6 +27,29 @@
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) do { CHECK_CUDA(x); CHECK_CONTIGUOUS(x); } while(false)
+
+/* E8P coordinate shuffle map: output coord i reads nibble shuffle_map[i] from packed uint32.
+ * Matches QuIP#'s latticee8_padded12.py get_full_grid() shuffle_map = [0,4,1,5,2,6,3,7] */
+__device__ __constant__ int E8P_SHUFFLE[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+/* E8P decode: extract one float coordinate from a packed index.
+ * idx16: full 16-bit E8P index
+ * packed_abs: the uint32 from codebook_abs[idx16 >> 8]
+ * elem: which of the 8 coordinates (0-7) this thread handles */
+__device__ __forceinline__ float e8p_decode_elem(uint16_t idx16, uint32_t packed_abs, int elem) {
+    int sign_byte = idx16 & 0xFF;
+    int parity = __popc(sign_byte) & 1;
+    int actual_signs = sign_byte ^ parity;
+
+    int nibble_pos = E8P_SHUFFLE[elem];
+    int nibble = (packed_abs >> (nibble_pos * 4)) & 0xF;
+    float abs_val = (nibble - 8) * 0.5f;
+
+    float sign = ((actual_signs >> nibble_pos) & 1) ? -1.0f : 1.0f;
+    float coset = parity ? -0.25f : 0.25f;
+
+    return abs_val * sign + coset;
+}
 
 /* ─────────────────────────────────────────────────────────────────────
  * B=1 Matvec kernel (decode path) — 4 rows per warp
@@ -150,13 +177,13 @@ __global__ void glq_matvec_kernel(
 
 #define BLOCKS_PER_SPLIT_DEFAULT 64
 
-template <bool HAS_STAGE2>
+template <bool HAS_STAGE2, bool USE_E8P = false>
 __global__ void __launch_bounds__(256, 2)
 glq_matvec_splitk_kernel(
     float* __restrict__ output,         // (M,) fp32, pre-zeroed
     const half* __restrict__ x,
     const int16_t* __restrict__ qidxs,
-    const half* __restrict__ codebook,
+    const half* __restrict__ codebook,  // (65536, 8) fp16 [flat] or unused [E8P]
     const int16_t* __restrict__ qidxs2,
     const half* __restrict__ codebook2,
     float inv_resid_scale,
@@ -164,16 +191,32 @@ glq_matvec_splitk_kernel(
     int M,
     int N_BLOCKS,
     int bps,                            // blocks per split (adaptive)
-    int cb2_size                        // secondary codebook entries (0 if no stage2)
+    int cb2_size,                       // secondary codebook entries (0 if no stage2)
+    const uint32_t* __restrict__ codebook_abs  // (256,) uint32 [E8P] or nullptr [flat]
 ) {
-    // Stage small secondary codebook into shared memory (256 entries = 4KB)
-    extern __shared__ half smem_cb2[];
+    // Shared memory layout: E8P table (1KB) then optional cb2 (4KB)
+    extern __shared__ char smem_raw[];
+    uint32_t* smem_e8p = (uint32_t*)smem_raw;
+    half* smem_cb2 = (half*)(smem_raw + (USE_E8P ? 256 * sizeof(uint32_t) : 0));
+
+    int tid_flat = threadIdx.y * 32 + threadIdx.x;
+
+    // Stage E8P packed abs grid (256 × uint32 = 1KB)
+    if (USE_E8P) {
+        for (int i = tid_flat; i < 256; i += 256) {
+            smem_e8p[i] = codebook_abs[i];
+        }
+    }
+
+    // Stage small secondary codebook into shared memory
     if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
-        int tid_flat = threadIdx.y * 32 + threadIdx.x;
         int total = cb2_size * 8;
         for (int i = tid_flat; i < total; i += 256) {
             smem_cb2[i] = codebook2[i];
         }
+    }
+
+    if (USE_E8P || (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256)) {
         __syncthreads();
     }
 
@@ -208,10 +251,17 @@ glq_matvec_splitk_kernel(
         }
         idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
 
-        // Gather codebook
+        // Decode codebook entry
         float cb_val = 0.0f;
         if (valid) {
-            cb_val = __half2float(codebook[idx * 8 + elem]);
+            if (USE_E8P) {
+                // E8P: decode from 256-entry smem table + ALU
+                uint32_t packed = smem_e8p[idx >> 8];
+                cb_val = e8p_decode_elem(idx, packed, elem);
+            } else {
+                // Flat: gather from 65536-entry L2 table
+                cb_val = __half2float(codebook[idx * 8 + elem]);
+            }
         }
 
         // Two-stage residual
@@ -681,26 +731,34 @@ __global__ void glq_matvec_packed_kernel(
 torch::Tensor glq_dequant_matvec_cuda(
     torch::Tensor x,           // (N,) fp16
     torch::Tensor qidxs,       // (M, N_BLOCKS) int16
-    torch::Tensor codebook,    // (65536, 8) fp16
+    torch::Tensor codebook,    // (65536, 8) fp16 [flat] or unused [E8P]
     float wscale,
     torch::Tensor qidxs2,      // (M, N_BLOCKS) int16 or empty
     torch::Tensor codebook2,   // (K2, 8) fp16 or empty
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor codebook_abs // (256,) int32 [E8P] or empty [flat]
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(qidxs);
-    CHECK_INPUT(codebook);
 
     int M = qidxs.size(0);
     int N_BLOCKS = qidxs.size(1);
+    bool use_e8p = (codebook_abs.numel() == 256);
+
+    if (!use_e8p) {
+        CHECK_INPUT(codebook);
+    }
 
     at::DeviceGuard guard(x.device());
-    // Split-K uses atomicAdd → output must be zeroed
     auto output = torch::zeros({M}, torch::dtype(torch::kFloat32).device(x.device()));
 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, x.get_device());
-    int num_sms = prop.multiProcessorCount;
+    // Cache SM count in static to avoid cudaGetDeviceProperties on every call
+    static int num_sms = 0;
+    if (num_sms == 0) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, x.get_device());
+        num_sms = prop.multiProcessorCount;
+    }
 
     const int WARPS = 8;
     const int rows_per_block = ROWS_PER_WARP * WARPS;  // 32
@@ -709,53 +767,62 @@ torch::Tensor glq_dequant_matvec_cuda(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
 
-    // Always use split-K: it handles all cases well (large M just gets k_splits=1)
     int m_blocks = (M + rows_per_block - 1) / rows_per_block;
     bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT_DEFAULT);
 
+    // Compute shared memory size
+    auto smem_size = [&](int cb2_entries) -> int {
+        int s = 0;
+        if (use_e8p) s += 256 * sizeof(uint32_t);  // 1KB for E8P table
+        if (has_stage2 && cb2_entries > 0 && cb2_entries <= 256)
+            s += cb2_entries * 8 * sizeof(half);     // up to 4KB for cb2
+        return s;
+    };
+
+    // Helper: get kernel args
+    auto cb_ptr = use_e8p ? nullptr : (const half*)codebook.data_ptr<c10::Half>();
+    auto cb_abs_ptr = use_e8p ? (const uint32_t*)codebook_abs.data_ptr<int32_t>() : nullptr;
+
     if (use_splitk) {
-        // Adaptive BPS: shrink BPS when grid is undersaturated to create more CTAs
         int bps = BLOCKS_PER_SPLIT_DEFAULT;
         int k_splits = (N_BLOCKS + bps - 1) / bps;
         int total_ctas = m_blocks * k_splits;
         if (total_ctas < num_sms * 2 && bps > 16) {
-            // Grid too small — halve BPS to double K-splits
             bps = max(16, bps / 2);
             k_splits = (N_BLOCKS + bps - 1) / bps;
         }
         dim3 grid(m_blocks, k_splits);
 
-        if (has_stage2) {
-            CHECK_INPUT(qidxs2);
-            CHECK_INPUT(codebook2);
-            int cb2_size = codebook2.size(0);
-            int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-            glq_matvec_splitk_kernel<true><<<grid, block, smem, stream>>>(
-                output.data_ptr<float>(),
-                (const half*)x.data_ptr<c10::Half>(),
-                qidxs.data_ptr<int16_t>(),
-                (const half*)codebook.data_ptr<c10::Half>(),
-                qidxs2.data_ptr<int16_t>(),
-                (const half*)codebook2.data_ptr<c10::Half>(),
-                inv_resid_scale,
-                wscale, M, N_BLOCKS, bps, cb2_size
+        int cb2_size = has_stage2 ? (int)codebook2.size(0) : 0;
+        int smem = smem_size(cb2_size);
+
+        #define LAUNCH_SPLITK(S2, E8P) \
+            glq_matvec_splitk_kernel<S2, E8P><<<grid, block, smem, stream>>>( \
+                output.data_ptr<float>(), \
+                (const half*)x.data_ptr<c10::Half>(), \
+                qidxs.data_ptr<int16_t>(), \
+                cb_ptr, \
+                S2 ? qidxs2.data_ptr<int16_t>() : nullptr, \
+                S2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr, \
+                S2 ? inv_resid_scale : 0.0f, \
+                wscale, M, N_BLOCKS, bps, cb2_size, cb_abs_ptr \
             );
+
+        if (use_e8p) {
+            if (has_stage2) { CHECK_INPUT(qidxs2); CHECK_INPUT(codebook2); LAUNCH_SPLITK(true, true) }
+            else { LAUNCH_SPLITK(false, true) }
         } else {
-            glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
-                output.data_ptr<float>(),
-                (const half*)x.data_ptr<c10::Half>(),
-                qidxs.data_ptr<int16_t>(),
-                (const half*)codebook.data_ptr<c10::Half>(),
-                nullptr, nullptr, 0.0f,
-                wscale, M, N_BLOCKS, bps, 0
-            );
+            if (has_stage2) { CHECK_INPUT(qidxs2); CHECK_INPUT(codebook2); LAUNCH_SPLITK(true, false) }
+            else { LAUNCH_SPLITK(false, false) }
         }
+        #undef LAUNCH_SPLITK
     } else {
         dim3 grid(num_sms);
-
+        // Non-split-K path uses the original kernel (no E8P support yet — rare path)
         if (has_stage2) {
             CHECK_INPUT(qidxs2);
             CHECK_INPUT(codebook2);
+            CHECK_INPUT(codebook);
             glq_matvec_kernel<true><<<grid, block, 0, stream>>>(
                 output.data_ptr<float>(),
                 (const half*)x.data_ptr<c10::Half>(),
@@ -767,6 +834,7 @@ torch::Tensor glq_dequant_matvec_cuda(
                 wscale, M, N_BLOCKS
             );
         } else {
+            CHECK_INPUT(codebook);
             glq_matvec_kernel<false><<<grid, block, 0, stream>>>(
                 output.data_ptr<float>(),
                 (const half*)x.data_ptr<c10::Half>(),
