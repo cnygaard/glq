@@ -492,9 +492,10 @@ class E8PCodebook:
         return self.codebook[indices], indices
 
     def _quantize_triton(self, x):
-        """Triton NN kernel — delegates to E8ShellCodebook's implementation."""
-        from glq.codebook_kernel import codebook_nn_triton
-        return codebook_nn_triton(x, self.codebook_half, self.codebook_norms_half)
+        """Triton NN kernel."""
+        from glq.codebook_kernel import triton_codebook_nn
+        indices = triton_codebook_nn(x, self.codebook_half, self.codebook_norms_half)
+        return self.codebook[indices], indices
 
     def quantize_rvq(self, x):
         """Two-stage RVQ: 4 bpw (32 bits / 8 dims)."""
