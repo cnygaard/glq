@@ -716,34 +716,36 @@ def glq_dequant_matmul(
 
     # CUDA C kernels: B=1 split-K matvec, B>1 inline PTX TC (mma.m16n8k16)
     # Both 2.7-3.3× faster than Triton
+    # Use torch.ops.glq.* when registered (torch.compile compatible),
+    # otherwise fall back to direct pybind11 calls.
     if _try_load_cuda_ext():
         _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
         _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
+        _use_ops = hasattr(torch.ops, 'glq') and hasattr(torch.ops.glq, 'dequant_matvec')
         if B == 1:
-            y = _glq_cuda.glq_dequant_matvec_cuda(
-                x_fp16[0], Qidxs, cb, Wscale,
-                q2 if has_stage2 else _empty_i16,
-                cb2 if has_stage2 else _empty_f16,
-                inv_resid_scale if has_stage2 else 0.0,
-            )
+            _q2 = q2 if has_stage2 else _empty_i16
+            _cb2 = cb2 if has_stage2 else _empty_f16
+            _irs = inv_resid_scale if has_stage2 else 0.0
+            if _use_ops:
+                y = torch.ops.glq.dequant_matvec(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs)
+            else:
+                y = _glq_cuda.glq_dequant_matvec_cuda(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs)
             return y.unsqueeze(0)  # (M,) → (1, M)
         else:
-            # Use packed TC kernel for 2bpw (no stage2) when packed codebook available
             if not has_stage2 and codebook_packed is not None:
-                y = _glq_cuda.glq_dequant_matmul_packed_cuda(
-                    x_fp16, Qidxs, codebook_packed, Wscale,
-                )
+                if _use_ops:
+                    y = torch.ops.glq.dequant_matmul_packed(x_fp16, Qidxs, codebook_packed, Wscale)
+                else:
+                    y = _glq_cuda.glq_dequant_matmul_packed_cuda(x_fp16, Qidxs, codebook_packed, Wscale)
                 return y
-            y = _glq_cuda.glq_dequant_matmul_cuda(
-                x_fp16, Qidxs, cb, Wscale,
-                q2 if has_stage2 else _empty_i16,
-                cb2 if has_stage2 else _empty_f16,
-                inv_resid_scale if has_stage2 else 0.0,
-            )
+            _q2 = q2 if has_stage2 else _empty_i16
+            _cb2 = cb2 if has_stage2 else _empty_f16
+            _irs = inv_resid_scale if has_stage2 else 0.0
+            if _use_ops:
+                y = torch.ops.glq.dequant_matmul(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs)
+            else:
+                y = _glq_cuda.glq_dequant_matmul_cuda(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs)
             return y
-        return _fallback_dequant_matmul(
-            x, Qidxs, codebook, Wscale, Qidxs2, codebook2, inv_resid_scale
-        )
 
     # Decide whether to use split-K based on estimated grid saturation.
     # BLOCK_M=64 is typical for both matvec and TC paths.

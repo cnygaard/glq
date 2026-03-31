@@ -84,7 +84,6 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         # w13 = gate_up_proj (or just up_proj for non-gated)
-        # Check FusedMoEConfig first, then layer attribute
         is_gated = getattr(self.moe, 'is_act_and_mul', None)
         if is_gated is None:
             is_gated = getattr(layer, 'is_act_and_mul', False)
@@ -144,7 +143,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         device = layer.w13_Qidxs.device
         bpw = getattr(self.quant_config, 'bpw', 2)
 
-        # Update PADDED dims from actual loaded weight shapes (auto-resize may have changed them)
+        # Update PADDED dims from actual loaded weight shapes
         if layer.w13_Qidxs.dim() == 3 and layer.w13_Qidxs.shape[1] > 0:
             layer.glq_m_pad_w13 = layer.w13_Qidxs.shape[1]
             layer.glq_n_pad_w13 = layer.w13_Qidxs.shape[2] * 8
@@ -164,6 +163,15 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
         _ensure_codebook(device, max_bpw=max_bpw)
 
+        # Ensure all weight tensors are on GPU
+        for attr in ['w13_Qidxs', 'w13_SU', 'w13_SV', 'w13_Wscale',
+                     'w2_Qidxs', 'w2_SU', 'w2_SV', 'w2_Wscale',
+                     'w13_Qidxs2', 'w13_inv_resid_scale',
+                     'w2_Qidxs2', 'w2_inv_resid_scale']:
+            t = getattr(layer, attr, None)
+            if t is not None and t.device != device:
+                setattr(layer, attr, torch.nn.Parameter(t.data.to(device), requires_grad=False))
+
         # Cache log2 values and per-expert scalars for fast apply()
         layer.glq_log_n_w13 = int(math.log2(layer.glq_n_pad_w13))
         layer.glq_log_m_w13 = int(math.log2(layer.glq_m_pad_w13))
@@ -176,12 +184,12 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         layer.glq_w13_inv_rs = [layer.w13_inv_resid_scale[i].item() for i in range(n)]
         layer.glq_w2_inv_rs = [layer.w2_inv_resid_scale[i].item() for i in range(n)]
 
-        # Remove weight_loader from params — no longer needed after loading,
-        # and function references prevent vLLM v1 serialization
+        # Remove weight_loader from params (prevents vLLM v1 serialization issues)
         for name, param in layer.named_parameters():
             if hasattr(param, 'weight_loader'):
                 del param.weight_loader
 
+    @torch.compiler.disable
     def apply(
         self,
         layer: nn.Module,
@@ -212,8 +220,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         for expert_idx_t in active_experts:
             expert_idx = expert_idx_t.item()
 
-            # Find tokens assigned to this expert
-            mask = (topk_ids == expert_idx)  # (num_tokens, topk)
+            mask = (topk_ids == expert_idx)
             token_mask = mask.any(dim=1)
             expert_weights = (topk_weights * mask.float()).sum(dim=1)
             selected_tokens = x[token_mask]

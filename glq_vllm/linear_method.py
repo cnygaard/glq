@@ -272,30 +272,44 @@ class GLQShardedParameter(BasevLLMParameter):
 def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
                      has_stage2, inv_rs, Qidxs2, out_features, in_features,
                      m_pad, n_pad, log_n, log_m):
-    """Run input RHT → dequant+matmul → output RHT for explicit tensors."""
+    """Run input RHT → dequant+matmul → output RHT for explicit tensors.
+
+    Uses torch.ops.glq.* custom ops when registered (for torch.compile/CUDA graph
+    compatibility), falling back to direct CUDA C or Triton calls.
+    """
     dtype = x.dtype
     B = x.shape[0]
-    # Ensure all tensors on device
-    Qidxs = Qidxs.to(device)
-    SU = SU.to(device)
-    SV = SV.to(device)
-    if Qidxs2 is not None:
+    _use_custom_ops = hasattr(torch.ops, 'glq') and hasattr(torch.ops.glq, 'dequant_matvec')
+    _use_cuda_c = _ik._glq_cuda is not None and not _VLLM_USE_TRITON
+
+    # Ensure weight tensors on device (safety net for fused QKV / first profile_run)
+    if Qidxs.device != x.device:
+        Qidxs = Qidxs.to(device)
+    if SU.device != x.device:
+        SU = SU.to(device)
+    if SV.device != x.device:
+        SV = SV.to(device)
+    if Qidxs2 is not None and Qidxs2.device != x.device:
         Qidxs2 = Qidxs2.to(device)
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
-    if n_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
-        _ik._glq_cuda.glq_input_rht_cuda(
-            x.half().contiguous(), SV, x_rht,
-            in_features, in_features,
-            1.0 / math.sqrt(n_pad), n_pad, log_n)
+    rsqrt_n = 1.0 / math.sqrt(n_pad)
+    if n_pad <= 16384 and (_use_custom_ops or _use_cuda_c):
+        x_half = x.half().contiguous()
+        if _use_custom_ops:
+            torch.ops.glq.input_rht(x_half, SV, x_rht,
+                                    in_features, in_features, rsqrt_n, n_pad, log_n)
+        else:
+            _ik._glq_cuda.glq_input_rht_cuda(x_half, SV, x_rht,
+                                              in_features, in_features, rsqrt_n, n_pad, log_n)
     else:
         from glq.quantized_linear import _input_rht_kernel
         _input_rht_kernel[(B,)](
             x, SV, x_rht, in_features, x.stride(0),
-            1.0 / math.sqrt(n_pad), N=n_pad, LOG_N=log_n, num_warps=8)
+            rsqrt_n, N=n_pad, LOG_N=log_n, num_warps=8)
 
-    # Dequant + matmul
+    # Dequant + matmul (always through glq_dequant_matmul which handles dispatch)
     cb_packed = getattr(cb, 'codebook_packed', None)
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
 
@@ -305,11 +319,13 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         inv_resid_scale=inv_rs, codebook_packed=cb_packed)
 
     # Output RHT
-    if m_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
+    rsqrt_m = 1.0 / math.sqrt(m_pad)
+    if m_pad <= 16384 and (_use_custom_ops or _use_cuda_c):
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
-        _ik._glq_cuda.glq_output_rht_cuda(
-            y_rht, SU, y, out_features, m_pad,
-            log_m, 1.0 / math.sqrt(m_pad))
+        if _use_custom_ops:
+            torch.ops.glq.output_rht(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
+        else:
+            _ik._glq_cuda.glq_output_rht_cuda(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
         if dtype != torch.float16:
             y = y.to(dtype)
     else:
@@ -318,8 +334,7 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         y = torch.empty(B, out_features, dtype=dtype, device=device)
         _output_rht_kernel[(B,)](
             y_rht, SU, y, out_features, y_rht.stride(0), y.stride(0),
-            1.0 / math.sqrt(m_pad),
-            OUTPUT_FP16=output_fp16, M=m_pad, LOG_M=log_m, num_warps=8)
+            rsqrt_m, OUTPUT_FP16=output_fp16, M=m_pad, LOG_M=log_m, num_warps=8)
     return y
 
 
@@ -492,6 +507,12 @@ class GLQLinearMethod(LinearMethodBase):
 
         _ensure_codebook(device, max_bpw=max_bpw)
         _try_load_cuda_ext()
+
+        # Ensure all weight tensors are on GPU
+        for attr in ['Qidxs', 'SU', 'SV', 'Wscale', 'Qidxs2', 'inv_resid_scale']:
+            t = getattr(layer, attr, None)
+            if t is not None and hasattr(t, 'device') and t.device != device:
+                setattr(layer, attr, torch.nn.Parameter(t.data.to(device), requires_grad=False))
 
         # Cache scalars for all shards
         if getattr(layer, 'glq_is_fused', False):
