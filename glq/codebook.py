@@ -355,3 +355,241 @@ class E8ShellCodebook:
         data = torch.load(path, map_location='cpu', weights_only=True)
         return cls.from_precomputed(
             data['codebook'], data['opt_scale'], data['resid_scale'], device=device)
+
+
+# ── E8P Codebook (QuIP#-style: 256 abs patterns, 1KB packed table) ──
+
+def _e8p_norm12_vectors():
+    """29 padding vectors from E8+1/4 with norm²=12 (from QuIP# paper)."""
+    return torch.tensor([
+        [3, 1, 1, 1, 3, 3, 3, 3], [1, 3, 1, 1, 3, 3, 3, 3],
+        [1, 1, 3, 1, 3, 3, 3, 3], [1, 1, 1, 3, 3, 3, 3, 3],
+        [3, 3, 3, 1, 3, 3, 1, 1], [3, 3, 3, 1, 3, 1, 3, 1],
+        [3, 3, 3, 1, 1, 3, 3, 1], [3, 3, 3, 1, 3, 1, 1, 3],
+        [3, 3, 3, 1, 1, 3, 1, 3], [3, 3, 3, 1, 1, 1, 3, 3],
+        [3, 3, 1, 3, 3, 3, 1, 1], [3, 3, 1, 3, 3, 1, 3, 1],
+        [3, 3, 1, 3, 1, 3, 3, 1], [3, 3, 1, 3, 3, 1, 1, 3],
+        [3, 3, 1, 3, 1, 3, 1, 3], [3, 3, 1, 3, 1, 1, 3, 3],
+        [3, 1, 3, 3, 3, 3, 1, 1], [3, 1, 3, 3, 3, 1, 3, 1],
+        [3, 1, 3, 3, 1, 3, 3, 1], [3, 1, 3, 3, 3, 1, 1, 3],
+        [3, 1, 3, 3, 1, 3, 1, 3], [1, 3, 3, 3, 1, 1, 3, 3],
+        [1, 3, 3, 3, 3, 3, 1, 1], [1, 3, 3, 3, 3, 1, 3, 1],
+        [1, 3, 3, 3, 1, 3, 3, 1], [1, 3, 3, 3, 3, 1, 1, 3],
+        [1, 3, 3, 3, 1, 3, 1, 3], [1, 1, 3, 3, 1, 3, 3, 3],
+        [3, 3, 1, 1, 3, 3, 3, 1],
+    ], dtype=torch.float32) / 2
+
+
+def _e8p_packed_abs_grid():
+    """Build the 256-entry packed uint32 abs grid for E8P decode.
+
+    Each entry is 8 nibbles packed into a uint32. Nibble value = (coord * 2 + 8).
+    The 256 entries are: 227 from D̂₈ with norm²≤10 + 29 padding from norm²=12.
+    """
+    intr = torch.arange(-4, 4)
+    d8 = torch.cartesian_prod(*[intr] * 8).float() + 0.5
+    d8m2 = (d8.sum(dim=-1) % 2 == 0)
+    d8n = d8.norm(dim=-1) ** 2 <= 10
+    d8abs = torch.unique(d8[sorted(torch.where(d8m2 * d8n)[0])].abs(), dim=0)
+    norm12 = _e8p_norm12_vectors()
+    cba = torch.cat([d8abs, norm12], dim=0)
+    # Interleave coordinates for kernel-friendly layout: [0,2,4,6,1,3,5,7]
+    cba = cba[:, [0, 2, 4, 6, 1, 3, 5, 7]]
+    # Fix parity of last coordinate
+    cba[:, 7] *= (1 - 2 * (cba.sum(1) % 2))
+    # Encode as nibbles: val → (val * 2 + 8) in [0, 15]
+    cba = (cba * 2 + 8).to(torch.int32)
+    packed = cba[:, 0]
+    for i in range(7):
+        packed = packed | (cba[:, i + 1] << ((i + 1) * 4))
+    return packed
+
+
+def _e8p_full_grid(packed_abs_grid):
+    """Expand 256 abs patterns × 2⁷ signs × 2 cosets = 65536 vectors."""
+    codebook = torch.zeros(1 << 16, 8)
+    shuffle_map = [0, 4, 1, 5, 2, 6, 3, 7]
+    for c in range(1 << 16):
+        signs = c & 255
+        abs_idx = c >> 8
+        parity = 0
+        for i in range(8):
+            parity ^= ((signs >> i) & 1)
+        signs = signs ^ parity
+        abs_code = packed_abs_grid[abs_idx].item()
+        for i in range(8):
+            ii = shuffle_map[i]
+            codebook[c, i] = (((abs_code >> (4 * ii)) & 15) - 8) * 0.5
+            if ((signs >> ii) & 1):
+                codebook[c, i] *= -1
+        if parity:
+            codebook[c, :] -= 0.25
+        else:
+            codebook[c, :] += 0.25
+    return codebook
+
+
+class E8PCodebook:
+    """E8P codebook from QuIP# — 256 abs patterns, 1KB packed table.
+
+    The 65536 codewords are factored as: 256 abs patterns × 128 signs × 2 cosets.
+    A 16-bit index encodes (abs_idx[8] | sign_mask[8]) where parity determines coset.
+    The CUDA kernel decodes from a 256-entry uint32 table using pure ALU (no fp16 loads).
+    """
+
+    CODEBOOK_SIZE = 65536
+    DIM = 8
+
+    def __init__(self, device='cpu', verbose=True):
+        if verbose:
+            print("E8PCodebook: building E8P grid ...")
+        t0 = time.perf_counter()
+
+        self.grid_packed_abs = _e8p_packed_abs_grid()  # (256,) int32
+        self.codebook = _e8p_full_grid(self.grid_packed_abs)  # (65536, 8) fp32
+
+        self.codebook = self.codebook.to(device)
+        self.codebook_norms = (self.codebook ** 2).sum(-1).to(device)
+        self.codebook_half = self.codebook.half()
+        self.codebook_half_t = self.codebook_half.T.contiguous()
+        self.codebook_norms_half = self.codebook_norms.half()
+        self.grid_packed_abs = self.grid_packed_abs.to(device)
+        # Keep flat packed codebook for backward compat with existing kernels
+        self.codebook_packed = _pack_codebook(self.codebook).to(device)
+        self.codesz = self.DIM
+        self.device = device
+
+        self.opt_scale = 1.03  # QuIP# empirical value for E8P
+        self.resid_scale = self._compute_resid_scale()
+
+        elapsed = time.perf_counter() - t0
+        if verbose:
+            print(f"  {self.CODEBOOK_SIZE} entries ({self.grid_packed_abs.shape[0]} abs patterns) "
+                  f"in {elapsed:.2f}s, opt_scale={self.opt_scale:.4f}, resid_scale={self.resid_scale:.2f}")
+
+    def decode(self, indices):
+        """Table lookup: index -> 8-d vector."""
+        return self.codebook[indices]
+
+    def quantize(self, x, _batch_size=16384):
+        """Nearest-neighbour lookup."""
+        if x.is_cuda and _triton_available:
+            return self._quantize_triton(x)
+        return self._quantize_pytorch(x, _batch_size)
+
+    def _quantize_pytorch(self, x, _batch_size=16384):
+        cb_t = self.codebook_half_t if x.is_cuda else self.codebook.T
+        cb_norms = self.codebook_norms_half if x.is_cuda else self.codebook_norms
+        use_half = x.is_cuda
+        all_indices = []
+        for start in range(0, x.shape[0], _batch_size):
+            chunk = x[start:start + _batch_size]
+            xq = chunk.half() if use_half else chunk
+            dots = xq @ cb_t
+            dists = -2.0 * dots + cb_norms
+            all_indices.append(dists.argmin(dim=-1))
+        indices = torch.cat(all_indices)
+        return self.codebook[indices], indices
+
+    def _quantize_triton(self, x):
+        """Triton NN kernel — delegates to E8ShellCodebook's implementation."""
+        from glq.codebook_kernel import codebook_nn_triton
+        return codebook_nn_triton(x, self.codebook_half, self.codebook_norms_half)
+
+    def quantize_rvq(self, x):
+        """Two-stage RVQ: 4 bpw (32 bits / 8 dims)."""
+        dec1, idx1 = self.quantize(x)
+        residual = x - dec1
+        dec2, idx2 = self.quantize(residual * self.resid_scale)
+        decoded = dec1 + dec2 / self.resid_scale
+        return decoded, (idx1, idx2)
+
+    def decode_rvq(self, idx1, idx2):
+        return self.codebook[idx1] + self.codebook[idx2] / self.resid_scale
+
+    def _compute_opt_scale(self, n_samples=8_000):
+        x = torch.randn(n_samples, self.DIM, device=self.device)
+        best_nmse, best_s = float('inf'), 1.0
+        for s in [0.3, 0.5, 0.7, 1.0, 1.03, 1.5, 2.0, 3.0, 5.0]:
+            _, idx = self.quantize(x / s)
+            dec = self.codebook[idx]
+            mse = ((x / s - dec) ** 2).sum(-1).mean().item()
+            nmse = mse * (s ** 2)
+            if nmse < best_nmse:
+                best_nmse, best_s = nmse, s
+        return best_s
+
+    def _compute_resid_scale(self, n_samples=8_000):
+        x = torch.randn(n_samples, self.DIM, device=self.device)
+        x_s = x / self.opt_scale
+        dec1, _ = self.quantize(x_s)
+        residual = x_s - dec1
+        best_nmse, best_rs = float('inf'), 1.0
+        for rs in [0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0]:
+            dec2, _ = self.quantize(residual * rs)
+            total = dec1 + dec2 / rs
+            mse = ((x_s - total) ** 2).sum(-1).mean().item()
+            nmse = mse * (self.opt_scale ** 2)
+            if nmse < best_nmse:
+                best_nmse, best_rs = nmse, rs
+        return best_rs
+
+    def make_small(self, n_entries=256):
+        """Create a small codebook from the first n_entries vectors."""
+        assert n_entries <= self.CODEBOOK_SIZE
+        small_cb = self.codebook[:n_entries].clone()
+        obj = object.__new__(type(self))
+        obj.codebook = small_cb.to(self.device)
+        obj.codebook_norms = (obj.codebook ** 2).sum(-1)
+        obj.codebook_half = obj.codebook.half()
+        obj.codebook_half_t = obj.codebook_half.T.contiguous()
+        obj.codebook_norms_half = obj.codebook_norms.half()
+        obj.codebook_packed = _pack_codebook(obj.codebook).to(self.device)
+        obj.grid_packed_abs = self.grid_packed_abs.to(self.device)
+        obj.codesz = self.DIM
+        obj.device = self.device
+        obj.opt_scale = obj._compute_opt_scale()
+        obj.resid_scale = 1.0
+        obj.CODEBOOK_SIZE = n_entries
+        return obj
+
+    def _move_to_device(self, device):
+        device = torch.device(device)
+        if self.codebook.device == device:
+            return
+        self.codebook = self.codebook.to(device)
+        self.codebook_half = self.codebook.half()
+        self.codebook_half_t = self.codebook_half.T.contiguous()
+        self.codebook_norms = self.codebook_norms.to(device)
+        self.codebook_norms_half = self.codebook_norms.half()
+        self.grid_packed_abs = self.grid_packed_abs.to(device)
+        if hasattr(self, 'codebook_packed') and self.codebook_packed is not None:
+            self.codebook_packed = self.codebook_packed.to(device)
+        self.device = device
+
+    def save(self, path: str):
+        torch.save({
+            'grid_packed_abs': self.grid_packed_abs.cpu(),
+            'codebook': self.codebook.cpu(),
+            'opt_scale': self.opt_scale,
+            'resid_scale': self.resid_scale,
+            'codebook_type': 'e8p',
+        }, path)
+
+    @classmethod
+    def load(cls, path: str, device='cpu'):
+        data = torch.load(path, map_location='cpu', weights_only=True)
+        obj = object.__new__(cls)
+        obj.grid_packed_abs = data['grid_packed_abs'].to(device)
+        obj.codebook = data['codebook'].float().to(device)
+        obj.codebook_norms = (obj.codebook ** 2).sum(-1)
+        obj.codebook_half = obj.codebook.half()
+        obj.codebook_half_t = obj.codebook_half.T.contiguous()
+        obj.codebook_norms_half = obj.codebook_norms.half()
+        obj.codebook_packed = _pack_codebook(obj.codebook).to(device)
+        obj.codesz = cls.DIM
+        obj.device = device
+        obj.opt_scale = data['opt_scale']
+        obj.resid_scale = data['resid_scale']
+        obj.CODEBOOK_SIZE = obj.codebook.shape[0]
+        return obj
