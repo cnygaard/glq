@@ -22,7 +22,7 @@ from concurrent.futures import ProcessPoolExecutor
 import torch
 import torch.nn as nn
 
-from .codebook import E8ShellCodebook
+from .codebook import E8ShellCodebook, E8PCodebook
 from .rht import RHT
 from .ldlq import quantize_ldlq_codebook, quantize_ldlq_codebook_2stage
 
@@ -32,12 +32,30 @@ from .ldlq import quantize_ldlq_codebook, quantize_ldlq_codebook_2stage
 _worker_codebook = None
 
 
-def _init_worker(cb_tensor, cb_opt_scale, cb_resid_scale, n_threads):
+def _init_worker(cb_tensor, cb_opt_scale, cb_resid_scale, n_threads,
+                 grid_packed_abs=None):
     """Initialize codebook in each worker process (called once per worker)."""
     global _worker_codebook
     torch.set_num_threads(n_threads)
-    _worker_codebook = E8ShellCodebook.from_precomputed(
-        cb_tensor, cb_opt_scale, cb_resid_scale, device='cpu')
+    if grid_packed_abs is not None:
+        # E8P codebook
+        obj = object.__new__(E8PCodebook)
+        obj.codebook = cb_tensor.float()
+        obj.codebook_norms = (obj.codebook ** 2).sum(-1)
+        obj.codebook_half = obj.codebook.half()
+        obj.codebook_half_t = obj.codebook_half.T.contiguous()
+        obj.codebook_norms_half = obj.codebook_norms.half()
+        obj.codebook_packed = None
+        obj.grid_packed_abs = grid_packed_abs
+        obj.codesz = 8
+        obj.device = 'cpu'
+        obj.opt_scale = cb_opt_scale
+        obj.resid_scale = cb_resid_scale
+        obj.CODEBOOK_SIZE = cb_tensor.shape[0]
+        _worker_codebook = obj
+    else:
+        _worker_codebook = E8ShellCodebook.from_precomputed(
+            cb_tensor, cb_opt_scale, cb_resid_scale, device='cpu')
 
 
 def _quantize_sublayer(args):
@@ -474,8 +492,8 @@ def quantize(
     print(f"  {n_chunks} sequences of length {seqlen}")
 
     # ---- Build codebook ----
-    print(f"\nBuilding E8 shell codebook ...")
-    codebook = E8ShellCodebook(device=device)
+    print(f"\nBuilding E8P codebook (256 abs patterns, 1KB table) ...")
+    codebook = E8PCodebook(device=device)
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
@@ -527,12 +545,14 @@ def quantize(
         import multiprocessing
         n_workers = workers if workers > 0 else min(os.cpu_count() or 1, 16)
         n_threads = max(1, (os.cpu_count() or 1) // n_workers)
+        grid_abs = getattr(codebook, 'grid_packed_abs', None)
         pool = ProcessPoolExecutor(
             max_workers=n_workers,
             mp_context=multiprocessing.get_context('spawn'),
             initializer=_init_worker,
             initargs=(codebook.codebook.cpu(), codebook.opt_scale,
-                      codebook.resid_scale, n_threads),
+                      codebook.resid_scale, n_threads,
+                      grid_abs.cpu() if grid_abs is not None else None),
         )
         print(f"  Using {n_workers} parallel workers for CPU quantization")
 
@@ -838,7 +858,7 @@ def quantize(
 
     config_dict["quantization_config"] = {
         "quant_method": "glq",
-        "codebook": "e8_shell",
+        "codebook": "e8p" if isinstance(codebook, E8PCodebook) else "e8_shell",
         "codesz": 8,
         "bpw": effective_bpw,
     }
