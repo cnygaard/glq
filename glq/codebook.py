@@ -497,6 +497,13 @@ class E8PCodebook:
         indices = triton_codebook_nn(x, self.codebook_half, self.codebook_norms_half)
         return self.codebook[indices], indices
 
+    def quantize_fast(self, x_half, decoded_out=None, idx_out=None):
+        """Fast quantize with fused NN+decode for LDLQ inner loop."""
+        from glq.codebook_kernel import triton_codebook_nn_decode
+        return triton_codebook_nn_decode(
+            x_half, self.codebook_half, self.codebook_norms,
+            decoded_out=decoded_out, idx_out=idx_out)
+
     def quantize_rvq(self, x):
         """Two-stage RVQ: 4 bpw (32 bits / 8 dims)."""
         dec1, idx1 = self.quantize(x)
