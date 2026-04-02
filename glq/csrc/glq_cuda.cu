@@ -1372,3 +1372,304 @@ torch::Tensor glq_fused_linear_cuda(
 
     return y;
 }
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Helper kernels for fused MoE
+ * ───────────────────────────────────────────────────────────────────── */
+
+// Squared ReLU (non-gated): out[i] = max(0, in[i])^2
+__global__ void relu2_activation_kernel(
+    const half* __restrict__ in,
+    half* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(in[i]);
+        v = fmaxf(v, 0.0f);
+        out[i] = __float2half(v * v);
+    }
+}
+
+// SiLU gated: out[i] = silu(in[i]) * in[i + half]
+__global__ void silu_gated_activation_kernel(
+    const half* __restrict__ in,
+    half* __restrict__ out,
+    int half_n  // output size = half of input size
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < half_n) {
+        float gate = __half2float(in[i]);
+        float up = __half2float(in[i + half_n]);
+        float silu = gate / (1.0f + expf(-gate));
+        out[i] = __float2half(silu * up);
+    }
+}
+
+// Weighted accumulate: out[i] += weight * in[i]
+__global__ void weighted_add_kernel(
+    half* __restrict__ out,
+    const half* __restrict__ in,
+    float weight,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(out[i]) + weight * __half2float(in[i]);
+        out[i] = __float2half(v);
+    }
+}
+
+// Helper: launch split-K matvec from C++ (avoids duplicating the grid logic)
+static void launch_matvec_splitk(
+    float* output, const half* x, const int16_t* qidxs,
+    const half* codebook, float wscale,
+    const int16_t* qidxs2, const half* codebook2,
+    float inv_resid_scale, bool has_stage2,
+    int M, int N_BLOCKS, int cb2_size,
+    int num_sms, cudaStream_t stream
+) {
+    const int WARPS = 8;
+    const int rows_per_block = ROWS_PER_WARP * WARPS;
+    dim3 block(32, WARPS);
+    int m_blocks = (M + rows_per_block - 1) / rows_per_block;
+    int bps = BLOCKS_PER_SPLIT_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    if (m_blocks * k_splits < num_sms * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
+    dim3 grid(m_blocks, k_splits);
+
+    if (has_stage2) {
+        int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
+        glq_matvec_splitk_kernel<true><<<grid, block, smem, stream>>>(
+            output, x, qidxs, codebook, qidxs2, codebook2,
+            inv_resid_scale, wscale, M, N_BLOCKS, bps, cb2_size);
+    } else {
+        glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
+            output, x, qidxs, codebook, nullptr, nullptr, 0.0f,
+            wscale, M, N_BLOCKS, bps, 0);
+    }
+}
+
+// Helper: launch input/output RHT
+static void launch_input_rht(
+    const half* x, const half* sv, float* out,
+    int in_features, int n_pad, int log_n, float rsqrt_n,
+    int B, cudaStream_t stream
+) {
+    int threads = min(n_pad, 1024);
+    int dbl = 2 * n_pad * sizeof(float);
+    int sgl = n_pad * sizeof(float);
+    int use_single = (dbl > 96*1024) ? 1 : 0;
+    int smem = use_single ? sgl : dbl;
+    if (smem > 48*1024)
+        cudaFuncSetAttribute(glq_input_rht_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+        x, sv, out, in_features, in_features, rsqrt_n, n_pad, log_n, use_single);
+}
+
+static void launch_output_rht(
+    const float* y_rht, const half* su, half* out,
+    int out_features, int m_pad, int log_m, float rsqrt_m,
+    int B, cudaStream_t stream
+) {
+    int threads = min(m_pad, 1024);
+    int dbl = 2 * m_pad * sizeof(float);
+    int sgl = m_pad * sizeof(float);
+    int use_single = (dbl > 96*1024) ? 1 : 0;
+    int smem = use_single ? sgl : dbl;
+    if (smem > 48*1024)
+        cudaFuncSetAttribute(glq_output_rht_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+        y_rht, su, out, out_features, m_pad, log_m, rsqrt_m, use_single);
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Fused MoE: full expert dispatch in one C++ call
+ *
+ * Eliminates Python dispatch between expert iterations, activation
+ * kernel launches, and topk_ids.unique() GPU-CPU sync.
+ * ───────────────────────────────────────────────────────────────────── */
+
+torch::Tensor glq_fused_moe_cuda(
+    torch::Tensor x,                    // (num_tokens, hidden) fp16
+    torch::Tensor topk_ids,             // (num_tokens, top_k) int64
+    torch::Tensor topk_weights,         // (num_tokens, top_k) fp32
+    // w13 (gate_up_proj) weights — all experts stacked
+    torch::Tensor w13_Qidxs,            // (E, m_pad_w13, n_blocks_w13) int16
+    torch::Tensor w13_SU,               // (E, m_pad_w13) fp16
+    torch::Tensor w13_SV,               // (n_pad_w13,) fp16 — shared
+    torch::Tensor w13_Wscale,           // (E,) fp32
+    torch::Tensor w13_Qidxs2,           // empty or (E, m_pad_w13, n_blocks_w13)
+    torch::Tensor w13_inv_rs,           // (E,) fp32
+    // w2 (down_proj) weights — all experts stacked
+    torch::Tensor w2_Qidxs,
+    torch::Tensor w2_SU,
+    torch::Tensor w2_SV,                // (n_pad_w2,) fp16 — shared
+    torch::Tensor w2_Wscale,
+    torch::Tensor w2_Qidxs2,
+    torch::Tensor w2_inv_rs,
+    // Codebooks
+    torch::Tensor codebook,
+    torch::Tensor codebook2,
+    // Dimensions
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13,
+    int n_pad_w2, int m_pad_w2,
+    int log_n_w13, int log_m_w13,
+    int log_n_w2, int log_m_w2,
+    int activation_type  // 0=silu(gated), 5=relu2_no_mul, etc.
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(w13_Qidxs);
+    CHECK_INPUT(codebook);
+
+    int num_tokens = x.size(0);
+    int top_k = topk_ids.size(1);
+    int M_w13 = w13_Qidxs.size(1);
+    int NB_w13 = w13_Qidxs.size(2);
+    int M_w2 = w2_Qidxs.size(1);
+    int NB_w2 = w2_Qidxs.size(2);
+    bool w13_has_s2 = (w13_Qidxs2.numel() > 0);
+    bool w2_has_s2 = (w2_Qidxs2.numel() > 0);
+    int cb2_size = codebook2.numel() > 0 ? (int)codebook2.size(0) : 0;
+
+    at::DeviceGuard guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    static int num_sms = 0;
+    if (num_sms == 0) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, x.get_device());
+        num_sms = prop.multiProcessorCount;
+    }
+
+    float rsqrt_n_w13 = 1.0f / sqrtf((float)n_pad_w13);
+    float rsqrt_m_w13 = 1.0f / sqrtf((float)m_pad_w13);
+    float rsqrt_n_w2 = 1.0f / sqrtf((float)n_pad_w2);
+    float rsqrt_m_w2 = 1.0f / sqrtf((float)m_pad_w2);
+
+    auto opts_f32 = torch::dtype(torch::kFloat32).device(x.device());
+    auto opts_f16 = torch::dtype(torch::kFloat16).device(x.device());
+
+    // Output accumulator (zeroed for weighted add)
+    auto output = torch::zeros({num_tokens, hidden_size}, opts_f16);
+
+    // Shared input RHT: same x and w13_SV for all experts
+    auto x_rht = torch::empty({num_tokens, n_pad_w13}, opts_f32);
+    launch_input_rht(
+        (const half*)x.data_ptr<c10::Half>(),
+        (const half*)w13_SV.data_ptr<c10::Half>(),
+        x_rht.data_ptr<float>(),
+        hidden_size, n_pad_w13, log_n_w13, rsqrt_n_w13,
+        num_tokens, stream);
+    auto x_rht_half = x_rht.to(torch::kFloat16);
+
+    // Reusable per-expert buffers
+    auto y_rht_w13 = torch::empty({num_tokens, M_w13}, opts_f32);
+    auto h_w13 = torch::empty({num_tokens, w13_out_features}, opts_f16);
+    auto h_act = torch::empty({num_tokens, intermediate_size}, opts_f16);
+    auto h_rht = torch::empty({num_tokens, n_pad_w2}, opts_f32);
+    auto y_rht_w2 = torch::empty({num_tokens, M_w2}, opts_f32);
+    auto expert_out = torch::empty({num_tokens, hidden_size}, opts_f16);
+
+    // Read expert IDs to CPU (tiny sync — 2 int64s for top-2)
+    auto topk_ids_cpu = topk_ids.cpu();
+    auto topk_w_cpu = topk_weights.cpu();
+
+    const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
+    const half* cb2_ptr = codebook2.numel() > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+
+    for (int t = 0; t < num_tokens; t++) {
+        for (int k = 0; k < top_k; k++) {
+            int eidx = topk_ids_cpu[t][k].item<int64_t>();
+            float ew = topk_w_cpu[t][k].item<float>();
+            if (ew == 0.0f) continue;
+
+            float w13_ws = w13_Wscale[eidx].item<float>();
+            float w13_irs = w13_has_s2 ? w13_inv_rs[eidx].item<float>() : 0.0f;
+            bool w13_s2 = (w13_irs != 0.0f);
+
+            float w2_ws = w2_Wscale[eidx].item<float>();
+            float w2_irs = w2_has_s2 ? w2_inv_rs[eidx].item<float>() : 0.0f;
+            bool w2_s2 = (w2_irs != 0.0f);
+
+            // ---- w13: dequant+matmul (input RHT already done) ----
+            y_rht_w13.zero_();
+            launch_matvec_splitk(
+                y_rht_w13.data_ptr<float>() + t * M_w13,
+                (const half*)x_rht_half.data_ptr<c10::Half>() + t * n_pad_w13,
+                w13_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w13_ws,
+                w13_s2 ? w13_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
+                w13_s2 ? cb2_ptr : nullptr,
+                w13_irs, w13_s2, M_w13, NB_w13, cb2_size, num_sms, stream);
+
+            // ---- w13: output RHT ----
+            launch_output_rht(
+                y_rht_w13.data_ptr<float>() + t * M_w13,
+                (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
+                (half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
+                w13_out_features, m_pad_w13, log_m_w13, rsqrt_m_w13, 1, stream);
+
+            // ---- Activation ----
+            {
+                int n_act = (activation_type < 3) ? w13_out_features / 2 : w13_out_features;
+                int blocks = (n_act + 255) / 256;
+                const half* act_in = (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features;
+                half* act_out = (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size;
+
+                if (activation_type == 5) {  // relu2_no_mul
+                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
+                } else if (activation_type == 0) {  // silu (gated)
+                    silu_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
+                } else {
+                    // Fallback: relu2_no_mul as default
+                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
+                }
+            }
+
+            // ---- w2: input RHT (different per expert — input is h_act) ----
+            launch_input_rht(
+                (const half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
+                (const half*)w2_SV.data_ptr<c10::Half>(),
+                h_rht.data_ptr<float>() + t * n_pad_w2,
+                intermediate_size, n_pad_w2, log_n_w2, rsqrt_n_w2, 1, stream);
+            auto h_rht_half = h_rht.to(torch::kFloat16);
+
+            // ---- w2: dequant+matmul ----
+            y_rht_w2.zero_();
+            launch_matvec_splitk(
+                y_rht_w2.data_ptr<float>() + t * M_w2,
+                (const half*)h_rht_half.data_ptr<c10::Half>() + t * n_pad_w2,
+                w2_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w2_ws,
+                w2_s2 ? w2_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
+                w2_s2 ? cb2_ptr : nullptr,
+                w2_irs, w2_s2, M_w2, NB_w2, cb2_size, num_sms, stream);
+
+            // ---- w2: output RHT ----
+            launch_output_rht(
+                y_rht_w2.data_ptr<float>() + t * M_w2,
+                (const half*)w2_SU[eidx].data_ptr<c10::Half>(),
+                (half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
+                hidden_size, m_pad_w2, log_m_w2, rsqrt_m_w2, 1, stream);
+
+            // ---- Weighted accumulate ----
+            {
+                int n = hidden_size;
+                int blocks = (n + 255) / 256;
+                weighted_add_kernel<<<blocks, 256, 0, stream>>>(
+                    (half*)output.data_ptr<c10::Half>() + t * hidden_size,
+                    (const half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
+                    ew, n);
+            }
+        }
+    }
+
+    return output;
+}

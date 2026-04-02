@@ -62,6 +62,21 @@ void glq_output_rht_cuda(
     float rsqrt_m
 );
 
+torch::Tensor glq_fused_moe_cuda(
+    torch::Tensor x,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    torch::Tensor w13_Qidxs, torch::Tensor w13_SU, torch::Tensor w13_SV,
+    torch::Tensor w13_Wscale, torch::Tensor w13_Qidxs2, torch::Tensor w13_inv_rs,
+    torch::Tensor w2_Qidxs, torch::Tensor w2_SU, torch::Tensor w2_SV,
+    torch::Tensor w2_Wscale, torch::Tensor w2_Qidxs2, torch::Tensor w2_inv_rs,
+    torch::Tensor codebook, torch::Tensor codebook2,
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2,
+    int log_n_w13, int log_m_w13, int log_n_w2, int log_m_w2,
+    int activation_type
+);
+
 torch::Tensor glq_fused_linear_cuda(
     torch::Tensor x,
     torch::Tensor sv,
@@ -81,6 +96,8 @@ torch::Tensor glq_fused_linear_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_fused_linear_cuda", &glq_fused_linear_cuda,
           "GLQ fused input_rht + dequant_matmul + output_rht (CUDA)");
+    m.def("glq_fused_moe_cuda", &glq_fused_moe_cuda,
+          "GLQ fused MoE expert dispatch (CUDA)");
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
           "GLQ dequant+matvec B=1 (CUDA)");
     m.def("glq_dequant_matmul_cuda", &glq_dequant_matmul_cuda,
