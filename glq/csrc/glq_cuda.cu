@@ -151,7 +151,7 @@ __global__ void glq_matvec_kernel(
 #define BLOCKS_PER_SPLIT_DEFAULT 64
 
 template <bool HAS_STAGE2>
-__global__ void __launch_bounds__(256, 2)
+__global__ void __launch_bounds__(256)
 glq_matvec_splitk_kernel(
     float* __restrict__ output,         // (M,) fp32, pre-zeroed
     const half* __restrict__ x,
