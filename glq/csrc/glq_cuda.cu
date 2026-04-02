@@ -1199,3 +1199,176 @@ void glq_output_rht_cuda(
         out_features, m_pad, log_m, rsqrt_m, use_single
     );
 }
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Fused linear: input_rht → dequant+matmul → output_rht in one host call
+ *
+ * Eliminates 2 Python→CUDA round-trips per linear layer.
+ * All 3 kernels launch on the same stream back-to-back (~1μs gap vs ~140μs).
+ * ───────────────────────────────────────────────────────────────────── */
+
+torch::Tensor glq_fused_linear_cuda(
+    torch::Tensor x,           // (B, in_features) fp16, contiguous
+    torch::Tensor sv,          // (n_pad,) fp16 — input RHT sign vector
+    torch::Tensor su,          // (m_pad,) fp16 — output RHT sign vector
+    torch::Tensor qidxs,       // (M_pad, N_BLOCKS) int16
+    torch::Tensor codebook,    // (65536, 8) fp16
+    float wscale,
+    int in_features,
+    int out_features,
+    int n_pad, int m_pad,
+    int log_n, int log_m,
+    torch::Tensor qidxs2,      // empty or (M_pad, N_BLOCKS) int16
+    torch::Tensor codebook2,   // empty or (K2, 8) fp16
+    float inv_resid_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(qidxs);
+    CHECK_INPUT(codebook);
+
+    int B = x.size(0);
+    int M = qidxs.size(0);
+    int N_BLOCKS = qidxs.size(1);
+    bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
+
+    at::DeviceGuard guard(x.device());
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    // ---- Step 1: Input RHT ----
+    auto x_rht = torch::empty({B, n_pad}, torch::dtype(torch::kFloat32).device(x.device()));
+    {
+        int threads = min(n_pad, 1024);
+        int double_buf = 2 * n_pad * sizeof(float);
+        int single_buf = n_pad * sizeof(float);
+        int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+        int smem = use_single ? single_buf : double_buf;
+        float rsqrt_n = 1.0f / sqrtf((float)n_pad);
+
+        if (smem > 48 * 1024) {
+            cudaFuncSetAttribute(glq_input_rht_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+
+        glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+            (const half*)x.data_ptr<c10::Half>(),
+            (const half*)sv.data_ptr<c10::Half>(),
+            x_rht.data_ptr<float>(),
+            in_features, in_features, rsqrt_n, n_pad, log_n, use_single
+        );
+    }
+
+    // ---- Step 2: Dequant + matmul ----
+    // Convert x_rht from fp32 to fp16 for the matmul kernels
+    auto x_rht_half = x_rht.to(torch::kFloat16);
+    auto y_rht = torch::zeros({B, M}, torch::dtype(torch::kFloat32).device(x.device()));
+    {
+        static int num_sms = 0;
+        if (num_sms == 0) {
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, x.get_device());
+            num_sms = prop.multiProcessorCount;
+        }
+
+        if (B == 1) {
+            // B=1: split-K matvec
+            const int WARPS = 8;
+            const int rows_per_block = ROWS_PER_WARP * WARPS;
+            dim3 block(32, WARPS);
+            int m_blocks = (M + rows_per_block - 1) / rows_per_block;
+
+            int bps = BLOCKS_PER_SPLIT_DEFAULT;
+            int k_splits = (N_BLOCKS + bps - 1) / bps;
+            int total_ctas = m_blocks * k_splits;
+            if (total_ctas < num_sms * 2 && bps > 16) {
+                bps = max(16, bps / 2);
+                k_splits = (N_BLOCKS + bps - 1) / bps;
+            }
+            dim3 grid(m_blocks, k_splits);
+
+            if (has_stage2) {
+                int cb2_size = codebook2.size(0);
+                int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
+                glq_matvec_splitk_kernel<true><<<grid, block, smem, stream>>>(
+                    y_rht.data_ptr<float>(),
+                    (const half*)x_rht_half.data_ptr<c10::Half>(),  // x_rht is fp32 but kernel expects fp16 input
+                    qidxs.data_ptr<int16_t>(),
+                    (const half*)codebook.data_ptr<c10::Half>(),
+                    qidxs2.data_ptr<int16_t>(),
+                    (const half*)codebook2.data_ptr<c10::Half>(),
+                    inv_resid_scale,
+                    wscale, M, N_BLOCKS, bps, cb2_size
+                );
+            } else {
+                glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
+                    y_rht.data_ptr<float>(),
+                    (const half*)x_rht_half.data_ptr<c10::Half>(),
+                    qidxs.data_ptr<int16_t>(),
+                    (const half*)codebook.data_ptr<c10::Half>(),
+                    nullptr, nullptr, 0.0f,
+                    wscale, M, N_BLOCKS, bps, 0
+                );
+            }
+        } else {
+            // B>=2: TC matmul
+            const int WARPS = 8;
+            dim3 tc_block(32, WARPS);
+            int b_tiles = (B + 15) / 16;
+            int m_tiles = (M + 7) / 8;
+            int m_grid = (m_tiles + WARPS - 1) / WARPS;
+            int bps = TC_BPS_DEFAULT;
+            int k_splits = (N_BLOCKS + bps - 1) / bps;
+
+            dim3 tc_grid(b_tiles, m_grid, k_splits);
+
+            if (has_stage2) {
+                int cb2_size = codebook2.size(0);
+                int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
+                glq_matmul_tc_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
+                    y_rht.data_ptr<float>(),
+                    (const half*)x_rht_half.data_ptr<c10::Half>(),
+                    qidxs.data_ptr<int16_t>(),
+                    (const half*)codebook.data_ptr<c10::Half>(),
+                    qidxs2.data_ptr<int16_t>(),
+                    (const half*)codebook2.data_ptr<c10::Half>(),
+                    inv_resid_scale,
+                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size
+                );
+            } else {
+                glq_matmul_tc_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
+                    y_rht.data_ptr<float>(),
+                    (const half*)x_rht_half.data_ptr<c10::Half>(),
+                    qidxs.data_ptr<int16_t>(),
+                    (const half*)codebook.data_ptr<c10::Half>(),
+                    nullptr, nullptr, 0.0f,
+                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, 0
+                );
+            }
+        }
+    }
+
+    // ---- Step 3: Output RHT ----
+    auto y = torch::empty({B, out_features}, torch::dtype(torch::kFloat16).device(x.device()));
+    {
+        int threads = min(m_pad, 1024);
+        int double_buf = 2 * m_pad * sizeof(float);
+        int single_buf = m_pad * sizeof(float);
+        int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+        int smem = use_single ? single_buf : double_buf;
+        float rsqrt_m = 1.0f / sqrtf((float)m_pad);
+
+        if (smem > 48 * 1024) {
+            cudaFuncSetAttribute(glq_output_rht_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+
+        glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+            y_rht.data_ptr<float>(),
+            (const half*)su.data_ptr<c10::Half>(),
+            (half*)y.data_ptr<c10::Half>(),
+            out_features, m_pad, log_m, rsqrt_m, use_single
+        );
+    }
+
+    return y;
+}

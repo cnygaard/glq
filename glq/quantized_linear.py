@@ -290,15 +290,41 @@ class E8RHTLinear(nn.Module):
         dtype = x.dtype
         use_fused = x.is_cuda and _triton_available and B <= 64
         _nvtx = torch.cuda.nvtx if x.is_cuda else None
+        has_stage2 = self._has_stage2
 
+        # Try fully-fused C++ path: input_rht + dequant_matmul + output_rht in 1 call
+        from . import inference_kernel as _ik
+        n_pad = self.n_pad
+        m_pad = self.m_pad
+        if (use_fused and n_pad <= 16384 and m_pad <= 16384
+                and _ik._try_load_cuda_ext()
+                and hasattr(_ik._glq_cuda, 'glq_fused_linear_cuda')):
+            _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
+            _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
+            cb2_tensor = self.codebook2.codebook_half if has_stage2 else _empty_f16
+            y = _ik._glq_cuda.glq_fused_linear_cuda(
+                x.half().contiguous(), self.SV, self.SU,
+                self.Qidxs, self.codebook.codebook_half,
+                self._wscale_float,
+                self.in_features, self.out_features,
+                n_pad, m_pad,
+                int(math.log2(n_pad)), int(math.log2(m_pad)),
+                self.Qidxs2 if has_stage2 else _empty_i16,
+                cb2_tensor,
+                self._inv_rs_float,
+            )
+            if dtype != torch.float16:
+                y = y.to(dtype)
+            if self.bias is not None:
+                y = y + self.bias.unsqueeze(0).to(dtype)
+            return y.reshape(*shape[:-1], self.out_features)
+
+        # Fallback: 3 separate kernel calls
         # Transform input to RHT domain
         if _nvtx: _nvtx.range_push("input_rht")
         if use_fused:
-            n_pad = self.n_pad
             log_n = int(math.log2(n_pad))
             x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
-            # CUDA C shared-memory FHT (double-buffer ≤8192, single-buffer ≤16384)
-            from . import inference_kernel as _ik
             if n_pad <= 16384 and _ik._try_load_cuda_ext():
                 _ik._glq_cuda.glq_input_rht_cuda(
                     x.half().contiguous(), self.SV, x_rht,
@@ -314,7 +340,7 @@ class E8RHTLinear(nn.Module):
                 )
         else:
             x_f = x.float()
-            x_pad = F.pad(x_f, (0, self.n_pad - self.in_features))
+            x_pad = F.pad(x_f, (0, n_pad - self.in_features))
             sv = self.SV.float()
             x_rht = fast_hadamard_transform(x_pad * sv.unsqueeze(0))
 
@@ -322,7 +348,6 @@ class E8RHTLinear(nn.Module):
 
         # Dequant + matmul in RHT domain
         if _nvtx: _nvtx.range_push("dequant_matmul")
-        has_stage2 = self._has_stage2
         if x_rht.is_cuda and _triton_available:
             from .inference_kernel import glq_dequant_matmul
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else None
@@ -337,23 +362,20 @@ class E8RHTLinear(nn.Module):
                 codebook_packed=cb_packed,
             )
         else:
-            # Fallback: materialize W then matmul
             W_rht = self.codebook.decode(self.Qidxs.long().reshape(-1))
-            W_rht = W_rht.reshape(self.m_pad, self.n_pad)
+            W_rht = W_rht.reshape(m_pad, n_pad)
             if has_stage2:
                 W_rht2 = self.codebook2.decode(self.Qidxs2.long().reshape(-1))
-                W_rht2 = W_rht2.reshape(self.m_pad, self.n_pad)
+                W_rht2 = W_rht2.reshape(m_pad, n_pad)
                 W_rht = W_rht + W_rht2 * self.inv_resid_scale.item()
             y_rht = x_rht @ W_rht.T * self.Wscale.float()
 
         if _nvtx: _nvtx.range_pop()  # dequant_matmul
 
-        # Inverse RHT on output: y = y_rht @ Had_m @ diag(SU)
+        # Inverse RHT on output
         if _nvtx: _nvtx.range_push("output_rht")
         if use_fused:
-            m_pad = self.m_pad
             log_m = int(math.log2(m_pad))
-            # CUDA C shared-memory FHT (double-buffer ≤8192, single-buffer ≤16384)
             if m_pad <= 16384 and _ik._try_load_cuda_ext():
                 y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
                 _ik._glq_cuda.glq_output_rht_cuda(

@@ -62,7 +62,25 @@ void glq_output_rht_cuda(
     float rsqrt_m
 );
 
+torch::Tensor glq_fused_linear_cuda(
+    torch::Tensor x,
+    torch::Tensor sv,
+    torch::Tensor su,
+    torch::Tensor qidxs,
+    torch::Tensor codebook,
+    float wscale,
+    int in_features,
+    int out_features,
+    int n_pad, int m_pad,
+    int log_n, int log_m,
+    torch::Tensor qidxs2,
+    torch::Tensor codebook2,
+    float inv_resid_scale
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("glq_fused_linear_cuda", &glq_fused_linear_cuda,
+          "GLQ fused input_rht + dequant_matmul + output_rht (CUDA)");
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
           "GLQ dequant+matvec B=1 (CUDA)");
     m.def("glq_dequant_matmul_cuda", &glq_dequant_matmul_cuda,
