@@ -327,6 +327,7 @@ class E8RHTLinear(nn.Module):
             from .inference_kernel import glq_dequant_matmul
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else None
             cb_packed = getattr(self.codebook, 'codebook_packed', None)
+            cb_abs = getattr(self.codebook, 'grid_packed_abs', None)
             y_rht = glq_dequant_matmul(
                 x_rht, self.Qidxs,
                 self.codebook.codebook_half,
@@ -335,6 +336,7 @@ class E8RHTLinear(nn.Module):
                 codebook2=cb2_tensor,
                 inv_resid_scale=self._inv_rs_float,
                 codebook_packed=cb_packed,
+                codebook_abs=cb_abs,
             )
         else:
             # Fallback: materialize W then matmul
