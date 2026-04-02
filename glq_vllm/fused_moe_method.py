@@ -189,6 +189,13 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             if hasattr(param, 'weight_loader'):
                 del param.weight_loader
 
+    @staticmethod
+    def _activation_type(activation) -> int:
+        """Map activation string/enum to integer for C++ dispatch."""
+        act = activation.value if hasattr(activation, 'value') else str(activation) if activation else "silu"
+        return {"silu": 0, "gelu": 1, "relu2": 2,
+                "silu_no_mul": 3, "gelu_no_mul": 4, "relu2_no_mul": 5}.get(act, 5)
+
     @torch.compiler.disable
     def apply(
         self,
@@ -200,6 +207,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         """Fused dequant+matmul for active experts via CUDA kernels."""
         from . import linear_method as _lm
+        from glq import inference_kernel as _ik
 
         cb = _lm._codebook
         cb2 = _lm._codebook2_small
@@ -212,9 +220,46 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         w13_out = layer.glq_w13_out
         activation = getattr(layer, 'activation', None)
 
-        output = torch.zeros(num_tokens, out_dim, dtype=dtype, device=device)
+        # Try fused C++ MoE path
+        if (_ik._try_load_cuda_ext()
+                and hasattr(_ik._glq_cuda, 'glq_fused_moe_cuda')
+                and layer.glq_n_pad_w13 <= 16384
+                and layer.glq_m_pad_w13 <= 16384
+                and layer.glq_n_pad_w2 <= 16384
+                and layer.glq_m_pad_w2 <= 16384):
+            _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
+            _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+            cb_half = cb.codebook_half if cb is not None else _empty_f16
+            cb2_half = cb2.codebook_half if cb2 is not None else _empty_f16
 
-        # Only iterate over active experts (typically top-2 out of 128)
+            output = _ik._glq_cuda.glq_fused_moe_cuda(
+                x.half().contiguous(),
+                topk_ids,
+                topk_weights,
+                # w13
+                layer.w13_Qidxs, layer.w13_SU, layer.w13_SV,
+                layer.w13_Wscale, layer.w13_Qidxs2, layer.w13_inv_resid_scale,
+                # w2
+                layer.w2_Qidxs, layer.w2_SU, layer.w2_SV,
+                layer.w2_Wscale, layer.w2_Qidxs2, layer.w2_inv_resid_scale,
+                # Codebooks
+                cb_half, cb2_half,
+                # Dims
+                hidden, inter_dim, w13_out,
+                layer.glq_n_pad_w13, layer.glq_m_pad_w13,
+                layer.glq_n_pad_w2, layer.glq_m_pad_w2,
+                layer.glq_log_n_w13, layer.glq_log_m_w13,
+                layer.glq_log_n_w2, layer.glq_log_m_w2,
+                self._activation_type(activation),
+            )
+            if dtype != torch.float16:
+                output = output.to(dtype)
+            if shared_experts_input is not None:
+                return output, shared_experts_input
+            return output
+
+        # Fallback: Python expert loop
+        output = torch.zeros(num_tokens, out_dim, dtype=dtype, device=device)
         active_experts = topk_ids.unique()
 
         for expert_idx_t in active_experts:
@@ -226,7 +271,6 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             selected_tokens = x[token_mask]
             selected_weights = expert_weights[token_mask]
 
-            # w13: fused input RHT → dequant+matmul → output RHT
             inv_rs_w13 = layer.glq_w13_inv_rs[expert_idx]
             has_s2_w13 = inv_rs_w13 != 0.0
             h = _glq_apply_shard(
@@ -245,7 +289,6 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
             h = _apply_activation(h, activation)
 
-            # w2: fused input RHT → dequant+matmul → output RHT
             inv_rs_w2 = layer.glq_w2_inv_rs[expert_idx]
             has_s2_w2 = inv_rs_w2 != 0.0
             h = _glq_apply_shard(
