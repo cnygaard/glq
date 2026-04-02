@@ -284,7 +284,12 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
 # ---- main quantization pipeline ----
 
 def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
-    """Load all tensors for a single layer from sharded safetensors."""
+    """Load all tensors for a single layer from sharded safetensors.
+
+    Handles FP8 quantized weights (e.g., Mistral/Devstral models):
+    if a weight is float8_e4m3fn with a corresponding weight_scale_inv,
+    dequantizes to bfloat16 in-place.
+    """
     from collections import defaultdict
     from safetensors import safe_open
 
@@ -301,6 +306,22 @@ def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
             for key in keys:
                 local_key = key[len(prefix):]
                 state[local_key] = f.get_tensor(key)
+
+    # Dequantize FP8 weights: weight_bf16 = weight_fp8.to(bf16) * weight_scale_inv
+    fp8_keys = [k for k in state if k.endswith('.weight')
+                and state[k].dtype == torch.float8_e4m3fn]
+    for wkey in fp8_keys:
+        scale_key = wkey.replace('.weight', '.weight_scale_inv')
+        if scale_key in state:
+            w_fp8 = state[wkey]
+            scale = state[scale_key]
+            state[wkey] = (w_fp8.to(torch.bfloat16) * scale).to(torch.bfloat16)
+            del state[scale_key]
+
+    # Remove activation_scale keys (not needed for weight quantization)
+    drop = [k for k in state if k.endswith('.activation_scale')]
+    for k in drop:
+        del state[k]
 
     return state
 
@@ -506,6 +527,14 @@ def quantize(
         embed = nn.Embedding(vocab_size, hidden_size, _weight=embed_weight)
         if use_gpu:
             embed.to(device)
+
+        # Create rotary embedding for streaming mode
+        if is_mistral3:
+            text_cfg = cfg.text_config
+            from transformers.models.ministral3.modeling_ministral3 import Ministral3RotaryEmbedding
+            rotary_emb = Ministral3RotaryEmbedding(config=text_cfg)
+            if use_gpu:
+                rotary_emb.to(device)
     else:
         decoder_layers = get_decoder_layers(text_model, profile)
         embed = get_embed(text_model, profile)
@@ -557,7 +586,8 @@ def quantize(
         if streaming:
             layer_state = _load_layer_state(
                 weight_map, shard_paths, layer_idx, sd_prefix)
-            layer = BlockClass(cfg, layer_idx)
+            layer_cfg = cfg.text_config if is_mistral3 else cfg
+            layer = BlockClass(layer_cfg, layer_idx)
             layer.load_state_dict(layer_state, strict=False)
             del layer_state
             if use_gpu:
