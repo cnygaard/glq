@@ -18,7 +18,7 @@ from transformers.quantizers.base import HfQuantizer
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
 from .quantized_linear import E8RHTLinear
-from .codebook import E8ShellCodebook, E8PCodebook
+from .codebook import E8ShellCodebook
 
 
 @register_quantization_config("glq")
@@ -112,28 +112,16 @@ class GLQQuantizer(HfQuantizer):
 
     def _process_model_after_weight_loading(self, model, **kwargs):
         # Build the shared codebook and attach to all E8RHTLinear modules.
-        # Detect codebook type from quantization_config
-        cb_type = getattr(self.quantization_config, 'codebook', 'e8_shell')
-        if cb_type == 'e8p':
-            codebook_path = os.path.join(os.path.dirname(__file__), "e8_codebook.pt")
-            if os.path.exists(codebook_path):
-                data = torch.load(codebook_path, map_location='cpu', weights_only=True)
-                if data.get('codebook_type') == 'e8p':
-                    codebook = E8PCodebook.load(codebook_path, device='cpu')
-                else:
-                    codebook = E8PCodebook(device='cpu', verbose=False)
-            else:
-                codebook = E8PCodebook(device='cpu', verbose=False)
-        else:
-            codebook = None
-            for path in [
-                os.path.join(os.path.dirname(__file__), "e8_codebook.pt"),
-            ]:
-                if os.path.exists(path):
-                    codebook = E8ShellCodebook.load(path, device='cpu')
-                    break
-            if codebook is None:
-                codebook = E8ShellCodebook(device='cpu', verbose=False)
+        # Try loading from: 1) glq package dir, 2) enumerate fresh
+        codebook = None
+        for path in [
+            os.path.join(os.path.dirname(__file__), "e8_codebook.pt"),
+        ]:
+            if os.path.exists(path):
+                codebook = E8ShellCodebook.load(path, device='cpu')
+                break
+        if codebook is None:
+            codebook = E8ShellCodebook(device='cpu', verbose=False)
 
         # Secondary codebook for 3/4bpw
         # For mixed-precision models, use the max bpw to build the largest

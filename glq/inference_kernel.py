@@ -671,7 +671,6 @@ def glq_dequant_matmul(
     codebook2: torch.Tensor = None,
     inv_resid_scale: float = 0.0,
     codebook_packed: torch.Tensor = None,
-    codebook_abs: torch.Tensor = None,
 ) -> torch.Tensor:
     """Fused dequant+matmul: Y = X @ dequant(Qidxs)^T * Wscale.
 
@@ -724,15 +723,14 @@ def glq_dequant_matmul(
         _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
         _empty_i32 = torch.empty(0, dtype=torch.int32, device=x.device)
         _use_ops = hasattr(torch.ops, 'glq') and hasattr(torch.ops.glq, 'dequant_matvec')
-        _cb_abs = codebook_abs if codebook_abs is not None else _empty_i32
         if B == 1:
             _q2 = q2 if has_stage2 else _empty_i16
             _cb2 = cb2 if has_stage2 else _empty_f16
             _irs = inv_resid_scale if has_stage2 else 0.0
             if _use_ops:
-                y = torch.ops.glq.dequant_matvec(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs, _cb_abs)
+                y = torch.ops.glq.dequant_matvec(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32)
             else:
-                y = _glq_cuda.glq_dequant_matvec_cuda(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs, _cb_abs)
+                y = _glq_cuda.glq_dequant_matvec_cuda(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32)
             return y.unsqueeze(0)  # (M,) → (1, M)
         else:
             if not has_stage2 and codebook_packed is not None:
@@ -745,9 +743,9 @@ def glq_dequant_matmul(
             _cb2 = cb2 if has_stage2 else _empty_f16
             _irs = inv_resid_scale if has_stage2 else 0.0
             if _use_ops:
-                y = torch.ops.glq.dequant_matmul(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _cb_abs)
+                y = torch.ops.glq.dequant_matmul(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32)
             else:
-                y = _glq_cuda.glq_dequant_matmul_cuda(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _cb_abs)
+                y = _glq_cuda.glq_dequant_matmul_cuda(x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32)
             return y
 
     # Decide whether to use split-K based on estimated grid saturation.

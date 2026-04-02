@@ -33,7 +33,7 @@ def _ensure_registered():
 
     cuda = _ik._glq_cuda
 
-    # -- 1. dequant_matvec: (N,) fp16 → (M,) fp32, with optional E8P codebook_abs --
+    # -- 1. dequant_matvec: (N,) fp16 → (M,) fp32 --
     _glq_lib.define(
         "dequant_matvec(Tensor x, Tensor qidxs, Tensor codebook, float wscale, "
         "Tensor qidxs2, Tensor codebook2, float inv_resid_scale, "

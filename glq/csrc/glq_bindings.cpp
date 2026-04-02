@@ -13,7 +13,7 @@ torch::Tensor glq_dequant_matvec_cuda(
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
     float inv_resid_scale,
-    torch::Tensor codebook_abs  // (256,) int32 for E8P, or empty for flat
+    torch::Tensor codebook_abs  // unused, kept for ABI compat
 );
 
 torch::Tensor glq_dequant_matmul_cuda(
@@ -24,7 +24,7 @@ torch::Tensor glq_dequant_matmul_cuda(
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
     float inv_resid_scale,
-    torch::Tensor codebook_abs  // (256,) int32 for E8P, or empty for flat
+    torch::Tensor codebook_abs  // unused, kept for ABI compat
 );
 
 torch::Tensor glq_dequant_matvec_packed_cuda(
@@ -64,7 +64,7 @@ void glq_output_rht_cuda(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
-          "GLQ dequant+matvec B=1 (CUDA), supports E8P and flat codebook");
+          "GLQ dequant+matvec B=1 (CUDA)");
     m.def("glq_dequant_matmul_cuda", &glq_dequant_matmul_cuda,
           "GLQ dequant+matmul any B (CUDA, loops B matvecs)");
     m.def("glq_dequant_matvec_packed_cuda", &glq_dequant_matvec_packed_cuda,
