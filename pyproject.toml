@@ -25,13 +25,16 @@ quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepi
 [project.scripts]
 glq-quantize = "glq.quantize_model:main"
 
+[project.entry-points."vllm.general_plugins"]
+glq = "glq_vllm:register"
+
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests that download models / take >30s (deselect with '-m \"not slow\"')",
 ]
 
 [tool.setuptools.packages.find]
-include = ["glq*"]
+include = ["glq*", "glq_vllm*"]
 
 [tool.setuptools.package-data]
 glq = ["*.pt"]
