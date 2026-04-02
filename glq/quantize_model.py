@@ -492,8 +492,8 @@ def quantize(
     print(f"  {n_chunks} sequences of length {seqlen}")
 
     # ---- Build codebook ----
-    print(f"\nBuilding E8P codebook (256 abs patterns, 1KB table) ...")
-    codebook = E8PCodebook(device=device)
+    print(f"\nBuilding E8 shell codebook ...")
+    codebook = E8ShellCodebook(device=device)
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
