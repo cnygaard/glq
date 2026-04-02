@@ -869,6 +869,17 @@ def quantize(
     # 5. Save tokenizer
     tokenizer.save_pretrained(output_dir)
 
+    # Strip tokenizer_class if it references an external library class
+    # (e.g., "TokenizersBackend" from the tokenizers lib, not transformers).
+    # Without this field, transformers auto-detects from tokenizer.json presence.
+    tc_path = os.path.join(output_dir, "tokenizer_config.json")
+    if os.path.exists(tc_path):
+        with open(tc_path) as f:
+            tc = json.load(f)
+        if tc.pop("tokenizer_class", None):
+            with open(tc_path, "w") as f:
+                json.dump(tc, f, indent=2)
+
     print(f"Done! Saved to {output_dir}")
     print(f"  model.safetensors: {os.path.getsize(os.path.join(output_dir, 'model.safetensors')) / 1e6:.1f} MB")
     print(f"  config.json: quantization_config.quant_method = 'glq'")
