@@ -247,9 +247,10 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
             return quantize_ldlq_codebook(W_p, H_p, codebook, tune_iters=tune_iters)
         elif bpw == 3:
             codebook_small = codebook.make_small(256)
+            rs = getattr(codebook, 'resid_scale_3bpw', codebook.resid_scale)
             return quantize_ldlq_codebook_2stage(
                 W_p, H_p, codebook, codebook_small,
-                resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+                resid_scale=rs, tune_iters=tune_iters)
         else:
             return quantize_ldlq_codebook_2stage(
                 W_p, H_p, codebook, codebook,

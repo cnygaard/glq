@@ -429,6 +429,36 @@ def _e8p_full_grid(packed_abs_grid):
     return codebook
 
 
+def _build_e81b_grid():
+    """Build the E81B residual codebook (QuIP# 3bpw secondary stage).
+
+    E8 lattice vectors with norm²≤2 (from both integer and half-integer sublattices)
+    plus 15 padding vectors [±2, 0, ..., 0]. Total ~146 entries.
+    Ported from quip-sharp/lib/codebook/latticee8_padded12_rvq3bit.py:111-145.
+    """
+    intr = torch.arange(-4, 4)
+    hintr = intr + 0.5
+
+    gintr = torch.cartesian_prod(*[intr] * 8)
+    ghintr = torch.cartesian_prod(*[hintr] * 8)
+
+    ge8 = torch.cat([gintr, ghintr], dim=0).float()
+    ge8m2 = (ge8.sum(dim=-1) % 2 == 0)
+    ge8n = ge8.norm(dim=-1) ** 2 <= 2
+
+    e8 = ge8[torch.where(ge8m2 * ge8n)[0]]
+
+    # Padding: ±2 along each axis (except last negative, matching QuIP#)
+    norm4 = torch.zeros(15, 8)
+    for i in range(8):
+        norm4[i, i] = 2.0
+    for i in range(7):
+        norm4[8 + i, i] = -2.0
+
+    e81b = torch.cat([e8, norm4], dim=0)
+    return e81b
+
+
 class E8PCodebook:
     """E8P codebook from QuIP# — 256 abs patterns, 1KB packed table.
 
@@ -459,8 +489,9 @@ class E8PCodebook:
         self.codesz = self.DIM
         self.device = device
 
-        self.opt_scale = 1.03  # QuIP# empirical value for E8P
-        self.resid_scale = self._compute_resid_scale()
+        self.opt_scale = 1.03        # QuIP# empirical value for E8P 2/4bpw
+        self.resid_scale = 3.45      # QuIP# empirical value for E8P 4bpw RVQ
+        self.resid_scale_3bpw = 2.04 # QuIP# empirical value for E8P 3bpw RVQ
 
         elapsed = time.perf_counter() - t0
         if verbose:
@@ -543,11 +574,14 @@ class E8PCodebook:
         return best_rs
 
     def make_small(self, n_entries=256):
-        """Create a small codebook from the first n_entries vectors."""
-        assert n_entries <= self.CODEBOOK_SIZE
-        small_cb = self.codebook[:n_entries].clone()
+        """Create a small residual codebook for 3bpw secondary stage.
+
+        For E8P, uses the E81B lattice (QuIP# design) instead of first-N entries.
+        E81B has ~146 E8 vectors with norm²≤2 + 15 padding = specialized for residuals.
+        """
+        e81b = _build_e81b_grid().to(self.device)
         obj = object.__new__(type(self))
-        obj.codebook = small_cb.to(self.device)
+        obj.codebook = e81b
         obj.codebook_norms = (obj.codebook ** 2).sum(-1)
         obj.codebook_half = obj.codebook.half()
         obj.codebook_half_t = obj.codebook_half.T.contiguous()
@@ -556,9 +590,9 @@ class E8PCodebook:
         obj.grid_packed_abs = self.grid_packed_abs.to(self.device)
         obj.codesz = self.DIM
         obj.device = self.device
-        obj.opt_scale = obj._compute_opt_scale()
+        obj.opt_scale = 0.98  # QuIP# 3bpw value
         obj.resid_scale = 1.0
-        obj.CODEBOOK_SIZE = n_entries
+        obj.CODEBOOK_SIZE = e81b.shape[0]
         return obj
 
     def _move_to_device(self, device):
