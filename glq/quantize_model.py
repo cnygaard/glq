@@ -407,18 +407,27 @@ def quantize(
     weight_map = None
     shard_paths = None
     BlockClass = None
+    is_mistral3 = "Mistral3" in arch
 
     if streaming:
         # Streaming mode: don't load model into RAM. Instead, instantiate
         # on meta device to discover the block class, then load weights
         # one layer at a time from safetensors.
-        with torch.device("meta"):
-            _model = AutoModelForCausalLM.from_config(
-                cfg, trust_remote_code=trust_remote_code, dtype=dtype)
-        if profile.get('layers_attr'):
-            _layers = _resolve_attr(_model, profile['layers_attr'])
+        if is_mistral3:
+            from transformers import Mistral3ForConditionalGeneration
+            with torch.device("meta"):
+                _model = Mistral3ForConditionalGeneration(cfg)
+            _text = _model.model.language_model
+            _layers = get_decoder_layers(_text, profile)
+            sd_prefix = "language_model.model.layers"
         else:
-            _layers = get_decoder_layers(_model, profile)
+            with torch.device("meta"):
+                _model = AutoModelForCausalLM.from_config(
+                    cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+            if profile.get('layers_attr'):
+                _layers = _resolve_attr(_model, profile['layers_attr'])
+            else:
+                _layers = get_decoder_layers(_model, profile)
         BlockClass = type(_layers[0])
         n_layers = len(_layers)
         del _model, _layers
@@ -479,13 +488,18 @@ def quantize(
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
-    sd_prefix = profile['sd_prefix']
+    # Mistral3 streaming overrides sd_prefix in the streaming block above
+    if not (streaming and is_mistral3):
+        sd_prefix = profile['sd_prefix']
     rotary_emb = None
 
     if streaming:
         # Load embedding from safetensors
-        embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
-        embed_key = f"{embed_attr}.weight"
+        if is_mistral3:
+            embed_key = "language_model.model.embed_tokens.weight"
+        else:
+            embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
+            embed_key = f"{embed_attr}.weight"
         embed_weight = _load_tensor_from_shards(weight_map, shard_paths, embed_key)
         vocab_size = embed_weight.shape[0]
         hidden_size = embed_weight.shape[1]
