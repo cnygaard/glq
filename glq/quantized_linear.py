@@ -325,7 +325,7 @@ class E8RHTLinear(nn.Module):
         if use_fused:
             log_n = int(math.log2(n_pad))
             x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
-            if n_pad <= 16384 and _ik._try_load_cuda_ext():
+            if n_pad <= 32768 and _ik._try_load_cuda_ext():
                 _ik._glq_cuda.glq_input_rht_cuda(
                     x.half().contiguous(), self.SV, x_rht,
                     self.in_features, self.in_features,
@@ -376,7 +376,7 @@ class E8RHTLinear(nn.Module):
         if _nvtx: _nvtx.range_push("output_rht")
         if use_fused:
             log_m = int(math.log2(m_pad))
-            if m_pad <= 16384 and _ik._try_load_cuda_ext():
+            if m_pad <= 32768 and _ik._try_load_cuda_ext():
                 y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
                 _ik._glq_cuda.glq_output_rht_cuda(
                     y_rht, self.SU, y,

@@ -194,49 +194,88 @@ glq_matvec_splitk_kernel(
 
     float acc = 0.0f;
 
-    for (int j = j_start; j < j_end; j++) {
-        // Load x once, broadcast
-        float x_val;
+    // Unrolled-by-2: issue two codebook gathers back-to-back to overlap L2 latency
+    int j = j_start;
+    for (; j + 1 < j_end; j += 2) {
+        // Load x for both iterations (consecutive, share cache line)
+        float x_val_0, x_val_1;
         if (lane_id < 8) {
-            x_val = __half2float(x[j * 8 + lane_id]);
+            x_val_0 = __half2float(x[j * 8 + lane_id]);
+            x_val_1 = __half2float(x[(j + 1) * 8 + lane_id]);
         }
-        x_val = __shfl_sync(FULL_MASK, x_val, elem);
+        x_val_0 = __shfl_sync(FULL_MASK, x_val_0, elem);
+        x_val_1 = __shfl_sync(FULL_MASK, x_val_1, elem);
 
-        // Each group loads its index
-        uint16_t idx = 0;
+        // Load both qidxs (consecutive int16, compiler can merge to uint32)
+        uint16_t idx_0 = 0, idx_1 = 0;
         if (valid && elem == 0) {
-            idx = (uint16_t)qidxs[my_row * N_BLOCKS + j];
+            idx_0 = (uint16_t)qidxs[my_row * N_BLOCKS + j];
+            idx_1 = (uint16_t)qidxs[my_row * N_BLOCKS + j + 1];
         }
-        idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
+        idx_0 = __shfl_sync(FULL_MASK, idx_0, row_in_warp * 8);
+        idx_1 = __shfl_sync(FULL_MASK, idx_1, row_in_warp * 8);
 
-        // Gather codebook
-        float cb_val = 0.0f;
+        // Two codebook gathers issued back-to-back — overlap in L2
+        float cb_val_0 = 0.0f, cb_val_1 = 0.0f;
         if (valid) {
-            cb_val = __half2float(codebook[idx * 8 + elem]);
+            cb_val_0 = __half2float(codebook[idx_0 * 8 + elem]);
+            cb_val_1 = __half2float(codebook[idx_1 * 8 + elem]);
         }
 
-        // Two-stage residual
+        // Two-stage residual for both iterations
+        if (HAS_STAGE2) {
+            const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+            uint16_t idx2_0 = 0, idx2_1 = 0;
+            if (valid && elem == 0) {
+                idx2_0 = (uint16_t)qidxs2[my_row * N_BLOCKS + j];
+                idx2_1 = (uint16_t)qidxs2[my_row * N_BLOCKS + j + 1];
+            }
+            idx2_0 = __shfl_sync(FULL_MASK, idx2_0, row_in_warp * 8);
+            idx2_1 = __shfl_sync(FULL_MASK, idx2_1, row_in_warp * 8);
+            if (valid) {
+                cb_val_0 += __half2float(cb2[idx2_0 * 8 + elem]) * inv_resid_scale;
+                cb_val_1 += __half2float(cb2[idx2_1 * 8 + elem]) * inv_resid_scale;
+            }
+        }
+
+        // Independent reductions for both iterations
+        float prod_0 = cb_val_0 * x_val_0;
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 4);
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 2);
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 1);
+
+        float prod_1 = cb_val_1 * x_val_1;
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 4);
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 2);
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 1);
+
+        if (elem == 0) {
+            acc += prod_0 + prod_1;
+        }
+    }
+
+    // Tail: handle odd remaining iteration
+    if (j < j_end) {
+        float x_val;
+        if (lane_id < 8) { x_val = __half2float(x[j * 8 + lane_id]); }
+        x_val = __shfl_sync(FULL_MASK, x_val, elem);
+        uint16_t idx = 0;
+        if (valid && elem == 0) { idx = (uint16_t)qidxs[my_row * N_BLOCKS + j]; }
+        idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
+        float cb_val = 0.0f;
+        if (valid) { cb_val = __half2float(codebook[idx * 8 + elem]); }
         if (HAS_STAGE2) {
             const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
             uint16_t idx2 = 0;
-            if (valid && elem == 0) {
-                idx2 = (uint16_t)qidxs2[my_row * N_BLOCKS + j];
-            }
+            if (valid && elem == 0) { idx2 = (uint16_t)qidxs2[my_row * N_BLOCKS + j]; }
             idx2 = __shfl_sync(FULL_MASK, idx2, row_in_warp * 8);
-            if (valid) {
-                cb_val += __half2float(cb2[idx2 * 8 + elem]) * inv_resid_scale;
-            }
+            if (valid) { cb_val += __half2float(cb2[idx2 * 8 + elem]) * inv_resid_scale; }
         }
-
-        // Dot product within 8-lane group
         float prod = cb_val * x_val;
         prod += __shfl_xor_sync(FULL_MASK, prod, 4);
         prod += __shfl_xor_sync(FULL_MASK, prod, 2);
         prod += __shfl_xor_sync(FULL_MASK, prod, 1);
-
-        if (elem == 0) {
-            acc += prod;
-        }
+        if (elem == 0) { acc += prod; }
     }
 
     // atomicAdd partial sum (output pre-zeroed by host)
@@ -563,34 +602,63 @@ glq_matvec_splitk_packed_kernel(
 
     float acc = 0.0f;
 
-    for (int j = j_start; j < j_end; j++) {
-        float x_val;
+    // Unrolled-by-2: overlap packed codebook gathers
+    int j = j_start;
+    for (; j + 1 < j_end; j += 2) {
+        float x_val_0, x_val_1;
         if (lane_id < 8) {
-            x_val = __half2float(x[j * 8 + lane_id]);
+            x_val_0 = __half2float(x[j * 8 + lane_id]);
+            x_val_1 = __half2float(x[(j + 1) * 8 + lane_id]);
         }
-        x_val = __shfl_sync(FULL_MASK, x_val, elem);
+        x_val_0 = __shfl_sync(FULL_MASK, x_val_0, elem);
+        x_val_1 = __shfl_sync(FULL_MASK, x_val_1, elem);
 
-        uint16_t idx = 0;
+        uint16_t idx_0 = 0, idx_1 = 0;
         if (valid && elem == 0) {
-            idx = (uint16_t)qidxs[my_row * N_BLOCKS + j];
+            idx_0 = (uint16_t)qidxs[my_row * N_BLOCKS + j];
+            idx_1 = (uint16_t)qidxs[my_row * N_BLOCKS + j + 1];
         }
-        idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
+        idx_0 = __shfl_sync(FULL_MASK, idx_0, row_in_warp * 8);
+        idx_1 = __shfl_sync(FULL_MASK, idx_1, row_in_warp * 8);
 
+        float cb_val_0 = 0.0f, cb_val_1 = 0.0f;
+        if (valid) {
+            uint32_t packed_0 = codebook_packed[idx_0];
+            uint32_t packed_1 = codebook_packed[idx_1];
+            cb_val_0 = (float)((packed_0 >> (elem * 4)) & 0xF) * 0.5f - 3.0f;
+            cb_val_1 = (float)((packed_1 >> (elem * 4)) & 0xF) * 0.5f - 3.0f;
+        }
+
+        float prod_0 = cb_val_0 * x_val_0;
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 4);
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 2);
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 1);
+
+        float prod_1 = cb_val_1 * x_val_1;
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 4);
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 2);
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 1);
+
+        if (elem == 0) { acc += prod_0 + prod_1; }
+    }
+    // Tail
+    if (j < j_end) {
+        float x_val;
+        if (lane_id < 8) { x_val = __half2float(x[j * 8 + lane_id]); }
+        x_val = __shfl_sync(FULL_MASK, x_val, elem);
+        uint16_t idx = 0;
+        if (valid && elem == 0) { idx = (uint16_t)qidxs[my_row * N_BLOCKS + j]; }
+        idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
         float cb_val = 0.0f;
         if (valid) {
             uint32_t packed = codebook_packed[idx];
-            uint32_t nibble = (packed >> (elem * 4)) & 0xF;
-            cb_val = (float)nibble * 0.5f - 3.0f;
+            cb_val = (float)((packed >> (elem * 4)) & 0xF) * 0.5f - 3.0f;
         }
-
         float prod = cb_val * x_val;
         prod += __shfl_xor_sync(FULL_MASK, prod, 4);
         prod += __shfl_xor_sync(FULL_MASK, prod, 2);
         prod += __shfl_xor_sync(FULL_MASK, prod, 1);
-
-        if (elem == 0) {
-            acc += prod;
-        }
+        if (elem == 0) { acc += prod; }
     }
 
     if (elem == 0 && valid) {
@@ -1053,6 +1121,169 @@ __global__ void glq_input_rht_kernel(
 }
 
 
+/* ─────────────────────────────────────────────────────────────────────
+ * Two-pass FHT kernels for n_pad/m_pad > 16384 (exceeds smem limit).
+ *
+ * Butterfly stage k swaps pairs at distance 2^k. For n=32768 (15 stages):
+ *   Stages 0-13: distance ≤ 8192 → within each 16384-element half
+ *   Stage 14:    distance = 16384 → cross-boundary (a+b, a-b)
+ *
+ * Pass 1: Two blocks per batch row, each processes one 16384-element half
+ *         with 14 butterfly stages in 64KB shared memory.
+ * Pass 2: One block per batch row, applies the final cross-boundary stage.
+ * ───────────────────────────────────────────────────────────────────── */
+
+// Input RHT pass 1: 14 butterfly stages within each 16384-element half
+__global__ void glq_input_rht_twopass_kernel(
+    const half* __restrict__ x,
+    const half* __restrict__ sv,
+    float* __restrict__ temp,       // (B, n_pad) fp32 intermediate
+    int in_features,
+    int stride_x,
+    int n_pad
+) {
+    extern __shared__ float smem[];
+    float* buf = smem;
+
+    const int half_size = n_pad / 2;  // 16384
+    const int half_id = blockIdx.x % 2;
+    const int b = blockIdx.x / 2;
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;  // 1024
+    const int offset = half_id * half_size;
+
+    // Load half of x with zero-padding, multiply by SV signs
+    for (int i = tid; i < half_size; i += n_threads) {
+        int global_i = offset + i;
+        float x_val = (global_i < in_features) ? __half2float(x[b * stride_x + global_i]) : 0.0f;
+        buf[i] = x_val * __half2float(sv[global_i]);
+    }
+    __syncthreads();
+
+    // 14 butterfly stages (single-buffer with registers)
+    const int log_half = 14;  // log2(16384)
+    const int elems_per_thread = half_size / n_threads;  // 16
+    float reg[16];
+
+    for (int k = 0; k < log_half; k++) {
+        for (int e = 0; e < elems_per_thread; e++) {
+            int i = tid + e * n_threads;
+            int partner = i ^ (1 << k);
+            float my_val = buf[i];
+            float partner_val = buf[partner];
+            bool lo = (i & (1 << k)) == 0;
+            reg[e] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        for (int e = 0; e < elems_per_thread; e++) {
+            buf[tid + e * n_threads] = reg[e];
+        }
+        __syncthreads();
+    }
+
+    // Write to global temp buffer (NOT normalized yet — pass 2 does that)
+    for (int i = tid; i < half_size; i += n_threads) {
+        temp[b * n_pad + offset + i] = buf[i];
+    }
+}
+
+// Input RHT pass 2: cross-boundary butterfly (stage 14) + normalize
+__global__ void glq_input_rht_cross_kernel(
+    const float* __restrict__ temp,   // (B, n_pad) from pass 1
+    float* __restrict__ out,          // (B, n_pad) final output
+    float rsqrt_n,
+    int n_pad
+) {
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+    const int half_size = n_pad / 2;
+
+    for (int i = tid; i < half_size; i += n_threads) {
+        float a = temp[b * n_pad + i];
+        float b_val = temp[b * n_pad + half_size + i];
+        out[b * n_pad + i] = (a + b_val) * rsqrt_n;
+        out[b * n_pad + half_size + i] = (a - b_val) * rsqrt_n;
+    }
+}
+
+// Output RHT pass 1: cross-boundary butterfly (stage 14) — run FIRST for output
+__global__ void glq_output_rht_cross_kernel(
+    const float* __restrict__ y_rht,  // (B, m_pad) input
+    float* __restrict__ temp,         // (B, m_pad) intermediate
+    int m_pad
+) {
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+    const int half_size = m_pad / 2;
+
+    for (int i = tid; i < half_size; i += n_threads) {
+        float a = y_rht[b * m_pad + i];
+        float b_val = y_rht[b * m_pad + half_size + i];
+        temp[b * m_pad + i] = a + b_val;
+        temp[b * m_pad + half_size + i] = a - b_val;
+    }
+}
+
+// Output RHT pass 2: 14 butterfly stages within each half + SU signs + unpad + cast
+__global__ void glq_output_rht_twopass_kernel(
+    const float* __restrict__ temp,   // (B, m_pad) from cross kernel
+    const half* __restrict__ su,
+    half* __restrict__ out,           // (B, out_features) fp16
+    int out_features,
+    int m_pad,
+    float rsqrt_m
+) {
+    extern __shared__ float smem[];
+    float* buf = smem;
+
+    const int half_size = m_pad / 2;
+    const int half_id = blockIdx.x % 2;
+    const int b = blockIdx.x / 2;
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+    const int offset = half_id * half_size;
+
+    // Load half from temp into smem
+    for (int i = tid; i < half_size; i += n_threads) {
+        buf[i] = temp[b * m_pad + offset + i];
+    }
+    __syncthreads();
+
+    // 14 butterfly stages (single-buffer with registers)
+    const int log_half = 14;
+    const int elems_per_thread = half_size / n_threads;
+    float reg[16];
+
+    for (int k = 0; k < log_half; k++) {
+        for (int e = 0; e < elems_per_thread; e++) {
+            int i = tid + e * n_threads;
+            int partner = i ^ (1 << k);
+            float my_val = buf[i];
+            float partner_val = buf[partner];
+            bool lo = (i & (1 << k)) == 0;
+            reg[e] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        for (int e = 0; e < elems_per_thread; e++) {
+            buf[tid + e * n_threads] = reg[e];
+        }
+        __syncthreads();
+    }
+
+    // Normalize, apply SU signs, unpad, cast to fp16
+    for (int i = tid; i < half_size; i += n_threads) {
+        int global_i = offset + i;
+        if (global_i < out_features) {
+            float val = buf[i] * rsqrt_m;
+            float s = __half2float(su[global_i]);
+            out[b * out_features + global_i] = __float2half(val * s);
+        }
+    }
+}
+
+
 __global__ void glq_output_rht_kernel(
     const float* __restrict__ y_rht, // (B, m_pad) fp32 input
     const half* __restrict__ su,     // (m_pad,) fp16 sign vector
@@ -1143,14 +1374,35 @@ void glq_input_rht_cuda(
     CHECK_INPUT(sv);
 
     int B = x.size(0);
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    if (n_pad > 16384) {
+        // Two-pass path for n_pad=32768 (128KB > max smem)
+        auto temp = torch::empty({B, n_pad}, torch::dtype(torch::kFloat32).device(x.device()));
+        int half_smem = (n_pad / 2) * sizeof(float);  // 64KB
+        cudaFuncSetAttribute(glq_input_rht_twopass_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
+        // Pass 1: 14 butterfly stages within each half (2 blocks per batch row)
+        glq_input_rht_twopass_kernel<<<2 * B, 1024, half_smem, stream>>>(
+            (const half*)x.data_ptr<c10::Half>(),
+            (const half*)sv.data_ptr<c10::Half>(),
+            temp.data_ptr<float>(),
+            in_features, stride_x, n_pad
+        );
+        // Pass 2: cross-boundary butterfly + normalize
+        glq_input_rht_cross_kernel<<<B, 1024, 0, stream>>>(
+            temp.data_ptr<float>(),
+            out.data_ptr<float>(),
+            rsqrt_n, n_pad
+        );
+        return;
+    }
+
     int threads = min(n_pad, 1024);
     int double_buf_smem = 2 * n_pad * sizeof(float);
     int single_buf_smem = n_pad * sizeof(float);
-    // Use single-buffer if double doesn't fit in 96KB extended smem
     int use_single = (double_buf_smem > 96 * 1024) ? 1 : 0;
     int smem = use_single ? single_buf_smem : double_buf_smem;
-
-    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
     if (smem > 48 * 1024) {
         cudaFuncSetAttribute(glq_input_rht_kernel,
@@ -1179,13 +1431,35 @@ void glq_output_rht_cuda(
     CHECK_INPUT(su);
 
     int B = y_rht.size(0);
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    if (m_pad > 16384) {
+        // Two-pass path for m_pad=32768
+        auto temp = torch::empty({B, m_pad}, torch::dtype(torch::kFloat32).device(y_rht.device()));
+        int half_smem = (m_pad / 2) * sizeof(float);  // 64KB
+        // Pass 1: cross-boundary butterfly (stage 14)
+        glq_output_rht_cross_kernel<<<B, 1024, 0, stream>>>(
+            y_rht.data_ptr<float>(),
+            temp.data_ptr<float>(),
+            m_pad
+        );
+        // Pass 2: 14 butterfly stages within each half + SU + unpad + cast
+        cudaFuncSetAttribute(glq_output_rht_twopass_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
+        glq_output_rht_twopass_kernel<<<2 * B, 1024, half_smem, stream>>>(
+            temp.data_ptr<float>(),
+            (const half*)su.data_ptr<c10::Half>(),
+            (half*)out.data_ptr<c10::Half>(),
+            out_features, m_pad, rsqrt_m
+        );
+        return;
+    }
+
     int threads = min(m_pad, 1024);
     int double_buf_smem = 2 * m_pad * sizeof(float);
     int single_buf_smem = m_pad * sizeof(float);
     int use_single = (double_buf_smem > 96 * 1024) ? 1 : 0;
     int smem = use_single ? single_buf_smem : double_buf_smem;
-
-    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
     if (smem > 48 * 1024) {
         cudaFuncSetAttribute(glq_output_rht_kernel,
@@ -1460,6 +1734,20 @@ static void launch_input_rht(
     int in_features, int n_pad, int log_n, float rsqrt_n,
     int B, cudaStream_t stream
 ) {
+    if (n_pad > 16384) {
+        // Two-pass for large n_pad (e.g., 32768)
+        float* temp;
+        cudaMalloc(&temp, (size_t)B * n_pad * sizeof(float));
+        int half_smem = (n_pad / 2) * sizeof(float);
+        cudaFuncSetAttribute(glq_input_rht_twopass_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
+        glq_input_rht_twopass_kernel<<<2*B, 1024, half_smem, stream>>>(
+            x, sv, temp, in_features, in_features, n_pad);
+        glq_input_rht_cross_kernel<<<B, 1024, 0, stream>>>(
+            temp, out, rsqrt_n, n_pad);
+        cudaFree(temp);
+        return;
+    }
     int threads = min(n_pad, 1024);
     int dbl = 2 * n_pad * sizeof(float);
     int sgl = n_pad * sizeof(float);
@@ -1477,6 +1765,20 @@ static void launch_output_rht(
     int out_features, int m_pad, int log_m, float rsqrt_m,
     int B, cudaStream_t stream
 ) {
+    if (m_pad > 16384) {
+        // Two-pass for large m_pad
+        float* temp;
+        cudaMalloc(&temp, (size_t)B * m_pad * sizeof(float));
+        int half_smem = (m_pad / 2) * sizeof(float);
+        glq_output_rht_cross_kernel<<<B, 1024, 0, stream>>>(
+            y_rht, temp, m_pad);
+        cudaFuncSetAttribute(glq_output_rht_twopass_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
+        glq_output_rht_twopass_kernel<<<2*B, 1024, half_smem, stream>>>(
+            temp, su, out, out_features, m_pad, rsqrt_m);
+        cudaFree(temp);
+        return;
+    }
     int threads = min(m_pad, 1024);
     int dbl = 2 * m_pad * sizeof(float);
     int sgl = m_pad * sizeof(float);
