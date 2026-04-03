@@ -95,14 +95,31 @@ GLQ 4-bit retains 99.6% of bf16 accuracy vs GPTQ's 87.2% on this 360M model. GPT
 
 ### Inference performance
 
-**SmolLM3-3B-Base** decode throughput on NVIDIA L40S (B=1, single-token generation):
+**SmolLM3-3B** vLLM 0.18.1 throughput on NVIDIA L40S:
+
+| Method | Eff. BPW | Single request | Batch=5 | vs bf16 |
+|--------|----------|---------------|---------|---------|
+| bf16 | 16.0 | 39.4 tok/s | 184 tok/s | 100% |
+| **GLQ 3.5bpw** | **3.5** | **37.1 tok/s** | **173 tok/s** | **94%** |
+| GPTQ W4 (g128) | ~4.5 | 34.6 tok/s | 172 tok/s | 88% |
+
+GLQ serves at 94% of bf16 speed while GPTQ reaches 88%, and GLQ achieves this at a lower effective bit width (3.5 vs ~4.5 bpw). At batch=5 all methods converge as compute dominates over memory bandwidth.
+
+**SmolLM3-3B** HuggingFace Transformers decode on NVIDIA L40S:
 
 | Mode | GLQ 3.5bpw | bf16 | GLQ / bf16 |
 |------|-----------|------|------------|
-| Eager (default) | 18 tok/s | 40 tok/s | 45% |
-| CUDA graph | 44 tok/s | 40 tok/s | 110% |
+| Eager (default) | 25 tok/s | 40 tok/s | 63% |
+| CUDA graph | 37 tok/s | 40 tok/s | 93% |
 
-With CUDA graph capture, GLQ decode **exceeds bf16 throughput** at 4.6x compression because the smaller quantized weights require less DRAM bandwidth. Larger models are slower: Nemotron-30B (MoE, 6004 quantized sublayers) runs at ~0.7 tok/s on L40S.
+With CUDA graph capture, GLQ decode approaches bf16 throughput at 4.6x compression because the smaller quantized weights require less DRAM bandwidth.
+
+**Devstral-24B** (Ministral3, 24B params) GLQ 4bpw on NVIDIA L40S — fits in 21 GB (bf16 would need ~48 GB):
+
+| Mode | tok/s |
+|------|-------|
+| HF eager | 6.6 tok/s |
+| CUDA graph | 6.4 tok/s (compute-bound, no graph benefit) |
 
 #### CUDA graph acceleration
 
