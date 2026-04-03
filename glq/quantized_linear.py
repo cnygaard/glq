@@ -296,7 +296,7 @@ class E8RHTLinear(nn.Module):
         from . import inference_kernel as _ik
         n_pad = self.n_pad
         m_pad = self.m_pad
-        if (use_fused and n_pad <= 16384 and m_pad <= 16384
+        if (use_fused and n_pad <= 32768 and m_pad <= 32768
                 and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_linear_cuda')):
             _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)

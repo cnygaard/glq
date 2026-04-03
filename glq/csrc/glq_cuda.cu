@@ -17,6 +17,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/extension.h>
 
 #define FULL_MASK 0xffffffff
@@ -1512,24 +1513,44 @@ torch::Tensor glq_fused_linear_cuda(
     // ---- Step 1: Input RHT ----
     auto x_rht = torch::empty({B, n_pad}, torch::dtype(torch::kFloat32).device(x.device()));
     {
-        int threads = min(n_pad, 1024);
-        int double_buf = 2 * n_pad * sizeof(float);
-        int single_buf = n_pad * sizeof(float);
-        int use_single = (double_buf > 96 * 1024) ? 1 : 0;
-        int smem = use_single ? single_buf : double_buf;
         float rsqrt_n = 1.0f / sqrtf((float)n_pad);
 
-        if (smem > 48 * 1024) {
-            cudaFuncSetAttribute(glq_input_rht_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        }
+        if (n_pad > 16384) {
+            // Two-pass for large n_pad (e.g., 32768)
+            auto temp = torch::empty({B, n_pad}, torch::dtype(torch::kFloat32).device(x.device()));
+            int half_smem = (n_pad / 2) * sizeof(float);
+            cudaFuncSetAttribute(glq_input_rht_twopass_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
+            glq_input_rht_twopass_kernel<<<2 * B, 1024, half_smem, stream>>>(
+                (const half*)x.data_ptr<c10::Half>(),
+                (const half*)sv.data_ptr<c10::Half>(),
+                temp.data_ptr<float>(),
+                in_features, in_features, n_pad
+            );
+            glq_input_rht_cross_kernel<<<B, 1024, 0, stream>>>(
+                temp.data_ptr<float>(),
+                x_rht.data_ptr<float>(),
+                rsqrt_n, n_pad
+            );
+        } else {
+            int threads = min(n_pad, 1024);
+            int double_buf = 2 * n_pad * sizeof(float);
+            int single_buf = n_pad * sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
 
-        glq_input_rht_kernel<<<B, threads, smem, stream>>>(
-            (const half*)x.data_ptr<c10::Half>(),
-            (const half*)sv.data_ptr<c10::Half>(),
-            x_rht.data_ptr<float>(),
-            in_features, in_features, rsqrt_n, n_pad, log_n, use_single
-        );
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_input_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+
+            glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+                (const half*)x.data_ptr<c10::Half>(),
+                (const half*)sv.data_ptr<c10::Half>(),
+                x_rht.data_ptr<float>(),
+                in_features, in_features, rsqrt_n, n_pad, log_n, use_single
+            );
+        }
     }
 
     // ---- Step 2: Dequant + matmul ----
@@ -1624,24 +1645,43 @@ torch::Tensor glq_fused_linear_cuda(
     // ---- Step 3: Output RHT ----
     auto y = torch::empty({B, out_features}, torch::dtype(torch::kFloat16).device(x.device()));
     {
-        int threads = min(m_pad, 1024);
-        int double_buf = 2 * m_pad * sizeof(float);
-        int single_buf = m_pad * sizeof(float);
-        int use_single = (double_buf > 96 * 1024) ? 1 : 0;
-        int smem = use_single ? single_buf : double_buf;
         float rsqrt_m = 1.0f / sqrtf((float)m_pad);
 
-        if (smem > 48 * 1024) {
-            cudaFuncSetAttribute(glq_output_rht_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        }
+        if (m_pad > 16384) {
+            auto temp = torch::empty({B, m_pad}, torch::dtype(torch::kFloat32).device(x.device()));
+            int half_smem = (m_pad / 2) * sizeof(float);
+            glq_output_rht_cross_kernel<<<B, 1024, 0, stream>>>(
+                y_rht.data_ptr<float>(),
+                temp.data_ptr<float>(),
+                m_pad
+            );
+            cudaFuncSetAttribute(glq_output_rht_twopass_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
+            glq_output_rht_twopass_kernel<<<2 * B, 1024, half_smem, stream>>>(
+                temp.data_ptr<float>(),
+                (const half*)su.data_ptr<c10::Half>(),
+                (half*)y.data_ptr<c10::Half>(),
+                out_features, m_pad, rsqrt_m
+            );
+        } else {
+            int threads = min(m_pad, 1024);
+            int double_buf = 2 * m_pad * sizeof(float);
+            int single_buf = m_pad * sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
 
-        glq_output_rht_kernel<<<B, threads, smem, stream>>>(
-            y_rht.data_ptr<float>(),
-            (const half*)su.data_ptr<c10::Half>(),
-            (half*)y.data_ptr<c10::Half>(),
-            out_features, m_pad, log_m, rsqrt_m, use_single
-        );
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_output_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+
+            glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+                y_rht.data_ptr<float>(),
+                (const half*)su.data_ptr<c10::Half>(),
+                (half*)y.data_ptr<c10::Half>(),
+                out_features, m_pad, log_m, rsqrt_m, use_single
+            );
+        }
     }
 
     return y;
@@ -1736,8 +1776,8 @@ static void launch_input_rht(
 ) {
     if (n_pad > 16384) {
         // Two-pass for large n_pad (e.g., 32768)
-        float* temp;
-        cudaMalloc(&temp, (size_t)B * n_pad * sizeof(float));
+        float* temp = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(
+            (size_t)B * n_pad * sizeof(float));
         int half_smem = (n_pad / 2) * sizeof(float);
         cudaFuncSetAttribute(glq_input_rht_twopass_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
@@ -1745,7 +1785,7 @@ static void launch_input_rht(
             x, sv, temp, in_features, in_features, n_pad);
         glq_input_rht_cross_kernel<<<B, 1024, 0, stream>>>(
             temp, out, rsqrt_n, n_pad);
-        cudaFree(temp);
+        c10::cuda::CUDACachingAllocator::raw_delete(temp);
         return;
     }
     int threads = min(n_pad, 1024);
@@ -1766,9 +1806,8 @@ static void launch_output_rht(
     int B, cudaStream_t stream
 ) {
     if (m_pad > 16384) {
-        // Two-pass for large m_pad
-        float* temp;
-        cudaMalloc(&temp, (size_t)B * m_pad * sizeof(float));
+        float* temp = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(
+            (size_t)B * m_pad * sizeof(float));
         int half_smem = (m_pad / 2) * sizeof(float);
         glq_output_rht_cross_kernel<<<B, 1024, 0, stream>>>(
             y_rht, temp, m_pad);
@@ -1776,7 +1815,7 @@ static void launch_output_rht(
             cudaFuncAttributeMaxDynamicSharedMemorySize, half_smem);
         glq_output_rht_twopass_kernel<<<2*B, 1024, half_smem, stream>>>(
             temp, su, out, out_features, m_pad, rsqrt_m);
-        cudaFree(temp);
+        c10::cuda::CUDACachingAllocator::raw_delete(temp);
         return;
     }
     int threads = min(m_pad, 1024);
