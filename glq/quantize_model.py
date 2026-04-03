@@ -632,12 +632,15 @@ def quantize(
         # Filter to quantizable sublayers
         quant_names = []
         for name in linears:
-            if name not in hessians:
-                print(f"  {name}: no activations, skipping")
-                continue
             if linears[name].weight.data.shape[1] < 8:
                 print(f"  {name}: in={linears[name].weight.data.shape[1]} < 8, skipping")
                 continue
+            if name not in hessians:
+                # No activations (e.g., MoE expert never routed during calibration).
+                # Use identity Hessian so LDLQ falls back to simple nearest-neighbor.
+                n_cols = linears[name].weight.data.shape[1]
+                hessians[name] = torch.eye(n_cols, dtype=torch.float32)
+                print(f"  {name}: no activations, using identity Hessian")
             quant_names.append(name)
 
         if pool is not None and len(quant_names) > 1:
