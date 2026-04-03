@@ -83,6 +83,15 @@ GLQ 4-bit retains 98.6% of bf16 accuracy at exactly 4.00 effective bpw (no group
 
 GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (17.94) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
 
+**SmolLM2-360M-Instruct** 5-task accuracy via lm-evaluation-harness (128 calibration samples, NVIDIA L40S):
+
+| Method | Eff. BPW | ARC-e | HellaSwag | PIQA | WinoGrande | LAMBADA | Avg | % of bf16 |
+|--------|----------|-------|-----------|------|------------|---------|-----|-----------|
+| bf16 baseline | 16.00 | 0.565 | 0.428 | 0.712 | 0.573 | 0.508 | 0.557 | 100% |
+| GLQ 4-bit | 4.00 | 0.554 | 0.420 | 0.717 | 0.575 | 0.508 | 0.555 | **99.6%** |
+
+GLQ 4-bit retains 99.6% of bf16 accuracy even on this small 360M-parameter model, demonstrating that E8 lattice quantization preserves quality across model scales.
+
 ### Inference performance
 
 **SmolLM3-3B-Base** decode throughput on NVIDIA L40S (B=1, single-token generation):
