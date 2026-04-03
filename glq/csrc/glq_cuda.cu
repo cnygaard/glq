@@ -198,7 +198,6 @@ glq_matvec_splitk_kernel(
     // Unrolled-by-2: issue two codebook gathers back-to-back to overlap L2 latency
     int j = j_start;
     for (; j + 1 < j_end; j += 2) {
-        // Load x for both iterations (consecutive, share cache line)
         float x_val_0, x_val_1;
         if (lane_id < 8) {
             x_val_0 = __half2float(x[j * 8 + lane_id]);
@@ -207,7 +206,6 @@ glq_matvec_splitk_kernel(
         x_val_0 = __shfl_sync(FULL_MASK, x_val_0, elem);
         x_val_1 = __shfl_sync(FULL_MASK, x_val_1, elem);
 
-        // Load both qidxs (consecutive int16, compiler can merge to uint32)
         uint16_t idx_0 = 0, idx_1 = 0;
         if (valid && elem == 0) {
             idx_0 = (uint16_t)qidxs[my_row * N_BLOCKS + j];
@@ -216,14 +214,12 @@ glq_matvec_splitk_kernel(
         idx_0 = __shfl_sync(FULL_MASK, idx_0, row_in_warp * 8);
         idx_1 = __shfl_sync(FULL_MASK, idx_1, row_in_warp * 8);
 
-        // Two codebook gathers issued back-to-back — overlap in L2
         float cb_val_0 = 0.0f, cb_val_1 = 0.0f;
         if (valid) {
             cb_val_0 = __half2float(codebook[idx_0 * 8 + elem]);
             cb_val_1 = __half2float(codebook[idx_1 * 8 + elem]);
         }
 
-        // Two-stage residual for both iterations
         if (HAS_STAGE2) {
             const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
             uint16_t idx2_0 = 0, idx2_1 = 0;
@@ -239,7 +235,6 @@ glq_matvec_splitk_kernel(
             }
         }
 
-        // Independent reductions for both iterations
         float prod_0 = cb_val_0 * x_val_0;
         prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 4);
         prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 2);
@@ -254,7 +249,6 @@ glq_matvec_splitk_kernel(
             acc += prod_0 + prod_1;
         }
     }
-
     // Tail: handle odd remaining iteration
     if (j < j_end) {
         float x_val;
