@@ -88,9 +88,10 @@ GLQ uses a single global scale per layer rather than per-group scales, so effect
 | Method | Eff. BPW | ARC-e | HellaSwag | PIQA | WinoGrande | LAMBADA | Avg | % of bf16 |
 |--------|----------|-------|-----------|------|------------|---------|-----|-----------|
 | bf16 baseline | 16.00 | 0.565 | 0.428 | 0.712 | 0.573 | 0.508 | 0.557 | 100% |
-| GLQ 4-bit | 4.00 | 0.554 | 0.420 | 0.717 | 0.575 | 0.508 | 0.555 | **99.6%** |
+| **GLQ 4-bit** | **4.00** | 0.554 | 0.420 | 0.717 | 0.575 | 0.508 | **0.555** | **99.6%** |
+| GPTQ W4 (g64) | ~4.5 | 0.473 | 0.386 | 0.681 | 0.542 | 0.346 | 0.486 | 87.2% |
 
-GLQ 4-bit retains 99.6% of bf16 accuracy even on this small 360M-parameter model, demonstrating that E8 lattice quantization preserves quality across model scales.
+GLQ 4-bit retains 99.6% of bf16 accuracy vs GPTQ's 87.2% on this 360M model. GPTQ with group_size=64 (required since hidden_size=960 is not divisible by 128) loses 13% of quality, with LAMBADA dropping from 0.508 to 0.346. GLQ preserves LAMBADA perfectly (0.508). The E8 lattice codebook approach handles small models significantly better than group-wise INT4.
 
 ### Inference performance
 
