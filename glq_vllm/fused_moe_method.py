@@ -254,8 +254,6 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             )
             if dtype != torch.float16:
                 output = output.to(dtype)
-            if shared_experts_input is not None:
-                return output, shared_experts_input
             return output
 
         # Fallback: Python expert loop
@@ -306,8 +304,5 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             )
 
             output[token_mask] += h.to(dtype) * selected_weights.unsqueeze(-1)
-
-        if shared_experts_input is not None:
-            return output, shared_experts_input
 
         return output
