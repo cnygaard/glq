@@ -463,8 +463,14 @@ class GLQLinearMethod(LinearMethodBase):
             # to allocate per-shard with correct padded size
             layer.SU = GLQShardedParameter(
                 output_partition_sizes, -1, torch.float16, weight_loader=weight_loader)
-            layer.SV = _make_glq_param(
-                torch.ones(n_pad, dtype=torch.float16))
+            # SV is per-shard too: the quantizer uses an independent random
+            # Hadamard rotation per layer, so q/k/v have different SV vectors
+            # even though they share the input dim. Each shard stores a full
+            # n_pad-length SV; reuse GLQShardedParameter with
+            # shard_sizes=[n_pad]*num_shards to get that layout.
+            layer.SV = GLQShardedParameter(
+                [n_pad] * len(output_partition_sizes), -1, torch.float16,
+                weight_loader=weight_loader)
             layer.Wscale = GLQShardedParameter(
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
             layer.Qidxs2 = GLQShardedParameter(
@@ -612,7 +618,7 @@ class GLQLinearMethod(LinearMethodBase):
                     x, device, cb, cb2,
                     Qidxs=layer.Qidxs.get_shard(i),
                     SU=layer.SU.get_shard(i),
-                    SV=layer.SV,
+                    SV=layer.SV.get_shard(i),
                     wscale=meta['wscale'],
                     has_stage2=meta['has_stage2'],
                     inv_rs=meta['inv_rs'],
