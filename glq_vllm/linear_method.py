@@ -188,6 +188,9 @@ class GLQShardedParameter(BasevLLMParameter):
         total_m = sum(_glq_pad(s) if s > 1 else 1 for s in shard_sizes)
         if inner_dim > 0:
             data = torch.zeros(total_m, inner_dim, dtype=dtype)
+        elif inner_dim == -1:
+            # 1D vector: SU sign vector, m_pad per shard concatenated
+            data = torch.zeros(total_m, dtype=dtype)
         else:
             data = torch.zeros(len(shard_sizes), dtype=dtype)
         return super().__new__(cls, data=data, **kwargs)
@@ -197,6 +200,8 @@ class GLQShardedParameter(BasevLLMParameter):
         total_m = sum(_glq_pad(s) if s > 1 else 1 for s in shard_sizes)
         if inner_dim > 0:
             data = torch.zeros(total_m, inner_dim, dtype=dtype)
+        elif inner_dim == -1:
+            data = torch.zeros(total_m, dtype=dtype)
         else:
             data = torch.zeros(len(shard_sizes), dtype=dtype)
         super().__init__(data=data, weight_loader=weight_loader)
@@ -209,6 +214,9 @@ class GLQShardedParameter(BasevLLMParameter):
             m_pad = _glq_pad(sz) if sz > 1 else 1
             if inner_dim > 0:
                 self._shard_data.append(torch.zeros(m_pad, inner_dim, dtype=dtype))
+            elif inner_dim == -1:
+                # 1D vector per shard (SU sign vector)
+                self._shard_data.append(torch.ones(m_pad, dtype=dtype))
             else:
                 # Scalar per shard (Wscale, inv_resid_scale)
                 self._shard_data.append(torch.zeros((), dtype=dtype))
@@ -281,6 +289,7 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     B = x.shape[0]
     _use_custom_ops = hasattr(torch.ops, 'glq') and hasattr(torch.ops.glq, 'dequant_matvec')
     _use_cuda_c = _ik._glq_cuda is not None and not _VLLM_USE_TRITON
+    _GLQ_DEBUG = os.environ.get("GLQ_DEBUG") == "1"
 
     # Ensure weight tensors on device (safety net for fused QKV / first profile_run)
     if Qidxs.device != x.device:
@@ -309,6 +318,10 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
             x, SV, x_rht, in_features, x.stride(0),
             rsqrt_n, N=n_pad, LOG_N=log_n, num_warps=8)
 
+    if _GLQ_DEBUG:
+        torch.cuda.synchronize()
+        print(f"GLQ_DEBUG: input_rht OK x_rht={x_rht.shape} nan={x_rht.isnan().any().item()}", file=sys.stderr, flush=True)
+
     # Dequant + matmul (always through glq_dequant_matmul which handles dispatch)
     cb_packed = getattr(cb, 'codebook_packed', None)
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
@@ -318,14 +331,23 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         Qidxs2=Qidxs2, codebook2=cb2_half,
         inv_resid_scale=inv_rs, codebook_packed=cb_packed)
 
+    if _GLQ_DEBUG:
+        torch.cuda.synchronize()
+        print(f"GLQ_DEBUG: matmul OK y_rht={y_rht.shape} nan={y_rht.isnan().any().item()}", file=sys.stderr, flush=True)
+
     # Output RHT
     rsqrt_m = 1.0 / math.sqrt(m_pad)
+    if _GLQ_DEBUG:
+        print(f"GLQ_DEBUG: output_rht params B={B} out={out_features} m_pad={m_pad} log_m={log_m} SU={SU.shape} SU_dev={SU.device} y_rht_dev={y_rht.device}", file=sys.stderr, flush=True)
     if m_pad <= 16384 and (_use_custom_ops or _use_cuda_c):
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
         if _use_custom_ops:
             torch.ops.glq.output_rht(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
         else:
             _ik._glq_cuda.glq_output_rht_cuda(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
+        if _GLQ_DEBUG:
+            torch.cuda.synchronize()
+            print(f"GLQ_DEBUG: output_rht OK y={y.shape}", file=sys.stderr, flush=True)
         if dtype != torch.float16:
             y = y.to(dtype)
     else:
@@ -437,8 +459,10 @@ class GLQLinearMethod(LinearMethodBase):
             # Each GLQ buffer is a GLQShardedParameter that routes shard_id
             layer.Qidxs = GLQShardedParameter(
                 output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
+            # SU is a 1D sign vector of size m_pad per shard — use -1 as sentinel
+            # to allocate per-shard with correct padded size
             layer.SU = GLQShardedParameter(
-                output_partition_sizes, 0, torch.float16, weight_loader=weight_loader)
+                output_partition_sizes, -1, torch.float16, weight_loader=weight_loader)
             layer.SV = _make_glq_param(
                 torch.ones(n_pad, dtype=torch.float16))
             layer.Wscale = GLQShardedParameter(
@@ -471,7 +495,7 @@ class GLQLinearMethod(LinearMethodBase):
 
         # Mamba layers: dequant to dense weight for compatibility
         # (Mamba mixer overwrites weight_loader, causing weight loading conflict)
-        if (hasattr(layer, 'weight') and layer.weight.numel() == 1
+        if (hasattr(layer, 'weight') and layer.weight.numel() <= 1
                 and hasattr(layer, 'Qidxs') and not getattr(layer, 'glq_is_fused', False)):
             from .dequant import dequantize_glq_weight, get_codebook, get_codebook2
             cb = get_codebook()
