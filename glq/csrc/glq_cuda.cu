@@ -782,14 +782,11 @@ torch::Tensor glq_dequant_matvec_cuda(
     bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT_DEFAULT);
 
     if (use_splitk) {
-        // Adaptive BPS: shrink BPS when grid is undersaturated to create more CTAs
-        int bps = BLOCKS_PER_SPLIT_DEFAULT;
-        int k_splits = (N_BLOCKS + bps - 1) / bps;
-        int total_ctas = m_blocks * k_splits;
-        if (total_ctas < num_sms * 2 && bps > 16) {
-            bps = max(16, bps / 2);
-            k_splits = (N_BLOCKS + bps - 1) / bps;
-        }
+        // Force k_splits=1 for determinism. Split-K uses atomicAdd across
+        // multiple CTAs targeting the same output row; float atomicAdd is
+        // ordering-dependent and would make single-token decode nondeterministic.
+        int bps = N_BLOCKS;
+        int k_splits = 1;
         dim3 grid(m_blocks, k_splits);
 
         if (has_stage2) {
@@ -1558,19 +1555,14 @@ torch::Tensor glq_fused_linear_cuda(
         }
 
         if (B == 1) {
-            // B=1: split-K matvec
+            // B=1: split-K matvec (force k_splits=1 for determinism — atomicAdd)
             const int WARPS = 8;
             const int rows_per_block = ROWS_PER_WARP * WARPS;
             dim3 block(32, WARPS);
             int m_blocks = (M + rows_per_block - 1) / rows_per_block;
 
-            int bps = BLOCKS_PER_SPLIT_DEFAULT;
-            int k_splits = (N_BLOCKS + bps - 1) / bps;
-            int total_ctas = m_blocks * k_splits;
-            if (total_ctas < num_sms * 2 && bps > 16) {
-                bps = max(16, bps / 2);
-                k_splits = (N_BLOCKS + bps - 1) / bps;
-            }
+            int bps = N_BLOCKS;
+            int k_splits = 1;
             dim3 grid(m_blocks, k_splits);
 
             if (has_stage2) {
@@ -1741,12 +1733,9 @@ static void launch_matvec_splitk(
     const int rows_per_block = ROWS_PER_WARP * WARPS;
     dim3 block(32, WARPS);
     int m_blocks = (M + rows_per_block - 1) / rows_per_block;
-    int bps = BLOCKS_PER_SPLIT_DEFAULT;
-    int k_splits = (N_BLOCKS + bps - 1) / bps;
-    if (m_blocks * k_splits < num_sms * 2 && bps > 16) {
-        bps = max(16, bps / 2);
-        k_splits = (N_BLOCKS + bps - 1) / bps;
-    }
+    // Force k_splits=1 for determinism (split-K uses atomicAdd)
+    int bps = N_BLOCKS;
+    int k_splits = 1;
     dim3 grid(m_blocks, k_splits);
 
     if (has_stage2) {
