@@ -279,6 +279,43 @@ The `import glq.hf_integration` line registers GLQ as a quantization method with
 
 On CUDA, inference automatically uses CUDA C kernels (with Triton as fallback). On CPU, it falls back to dequantize-then-matmul.
 
+### Devstral-24B tokenizer note
+
+`transformers` 5.x auto-routes Mistral/Devstral models through `mistral_common`, which rejects the standard `tokenizer.json` format shipped in the quantized repo. `examples/inference_hf.py` includes a `load_tokenizer()` helper that handles the fallback automatically. For your own scripts:
+
+```python
+from huggingface_hub import snapshot_download
+from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
+
+path = snapshot_download("xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw")
+tok = PreTrainedTokenizerFast(tokenizer_file=f"{path}/tokenizer.json")
+tok.pad_token, tok.eos_token, tok.bos_token = "<pad>", "</s>", "<s>"
+
+model = AutoModelForCausalLM.from_pretrained(
+    "xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw",
+    device_map="cuda", dtype="float16",
+)
+```
+
+Devstral-24B GLQ 4bpw uses ~22 GB of GPU memory (bf16 would need ~48 GB), so it fits on an L40S/A100 40 GB.
+
+### Serving with sglang
+
+A fork of sglang with GLQ support is maintained at [cnygaard/sglang](https://github.com/cnygaard/sglang) on the `glq-quantization` branch. It registers `"glq"` as a quantization method, reuses the existing `glq.inference_kernel` CUDA extension as a runtime dependency (no kernel port needed), and handles fused QKV / gate-up projections via a `GLQShardedParameter` with per-shard SV vectors.
+
+```bash
+git clone -b glq-quantization https://github.com/cnygaard/sglang
+cd sglang/python && pip install -e .
+
+python -m sglang.launch_server \
+    --model xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw \
+    --tokenizer-path HuggingFaceTB/SmolLM2-360M-Instruct \
+    --quantization glq --disable-cuda-graph --disable-piecewise-cuda-graph \
+    --attention-backend triton --sampling-backend pytorch
+```
+
+SmolLM2-360M-Instruct GLQ 4bpw via the native `LlamaForCausalLM` sglang path at `num_concurrent=16` batched lm-eval 5-task matches bf16 within 99.3-99.6% (the exact number shifts by ~0.1% with each fresh quant run). The `triton` attention backend is required — `flashinfer` returns wrong logprobs in echo/prefill mode. `--disable-piecewise-cuda-graph` is required because torch.dynamo can't trace through the pybind GLQ extension.
+
 ### INT8 KV cache
 
 For long-context inference, GLQ provides an optional INT8 quantized KV cache that halves the memory used by keys and values. This is especially useful for large models at long sequence lengths where the KV cache dominates VRAM (e.g. 30B model at 4K+ context).
@@ -327,12 +364,18 @@ This means GPU memory holds only the compressed indices (2 bytes per 8 weights) 
 
 ### Kernel variants
 
-- **CUDA C Tensor Core kernel** (`glq_matmul_tc_kernel`): For batch sizes >= 2 (prefill). Uses inline PTX `mma.sync.aligned.m16n8k16` with direct codebook-to-register loading — no shared memory staging. 3-5x faster than Triton TC for prefill.
-- **CUDA C split-K matvec** (`glq_matvec_splitk_kernel`): For B=1 (autoregressive decode). 4 rows per warp with `__shfl_xor_sync` reduction, 2D grid for K-split parallelism. 2.7x faster than Triton matvec.
+- **CUDA C Tensor Core kernel** (`glq_matmul_tc_kernel` / `glq_matmul_tc_scratch_kernel`): For batch sizes >= 2 (prefill). Uses inline PTX `mma.sync.aligned.m16n8k16` with direct codebook-to-register loading — no shared memory staging. 3-5x faster than Triton TC for prefill.
+- **CUDA C split-K matvec** (`glq_matvec_splitk_kernel` / `glq_matvec_splitk_scratch_kernel`): For B=1 (autoregressive decode). 4 rows per warp with `__shfl_xor_sync` reduction, 2D grid for K-split parallelism. 2.7x faster than Triton matvec.
 - **CUDA C shared-memory FHT** (`glq_input_rht_kernel`, `glq_output_rht_kernel`): Double-buffered butterfly stages in shared memory for the Hadamard transform. 1.6-3x faster than Triton FHT.
 - **Triton fallback kernels**: Used when CUDA C extension is unavailable (no ninja) or for dimensions exceeding shared memory limits (n_pad > 8192).
 
 All kernels support two-stage RVQ for 3/4 bpw via a `HAS_STAGE2` compile-time constant. The CUDA C path is selected automatically when available; Triton is the fallback.
+
+### Bit-exact determinism
+
+The B=1 matvec and B>=2 TC matmul launchers use a scratch-buffer + fixed-order reduction pipeline instead of `atomicAdd` across k-splits. Each CTA writes its partial sum to a unique `(k_split, b, m)` slot (no atomic), then a follow-up `glq_reduce_splits_kernel` sums across k-splits in deterministic loop order.
+
+This means **every GLQ kernel is bit-exact run-to-run** on the same input. Running the same prompt at B=1 decode or B=8 batched prefill produces identical logits across runs, which is required for reproducible `lm-eval` scoring, RL on-policy rollouts, and CI regression tests. The adaptive split-K SM-saturation benefit is preserved — determinism costs only a small follow-up reduction kernel launch per matmul.
 
 ### Using the kernel directly
 
