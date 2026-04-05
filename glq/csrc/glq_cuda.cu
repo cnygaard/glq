@@ -610,6 +610,167 @@ glq_matmul_tc_kernel(
 
 
 /* ─────────────────────────────────────────────────────────────────────
+ * Deterministic scratch variant of glq_matmul_tc_kernel.
+ * scratch layout: (k_splits, B_dim, M). Each thread writes 4 unique
+ * (k_split, b_row, m_col) slots → no atomic, no race. A follow-up
+ * glq_reduce_splits_2d_kernel sums across the k_splits axis in fixed
+ * order, giving bit-exact run-to-run results.
+ * ───────────────────────────────────────────────────────────────────── */
+template <bool HAS_STAGE2>
+__global__ void __launch_bounds__(256, 2)
+glq_matmul_tc_scratch_kernel(
+    float* __restrict__ scratch,        // (k_splits * B_dim * M) fp32, overwritten
+    const half* __restrict__ x,
+    const int16_t* __restrict__ qidxs,
+    const half* __restrict__ codebook,
+    const int16_t* __restrict__ qidxs2,
+    const half* __restrict__ codebook2,
+    float inv_resid_scale,
+    float wscale,
+    int B_dim,
+    int M,
+    int N,
+    int N_BLOCKS,
+    int stride_x,
+    int bps,
+    int cb2_size
+) {
+    extern __shared__ half smem_cb2[];
+    if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
+        int tid_flat = threadIdx.y * 32 + threadIdx.x;
+        int total = cb2_size * 8;
+        for (int i = tid_flat; i < total; i += 256) {
+            smem_cb2[i] = codebook2[i];
+        }
+        __syncthreads();
+    }
+
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int groupID = lane_id >> 2;
+    const int tid_g = lane_id & 3;
+
+    int b_start = blockIdx.x * 16;
+    int m_start = (blockIdx.y * blockDim.y + warp_id) * 8;
+    int k_split = blockIdx.z;
+
+    if (b_start >= B_dim || m_start >= M) return;
+
+    int j_start = k_split * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
+
+    float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
+
+    int b_row0 = b_start + groupID;
+    int b_row1 = b_start + groupID + 8;
+    int m_row = m_start + groupID;
+    bool b0_valid = (b_row0 < B_dim);
+    bool b1_valid = (b_row1 < B_dim);
+    bool m_valid = (m_row < M);
+    int k_elem = tid_g * 2;
+
+    for (int j = j_start; j < j_end; j += 2) {
+        bool j1_valid = (j + 1 < N_BLOCKS);
+
+        uint16_t idx_j = 0, idx_j1 = 0;
+        if (m_valid) {
+            idx_j = (uint16_t)qidxs[m_row * N_BLOCKS + j];
+            if (j1_valid) idx_j1 = (uint16_t)qidxs[m_row * N_BLOCKS + j + 1];
+        }
+
+        half bv0 = m_valid ? codebook[idx_j * 8 + k_elem]     : __float2half(0.0f);
+        half bv1 = m_valid ? codebook[idx_j * 8 + k_elem + 1] : __float2half(0.0f);
+        half bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
+        half bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
+
+        if (HAS_STAGE2 && m_valid) {
+            const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+            uint16_t idx2_j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
+            bv0 = __float2half(__half2float(bv0) + __half2float(cb2[idx2_j * 8 + k_elem]) * inv_resid_scale);
+            bv1 = __float2half(__half2float(bv1) + __half2float(cb2[idx2_j * 8 + k_elem + 1]) * inv_resid_scale);
+            if (j1_valid) {
+                uint16_t idx2_j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
+                bv2 = __float2half(__half2float(bv2) + __half2float(cb2[idx2_j1 * 8 + k_elem]) * inv_resid_scale);
+                bv3 = __float2half(__half2float(bv3) + __half2float(cb2[idx2_j1 * 8 + k_elem + 1]) * inv_resid_scale);
+            }
+        }
+
+        __half2 b_h0 = __halves2half2(bv0, bv1);
+        __half2 b_h1 = __halves2half2(bv2, bv3);
+        uint32_t b_reg0 = *reinterpret_cast<uint32_t*>(&b_h0);
+        uint32_t b_reg1 = *reinterpret_cast<uint32_t*>(&b_h1);
+
+        int x_off_j = j * 8 + k_elem;
+        int x_off_j1 = (j + 1) * 8 + k_elem;
+
+        half av0 = b0_valid ? x[b_row0 * stride_x + x_off_j]     : __float2half(0.0f);
+        half av1 = b0_valid ? x[b_row0 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half av2 = b1_valid ? x[b_row1 * stride_x + x_off_j]     : __float2half(0.0f);
+        half av3 = b1_valid ? x[b_row1 * stride_x + x_off_j + 1] : __float2half(0.0f);
+
+        half av4 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half av5 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+        half av6 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half av7 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+
+        __half2 a_h0 = __halves2half2(av0, av1);
+        __half2 a_h1 = __halves2half2(av2, av3);
+        __half2 a_h2 = __halves2half2(av4, av5);
+        __half2 a_h3 = __halves2half2(av6, av7);
+
+        uint32_t a_reg0 = *reinterpret_cast<uint32_t*>(&a_h0);
+        uint32_t a_reg1 = *reinterpret_cast<uint32_t*>(&a_h1);
+        uint32_t a_reg2 = *reinterpret_cast<uint32_t*>(&a_h2);
+        uint32_t a_reg3 = *reinterpret_cast<uint32_t*>(&a_h3);
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " { %0, %1, %2, %3 },"
+            " { %4, %5, %6, %7 },"
+            " { %8, %9 },"
+            " { %0, %1, %2, %3 };"
+            : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+            : "r"(a_reg0), "r"(a_reg1), "r"(a_reg2), "r"(a_reg3),
+              "r"(b_reg0), "r"(b_reg1)
+        );
+    }
+
+    // Deterministic: each (k_split, b_row, m_col) slot has exactly one writer.
+    int m_col0 = m_start + tid_g * 2;
+    int m_col1 = m_col0 + 1;
+    size_t k_base = (size_t)k_split * B_dim * M;
+
+    if (b0_valid && m_col0 < M)
+        scratch[k_base + (size_t)b_row0 * M + m_col0] = z0 * wscale;
+    if (b0_valid && m_col1 < M)
+        scratch[k_base + (size_t)b_row0 * M + m_col1] = z1 * wscale;
+    if (b1_valid && m_col0 < M)
+        scratch[k_base + (size_t)b_row1 * M + m_col0] = z2 * wscale;
+    if (b1_valid && m_col1 < M)
+        scratch[k_base + (size_t)b_row1 * M + m_col1] = z3 * wscale;
+}
+
+
+/* Deterministic 2D reduction: sum scratch[0:k_splits, 0:B_dim*M] →
+ * output[0:B_dim*M] in fixed loop order. One thread per output element. */
+__global__ void __launch_bounds__(256)
+glq_reduce_splits_2d_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ scratch,
+    int BM,       // B_dim * M
+    int k_splits
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= BM) return;
+    float sum = 0.0f;
+    for (int k = 0; k < k_splits; ++k) {
+        sum += scratch[(size_t)k * BM + i];
+    }
+    output[i] = sum;
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
  * Packed TC matmul kernel (B>=2) — uint32 codebook, 2bpw only
  *
  * Same mma.m16n8k16 layout as glq_matmul_tc_kernel but gathers from
@@ -718,6 +879,114 @@ glq_matmul_tc_packed_kernel(
         atomicAdd(&output[b_row1 * M + m_col0], z2 * wscale);
     if (b1_valid && m_col1 < M)
         atomicAdd(&output[b_row1 * M + m_col1], z3 * wscale);
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Deterministic scratch variant of glq_matmul_tc_packed_kernel.
+ * Same pattern as glq_matmul_tc_scratch_kernel but using the packed
+ * uint32 codebook. 2bpw only, no stage2.
+ * ───────────────────────────────────────────────────────────────────── */
+__global__ void __launch_bounds__(256, 2)
+glq_matmul_tc_packed_scratch_kernel(
+    float* __restrict__ scratch,
+    const half* __restrict__ x,
+    const int16_t* __restrict__ qidxs,
+    const uint32_t* __restrict__ codebook_packed,
+    float wscale,
+    int B_dim, int M, int N, int N_BLOCKS, int stride_x, int bps
+) {
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int groupID = lane_id >> 2;
+    const int tid_g = lane_id & 3;
+
+    int b_start = blockIdx.x * 16;
+    int m_start = (blockIdx.y * blockDim.y + warp_id) * 8;
+    int k_split = blockIdx.z;
+
+    if (b_start >= B_dim || m_start >= M) return;
+
+    int j_start = k_split * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
+
+    float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
+
+    int b_row0 = b_start + groupID;
+    int b_row1 = b_start + groupID + 8;
+    int m_row = m_start + groupID;
+    bool b0_valid = (b_row0 < B_dim);
+    bool b1_valid = (b_row1 < B_dim);
+    bool m_valid = (m_row < M);
+    int k_elem = tid_g * 2;
+
+    for (int j = j_start; j < j_end; j += 2) {
+        bool j1_valid = (j + 1 < N_BLOCKS);
+
+        uint16_t idx_j = 0, idx_j1 = 0;
+        if (m_valid) {
+            idx_j = (uint16_t)qidxs[m_row * N_BLOCKS + j];
+            if (j1_valid) idx_j1 = (uint16_t)qidxs[m_row * N_BLOCKS + j + 1];
+        }
+
+        uint32_t packed_j = m_valid ? codebook_packed[idx_j] : 0;
+        uint32_t packed_j1 = (m_valid && j1_valid) ? codebook_packed[idx_j1] : 0;
+
+        half bv0 = __float2half(((packed_j >> (k_elem * 4)) & 0xF) * 0.5f - 3.0f);
+        half bv1 = __float2half(((packed_j >> ((k_elem + 1) * 4)) & 0xF) * 0.5f - 3.0f);
+        half bv2 = __float2half(((packed_j1 >> (k_elem * 4)) & 0xF) * 0.5f - 3.0f);
+        half bv3 = __float2half(((packed_j1 >> ((k_elem + 1) * 4)) & 0xF) * 0.5f - 3.0f);
+
+        __half2 b_h0 = __halves2half2(bv0, bv1);
+        __half2 b_h1 = __halves2half2(bv2, bv3);
+        uint32_t b_reg0 = *reinterpret_cast<uint32_t*>(&b_h0);
+        uint32_t b_reg1 = *reinterpret_cast<uint32_t*>(&b_h1);
+
+        int x_off_j = j * 8 + k_elem;
+        int x_off_j1 = (j + 1) * 8 + k_elem;
+
+        half a00 = b0_valid ? x[b_row0 * stride_x + x_off_j]     : __float2half(0.0f);
+        half a01 = b0_valid ? x[b_row0 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half a10 = b1_valid ? x[b_row1 * stride_x + x_off_j]     : __float2half(0.0f);
+        half a11 = b1_valid ? x[b_row1 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half a02 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half a03 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+        half a12 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half a13 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+
+        __half2 ah0 = __halves2half2(a00, a01);
+        __half2 ah1 = __halves2half2(a10, a11);
+        __half2 ah2 = __halves2half2(a02, a03);
+        __half2 ah3 = __halves2half2(a12, a13);
+        uint32_t a_reg0 = *reinterpret_cast<uint32_t*>(&ah0);
+        uint32_t a_reg1 = *reinterpret_cast<uint32_t*>(&ah1);
+        uint32_t a_reg2 = *reinterpret_cast<uint32_t*>(&ah2);
+        uint32_t a_reg3 = *reinterpret_cast<uint32_t*>(&ah3);
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " { %0, %1, %2, %3 },"
+            " { %4, %5, %6, %7 },"
+            " { %8, %9 },"
+            " { %0, %1, %2, %3 };"
+            : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+            : "r"(a_reg0), "r"(a_reg1), "r"(a_reg2), "r"(a_reg3),
+              "r"(b_reg0), "r"(b_reg1)
+        );
+    }
+
+    int m_col0 = m_start + tid_g * 2;
+    int m_col1 = m_col0 + 1;
+    size_t k_base = (size_t)k_split * B_dim * M;
+
+    if (b0_valid && m_col0 < M)
+        scratch[k_base + (size_t)b_row0 * M + m_col0] = z0 * wscale;
+    if (b0_valid && m_col1 < M)
+        scratch[k_base + (size_t)b_row0 * M + m_col1] = z1 * wscale;
+    if (b1_valid && m_col0 < M)
+        scratch[k_base + (size_t)b_row1 * M + m_col0] = z2 * wscale;
+    if (b1_valid && m_col1 < M)
+        scratch[k_base + (size_t)b_row1 * M + m_col1] = z3 * wscale;
 }
 
 
@@ -1067,35 +1336,51 @@ torch::Tensor glq_dequant_matmul_cuda(
         CHECK_INPUT(codebook2);
     }
 
-    // Use TC kernel: single launch for all B rows
+    // Deterministic scratch+reduce split-K for the B>=2 path. Same pattern as
+    // the B=1 matvec fix: adaptive k_splits for SM saturation, each CTA writes
+    // to a unique (k_split, b_row, m_col) scratch slot (no atomicAdd), then a
+    // reduction kernel sums across k_splits in fixed order → bit-exact runs.
     int b_tiles = (B_dim + 15) / 16;
     int m_tiles = (M + 7) / 8;
     int m_tiles_per_block = WARPS;
     int m_grid = (m_tiles + m_tiles_per_block - 1) / m_tiles_per_block;
 
-    // Force k_splits=1 for the B>=2 path to keep inference deterministic.
-    // Split-K uses atomicAdd across multiple CTAs targeting the same output
-    // element; atomicAdd on float is ordering-dependent, which made batched
-    // prefill nondeterministic and broke loglikelihood scoring in lm-eval.
-    int bps = N_BLOCKS;
-    int k_splits = 1;
+    int bps = TC_BPS_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    int total_ctas = b_tiles * m_grid * k_splits;
+    if (total_ctas < num_sms * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
 
     dim3 tc_grid(b_tiles, m_grid, k_splits);
     dim3 tc_block(32, WARPS);
 
+    size_t scratch_bytes = (size_t)k_splits * B_dim * M * sizeof(float);
+    float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+
     if (has_stage2) {
         int cb2_size = codebook2.size(0);
         int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-        glq_matmul_tc_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
-            out_ptr, x_ptr, q_ptr, cb_ptr,
+        glq_matmul_tc_scratch_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
+            scratch, x_ptr, q_ptr, cb_ptr,
             q2_ptr, cb2_ptr, inv_resid_scale,
             wscale, B_dim, M, N, N_BLOCKS, N, bps, cb2_size);
     } else {
-        glq_matmul_tc_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
-            out_ptr, x_ptr, q_ptr, cb_ptr,
+        glq_matmul_tc_scratch_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
+            scratch, x_ptr, q_ptr, cb_ptr,
             nullptr, nullptr, 0.0f,
             wscale, B_dim, M, N, N_BLOCKS, N, bps, 0);
     }
+
+    int BM = B_dim * M;
+    int reduce_threads = 256;
+    int reduce_blocks = (BM + reduce_threads - 1) / reduce_threads;
+    glq_reduce_splits_2d_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+        out_ptr, scratch, BM, k_splits
+    );
+
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
 
     return output;
 }
@@ -1168,23 +1453,37 @@ torch::Tensor glq_dequant_matmul_packed_cuda(
     int m_tiles = (M + 7) / 8;
     int m_grid = (m_tiles + WARPS - 1) / WARPS;
 
-    // Force k_splits=1 for the B>=2 path to keep inference deterministic.
-    // Split-K uses atomicAdd across multiple CTAs targeting the same output
-    // element; atomicAdd on float is ordering-dependent, which made batched
-    // prefill nondeterministic and broke loglikelihood scoring in lm-eval.
-    int bps = N_BLOCKS;
-    int k_splits = 1;
+    // Deterministic scratch+reduce split-K (packed 2bpw variant).
+    int bps = TC_BPS_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    int total_ctas = b_tiles * m_grid * k_splits;
+    if (total_ctas < num_sms * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
 
     dim3 tc_grid(b_tiles, m_grid, k_splits);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
-    glq_matmul_tc_packed_kernel<<<tc_grid, tc_block, 0, stream>>>(
-        output.data_ptr<float>(),
+    size_t scratch_bytes = (size_t)k_splits * B_dim * M * sizeof(float);
+    float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+
+    glq_matmul_tc_packed_scratch_kernel<<<tc_grid, tc_block, 0, stream>>>(
+        scratch,
         (const half*)x.data_ptr<c10::Half>(),
         qidxs.data_ptr<int16_t>(),
         (const uint32_t*)codebook_packed.data_ptr<int32_t>(),
         wscale, B_dim, M, N, N_BLOCKS, N, bps
     );
+
+    int BM = B_dim * M;
+    int reduce_threads = 256;
+    int reduce_blocks = (BM + reduce_threads - 1) / reduce_threads;
+    glq_reduce_splits_2d_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+        output.data_ptr<float>(), scratch, BM, k_splits
+    );
+
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
 
     return output;
 }
@@ -1638,6 +1937,17 @@ void glq_output_rht_cuda(
 }
 
 
+// Forward declaration (defined later after glq_fused_moe_cuda helpers).
+static void launch_matvec_splitk(
+    float* output, const half* x, const int16_t* qidxs,
+    const half* codebook, float wscale,
+    const int16_t* qidxs2, const half* codebook2,
+    float inv_resid_scale, bool has_stage2,
+    int M, int N_BLOCKS, int cb2_size,
+    int num_sms, cudaStream_t stream
+);
+
+
 /* ─────────────────────────────────────────────────────────────────────
  * Fused linear: input_rht → dequant+matmul → output_rht in one host call
  *
@@ -1728,57 +2038,45 @@ torch::Tensor glq_fused_linear_cuda(
         }
 
         if (B == 1) {
-            // B=1: split-K matvec (force k_splits=1 for determinism — atomicAdd)
-            const int WARPS = 8;
-            const int rows_per_block = ROWS_PER_WARP * WARPS;
-            dim3 block(32, WARPS);
-            int m_blocks = (M + rows_per_block - 1) / rows_per_block;
-
-            int bps = N_BLOCKS;
-            int k_splits = 1;
-            dim3 grid(m_blocks, k_splits);
-
-            if (has_stage2) {
-                int cb2_size = codebook2.size(0);
-                int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-                glq_matvec_splitk_kernel<true><<<grid, block, smem, stream>>>(
-                    y_rht.data_ptr<float>(),
-                    (const half*)x_rht_half.data_ptr<c10::Half>(),  // x_rht is fp32 but kernel expects fp16 input
-                    qidxs.data_ptr<int16_t>(),
-                    (const half*)codebook.data_ptr<c10::Half>(),
-                    qidxs2.data_ptr<int16_t>(),
-                    (const half*)codebook2.data_ptr<c10::Half>(),
-                    inv_resid_scale,
-                    wscale, M, N_BLOCKS, bps, cb2_size
-                );
-            } else {
-                glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
-                    y_rht.data_ptr<float>(),
-                    (const half*)x_rht_half.data_ptr<c10::Half>(),
-                    qidxs.data_ptr<int16_t>(),
-                    (const half*)codebook.data_ptr<c10::Half>(),
-                    nullptr, nullptr, 0.0f,
-                    wscale, M, N_BLOCKS, bps, 0
-                );
-            }
+            // B=1: deterministic scratch+reduce split-K matvec
+            int cb2_size = has_stage2 ? codebook2.size(0) : 0;
+            launch_matvec_splitk(
+                y_rht.data_ptr<float>(),
+                (const half*)x_rht_half.data_ptr<c10::Half>(),
+                qidxs.data_ptr<int16_t>(),
+                (const half*)codebook.data_ptr<c10::Half>(),
+                wscale,
+                has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr,
+                has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr,
+                inv_resid_scale, has_stage2,
+                M, N_BLOCKS, cb2_size, num_sms, stream
+            );
         } else {
-            // B>=2: TC matmul
+            // B>=2: deterministic scratch+reduce TC matmul
             const int WARPS = 8;
             dim3 tc_block(32, WARPS);
             int b_tiles = (B + 15) / 16;
             int m_tiles = (M + 7) / 8;
             int m_grid = (m_tiles + WARPS - 1) / WARPS;
-            // Force k_splits=1 for determinism (split-K uses atomicAdd)
-            int bps = N_BLOCKS;
-            int k_splits = 1;
+
+            int bps = TC_BPS_DEFAULT;
+            int k_splits = (N_BLOCKS + bps - 1) / bps;
+            int total_ctas = b_tiles * m_grid * k_splits;
+            if (total_ctas < num_sms * 2 && bps > 16) {
+                bps = max(16, bps / 2);
+                k_splits = (N_BLOCKS + bps - 1) / bps;
+            }
 
             dim3 tc_grid(b_tiles, m_grid, k_splits);
+
+            size_t scratch_bytes = (size_t)k_splits * B * M * sizeof(float);
+            float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
             if (has_stage2) {
                 int cb2_size = codebook2.size(0);
                 int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-                glq_matmul_tc_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
-                    y_rht.data_ptr<float>(),
+                glq_matmul_tc_scratch_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
+                    scratch,
                     (const half*)x_rht_half.data_ptr<c10::Half>(),
                     qidxs.data_ptr<int16_t>(),
                     (const half*)codebook.data_ptr<c10::Half>(),
@@ -1788,8 +2086,8 @@ torch::Tensor glq_fused_linear_cuda(
                     wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size
                 );
             } else {
-                glq_matmul_tc_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
-                    y_rht.data_ptr<float>(),
+                glq_matmul_tc_scratch_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
+                    scratch,
                     (const half*)x_rht_half.data_ptr<c10::Half>(),
                     qidxs.data_ptr<int16_t>(),
                     (const half*)codebook.data_ptr<c10::Half>(),
@@ -1797,6 +2095,15 @@ torch::Tensor glq_fused_linear_cuda(
                     wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, 0
                 );
             }
+
+            int BM = B * M;
+            int reduce_threads = 256;
+            int reduce_blocks = (BM + reduce_threads - 1) / reduce_threads;
+            glq_reduce_splits_2d_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+                y_rht.data_ptr<float>(), scratch, BM, k_splits
+            );
+
+            c10::cuda::CUDACachingAllocator::raw_delete(scratch);
         }
     }
 
@@ -1893,7 +2200,8 @@ __global__ void weighted_add_kernel(
     }
 }
 
-// Helper: launch split-K matvec from C++ (avoids duplicating the grid logic)
+// Helper: launch split-K matvec from C++ (deterministic scratch+reduce path).
+// Preserves adaptive split-K SM saturation while staying bit-exact across runs.
 static void launch_matvec_splitk(
     float* output, const half* x, const int16_t* qidxs,
     const half* codebook, float wscale,
@@ -1906,21 +2214,39 @@ static void launch_matvec_splitk(
     const int rows_per_block = ROWS_PER_WARP * WARPS;
     dim3 block(32, WARPS);
     int m_blocks = (M + rows_per_block - 1) / rows_per_block;
-    // Force k_splits=1 for determinism (split-K uses atomicAdd)
-    int bps = N_BLOCKS;
-    int k_splits = 1;
+
+    // Adaptive split-K (same sizing logic as glq_dequant_matvec_cuda).
+    int bps = BLOCKS_PER_SPLIT_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    int total_ctas = m_blocks * k_splits;
+    if (total_ctas < num_sms * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
     dim3 grid(m_blocks, k_splits);
+
+    size_t scratch_bytes = (size_t)k_splits * M * sizeof(float);
+    float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
     if (has_stage2) {
         int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-        glq_matvec_splitk_kernel<true><<<grid, block, smem, stream>>>(
-            output, x, qidxs, codebook, qidxs2, codebook2,
+        glq_matvec_splitk_scratch_kernel<true><<<grid, block, smem, stream>>>(
+            scratch, x, qidxs, codebook, qidxs2, codebook2,
             inv_resid_scale, wscale, M, N_BLOCKS, bps, cb2_size);
     } else {
-        glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
-            output, x, qidxs, codebook, nullptr, nullptr, 0.0f,
+        glq_matvec_splitk_scratch_kernel<false><<<grid, block, 0, stream>>>(
+            scratch, x, qidxs, codebook, nullptr, nullptr, 0.0f,
             wscale, M, N_BLOCKS, bps, 0);
     }
+
+    // Deterministic reduction: sum scratch[0:k_splits, m] → output[m]
+    int reduce_threads = 256;
+    int reduce_blocks = (M + reduce_threads - 1) / reduce_threads;
+    glq_reduce_splits_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+        output, scratch, M, k_splits
+    );
+
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
 }
 
 // Helper: launch input/output RHT
