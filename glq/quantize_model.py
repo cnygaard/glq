@@ -428,7 +428,11 @@ def quantize(
     weight_map = None
     shard_paths = None
     BlockClass = None
-    is_mistral3 = "Mistral3" in arch
+    is_mistral3 = "Mistral3" in arch  # Mistral3ForConditionalGeneration (multimodal 24B)
+    # Pure-text Ministral3 (123B Devstral-2) uses its own LM class but the same
+    # Ministral3RotaryEmbedding as the multimodal variant. Careful: "Mistral3"
+    # is NOT a substring of "Ministral3" (the latter has an extra 'n').
+    is_ministral3_text = arch == "Ministral3ForCausalLM"
 
     if streaming:
         # Streaming mode: don't load model into RAM. Instead, instantiate
@@ -529,8 +533,10 @@ def quantize(
             embed.to(device)
 
         # Create rotary embedding for streaming mode
-        if is_mistral3:
-            text_cfg = cfg.text_config
+        if is_mistral3 or is_ministral3_text:
+            # Mistral3ForConditionalGeneration exposes its text config under
+            # cfg.text_config; Ministral3ForCausalLM (text-only) uses cfg directly.
+            text_cfg = cfg.text_config if is_mistral3 else cfg
             from transformers.models.ministral3.modeling_ministral3 import Ministral3RotaryEmbedding
             rotary_emb = Ministral3RotaryEmbedding(config=text_cfg)
             if use_gpu:
