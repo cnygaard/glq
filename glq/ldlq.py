@@ -188,11 +188,14 @@ def quantize_ldlq_codebook_2stage(
         Wscale = W_rms / codebook1.opt_scale if W_rms > 1e-10 else 1.0
 
     Wr = W / Wscale
-    hatWr = torch.zeros_like(Wr)
     all_indices1 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
     all_indices2 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
 
     use_cuda = torch.device(device).type == 'cuda'
+    # hatWr is allocated inside each branch: the CUDA path builds hatWr_half
+    # in the loop and converts to fp32 at the end; the CPU path allocates
+    # zeros upfront. Avoiding the upfront fp32 allocation on CUDA saves
+    # m*n*4 bytes (~1.4 GB for the 123B down_proj shape).
     if use_cuda:
         L_half = L.half()
         Wr_half = Wr.half()
@@ -234,8 +237,24 @@ def quantize_ldlq_codebook_2stage(
             hatWr_half[:, kb:ke] = dec1_buf + dec2_buf * inv_resid_scale_half
             R_half[:, kb:ke] = Wr_half[:, kb:ke] - hatWr_half[:, kb:ke]
 
+        # Free the large CUDA-loop temporaries before the final fp32
+        # conversion. For a 12288x28672 weight (123B Devstral-2 down_proj),
+        # L_half, Wr_half, R_half and the per-block buffers together hold
+        # ~4-5 GB that's no longer needed once the loop exits; freeing it
+        # avoids OOM on the hatWr_half.float() allocation (~1.4 GB fresh).
+        del L_half, Wr_half, R_half
+        del target_buf, resid_buf, dec1_buf, dec2_buf, idx1_buf, idx2_buf
+        del resid_scale_half, inv_resid_scale_half
+        # L, D, H_reg are only needed by the tune_iters refinement pass.
+        if tune_iters == 0:
+            del L, D, H_reg
+        torch.cuda.empty_cache()
+
         hatWr = hatWr_half.float()
+        del hatWr_half
+        torch.cuda.empty_cache()
     else:
+        hatWr = torch.zeros_like(Wr)
         R = Wr.clone()
         for k in reversed(range(num_blocks)):
             kb, ke = k * b, (k + 1) * b
