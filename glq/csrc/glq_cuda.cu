@@ -903,13 +903,12 @@ torch::Tensor glq_dequant_matmul_cuda(
     int m_tiles_per_block = WARPS;
     int m_grid = (m_tiles + m_tiles_per_block - 1) / m_tiles_per_block;
 
-    int bps = TC_BPS_DEFAULT;
-    int k_splits = (N_BLOCKS + bps - 1) / bps;
-    int total_ctas = b_tiles * m_grid * k_splits;
-    if (total_ctas < num_sms * 2 && bps > 16) {
-        bps = max(16, bps / 2);
-        k_splits = (N_BLOCKS + bps - 1) / bps;
-    }
+    // Force k_splits=1 for the B>=2 path to keep inference deterministic.
+    // Split-K uses atomicAdd across multiple CTAs targeting the same output
+    // element; atomicAdd on float is ordering-dependent, which made batched
+    // prefill nondeterministic and broke loglikelihood scoring in lm-eval.
+    int bps = N_BLOCKS;
+    int k_splits = 1;
 
     dim3 tc_grid(b_tiles, m_grid, k_splits);
     dim3 tc_block(32, WARPS);
@@ -999,13 +998,12 @@ torch::Tensor glq_dequant_matmul_packed_cuda(
     int m_tiles = (M + 7) / 8;
     int m_grid = (m_tiles + WARPS - 1) / WARPS;
 
-    int bps = TC_BPS_DEFAULT;
-    int k_splits = (N_BLOCKS + bps - 1) / bps;
-    int total_ctas = b_tiles * m_grid * k_splits;
-    if (total_ctas < num_sms * 2 && bps > 16) {
-        bps = max(16, bps / 2);
-        k_splits = (N_BLOCKS + bps - 1) / bps;
-    }
+    // Force k_splits=1 for the B>=2 path to keep inference deterministic.
+    // Split-K uses atomicAdd across multiple CTAs targeting the same output
+    // element; atomicAdd on float is ordering-dependent, which made batched
+    // prefill nondeterministic and broke loglikelihood scoring in lm-eval.
+    int bps = N_BLOCKS;
+    int k_splits = 1;
 
     dim3 tc_grid(b_tiles, m_grid, k_splits);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
@@ -1605,8 +1603,9 @@ torch::Tensor glq_fused_linear_cuda(
             int b_tiles = (B + 15) / 16;
             int m_tiles = (M + 7) / 8;
             int m_grid = (m_tiles + WARPS - 1) / WARPS;
-            int bps = TC_BPS_DEFAULT;
-            int k_splits = (N_BLOCKS + bps - 1) / bps;
+            // Force k_splits=1 for determinism (split-K uses atomicAdd)
+            int bps = N_BLOCKS;
+            int k_splits = 1;
 
             dim3 tc_grid(b_tiles, m_grid, k_splits);
 
