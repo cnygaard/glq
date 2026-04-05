@@ -14,7 +14,29 @@ Published models:
 
 import torch
 import glq.hf_integration  # noqa: F401 — registers GLQ quantization method
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
+
+
+def load_tokenizer(tokenizer_id):
+    """Load a tokenizer, working around the transformers 5.x + Mistral issue.
+
+    transformers 5.x auto-routes Mistral/Devstral models through mistral_common,
+    which rejects the standard tokenizer.json format shipped in our quantized
+    repos. Fall back to PreTrainedTokenizerFast using the local tokenizer.json
+    file when that happens.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(tokenizer_id)
+    except (ValueError, ImportError) as e:
+        if "tokenizer" not in str(e).lower() and "mistral" not in str(e).lower():
+            raise
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(tokenizer_id)
+        tok = PreTrainedTokenizerFast(tokenizer_file=f"{path}/tokenizer.json")
+        tok.pad_token = "<pad>"
+        tok.eos_token = "</s>"
+        tok.bos_token = "<s>"
+        return tok
 
 
 def generate(model_id, tokenizer_id=None, prompt="The capital of France is", max_tokens=50):
@@ -27,7 +49,7 @@ def generate(model_id, tokenizer_id=None, prompt="The capital of France is", max
         device_map="cuda",
         dtype=torch.float16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+    tokenizer = load_tokenizer(tokenizer_id)
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
     with torch.no_grad():
@@ -55,7 +77,7 @@ def generate_with_cuda_graph(model_id, tokenizer_id=None, prompt="Write a fibona
         device_map="cuda",
         dtype=torch.float16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+    tokenizer = load_tokenizer(tokenizer_id)
     wrapper = CUDAGraphWrapper(model)
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
