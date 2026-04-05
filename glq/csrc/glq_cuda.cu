@@ -281,6 +281,158 @@ glq_matvec_splitk_kernel(
 
 
 /* ─────────────────────────────────────────────────────────────────────
+ * Deterministic split-K matvec: writes per-split partial sums to a
+ * scratch[k_splits, M] buffer without atomicAdd. A follow-up reduction
+ * kernel sums the scratch rows in fixed order, giving bit-exact
+ * run-to-run results while preserving the SM-saturation benefit of
+ * split-K. Body is identical to glq_matvec_splitk_kernel except the
+ * final write: one unique (k_split, m) slot per CTA, plain store.
+ * ───────────────────────────────────────────────────────────────────── */
+template <bool HAS_STAGE2>
+__global__ void __launch_bounds__(256)
+glq_matvec_splitk_scratch_kernel(
+    float* __restrict__ scratch,        // (k_splits, M) fp32, overwritten
+    const half* __restrict__ x,
+    const int16_t* __restrict__ qidxs,
+    const half* __restrict__ codebook,
+    const int16_t* __restrict__ qidxs2,
+    const half* __restrict__ codebook2,
+    float inv_resid_scale,
+    float wscale,
+    int M,
+    int N_BLOCKS,
+    int bps,
+    int cb2_size
+) {
+    extern __shared__ half smem_cb2[];
+
+    if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
+        int tid_flat = threadIdx.y * 32 + threadIdx.x;
+        int total = cb2_size * 8;
+        for (int i = tid_flat; i < total; i += 256) {
+            smem_cb2[i] = codebook2[i];
+        }
+        __syncthreads();
+    }
+
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int row_in_warp = lane_id >> 3;
+    const int elem = lane_id & 7;
+
+    int base_row = (blockIdx.x * blockDim.y + warp_id) * ROWS_PER_WARP;
+    int my_row = base_row + row_in_warp;
+    bool valid = (my_row < M);
+
+    int j_start = blockIdx.y * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
+
+    float acc = 0.0f;
+
+    int j = j_start;
+    for (; j + 1 < j_end; j += 2) {
+        float x_val_0, x_val_1;
+        if (lane_id < 8) {
+            x_val_0 = __half2float(x[j * 8 + lane_id]);
+            x_val_1 = __half2float(x[(j + 1) * 8 + lane_id]);
+        }
+        x_val_0 = __shfl_sync(FULL_MASK, x_val_0, elem);
+        x_val_1 = __shfl_sync(FULL_MASK, x_val_1, elem);
+
+        uint16_t idx_0 = 0, idx_1 = 0;
+        if (valid && elem == 0) {
+            idx_0 = (uint16_t)qidxs[my_row * N_BLOCKS + j];
+            idx_1 = (uint16_t)qidxs[my_row * N_BLOCKS + j + 1];
+        }
+        idx_0 = __shfl_sync(FULL_MASK, idx_0, row_in_warp * 8);
+        idx_1 = __shfl_sync(FULL_MASK, idx_1, row_in_warp * 8);
+
+        float cb_val_0 = 0.0f, cb_val_1 = 0.0f;
+        if (valid) {
+            cb_val_0 = __half2float(codebook[idx_0 * 8 + elem]);
+            cb_val_1 = __half2float(codebook[idx_1 * 8 + elem]);
+        }
+
+        if (HAS_STAGE2) {
+            const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+            uint16_t idx2_0 = 0, idx2_1 = 0;
+            if (valid && elem == 0) {
+                idx2_0 = (uint16_t)qidxs2[my_row * N_BLOCKS + j];
+                idx2_1 = (uint16_t)qidxs2[my_row * N_BLOCKS + j + 1];
+            }
+            idx2_0 = __shfl_sync(FULL_MASK, idx2_0, row_in_warp * 8);
+            idx2_1 = __shfl_sync(FULL_MASK, idx2_1, row_in_warp * 8);
+            if (valid) {
+                cb_val_0 += __half2float(cb2[idx2_0 * 8 + elem]) * inv_resid_scale;
+                cb_val_1 += __half2float(cb2[idx2_1 * 8 + elem]) * inv_resid_scale;
+            }
+        }
+
+        float prod_0 = cb_val_0 * x_val_0;
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 4);
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 2);
+        prod_0 += __shfl_xor_sync(FULL_MASK, prod_0, 1);
+
+        float prod_1 = cb_val_1 * x_val_1;
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 4);
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 2);
+        prod_1 += __shfl_xor_sync(FULL_MASK, prod_1, 1);
+
+        if (elem == 0) {
+            acc += prod_0 + prod_1;
+        }
+    }
+    if (j < j_end) {
+        float x_val;
+        if (lane_id < 8) { x_val = __half2float(x[j * 8 + lane_id]); }
+        x_val = __shfl_sync(FULL_MASK, x_val, elem);
+        uint16_t idx = 0;
+        if (valid && elem == 0) { idx = (uint16_t)qidxs[my_row * N_BLOCKS + j]; }
+        idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
+        float cb_val = 0.0f;
+        if (valid) { cb_val = __half2float(codebook[idx * 8 + elem]); }
+        if (HAS_STAGE2) {
+            const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+            uint16_t idx2 = 0;
+            if (valid && elem == 0) { idx2 = (uint16_t)qidxs2[my_row * N_BLOCKS + j]; }
+            idx2 = __shfl_sync(FULL_MASK, idx2, row_in_warp * 8);
+            if (valid) { cb_val += __half2float(cb2[idx2 * 8 + elem]) * inv_resid_scale; }
+        }
+        float prod = cb_val * x_val;
+        prod += __shfl_xor_sync(FULL_MASK, prod, 4);
+        prod += __shfl_xor_sync(FULL_MASK, prod, 2);
+        prod += __shfl_xor_sync(FULL_MASK, prod, 1);
+        if (elem == 0) { acc += prod; }
+    }
+
+    // Deterministic: each (k_split, m) slot is written by exactly one CTA.
+    // No atomics, no race. Scratch is uninitialized; we write it here.
+    if (elem == 0 && valid) {
+        scratch[blockIdx.y * M + my_row] = acc * wscale;
+    }
+}
+
+
+/* Deterministic reduction: sum scratch[0:k_splits, m] → output[m] in
+ * fixed loop order. One thread per output row, 256-thread blocks. */
+__global__ void __launch_bounds__(256)
+glq_reduce_splits_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ scratch,
+    int M,
+    int k_splits
+) {
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    float sum = 0.0f;
+    for (int k = 0; k < k_splits; ++k) {
+        sum += scratch[k * M + m];
+    }
+    output[m] = sum;
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
  * Tensor Core matmul kernel (B>=2) — inline PTX mma.m16n8k16
  *
  * Y(B×M) = X(B×N) @ dequant(W)^T(N×M) * Wscale
@@ -760,7 +912,9 @@ torch::Tensor glq_dequant_matvec_cuda(
     int N_BLOCKS = qidxs.size(1);
 
     at::DeviceGuard guard(x.device());
-    // Split-K uses atomicAdd → output must be zeroed
+    // Output zeroed for the non-splitk branch (glq_matvec_kernel uses atomicAdd).
+    // The splitk branch overwrites output via the reduction kernel, so the
+    // zero-init is unnecessary there but the cost is negligible.
     auto output = torch::zeros({M}, torch::dtype(torch::kFloat32).device(x.device()));
 
     static int num_sms = 0;
@@ -777,25 +931,35 @@ torch::Tensor glq_dequant_matvec_cuda(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
 
-    // Always use split-K: it handles all cases well (large M just gets k_splits=1)
     int m_blocks = (M + rows_per_block - 1) / rows_per_block;
     bool use_splitk = (N_BLOCKS >= BLOCKS_PER_SPLIT_DEFAULT);
 
     if (use_splitk) {
-        // Force k_splits=1 for determinism. Split-K uses atomicAdd across
-        // multiple CTAs targeting the same output row; float atomicAdd is
-        // ordering-dependent and would make single-token decode nondeterministic.
-        int bps = N_BLOCKS;
-        int k_splits = 1;
+        // Deterministic split-K via scratch buffer + reduction kernel.
+        // Each CTA writes its partial sum to a unique (k_split, m) slot in
+        // `scratch` with a plain store (no atomicAdd). A follow-up reduction
+        // kernel sums scratch in fixed loop order → bit-exact across runs.
+        // This preserves the SM-saturation benefit of adaptive split-K.
+        int bps = BLOCKS_PER_SPLIT_DEFAULT;
+        int k_splits = (N_BLOCKS + bps - 1) / bps;
+        int total_ctas = m_blocks * k_splits;
+        if (total_ctas < num_sms * 2 && bps > 16) {
+            bps = max(16, bps / 2);
+            k_splits = (N_BLOCKS + bps - 1) / bps;
+        }
         dim3 grid(m_blocks, k_splits);
+
+        // Allocate scratch via the caching allocator (stream-safe, fast reuse).
+        size_t scratch_bytes = (size_t)k_splits * M * sizeof(float);
+        float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
         if (has_stage2) {
             CHECK_INPUT(qidxs2);
             CHECK_INPUT(codebook2);
             int cb2_size = codebook2.size(0);
             int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-            glq_matvec_splitk_kernel<true><<<grid, block, smem, stream>>>(
-                output.data_ptr<float>(),
+            glq_matvec_splitk_scratch_kernel<true><<<grid, block, smem, stream>>>(
+                scratch,
                 (const half*)x.data_ptr<c10::Half>(),
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
@@ -805,8 +969,8 @@ torch::Tensor glq_dequant_matvec_cuda(
                 wscale, M, N_BLOCKS, bps, cb2_size
             );
         } else {
-            glq_matvec_splitk_kernel<false><<<grid, block, 0, stream>>>(
-                output.data_ptr<float>(),
+            glq_matvec_splitk_scratch_kernel<false><<<grid, block, 0, stream>>>(
+                scratch,
                 (const half*)x.data_ptr<c10::Half>(),
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
@@ -814,6 +978,15 @@ torch::Tensor glq_dequant_matvec_cuda(
                 wscale, M, N_BLOCKS, bps, 0
             );
         }
+
+        // Deterministic reduction: sum scratch[0:k_splits, m] → output[m]
+        int reduce_threads = 256;
+        int reduce_blocks = (M + reduce_threads - 1) / reduce_threads;
+        glq_reduce_splits_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+            output.data_ptr<float>(), scratch, M, k_splits
+        );
+
+        c10::cuda::CUDACachingAllocator::raw_delete(scratch);
     } else {
         dim3 grid(num_sms);
 
