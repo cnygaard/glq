@@ -919,17 +919,45 @@ def quantize(
     with open(os.path.join(output_dir, "quantize_config.json"), "w") as f:
         json.dump(quant_meta, f, indent=2)
 
-    # 5. Save tokenizer
+    # 5. Save tokenizer, preserving the original tokenizer.json pre_tokenizer
+    # and decoder which save_pretrained may corrupt (e.g. Sequence(ByteLevel)
+    # can be flattened to plain ByteLevel or replaced with Metaspace).
+    src_tok_json = None
+    try:
+        from huggingface_hub import hf_hub_download
+        src_path = hf_hub_download(model_name, "tokenizer.json")
+        with open(src_path) as f:
+            src_tok_json = json.load(f)
+    except Exception:
+        pass
+
     tokenizer.save_pretrained(output_dir)
 
-    # Strip tokenizer_class if it references an external library class
+    # Restore pre_tokenizer and decoder from the source tokenizer.json
+    tok_json_path = os.path.join(output_dir, "tokenizer.json")
+    if src_tok_json and os.path.exists(tok_json_path):
+        with open(tok_json_path) as f:
+            saved_tok = json.load(f)
+        saved_tok["pre_tokenizer"] = src_tok_json["pre_tokenizer"]
+        saved_tok["decoder"] = src_tok_json["decoder"]
+        with open(tok_json_path, "w") as f:
+            json.dump(saved_tok, f, ensure_ascii=False)
+
+    # Strip tokenizer_class only if it references an external library class
     # (e.g., "TokenizersBackend" from the tokenizers lib, not transformers).
-    # Without this field, transformers auto-detects from tokenizer.json presence.
+    # Keep known-good classes like GPT2Tokenizer, GPT2TokenizerFast, etc.
+    _KEEP_TOKENIZER_CLASSES = {
+        "GPT2Tokenizer", "GPT2TokenizerFast",
+        "LlamaTokenizer", "LlamaTokenizerFast",
+        "PreTrainedTokenizerFast",
+    }
     tc_path = os.path.join(output_dir, "tokenizer_config.json")
     if os.path.exists(tc_path):
         with open(tc_path) as f:
             tc = json.load(f)
-        if tc.pop("tokenizer_class", None):
+        tok_cls = tc.get("tokenizer_class")
+        if tok_cls and tok_cls not in _KEEP_TOKENIZER_CLASSES:
+            tc.pop("tokenizer_class")
             with open(tc_path, "w") as f:
                 json.dump(tc, f, indent=2)
 
