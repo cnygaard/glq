@@ -417,7 +417,8 @@ def quantize(
     if profile.get('forward_kwargs') == 'nemotron_h':
         cfg._attn_implementation = "eager"
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code)
 
     # ---- Load model or prepare streaming ----
     print(f"\nLoading model ...")
