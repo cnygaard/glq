@@ -124,3 +124,36 @@ except ImportError:
             return _pytorch_fht(x)
     else:
         fast_hadamard_transform = _pytorch_fht
+
+
+# ---------- Block-diagonal FHT ----------
+
+def _block_decompose(n: int) -> list[int]:
+    """Decompose n into a sum of descending powers of 2.
+
+    >>> _block_decompose(2688)
+    [2048, 512, 128]
+    >>> _block_decompose(4096)
+    [4096]
+    """
+    blocks = []
+    while n > 0:
+        p = 1 << (n.bit_length() - 1)
+        blocks.append(p)
+        n -= p
+    return blocks
+
+
+def block_diagonal_fht(x: torch.Tensor, block_sizes: list[int]) -> torch.Tensor:
+    """Apply FHT independently to each power-of-2 block along the last dim.
+
+    Equivalent to multiplying by a block-diagonal Hadamard matrix
+    diag(H_{b1}, H_{b2}, ...) where each b_i is a power of 2.
+    """
+    offset = 0
+    for bs in block_sizes:
+        x[..., offset:offset + bs] = fast_hadamard_transform(
+            x[..., offset:offset + bs].contiguous()
+        )
+        offset += bs
+    return x

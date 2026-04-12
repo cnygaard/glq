@@ -121,14 +121,25 @@ class E8RHTLinear(nn.Module):
         codebook2: E8ShellCodebook instance (secondary, for 3/4bpw)
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
+                 block_diagonal: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
-        # Padded dimensions (power of 2)
-        self.m_pad = 1 << (out_features - 1).bit_length() if out_features > 0 else 1
-        self.n_pad = 1 << (in_features - 1).bit_length() if in_features > 0 else 1
+        if block_diagonal:
+            from .hadamard import _block_decompose
+            self.blocks_m = _block_decompose(out_features)
+            self.blocks_n = _block_decompose(in_features)
+            self.m_pad = sum(self.blocks_m)  # = out_features (no padding)
+            self.n_pad = sum(self.blocks_n)  # = in_features (no padding)
+        else:
+            # Legacy: pad to next power of 2
+            self.m_pad = 1 << (out_features - 1).bit_length() if out_features > 0 else 1
+            self.n_pad = 1 << (in_features - 1).bit_length() if in_features > 0 else 1
+            self.blocks_m = [self.m_pad]
+            self.blocks_n = [self.n_pad]
+        self.block_diagonal = block_diagonal
 
         # Quantized weight storage
         self.register_buffer('Qidxs', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
@@ -187,11 +198,43 @@ class E8RHTLinear(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys, error_msgs):
-        """Pad unpadded tensors back to power-of-2 dimensions on load.
+        """Adapt buffer sizes to match checkpoint on load.
 
-        Also handles 2bpw models that omit Qidxs2/inv_resid_scale
-        (they default to zeros from __init__).
+        Handles both legacy (power-of-2 padded) and block-diagonal (unpadded)
+        checkpoints by resizing buffers to match the checkpoint's actual shapes.
+        Also handles 2bpw models that omit Qidxs2/inv_resid_scale.
         """
+        # Detect checkpoint dimensions from Qidxs shape
+        qidxs_key = prefix + 'Qidxs'
+        if qidxs_key in state_dict:
+            t = state_dict[qidxs_key]
+            ckpt_m_pad = t.shape[0]
+            ckpt_n_blocks = t.shape[1]
+            ckpt_n_pad = ckpt_n_blocks * 8
+            # Resize buffers if checkpoint dims differ from __init__ dims
+            if ckpt_m_pad != self.m_pad or ckpt_n_pad != self.n_pad:
+                from .hadamard import _block_decompose
+                self.m_pad = ckpt_m_pad
+                self.n_pad = ckpt_n_pad
+                # Detect if checkpoint is block-diagonal (unpadded) or legacy
+                is_pow2_m = (ckpt_m_pad & (ckpt_m_pad - 1)) == 0
+                is_pow2_n = (ckpt_n_pad & (ckpt_n_pad - 1)) == 0
+                if is_pow2_m and is_pow2_n:
+                    self.block_diagonal = False
+                    self.blocks_m = [ckpt_m_pad]
+                    self.blocks_n = [ckpt_n_pad]
+                else:
+                    self.block_diagonal = True
+                    self.blocks_m = _block_decompose(ckpt_m_pad)
+                    self.blocks_n = _block_decompose(ckpt_n_pad)
+                # Resize registered buffers to match
+                for suffix in ('Qidxs', 'Qidxs2'):
+                    self.register_buffer(suffix, torch.zeros(
+                        ckpt_m_pad, ckpt_n_blocks, dtype=torch.int16))
+                self.register_buffer('SU', torch.ones(ckpt_m_pad, dtype=torch.float16))
+                self.register_buffer('SV', torch.ones(ckpt_n_pad, dtype=torch.float16))
+
+        # Pad if checkpoint is smaller than current buffers (legacy compat)
         for suffix in ('Qidxs', 'Qidxs2'):
             key = prefix + suffix
             if key in state_dict:
@@ -227,11 +270,26 @@ class E8RHTLinear(nn.Module):
             strict, missing_keys, unexpected_keys, error_msgs)
 
     def _pad_if_needed(self):
-        """Pad buffers to power-of-2 dims if loaded at unpadded size.
+        """Adapt buffer dimensions on first forward.
 
-        Handles accelerate dispatch (which bypasses load_state_dict).
-        Called once on first forward; a no-op if already padded.
+        Handles accelerate dispatch (which bypasses _load_from_state_dict).
+        Detects block-diagonal checkpoints (non-power-of-2 buffer shapes)
+        and reconfigures m_pad/n_pad/blocks accordingly.
         """
+        actual_m = self.Qidxs.shape[0]
+        actual_n = self.Qidxs.shape[1] * 8
+        # Detect block-diagonal: buffer dims differ from init AND are not power-of-2
+        if actual_m != self.m_pad or actual_n != self.n_pad:
+            is_pow2_m = actual_m > 0 and (actual_m & (actual_m - 1)) == 0
+            is_pow2_n = actual_n > 0 and (actual_n & (actual_n - 1)) == 0
+            if not (is_pow2_m and is_pow2_n):
+                from .hadamard import _block_decompose
+                self.m_pad = actual_m
+                self.n_pad = actual_n
+                self.block_diagonal = True
+                self.blocks_m = _block_decompose(actual_m)
+                self.blocks_n = _block_decompose(actual_n)
+                return
         if self.Qidxs.shape[0] == self.m_pad:
             return
         dev = self.Qidxs.device
@@ -293,10 +351,12 @@ class E8RHTLinear(nn.Module):
         has_stage2 = self._has_stage2
 
         # Try fully-fused C++ path: input_rht + dequant_matmul + output_rht in 1 call
+        # (requires power-of-2 dims — not available for block-diagonal models)
         from . import inference_kernel as _ik
         n_pad = self.n_pad
         m_pad = self.m_pad
-        if (use_fused and n_pad <= 32768 and m_pad <= 32768
+        _is_pow2 = not self.block_diagonal
+        if (_is_pow2 and use_fused and n_pad <= 32768 and m_pad <= 32768
                 and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_linear_cuda')):
             _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
@@ -322,7 +382,7 @@ class E8RHTLinear(nn.Module):
         # Fallback: 3 separate kernel calls
         # Transform input to RHT domain
         if _nvtx: _nvtx.range_push("input_rht")
-        if use_fused:
+        if _is_pow2 and use_fused:
             log_n = int(math.log2(n_pad))
             x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
             if n_pad <= 32768 and _ik._try_load_cuda_ext():
@@ -339,10 +399,11 @@ class E8RHTLinear(nn.Module):
                     num_warps=8,
                 )
         else:
+            from .hadamard import block_diagonal_fht
             x_f = x.float()
             x_pad = F.pad(x_f, (0, n_pad - self.in_features))
             sv = self.SV.float()
-            x_rht = fast_hadamard_transform(x_pad * sv.unsqueeze(0))
+            x_rht = block_diagonal_fht(x_pad * sv.unsqueeze(0), self.blocks_n)
 
         if _nvtx: _nvtx.range_pop()  # input_rht
 
@@ -374,7 +435,7 @@ class E8RHTLinear(nn.Module):
 
         # Inverse RHT on output
         if _nvtx: _nvtx.range_push("output_rht")
-        if use_fused:
+        if _is_pow2 and use_fused:
             log_m = int(math.log2(m_pad))
             if m_pad <= 32768 and _ik._try_load_cuda_ext():
                 y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
@@ -398,8 +459,9 @@ class E8RHTLinear(nn.Module):
             if self.bias is not None:
                 y = y + self.bias.unsqueeze(0).to(dtype)
         else:
+            from .hadamard import block_diagonal_fht
             su = self.SU.float()
-            y = fast_hadamard_transform(y_rht) * su.unsqueeze(0)
+            y = block_diagonal_fht(y_rht, self.blocks_m) * su.unsqueeze(0)
             y = y[:, :self.out_features]
             if self.bias is not None:
                 y = y + self.bias.float().unsqueeze(0)
