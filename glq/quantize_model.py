@@ -225,6 +225,7 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
     H_pad = pad_hessian(H_tilde, 8)
 
     def _run_ldlq(W_p, H_p):
+        from .ldlq import quantize_ldlq_codebook_nstage
         if bpw == 2:
             return quantize_ldlq_codebook(W_p, H_p, codebook, tune_iters=tune_iters)
         elif bpw == 3:
@@ -232,10 +233,38 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
             return quantize_ldlq_codebook_2stage(
                 W_p, H_p, codebook, codebook_small,
                 resid_scale=codebook.resid_scale, tune_iters=tune_iters)
-        else:
+        elif bpw == 4:
             return quantize_ldlq_codebook_2stage(
                 W_p, H_p, codebook, codebook,
                 resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+        elif bpw == 5:
+            cb_small = codebook.make_small(256)
+            return quantize_ldlq_codebook_nstage(
+                W_p, H_p,
+                codebooks=[codebook, codebook, cb_small],
+                resid_scales=[codebook.resid_scale, codebook.resid_scale],
+                tune_iters=tune_iters)
+        elif bpw == 6:
+            return quantize_ldlq_codebook_nstage(
+                W_p, H_p,
+                codebooks=[codebook, codebook, codebook],
+                resid_scales=[codebook.resid_scale, codebook.resid_scale],
+                tune_iters=tune_iters)
+        elif bpw == 7:
+            cb_small = codebook.make_small(256)
+            return quantize_ldlq_codebook_nstage(
+                W_p, H_p,
+                codebooks=[codebook, codebook, codebook, cb_small],
+                resid_scales=[codebook.resid_scale] * 3,
+                tune_iters=tune_iters)
+        elif bpw == 8:
+            return quantize_ldlq_codebook_nstage(
+                W_p, H_p,
+                codebooks=[codebook] * 4,
+                resid_scales=[codebook.resid_scale] * 3,
+                tune_iters=tune_iters)
+        else:
+            raise ValueError(f"Unsupported bpw: {bpw}. Use 2, 3, 4, 5, 6, 7, or 8.")
 
     # 3-tier Cholesky error handling for sparse/degenerate Hessians
     # (e.g. MoE experts with few calibration tokens)
@@ -270,11 +299,23 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
         artifacts['Qidxs'] = result['indices'].to(torch.int16)
         # Don't store Qidxs2/inv_resid_scale at 2bpw — they're all zeros.
         # E8RHTLinear._load_from_state_dict handles missing keys.
-    else:
+    elif bpw <= 4:
         artifacts['Qidxs'] = result['indices1'].to(torch.int16)
         artifacts['Qidxs2'] = result['indices2'].to(torch.int16)
         artifacts['inv_resid_scale'] = torch.tensor(
             1.0 / result['resid_scale'], dtype=torch.float32)
+    else:
+        # N-stage (bpw 5-8): store all_indices and cumulative inv_resid_scales
+        all_idx = result['all_indices']
+        cum_inv_rs = result['cum_inv_rs']
+        artifacts['Qidxs'] = all_idx[0].to(torch.int16)
+        for i in range(1, len(all_idx)):
+            suffix = f'Qidxs{i + 1}'
+            artifacts[suffix] = all_idx[i].to(torch.int16)
+        # Store cumulative inverse resid_scales (stage 2 onward)
+        for i in range(1, len(cum_inv_rs)):
+            suffix = 'inv_resid_scale' if i == 1 else f'inv_resid_scale{i}'
+            artifacts[suffix] = torch.tensor(cum_inv_rs[i], dtype=torch.float32)
 
     metrics = {'sqnr': sqnr, 'bpw': result['bpw'], 'Wscale': result['Wscale'],
                'proxy_loss': result['proxy_loss']}

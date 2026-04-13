@@ -147,11 +147,16 @@ class E8RHTLinear(nn.Module):
         self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
         self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
 
-        # Two-stage buffers for 3/4bpw (always registered; 2bpw layers leave as zeros).
-        # HF load report may show MISSING for 2bpw layers — this is expected and harmless.
+        # Multi-stage buffers (2bpw layers leave as zeros; missing keys handled on load).
         self.register_buffer('Qidxs2', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
         self.register_buffer('inv_resid_scale', torch.zeros((), dtype=torch.float32))
+        # Stages 3-4 for 5-8bpw
+        self.register_buffer('Qidxs3', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
+        self.register_buffer('inv_resid_scale2', torch.zeros((), dtype=torch.float32))
+        self.register_buffer('Qidxs4', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
+        self.register_buffer('inv_resid_scale3', torch.zeros((), dtype=torch.float32))
         self._has_stage2 = False
+        self._n_stages = 1
 
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=torch.float16))
@@ -186,12 +191,19 @@ class E8RHTLinear(nn.Module):
             self._wscale_float = None
             self._inv_rs_float = None
             return
-        # Detect two-stage from inv_resid_scale (non-zero means 3/4bpw data was loaded)
+        # Detect number of stages from inv_resid_scale buffers
         self._has_stage2 = (
             codebook2 is not None
             and self.inv_resid_scale is not None
             and self.inv_resid_scale.abs().item() > 0
         )
+        self._n_stages = 1
+        if self._has_stage2:
+            self._n_stages = 2
+            if self.inv_resid_scale2.abs().item() > 0:
+                self._n_stages = 3
+                if self.inv_resid_scale3.abs().item() > 0:
+                    self._n_stages = 4
         # Cache scalar values to avoid GPU→CPU sync on every forward pass
         self._wscale_float = self.Wscale.item()
         self._inv_rs_float = self.inv_resid_scale.item() if self._has_stage2 else 0.0
@@ -204,38 +216,8 @@ class E8RHTLinear(nn.Module):
         checkpoints by resizing buffers to match the checkpoint's actual shapes.
         Also handles 2bpw models that omit Qidxs2/inv_resid_scale.
         """
-        # Detect checkpoint dimensions from Qidxs shape
-        qidxs_key = prefix + 'Qidxs'
-        if qidxs_key in state_dict:
-            t = state_dict[qidxs_key]
-            ckpt_m_pad = t.shape[0]
-            ckpt_n_blocks = t.shape[1]
-            ckpt_n_pad = ckpt_n_blocks * 8
-            # Resize buffers if checkpoint dims differ from __init__ dims
-            if ckpt_m_pad != self.m_pad or ckpt_n_pad != self.n_pad:
-                from .hadamard import _block_decompose
-                self.m_pad = ckpt_m_pad
-                self.n_pad = ckpt_n_pad
-                # Detect if checkpoint is block-diagonal (unpadded) or legacy
-                is_pow2_m = (ckpt_m_pad & (ckpt_m_pad - 1)) == 0
-                is_pow2_n = (ckpt_n_pad & (ckpt_n_pad - 1)) == 0
-                if is_pow2_m and is_pow2_n:
-                    self.block_diagonal = False
-                    self.blocks_m = [ckpt_m_pad]
-                    self.blocks_n = [ckpt_n_pad]
-                else:
-                    self.block_diagonal = True
-                    self.blocks_m = _block_decompose(ckpt_m_pad)
-                    self.blocks_n = _block_decompose(ckpt_n_pad)
-                # Resize registered buffers to match
-                for suffix in ('Qidxs', 'Qidxs2'):
-                    self.register_buffer(suffix, torch.zeros(
-                        ckpt_m_pad, ckpt_n_blocks, dtype=torch.int16))
-                self.register_buffer('SU', torch.ones(ckpt_m_pad, dtype=torch.float16))
-                self.register_buffer('SV', torch.ones(ckpt_n_pad, dtype=torch.float16))
-
         # Pad if checkpoint is smaller than current buffers (legacy compat)
-        for suffix in ('Qidxs', 'Qidxs2'):
+        for suffix in ('Qidxs', 'Qidxs2', 'Qidxs3', 'Qidxs4'):
             key = prefix + suffix
             if key in state_dict:
                 t = state_dict[key]
@@ -256,15 +238,24 @@ class E8RHTLinear(nn.Module):
             padded = torch.ones(self.n_pad, dtype=t.dtype, device=t.device)
             padded[:t.shape[0]] = t
             state_dict[sv_key] = padded
-        # 2bpw models omit Qidxs2 and inv_resid_scale to save disk space.
-        # Inject zero placeholders so super() doesn't report them as missing.
-        for suffix, default_fn in [
-            ('Qidxs2', lambda: torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16)),
-            ('inv_resid_scale', lambda: torch.zeros((), dtype=torch.float32)),
-        ]:
-            key = prefix + suffix
-            if key not in state_dict:
-                state_dict[key] = default_fn()
+        # Only inject zero placeholders for optional buffers that are BOTH:
+        # (a) missing from the checkpoint, AND (b) this is a full-model load
+        # (not a per-key load). Detect per-key loads by checking if the
+        # primary 'Qidxs' key is in the state_dict (it always is for full loads).
+        _primary_key = prefix + 'Qidxs'
+        _is_full_load = _primary_key in state_dict
+        if _is_full_load:
+            for suffix, default_fn in [
+                ('Qidxs2', lambda: torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16)),
+                ('inv_resid_scale', lambda: torch.zeros((), dtype=torch.float32)),
+                ('Qidxs3', lambda: torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16)),
+                ('inv_resid_scale2', lambda: torch.zeros((), dtype=torch.float32)),
+                ('Qidxs4', lambda: torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16)),
+                ('inv_resid_scale3', lambda: torch.zeros((), dtype=torch.float32)),
+            ]:
+                key = prefix + suffix
+                if key not in state_dict:
+                    state_dict[key] = default_fn()
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata,
             strict, missing_keys, unexpected_keys, error_msgs)
@@ -294,7 +285,7 @@ class E8RHTLinear(nn.Module):
             return
         dev = self.Qidxs.device
         target = (self.m_pad, self.n_pad // 8)
-        for name in ('Qidxs', 'Qidxs2'):
+        for name in ('Qidxs', 'Qidxs2', 'Qidxs3', 'Qidxs4'):
             old = getattr(self, name)
             if old.shape[0] < target[0] or old.shape[1] < target[1]:
                 new = torch.zeros(target, dtype=old.dtype, device='cpu')
@@ -409,7 +400,9 @@ class E8RHTLinear(nn.Module):
 
         # Dequant + matmul in RHT domain
         if _nvtx: _nvtx.range_push("dequant_matmul")
-        if x_rht.is_cuda and _triton_available:
+        n_stages = self._n_stages
+        if x_rht.is_cuda and _triton_available and n_stages <= 2:
+            # Triton/CUDA path: up to 2 stages
             from .inference_kernel import glq_dequant_matmul
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else None
             cb_packed = getattr(self.codebook, 'codebook_packed', None)
@@ -423,12 +416,25 @@ class E8RHTLinear(nn.Module):
                 codebook_packed=cb_packed,
             )
         else:
+            # PyTorch fallback: supports N stages
             W_rht = self.codebook.decode(self.Qidxs.long().reshape(-1))
             W_rht = W_rht.reshape(m_pad, n_pad)
             if has_stage2:
-                W_rht2 = self.codebook2.decode(self.Qidxs2.long().reshape(-1))
+                cb2 = self.codebook2 if self.codebook2 is not None else self.codebook
+                W_rht2 = cb2.decode(self.Qidxs2.long().reshape(-1))
                 W_rht2 = W_rht2.reshape(m_pad, n_pad)
                 W_rht = W_rht + W_rht2 * self.inv_resid_scale.item()
+            # Stages 3-4 (5-8bpw)
+            _extra_stages = [
+                (self.Qidxs3, self.inv_resid_scale2),
+                (self.Qidxs4, self.inv_resid_scale3),
+            ]
+            for qidxs_i, inv_rs_i in _extra_stages:
+                if inv_rs_i.abs().item() == 0:
+                    break
+                cb_i = self.codebook  # all extra stages use full codebook
+                W_i = cb_i.decode(qidxs_i.long().reshape(-1)).reshape(m_pad, n_pad)
+                W_rht = W_rht + W_i * inv_rs_i.item()
             y_rht = x_rht @ W_rht.T * self.Wscale.float()
 
         if _nvtx: _nvtx.range_pop()  # dequant_matmul

@@ -63,7 +63,28 @@ class GLQConfig(QuantizationConfigMixin):
 MODULES_TO_NOT_CONVERT = ["lm_head"]
 
 
-def replace_with_glq_linear(model):
+def _detect_block_diagonal(pretrained_path):
+    """Peek at checkpoint to detect block-diagonal quantization."""
+    try:
+        from safetensors import safe_open
+        from transformers.utils.hub import cached_file
+        st_path = cached_file(pretrained_path, "model.safetensors",
+                              _raise_exceptions_for_missing_entries=False)
+        if st_path is None:
+            return False
+        with safe_open(st_path, framework="pt") as st:
+            for k in st.keys():
+                if k.endswith(".Qidxs"):
+                    t = st.get_tensor(k)
+                    m = t.shape[0]
+                    is_pow2 = m > 0 and (m & (m - 1)) == 0
+                    return not is_pow2
+    except Exception:
+        pass
+    return False
+
+
+def replace_with_glq_linear(model, block_diagonal=False):
     """Replace nn.Linear modules with E8RHTLinear on meta device."""
     has_replaced = False
     for name, module in list(model.named_modules()):
@@ -76,6 +97,7 @@ def replace_with_glq_linear(model):
                 module.in_features,
                 module.out_features,
                 bias=module.bias is not None,
+                block_diagonal=block_diagonal,
             )
         new_module.requires_grad_(False)
         model.set_submodule(name, new_module)
@@ -97,17 +119,18 @@ class GLQQuantizer(HfQuantizer):
         pass  # glq is bundled — no external deps beyond torch
 
     def _process_model_before_weight_loading(self, model, **kwargs):
-        replaced = replace_with_glq_linear(model)
+        pretrained_path = getattr(model.config, "_name_or_path", None)
+        block_diag = _detect_block_diagonal(pretrained_path) if pretrained_path else False
+        replaced = replace_with_glq_linear(model, block_diagonal=block_diag)
         if not replaced:
             import logging
             logging.getLogger(__name__).warning(
                 "GLQ: no nn.Linear modules found to replace")
-        # Suppress MISSING warnings for Qidxs2/inv_resid_scale on 2bpw layers.
-        # These are omitted from checkpoint to save disk; _load_from_state_dict
-        # injects zero defaults. The pattern matches any layer's optional buffers.
-        ignore = getattr(model, '_keys_to_ignore_on_load_missing', None) or []
-        ignore.extend(["Qidxs2", "inv_resid_scale"])
-        model._keys_to_ignore_on_load_missing = ignore
+        # DO NOT add Qidxs2 etc. to _keys_to_ignore_on_load_missing — HF's
+        # _move_missing_keys_from_meta_to_cpu uses the missing_keys list to
+        # reinitialize meta-device buffers, and "ignored" keys still get
+        # overwritten with zeros. Instead, let _load_from_state_dict inject
+        # zero defaults for truly missing keys.
         return model
 
     def _process_model_after_weight_loading(self, model, **kwargs):
