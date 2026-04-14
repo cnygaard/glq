@@ -5,7 +5,7 @@ Usage:
     python -m glq.quantize_model \
         --model mistralai/Ministral-3-3B-Reasoning-2512 \
         --output ./ministral-glq-2bpw \
-        --bpw 2 --nsamples 16
+        --bpw 2 --nsamples 128
 
 Python API:
     from glq.quantize_model import quantize
@@ -388,7 +388,7 @@ def quantize(
     min_bpw: int = None,
     max_bpw: int = None,
     tune_iters: int = 0,
-    nsamples: int = 16,
+    nsamples: int = 128,
     seqlen: int = 2048,
     device: str = "cuda",
     dtype=torch.bfloat16,
@@ -445,6 +445,13 @@ def quantize(
         avg_target = None
         print(f"GLQ Quantization: {model_name} -> {output_dir}")
         print(f"  bpw={bpw}, tune_iters={tune_iters}, nsamples={nsamples}")
+    if nsamples < 64:
+        import warnings
+        warnings.warn(
+            f"nsamples={nsamples} is low — Hessian estimates may be noisy, "
+            f"degrading quantization quality. Use nsamples>=128 for best results.",
+            UserWarning,
+        )
     if streaming:
         print(f"  streaming=True (layer-by-layer safetensors loading)")
 
@@ -1032,8 +1039,8 @@ def main():
                              "(triggers auto-allocation)")
     parser.add_argument("--tune-iters", type=int, default=0,
                         help="LDLQ refinement iterations")
-    parser.add_argument("--nsamples", type=int, default=16,
-                        help="Number of calibration samples")
+    parser.add_argument("--nsamples", type=int, default=128,
+                        help="Number of calibration samples (default 128; <64 may degrade quality)")
     parser.add_argument("--seqlen", type=int, default=2048,
                         help="Calibration sequence length")
     parser.add_argument("--device", type=str, default="cuda",
