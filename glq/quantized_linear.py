@@ -342,33 +342,52 @@ class E8RHTLinear(nn.Module):
         has_stage2 = self._has_stage2
 
         # Try fully-fused C++ path: input_rht + dequant_matmul + output_rht in 1 call
-        # (requires power-of-2 dims — not available for block-diagonal models)
         from . import inference_kernel as _ik
         n_pad = self.n_pad
         m_pad = self.m_pad
         _is_pow2 = not self.block_diagonal
-        if (_is_pow2 and use_fused and n_pad <= 32768 and m_pad <= 32768
+        if (use_fused and n_pad <= 32768 and m_pad <= 32768
+                and self._n_stages <= 2
                 and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_linear_cuda')):
             _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
             _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else _empty_f16
-            y = _ik._glq_cuda.glq_fused_linear_cuda(
-                x.half().contiguous(), self.SV, self.SU,
-                self.Qidxs, self.codebook.codebook_half,
-                self._wscale_float,
-                self.in_features, self.out_features,
-                n_pad, m_pad,
-                int(math.log2(n_pad)), int(math.log2(m_pad)),
-                self.Qidxs2 if has_stage2 else _empty_i16,
-                cb2_tensor,
-                self._inv_rs_float,
-            )
-            if dtype != torch.float16:
-                y = y.to(dtype)
-            if self.bias is not None:
-                y = y + self.bias.unsqueeze(0).to(dtype)
-            return y.reshape(*shape[:-1], self.out_features)
+            if _is_pow2:
+                y = _ik._glq_cuda.glq_fused_linear_cuda(
+                    x.half().contiguous(), self.SV, self.SU,
+                    self.Qidxs, self.codebook.codebook_half,
+                    self._wscale_float,
+                    self.in_features, self.out_features,
+                    n_pad, m_pad,
+                    int(math.log2(n_pad)), int(math.log2(m_pad)),
+                    self.Qidxs2 if has_stage2 else _empty_i16,
+                    cb2_tensor,
+                    self._inv_rs_float,
+                )
+            elif hasattr(_ik._glq_cuda, 'glq_fused_linear_block_diag_cuda'):
+                if not hasattr(self, '_blocks_n_tensor'):
+                    self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64)
+                    self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64)
+                y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
+                    x.half().contiguous(), self.SV, self.SU,
+                    self.Qidxs, self.codebook.codebook_half,
+                    self._wscale_float,
+                    self.in_features, self.out_features,
+                    n_pad, m_pad,
+                    self._blocks_n_tensor, self._blocks_m_tensor,
+                    self.Qidxs2 if has_stage2 else _empty_i16,
+                    cb2_tensor,
+                    self._inv_rs_float,
+                )
+            else:
+                y = None  # fall through to fallback
+            if y is not None:
+                if dtype != torch.float16:
+                    y = y.to(dtype)
+                if self.bias is not None:
+                    y = y + self.bias.unsqueeze(0).to(dtype)
+                return y.reshape(*shape[:-1], self.out_features)
 
         # Fallback: 3 separate kernel calls
         # Transform input to RHT domain

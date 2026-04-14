@@ -1505,13 +1505,15 @@ torch::Tensor glq_dequant_matmul_packed_cuda(
 __global__ void glq_input_rht_kernel(
     const half* __restrict__ x,      // (B, in_features) fp16 input
     const half* __restrict__ sv,     // (n_pad,) fp16 sign vector
-    float* __restrict__ out,         // (B, n_pad) fp32 output (x_rht)
+    float* __restrict__ out,         // (B, stride_out) fp32 output (x_rht)
     int in_features,
     int stride_x,                    // x.stride(0) in elements
     float rsqrt_n,                   // 1.0 / sqrt(n_pad)
     int n_pad,
     int log_n,
-    int use_single_buffer            // 1 if smem too small for double-buffer
+    int use_single_buffer,           // 1 if smem too small for double-buffer
+    int col_offset,                  // offset within row for block-diagonal
+    int stride_out                   // output row stride (total n_pad for block-diag)
 ) {
     extern __shared__ float smem[];
 
@@ -1522,8 +1524,8 @@ __global__ void glq_input_rht_kernel(
     // Step 1: Load x with zero-padding, multiply by SV signs
     float* buf = smem;
     for (int i = tid; i < n_pad; i += n_threads) {
-        float x_val = (i < in_features) ? __half2float(x[b * stride_x + i]) : 0.0f;
-        float s = __half2float(sv[i]);
+        float x_val = (col_offset + i < in_features) ? __half2float(x[b * stride_x + col_offset + i]) : 0.0f;
+        float s = __half2float(sv[col_offset + i]);
         buf[i] = x_val * s;
     }
     __syncthreads();
@@ -1578,7 +1580,7 @@ __global__ void glq_input_rht_kernel(
 
     // Step 3: Normalize and store
     for (int i = tid; i < n_pad; i += n_threads) {
-        out[b * n_pad + i] = buf[i] * rsqrt_n;
+        out[b * stride_out + col_offset + i] = buf[i] * rsqrt_n;
     }
 }
 
@@ -1747,14 +1749,17 @@ __global__ void glq_output_rht_twopass_kernel(
 
 
 __global__ void glq_output_rht_kernel(
-    const float* __restrict__ y_rht, // (B, m_pad) fp32 input
-    const half* __restrict__ su,     // (m_pad,) fp16 sign vector
-    half* __restrict__ out,          // (B, out_features) fp16 output
+    const float* __restrict__ y_rht, // (B, stride_in) fp32 input
+    const half* __restrict__ su,     // (total_m_pad,) fp16 sign vector
+    half* __restrict__ out,          // (B, stride_out) fp16 output
     int out_features,
     int m_pad,
     int log_m,
     float rsqrt_m,                   // 1.0 / sqrt(m_pad)
-    int use_single_buffer
+    int use_single_buffer,
+    int col_offset,                  // offset within row for block-diagonal
+    int stride_in,                   // y_rht row stride
+    int stride_out                   // output row stride
 ) {
     extern __shared__ float smem[];
     float* buf = smem;
@@ -1763,9 +1768,9 @@ __global__ void glq_output_rht_kernel(
     int tid = threadIdx.x;
     int n_threads = blockDim.x;
 
-    // Step 1: Load y_rht
+    // Step 1: Load y_rht from this block's column range
     for (int i = tid; i < m_pad; i += n_threads) {
-        buf[i] = y_rht[b * m_pad + i];
+        buf[i] = y_rht[b * stride_in + col_offset + i];
     }
     __syncthreads();
 
@@ -1810,10 +1815,12 @@ __global__ void glq_output_rht_kernel(
     }
 
     // Step 3: Normalize, apply SU signs, unpad, cast to fp16
-    for (int i = tid; i < out_features; i += n_threads) {
-        float val = buf[i] * rsqrt_m;
-        float s = __half2float(su[i]);
-        out[b * out_features + i] = __float2half(val * s);
+    for (int i = tid; i < m_pad; i += n_threads) {
+        if (col_offset + i < out_features) {
+            float val = buf[i] * rsqrt_m;
+            float s = __half2float(su[col_offset + i]);
+            out[b * stride_out + col_offset + i] = __float2half(val * s);
+        }
     }
 }
 
@@ -1875,7 +1882,8 @@ void glq_input_rht_cuda(
         (const half*)x.data_ptr<c10::Half>(),
         (const half*)sv.data_ptr<c10::Half>(),
         out.data_ptr<float>(),
-        in_features, stride_x, rsqrt_n, n_pad, log_n, use_single
+        in_features, stride_x, rsqrt_n, n_pad, log_n, use_single,
+        /*col_offset=*/0, /*stride_out=*/n_pad
     );
 }
 
@@ -1932,7 +1940,8 @@ void glq_output_rht_cuda(
         y_rht.data_ptr<float>(),
         (const half*)su.data_ptr<c10::Half>(),
         (half*)out.data_ptr<c10::Half>(),
-        out_features, m_pad, log_m, rsqrt_m, use_single
+        out_features, m_pad, log_m, rsqrt_m, use_single,
+        /*col_offset=*/0, /*stride_in=*/m_pad, /*stride_out=*/out_features
     );
 }
 
@@ -2020,7 +2029,8 @@ torch::Tensor glq_fused_linear_cuda(
                 (const half*)x.data_ptr<c10::Half>(),
                 (const half*)sv.data_ptr<c10::Half>(),
                 x_rht.data_ptr<float>(),
-                in_features, in_features, rsqrt_n, n_pad, log_n, use_single
+                in_features, in_features, rsqrt_n, n_pad, log_n, use_single,
+                /*col_offset=*/0, /*stride_out=*/n_pad
             );
         }
     }
@@ -2144,8 +2154,181 @@ torch::Tensor glq_fused_linear_cuda(
                 y_rht.data_ptr<float>(),
                 (const half*)su.data_ptr<c10::Half>(),
                 (half*)y.data_ptr<c10::Half>(),
-                out_features, m_pad, log_m, rsqrt_m, use_single
+                out_features, m_pad, log_m, rsqrt_m, use_single,
+                /*col_offset=*/0, /*stride_in=*/m_pad, /*stride_out=*/out_features
             );
+        }
+    }
+
+    return y;
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Block-diagonal fused linear: input_rht(blocks) + dequant_matmul + output_rht(blocks)
+ * ───────────────────────────────────────────────────────────────────── */
+
+torch::Tensor glq_fused_linear_block_diag_cuda(
+    torch::Tensor x,           // (B, in_features) fp16, contiguous
+    torch::Tensor sv,          // (n_pad,) fp16 — input RHT sign vector
+    torch::Tensor su,          // (m_pad,) fp16 — output RHT sign vector
+    torch::Tensor qidxs,       // (M, N_BLOCKS) int16
+    torch::Tensor codebook,    // (65536, 8) fp16
+    float wscale,
+    int in_features,
+    int out_features,
+    int n_pad, int m_pad,
+    torch::Tensor blocks_n,    // 1D int64 tensor: [2048, 512, 128]
+    torch::Tensor blocks_m,    // 1D int64 tensor: [2048, 512, 128]
+    torch::Tensor qidxs2,
+    torch::Tensor codebook2,
+    float inv_resid_scale
+) {
+    int B = x.size(0);
+    int M = qidxs.size(0);
+    int N_BLOCKS = qidxs.size(1);
+    bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    // ---- Step 1: Input RHT — loop over n-blocks ----
+    auto x_rht = torch::empty({B, n_pad}, torch::dtype(torch::kFloat32).device(x.device()));
+    {
+        const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
+        const half* sv_ptr = (const half*)sv.data_ptr<c10::Half>();
+        float* x_rht_ptr = x_rht.data_ptr<float>();
+        int64_t* bn = blocks_n.data_ptr<int64_t>();
+        int num_n_blocks = blocks_n.size(0);
+
+        int col_offset = 0;
+        for (int bi = 0; bi < num_n_blocks; bi++) {
+            int bs = (int)bn[bi];
+            int log_bs = __builtin_ctz(bs);  // log2 for power-of-2
+            int in_feat_block = min(in_features - col_offset, bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_input_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+            glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+                x_ptr, sv_ptr, x_rht_ptr,
+                in_features, in_features, 1.0f / sqrtf((float)bs),
+                bs, log_bs, use_single,
+                col_offset, n_pad
+            );
+            col_offset += bs;
+        }
+    }
+
+    // ---- Step 2: Dequant + matmul (identical to glq_fused_linear_cuda) ----
+    auto x_rht_half = x_rht.to(torch::kFloat16);
+    auto y_rht = torch::zeros({B, M}, torch::dtype(torch::kFloat32).device(x.device()));
+    {
+        static int num_sms = 0;
+        if (num_sms == 0) {
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, x.get_device());
+            num_sms = prop.multiProcessorCount;
+        }
+
+        if (B == 1) {
+            int cb2_size = has_stage2 ? codebook2.size(0) : 0;
+            launch_matvec_splitk(
+                y_rht.data_ptr<float>(),
+                (const half*)x_rht_half.data_ptr<c10::Half>(),
+                qidxs.data_ptr<int16_t>(),
+                (const half*)codebook.data_ptr<c10::Half>(),
+                wscale,
+                has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr,
+                has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr,
+                inv_resid_scale, has_stage2,
+                M, N_BLOCKS, cb2_size, num_sms, stream
+            );
+        } else {
+            const int WARPS = 8;
+            dim3 tc_block(32, WARPS);
+            int b_tiles = (B + 15) / 16;
+            int m_tiles = (M + 7) / 8;
+            int m_grid = (m_tiles + WARPS - 1) / WARPS;
+
+            int bps = TC_BPS_DEFAULT;
+            int k_splits = (N_BLOCKS + bps - 1) / bps;
+            int total_ctas = b_tiles * m_grid * k_splits;
+            if (total_ctas < num_sms * 2 && bps > 16) {
+                bps = max(16, bps / 2);
+                k_splits = (N_BLOCKS + bps - 1) / bps;
+            }
+
+            dim3 tc_grid(b_tiles, m_grid, k_splits);
+            size_t scratch_bytes = (size_t)k_splits * B * M * sizeof(float);
+            float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+
+            if (has_stage2) {
+                int cb2_size = codebook2.size(0);
+                int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
+                glq_matmul_tc_scratch_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
+                    scratch,
+                    (const half*)x_rht_half.data_ptr<c10::Half>(),
+                    qidxs.data_ptr<int16_t>(),
+                    (const half*)codebook.data_ptr<c10::Half>(),
+                    qidxs2.data_ptr<int16_t>(),
+                    (const half*)codebook2.data_ptr<c10::Half>(),
+                    inv_resid_scale,
+                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size
+                );
+            } else {
+                glq_matmul_tc_scratch_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
+                    scratch,
+                    (const half*)x_rht_half.data_ptr<c10::Half>(),
+                    qidxs.data_ptr<int16_t>(),
+                    (const half*)codebook.data_ptr<c10::Half>(),
+                    nullptr, nullptr, 0.0f,
+                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, 0
+                );
+            }
+
+            int BM = B * M;
+            int reduce_threads = 256;
+            int reduce_blocks = (BM + reduce_threads - 1) / reduce_threads;
+            glq_reduce_splits_2d_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+                y_rht.data_ptr<float>(), scratch, BM, k_splits
+            );
+            c10::cuda::CUDACachingAllocator::raw_delete(scratch);
+        }
+    }
+
+    // ---- Step 3: Output RHT — loop over m-blocks ----
+    auto y = torch::empty({B, out_features}, torch::dtype(torch::kFloat16).device(x.device()));
+    {
+        const half* su_ptr = (const half*)su.data_ptr<c10::Half>();
+        half* y_ptr = (half*)y.data_ptr<c10::Half>();
+        float* y_rht_ptr = y_rht.data_ptr<float>();
+        int64_t* bm = blocks_m.data_ptr<int64_t>();
+        int num_m_blocks = blocks_m.size(0);
+
+        int col_offset = 0;
+        for (int bi = 0; bi < num_m_blocks; bi++) {
+            int bs = (int)bm[bi];
+            int log_bs = __builtin_ctz(bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_output_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+            glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+                y_rht_ptr, su_ptr, y_ptr,
+                out_features, bs, log_bs, 1.0f / sqrtf((float)bs),
+                use_single,
+                col_offset, m_pad, out_features
+            );
+            col_offset += bs;
         }
     }
 
@@ -2278,7 +2461,8 @@ static void launch_input_rht(
         cudaFuncSetAttribute(glq_input_rht_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     glq_input_rht_kernel<<<B, threads, smem, stream>>>(
-        x, sv, out, in_features, in_features, rsqrt_n, n_pad, log_n, use_single);
+        x, sv, out, in_features, in_features, rsqrt_n, n_pad, log_n, use_single,
+        /*col_offset=*/0, /*stride_out=*/n_pad);
 }
 
 static void launch_output_rht(
@@ -2308,7 +2492,8 @@ static void launch_output_rht(
         cudaFuncSetAttribute(glq_output_rht_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     glq_output_rht_kernel<<<B, threads, smem, stream>>>(
-        y_rht, su, out, out_features, m_pad, log_m, rsqrt_m, use_single);
+        y_rht, su, out, out_features, m_pad, log_m, rsqrt_m, use_single,
+        /*col_offset=*/0, /*stride_in=*/m_pad, /*stride_out=*/out_features);
 }
 
 

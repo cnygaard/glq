@@ -93,9 +93,28 @@ torch::Tensor glq_fused_linear_cuda(
     float inv_resid_scale
 );
 
+torch::Tensor glq_fused_linear_block_diag_cuda(
+    torch::Tensor x,
+    torch::Tensor sv,
+    torch::Tensor su,
+    torch::Tensor qidxs,
+    torch::Tensor codebook,
+    float wscale,
+    int in_features,
+    int out_features,
+    int n_pad, int m_pad,
+    torch::Tensor blocks_n,
+    torch::Tensor blocks_m,
+    torch::Tensor qidxs2,
+    torch::Tensor codebook2,
+    float inv_resid_scale
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_fused_linear_cuda", &glq_fused_linear_cuda,
           "GLQ fused input_rht + dequant_matmul + output_rht (CUDA)");
+    m.def("glq_fused_linear_block_diag_cuda", &glq_fused_linear_block_diag_cuda,
+          "GLQ fused block-diagonal input_rht + dequant_matmul + output_rht (CUDA)");
     m.def("glq_fused_moe_cuda", &glq_fused_moe_cuda,
           "GLQ fused MoE expert dispatch (CUDA)");
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
