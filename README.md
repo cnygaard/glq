@@ -6,6 +6,8 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 
 ## Results
 
+> **Note on effective vs true bpw:** Numbers in the tables below use power-of-2 FHT padding. Effective bpw is 1.3-1.7× higher than labeled for models with non-power-of-2 hidden sizes. Use v0.2.9+ with block-diagonal FHT for true bpw labeling (effective bpw = nominal bpw exactly). See [`xv0y5ncu/SmolLM3-3B-GLQ-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-6bpw) for a model with true 6.0 bpw at 99.6% of bf16.
+
 **SmolLM3-3B-Base** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
 | Method | Eff. BPW | Size (MB) | Perplexity | vs bf16 |
@@ -67,7 +69,7 @@ GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy at 4.6x compression. WinoGrande
 | GPTQ W4A16 | 4.50 | 0.538 | 0.785 | 0.740 | 0.781 | 0.648 | 0.698 | 8.5† | 7,487 MB |
 | GLQ 4-bit | 4.00 | 0.522 | 0.776 | 0.746 | 0.780 | 0.672 | 0.699 | — | 5,044 MB |
 
-GLQ 4-bit retains 98.6% of bf16 accuracy at exactly 4.00 effective bpw (no group scales). AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw).
+GLQ 4-bit retains 98.6% of bf16 accuracy. AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw). With v0.2.9 block-diagonal FHT, GLQ reaches true 4.00 bpw storage.
 
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
@@ -81,7 +83,7 @@ GLQ 4-bit retains 98.6% of bf16 accuracy at exactly 4.00 effective bpw (no group
 | GLQ 2-bit | 2.00 | 17.94 | 1.56x |
 | GPTQ 3-bit | 9.48 | 18.61 | 1.62x |
 
-GLQ uses a single global scale per layer rather than per-group scales, so effective bit widths match the nominal rate exactly. GLQ 2-bit (17.94) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw (4.00 vs 4.75).
+GLQ uses a single global scale per layer rather than per-group scales. With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly (legacy power-of-2 FHT added 1.3-1.7× padding overhead on non-power-of-2 dimensions). GLQ 2-bit (17.94) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw.
 
 **SmolLM2-360M-Instruct** 5-task accuracy via lm-evaluation-harness (128 calibration samples, NVIDIA L40S):
 
@@ -112,7 +114,7 @@ GLQ serves at 94% of bf16 speed while GPTQ reaches 88%, and GLQ achieves this at
 | Eager (default) | 25 tok/s | 40 tok/s | 63% |
 | CUDA graph | 37 tok/s | 40 tok/s | 93% |
 
-With CUDA graph capture, GLQ decode approaches bf16 throughput at 4.6x compression because the smaller quantized weights require less DRAM bandwidth.
+With CUDA graph capture, GLQ decode approaches bf16 throughput because the smaller quantized weights require less DRAM bandwidth.
 
 **Devstral-24B** (Ministral3, 24B params) GLQ 4bpw on NVIDIA L40S — fits in 21 GB (bf16 would need ~48 GB):
 
@@ -165,6 +167,8 @@ pip install glq
 ```
 
 Triton is bundled with PyTorch on CUDA and will be used automatically when available. On CPU, GLQ falls back to a naive dequantize-then-matmul path.
+
+**Note on transformers version:** For small models (360M and below), use `transformers >= 5.0`. Transformers 4.57.x has a weight loading bug that produces garbage output for small GLQ models. Larger models (3B+) work with both 4.x and 5.x.
 
 ## Quickstart
 
@@ -228,9 +232,11 @@ All CLI options:
 glq-quantize --help
   --model              HuggingFace model ID or local path (required)
   --output             Output directory for quantized model (required)
-  --bpw                Bits per weight: 2, 3, or 4 (default: 2)
+  --bpw                Bits per weight: 2-8 or fractional like 2.5 (default: 2)
+  --min-bpw            Minimum per-layer bpw for mixed-precision
+  --max-bpw            Maximum per-layer bpw for mixed-precision
   --tune-iters         LDLQ refinement iterations (default: 0)
-  --nsamples           Calibration samples from WikiText-2 (default: 16)
+  --nsamples           Calibration samples from WikiText-2 (default: 128)
   --seqlen             Calibration sequence length (default: 2048)
   --device             cuda or cpu (default: cuda)
   --trust-remote-code  Allow custom model code from HF Hub
@@ -337,15 +343,23 @@ The INT8 cache uses per-channel absmax quantization with no external dependencie
 
 ### Bit widths
 
-| BPW | Encoding | Bits per 8 weights | Storage |
-|-----|----------|--------------------|---------|
-| 2 | 16-bit codebook index | 16 | Global scale only |
-| 3 | 16-bit primary + 8-bit residual index | 24 | Global scale + residual scale |
-| 4 | 16-bit primary + 16-bit residual index | 32 | Global scale + residual scale |
+| BPW | Stages | Bits per 8 weights | Storage |
+|-----|--------|--------------------|---------|
+| 2 | 1 | 16 | Global scale only |
+| 3 | 2 | 16 + 8 | Global scale + residual scale |
+| 4 | 2 | 16 + 16 | Global scale + residual scale |
+| 5 | 3 | 16 + 16 + 8 | Global scale + 2 residual scales |
+| 6 | 3 | 16 + 16 + 16 | Global scale + 2 residual scales |
+| 7 | 4 | 16 + 16 + 16 + 8 | Global scale + 3 residual scales |
+| 8 | 4 | 16 + 16 + 16 + 16 | Global scale + 3 residual scales |
 
-All bit widths use a single global scale per layer (no group-size parameter), so effective bit widths match the nominal rate exactly.
+All bit widths use a single global scale per layer (no group-size parameter). With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly.
 
-For 3/4 bpw, GLQ uses a two-stage residual vector quantization (RVQ): the primary codebook (65536 entries) encodes the bulk of the weight, and a secondary codebook (256 entries for 3 bpw, 65536 for 4 bpw) encodes the residual error scaled by a learned factor.
+For 3+ bpw, GLQ uses N-stage residual vector quantization (RVQ): the primary codebook (65536 entries) encodes the bulk of the weight, and each successive secondary codebook (256 entries for odd bpw, 65536 for even bpw) encodes the residual error scaled by a learned factor.
+
+### Block-diagonal FHT (v0.2.9+)
+
+Non-power-of-2 hidden sizes are decomposed into sums of powers of 2 (e.g. `2688 = 2048 + 512 + 128`), with independent FHTs per block. This eliminates the padding waste of single-block power-of-2 FHT (which would pad 2688 → 4096, inflating storage by 1.5×). Enabled by default when quantizing; existing power-of-2 models fall back to the original single-block FHT path.
 
 ## Inference kernels
 
