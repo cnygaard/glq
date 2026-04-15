@@ -6,11 +6,11 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 
 ## Results
 
-> **Note on effective vs true bpw:** Numbers in the tables below use power-of-2 FHT padding. Effective bpw is 1.3-1.7× higher than labeled for models with non-power-of-2 hidden sizes. Use v0.2.9+ with block-diagonal FHT for true bpw labeling (effective bpw = nominal bpw exactly). See [`xv0y5ncu/SmolLM3-3B-GLQ-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-6bpw) for a model with true 6.0 bpw at 99.6% of bf16.
+> **Note on BPW labels:** The `BPW` column in the tables below shows the **nominal** quantization config for GLQ rows (e.g. "GLQ 4-bit" → 4.00). For AWQ/QuIP+GPTQ rows the value is effective bpw including group scales. For legacy GLQ measurements (pre-v0.2.9), actual storage is 1.3-1.7× the nominal due to power-of-2 FHT padding on non-power-of-2 hidden sizes — you can derive actual eff bpw from `Size (MB) / bf16 MB × 16`. With v0.2.9+ block-diagonal FHT, new quantizations store at true nominal bpw. See [`xv0y5ncu/SmolLM3-3B-GLQ-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-6bpw) for a model with true 6.0 bpw at 99.6% of bf16.
 
 **SmolLM3-3B-Base** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
-| Method | Eff. BPW | Size (MB) | Perplexity | vs bf16 |
+| Method | BPW | Size (MB) | Perplexity | vs bf16 |
 |--------|----------|-----------|------------|---------|
 | bf16 | 16.00 | 6150 | 7.04 | 1.00x |
 | GLQ 4-bit | 4.00 | 2531 | 7.19 | 1.02x |
@@ -51,29 +51,29 @@ Mixed-precision models use `--bpw <target> --min-bpw 2 --max-bpw 4` to automatic
 
 **SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (acc_norm where available, 128 calibration samples, NVIDIA L40S):
 
-| Method | Eff. BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg |
+| Method | BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg |
 |--------|----------|-------|-------|-----------|------|------------|-----|
 | bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 |
 | GLQ 3.5-bit mixed | 3.50 | 0.497 | 0.777 | 0.735 | 0.769 | 0.668 | 0.685 |
 | GLQ 3-bit | 3.00 | 0.447 | 0.759 | 0.530 | 0.755 | 0.688 | 0.636 |
 | GLQ 2-bit | 2.00 | 0.415 | 0.679 | 0.634 | 0.730 | 0.660 | 0.623 |
 
-GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy at 4.6x compression. WinoGrande holds perfectly (0.668 = bf16). GLQ 2-bit retains 87.9% at 8x compression.
+GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy (nominal 4.6× weight-bpw ratio; actual storage ratio 2.70× on this legacy-padded measurement). WinoGrande holds perfectly (0.668 = bf16). GLQ 2-bit retains 87.9% (nominal 8× ratio; actual ~4×).
 
 **SmolLM3-3B-Base** 4-bit method comparison (acc_norm where available, 128 calibration samples, NVIDIA L40S):
 
-| Method | Eff. BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg | tok/s | VRAM |
+| Method | BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg | tok/s | VRAM |
 |--------|----------|-------|-------|-----------|------|------------|-----|-------|------|
 | bf16 baseline | 16.00 | 0.540 | 0.793 | 0.758 | 0.786 | 0.668 | 0.709 | 30.8 | 5,875 MB |
 | AutoRound W4 | 4.50 | 0.532 | 0.797 | 0.748 | 0.781 | 0.661 | 0.704 | — | — |
 | GPTQ W4A16 | 4.50 | 0.538 | 0.785 | 0.740 | 0.781 | 0.648 | 0.698 | 8.5† | 7,487 MB |
 | GLQ 4-bit | 4.00 | 0.522 | 0.776 | 0.746 | 0.780 | 0.672 | 0.699 | — | 5,044 MB |
 
-GLQ 4-bit retains 98.6% of bf16 accuracy. AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw). With v0.2.9 block-diagonal FHT, GLQ reaches true 4.00 bpw storage.
+GLQ 4-bit retains 98.6% of bf16 accuracy. AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw). The GLQ row above is a legacy-padded measurement (actual eff bpw ~6.6 on SmolLM3-3B); with v0.2.9+ block-diagonal FHT, new GLQ 4-bit quantizations store at true 4.00 bpw.
 
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
-| Method | Eff. BPW | Perplexity | vs bf16 |
+| Method | BPW | Perplexity | vs bf16 |
 |--------|----------|------------|---------|
 | bf16 baseline | 16.00 | 11.47 | 1.00x |
 | GLQ 4-bit | 4.00 | 11.77 | 1.03x |
@@ -82,11 +82,11 @@ GLQ 4-bit retains 98.6% of bf16 accuracy. AutoRound (99.3%) and GPTQ (98.5%) use
 | QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x |
 | GLQ 2-bit | 2.00 | 17.94 | 1.56x |
 
-GLQ uses a single global scale per layer rather than per-group scales. With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly (legacy power-of-2 FHT added 1.3-1.7× padding overhead on non-power-of-2 dimensions). GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw.
+GLQ uses a single global scale per layer rather than per-group scales. With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly (legacy power-of-2 FHT added 1.3-1.7× padding overhead on non-power-of-2 dimensions). GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) on perplexity.
 
 **SmolLM2-360M-Instruct** 5-task accuracy via lm-evaluation-harness (128 calibration samples, NVIDIA L40S):
 
-| Method | Eff. BPW | ARC-e | HellaSwag | PIQA | WinoGrande | LAMBADA | Avg | % of bf16 |
+| Method | BPW | ARC-e | HellaSwag | PIQA | WinoGrande | LAMBADA | Avg | % of bf16 |
 |--------|----------|-------|-----------|------|------------|---------|-----|-----------|
 | bf16 baseline | 16.00 | 0.565 | 0.428 | 0.712 | 0.573 | 0.508 | 0.557 | 100% |
 | **GLQ 4-bit** | **4.00** | 0.554 | 0.420 | 0.717 | 0.575 | 0.508 | **0.555** | **99.6%** |
@@ -98,13 +98,13 @@ GLQ 4-bit retains 99.6% of bf16 accuracy vs GPTQ's 87.2% on this 360M model. GPT
 
 **SmolLM3-3B** vLLM 0.18.1 throughput on NVIDIA L40S:
 
-| Method | Eff. BPW | Single request | Batch=5 | vs bf16 |
+| Method | BPW | Single request | Batch=5 | vs bf16 |
 |--------|----------|---------------|---------|---------|
 | bf16 | 16.0 | 39.4 tok/s | 184 tok/s | 100% |
 | **GLQ 3.5bpw** | **3.5** | **37.1 tok/s** | **173 tok/s** | **94%** |
 | GPTQ W4 (g128) | ~4.5 | 34.6 tok/s | 172 tok/s | 88% |
 
-GLQ serves at 94% of bf16 speed while GPTQ reaches 88%, and GLQ achieves this at a lower effective bit width (3.5 vs ~4.5 bpw). At batch=5 all methods converge as compute dominates over memory bandwidth.
+GLQ serves at 94% of bf16 speed while GPTQ reaches 88% at single-request. At batch=5 GPTQ closes most of its gap (88% → 93%), while GLQ holds at ~94% of bf16 — as batch size grows the matmul becomes more compute-bound and the memory-bandwidth advantage of compressed weights narrows.
 
 **SmolLM3-3B** HuggingFace Transformers decode on NVIDIA L40S:
 
@@ -302,7 +302,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
-Devstral-24B GLQ 4bpw uses ~22 GB of GPU memory (bf16 would need ~48 GB), so it fits on an L40S/A100 40 GB.
+Devstral-24B GLQ 4bpw uses ~22 GB of GPU memory (bf16 would need ~48 GB), so it fits on an L40S (48 GB) or A100 40 GB.
 
 ### Serving with sglang
 
