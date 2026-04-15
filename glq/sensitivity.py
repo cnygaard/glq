@@ -25,7 +25,7 @@ def allocate_bpw(
     Returns:
         {layer_name: bpw} assignment
     """
-    allowed = sorted({b for b in (2, 3, 4) if min_bpw <= b <= max_bpw})
+    allowed = sorted({b for b in (2, 3, 4, 5, 6, 7, 8) if min_bpw <= b <= max_bpw})
     if not allowed:
         raise ValueError(f"No valid bpw in [{min_bpw}, {max_bpw}]")
 

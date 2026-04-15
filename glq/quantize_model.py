@@ -1031,10 +1031,10 @@ def main():
     parser.add_argument("--bpw-map", type=str, default=None,
                         help="JSON file with per-layer bpw assignment "
                              "(overrides --bpw)")
-    parser.add_argument("--min-bpw", type=int, default=None, choices=[2, 3, 4],
+    parser.add_argument("--min-bpw", type=int, default=None, choices=[2, 3, 4, 5, 6, 7, 8],
                         help="Minimum per-layer bpw for mixed-precision "
                              "(triggers auto-allocation)")
-    parser.add_argument("--max-bpw", type=int, default=None, choices=[2, 3, 4],
+    parser.add_argument("--max-bpw", type=int, default=None, choices=[2, 3, 4, 5, 6, 7, 8],
                         help="Maximum per-layer bpw for mixed-precision "
                              "(triggers auto-allocation)")
     parser.add_argument("--tune-iters", type=int, default=0,
