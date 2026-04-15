@@ -17,7 +17,7 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 | AWQ 4-bit† | 5.60 | 2152 | 8.15 | 1.16x |
 | QuIP+GPTQ 4-bit† | 4.76 | 1829 | 8.17 | 1.16x |
 | **GLQ 3.5-bit mixed** | **3.50** | **2282** | **7.20** | **1.02x** |
-| GLQ 3-bit | 3.00 | 2531 | 7.64 | 1.09x |
+| GLQ 3-bit | 3.00 | — | 7.64 | 1.09x |
 | GLQ 3-bit mixed (2+4) | 3.00 | 2035 | 7.65 | 1.09x |
 | GLQ 2.5-bit mixed | 2.50 | 2031 | 8.08 | 1.15x |
 | QuIP+GPTQ 3-bit† | 3.70 | 1423 | 9.30 | 1.32x |
@@ -81,9 +81,8 @@ GLQ 4-bit retains 98.6% of bf16 accuracy. AutoRound (99.3%) and GPTQ (98.5%) use
 | GLQ 3-bit | 3.00 | 13.16 | 1.15x |
 | QuIP+GPTQ 3-bit | 3.69 | 14.84 | 1.29x |
 | GLQ 2-bit | 2.00 | 17.94 | 1.56x |
-| GPTQ 3-bit | 9.48 | 18.61 | 1.62x |
 
-GLQ uses a single global scale per layer rather than per-group scales. With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly (legacy power-of-2 FHT added 1.3-1.7× padding overhead on non-power-of-2 dimensions). GLQ 2-bit (17.94) beats GPTQ 3-bit (18.61) at less than 1/4 the storage. GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw.
+GLQ uses a single global scale per layer rather than per-group scales. With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly (legacy power-of-2 FHT added 1.3-1.7× padding overhead on non-power-of-2 dimensions). GLQ 4-bit (11.77) beats QuIP+GPTQ 4-bit (12.06) at lower effective bpw.
 
 **SmolLM2-360M-Instruct** 5-task accuracy via lm-evaluation-harness (128 calibration samples, NVIDIA L40S):
 
@@ -116,7 +115,7 @@ GLQ serves at 94% of bf16 speed while GPTQ reaches 88%, and GLQ achieves this at
 
 With CUDA graph capture, GLQ decode approaches bf16 throughput because the smaller quantized weights require less DRAM bandwidth.
 
-**Devstral-24B** (Ministral3, 24B params) GLQ 4bpw on NVIDIA L40S — fits in 21 GB (bf16 would need ~48 GB):
+**Devstral-24B** (Ministral3, 24B params) GLQ 4bpw on NVIDIA L40S — fits in ~22 GB (bf16 would need ~48 GB; this is a legacy power-of-2 FHT model, so effective bpw is above the nominal 4):
 
 | Mode | tok/s |
 |------|-------|
@@ -139,14 +138,14 @@ wrapper = CUDAGraphWrapper(model)
 
 # First call captures the graph; subsequent calls replay it
 input_ids = tokenizer("Hello", return_tensors="pt").input_ids[:, -1:].to(model.device)
-logits = wrapper(input_ids)  # 44 tok/s vs 18 tok/s eager
+logits = wrapper(input_ids)  # ~37 tok/s vs ~25 tok/s eager (SmolLM3-3B on L40S)
 ```
 
 The wrapper automatically falls back to eager execution for variable shapes (prefill, batch>1) or calls with extra kwargs (past_key_values, attention_mask). It only accelerates the fixed-shape B=1 seqlen=1 decode path.
 
 ## How it works
 
-1. **E8 lattice codebook**: 65536 vectors from the first 7 shells of the E8 lattice. Each 8-weight group maps to a 16-bit index (2 bpw). For 3/4 bpw, a second-stage residual codebook adds 8 or 16 more bits.
+1. **E8 lattice codebook**: 65536 vectors from the first 7 shells of the E8 lattice. Each 8-weight group maps to a 16-bit index (2 bpw). For 3-8 bpw, N-stage residual vector quantization adds further 8-bit (256-entry) or 16-bit (65536-entry) codebooks per stage — see the Bit widths table for the stage schedule.
 
 2. **Randomized Hadamard Transform (RHT)**: Random sign flips + Fast Walsh-Hadamard Transform applied to both weights and Hessian. This spreads weight magnitude evenly across dimensions, making the Hessian block-diagonal approximately proportional to identity. After RHT, Euclidean nearest-neighbor in the codebook is close to Hessian-optimal.
 
@@ -355,7 +354,7 @@ The INT8 cache uses per-channel absmax quantization with no external dependencie
 
 All bit widths use a single global scale per layer (no group-size parameter). With v0.2.9+ block-diagonal FHT, true bit widths match the nominal rate exactly.
 
-For 3+ bpw, GLQ uses N-stage residual vector quantization (RVQ): the primary codebook (65536 entries) encodes the bulk of the weight, and each successive secondary codebook (256 entries for odd bpw, 65536 for even bpw) encodes the residual error scaled by a learned factor.
+For 3+ bpw, GLQ uses N-stage residual vector quantization (RVQ): the primary codebook (65536 entries) encodes the bulk of the weight, and each additional stage encodes the residual error scaled by a learned factor. Each stage is either 8-bit (256-entry codebook) or 16-bit (65536-entry E8 codebook); see the table above for the per-bpw stage schedule.
 
 ### Block-diagonal FHT (v0.2.9+)
 
@@ -381,9 +380,9 @@ This means GPU memory holds only the compressed indices (2 bytes per 8 weights) 
 - **CUDA C Tensor Core kernel** (`glq_matmul_tc_kernel` / `glq_matmul_tc_scratch_kernel`): For batch sizes >= 2 (prefill). Uses inline PTX `mma.sync.aligned.m16n8k16` with direct codebook-to-register loading — no shared memory staging. 3-5x faster than Triton TC for prefill.
 - **CUDA C split-K matvec** (`glq_matvec_splitk_kernel` / `glq_matvec_splitk_scratch_kernel`): For B=1 (autoregressive decode). 4 rows per warp with `__shfl_xor_sync` reduction, 2D grid for K-split parallelism. 2.7x faster than Triton matvec.
 - **CUDA C shared-memory FHT** (`glq_input_rht_kernel`, `glq_output_rht_kernel`): Double-buffered butterfly stages in shared memory for the Hadamard transform. 1.6-3x faster than Triton FHT.
-- **Triton fallback kernels**: Used when CUDA C extension is unavailable (no ninja) or for dimensions exceeding shared memory limits (n_pad > 8192).
+- **Triton fallback kernels**: Used when CUDA C extension is unavailable (no ninja) or for dimensions exceeding shared memory limits (`n_pad > 32768`; the CUDA C FHT uses a two-pass path for `n_pad` up to 32768, and block-diagonal FHT decomposes non-power-of-2 dims into sub-blocks).
 
-All kernels support two-stage RVQ for 3/4 bpw via a `HAS_STAGE2` compile-time constant. The CUDA C path is selected automatically when available; Triton is the fallback.
+The CUDA C kernels currently implement two-stage RVQ (3/4 bpw) via a `HAS_STAGE2` compile-time constant. For 5-8 bpw (N-stage RVQ), inference falls back to the Triton/PyTorch path. The CUDA C path is selected automatically when available and supported.
 
 ### Bit-exact determinism
 
@@ -437,7 +436,7 @@ glq/
   csrc/glq_cuda.cu     # CUDA C kernels (split-K matvec, TC matmul, FHT)
   hf_integration.py    # HuggingFace Transformers integration
   kv_cache.py          # INT8 quantized KV cache (optional)
-  cuda_graph.py        # CUDA graph wrapper for B=1 decode (2.3x speedup)
+  cuda_graph.py        # CUDA graph wrapper for B=1 decode (~1.5x speedup)
 ```
 
 ## Acknowledgments
