@@ -102,9 +102,11 @@ try:
     from fast_hadamard_transform import hadamard_transform as _fht_cuda
 
     def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
-        """CUDA-accelerated Fast Walsh-Hadamard transform (normalized)."""
+        """CUDA FHT when x is on GPU; PyTorch fallback on CPU."""
         n = x.shape[-1]
         assert n > 0 and (n & (n - 1)) == 0, f"Last dim {n} must be power of 2"
+        if not x.is_cuda:
+            return _pytorch_fht(x)
         needs_batch = x.dim() == 1
         if needs_batch:
             x = x.unsqueeze(0)
