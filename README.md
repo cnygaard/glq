@@ -8,7 +8,7 @@ GLQ encodes weights into 8-dimensional E8 lattice points via nearest-neighbor lo
 
 > **Note on BPW labels:** The `BPW` column in the tables below shows the **nominal** quantization config for GLQ rows (e.g. "GLQ 4-bit" → 4.00). For AWQ/QuIP+GPTQ rows the value is effective bpw including group scales. For legacy GLQ measurements (pre-v0.2.9), actual storage is 1.3-1.7× the nominal due to power-of-2 FHT padding on non-power-of-2 hidden sizes — you can derive actual eff bpw from `Size (MB) / bf16 MB × 16`. With v0.2.9+ block-diagonal FHT, new quantizations store at true nominal bpw. See [`xv0y5ncu/SmolLM3-3B-GLQ-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-6bpw) for a model with true 6.0 bpw at 99.6% of bf16.
 
-**SmolLM3-3B-Base** on WikiText-2 (128 calibration samples, NVIDIA L40S):
+**SmolLM3-3B-Base** on WikiText-2 (128 calibration samples, NVIDIA L40S, pre-v0.2.9 legacy pow2 FHT). For current-gen (v0.2.10) true-bpw storage on this model see [`xv0y5ncu/SmolLM3-3B-GLQ-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-6bpw), measured at 99.6% of bf16 5-task accuracy.
 
 | Method | BPW | Size (MB) | Perplexity | vs bf16 |
 |--------|----------|-----------|------------|---------|
@@ -49,7 +49,7 @@ Mixed-precision models use `--bpw <target> --min-bpw 2 --max-bpw 4` to automatic
 | GLQ 3-bit | 3 | 6.78 | 1.10x | 3529 |
 | GLQ 2-bit | 2 | 8.49 | 1.38x | 3526 |
 
-**SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (acc_norm where available, 128 calibration samples, NVIDIA L40S):
+**SmolLM3-3B-Base** 5-task accuracy via lm-evaluation-harness (acc_norm where available, 128 calibration samples, NVIDIA L40S, pre-v0.2.9 legacy pow2 FHT):
 
 | Method | BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg |
 |--------|----------|-------|-------|-----------|------|------------|-----|
@@ -60,7 +60,7 @@ Mixed-precision models use `--bpw <target> --min-bpw 2 --max-bpw 4` to automatic
 
 GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy (nominal 4.6× weight-bpw ratio; actual storage ratio 2.70× on this legacy-padded measurement). WinoGrande holds perfectly (0.668 = bf16). GLQ 2-bit retains 87.9% (nominal 8× ratio; actual ~4×).
 
-**SmolLM3-3B-Base** 4-bit method comparison (acc_norm where available, 128 calibration samples, NVIDIA L40S):
+**SmolLM3-3B-Base** 4-bit method comparison (acc_norm where available, 128 calibration samples, NVIDIA L40S, pre-v0.2.9 legacy pow2 FHT):
 
 | Method | BPW | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | Avg | tok/s | VRAM |
 |--------|----------|-------|-------|-----------|------|------------|-----|-------|------|
