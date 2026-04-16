@@ -249,22 +249,25 @@ class TestPadIfNeeded:
         torch.testing.assert_close(layer.Qidxs, old_qidxs)
 
     def test_expands_small_buffers(self, codebook):
-        """Manually shrunk buffers get expanded to m_pad × n_pad//8."""
-        layer = E8RHTLinear(48, 32)  # m_pad=32, n_pad=64
-        # Simulate accelerate loading at unpadded size
-        small_q = torch.randint(0, 256, (20, 5), dtype=torch.int16)
+        """Legacy pow2 path: smaller-than-target buffers get expanded to
+        (m_pad, n_pad//8). Uses pow2-dim partials to avoid block-diag
+        auto-detection in _pad_if_needed."""
+        layer = E8RHTLinear(48, 32)  # block_diagonal=False default → m_pad=32, n_pad=64
+        # Register pow2 partials (smaller than target but still pow2 dims so
+        # _pad_if_needed doesn't misinterpret them as a block-diag checkpoint)
+        small_q = torch.randint(0, 256, (16, 4), dtype=torch.int16)
         layer.register_buffer('Qidxs', small_q)
-        layer.register_buffer('Qidxs2', torch.zeros(20, 5, dtype=torch.int16))
-        layer.register_buffer('SU', -torch.ones(20, dtype=torch.float16))
-        layer.register_buffer('SV', -torch.ones(48, dtype=torch.float16))
+        layer.register_buffer('Qidxs2', torch.zeros(16, 4, dtype=torch.int16))
+        layer.register_buffer('SU', -torch.ones(16, dtype=torch.float16))
+        layer.register_buffer('SV', -torch.ones(32, dtype=torch.float16))
 
         layer._pad_if_needed()
         assert layer.Qidxs.shape == (32, 8)
         assert layer.SU.shape == (32,)
         assert layer.SV.shape == (64,)
         # Padding fill for SU/SV is 1.0
-        assert (layer.SU[20:] == 1).all()
-        assert (layer.SV[48:] == 1).all()
+        assert (layer.SU[16:] == 1).all()
+        assert (layer.SV[32:] == 1).all()
 
 
 class TestWeightProperty:

@@ -100,15 +100,15 @@ class TestQuantizeLayer2bpw:
         assert 2.0 <= metrics['bpw'] <= 2.1
 
     def test_non_power_of_2_dims(self, codebook):
-        """Non-power-of-2 dimensions should pad internally."""
+        """Non-power-of-2 dimensions use block-diagonal FHT (no padding waste)."""
         W = torch.randn(10, 48)
         H = _random_psd(48)
         W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(W, H, codebook, bpw=2)
         assert W_hat.shape == (10, 48)
         assert metrics['sqnr'] > 0
-        # Padded dims: m_pad=16, n_pad=64
-        assert artifacts['SU'].shape[0] == 16
-        assert artifacts['SV'].shape[0] == 64
+        # Block-diag exact: m_pad=10 (= 8+2), n_pad=48 (= 32+16)
+        assert artifacts['SU'].shape[0] == 10
+        assert artifacts['SV'].shape[0] == 48
 
 
 class TestQuantizeLayer3bpw:

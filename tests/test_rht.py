@@ -47,14 +47,23 @@ class TestRHT:
         H_t = rht.transform_hessian(H)
         torch.testing.assert_close(H_t, H_t.T, atol=1e-4, rtol=1e-4)
 
-    def test_padding(self):
-        """Non-power-of-2 dimensions should be padded correctly."""
+    def test_block_diagonal_no_padding(self):
+        """Default (block_diagonal=True): non-pow2 dims use sum-of-pow2 blocks
+        with m_pad = m_orig (no padding waste)."""
         rht = RHT(10, 48, device="cpu")
+        assert rht.m_pad == 10  # 10 = 8 + 2
+        assert rht.n_pad == 48  # 48 = 32 + 16
+        assert rht.blocks_m == [8, 2]
+        assert rht.blocks_n == [32, 16]
+
+    def test_legacy_pow2_padding(self):
+        """block_diagonal=False: pads to next power of 2 (legacy behavior)."""
+        rht = RHT(10, 48, device="cpu", block_diagonal=False)
         assert rht.m_pad == 16
         assert rht.n_pad == 64
 
     def test_power_of_2_no_padding(self):
-        """Power-of-2 dimensions should not change."""
+        """Power-of-2 dimensions should not change in either mode."""
         rht = RHT(32, 128, device="cpu")
         assert rht.m_pad == 32
         assert rht.n_pad == 128
@@ -73,11 +82,14 @@ class TestRHT:
         assert not torch.equal(rht1.su, rht2.su) or not torch.equal(rht1.sv, rht2.sv)
 
     def test_input_transform_shape(self):
-        """transform_input should produce (batch, n_pad)."""
-        rht = RHT(16, 48, device="cpu")
+        """transform_input should produce (batch, n_pad). Block-diag default
+        keeps n_pad == n_orig; pow2 legacy rounds up to next power of 2."""
+        rht_bd = RHT(16, 48, device="cpu")
         x = torch.randn(5, 48)
-        x_t = rht.transform_input(x)
-        assert x_t.shape == (5, 64)
+        assert rht_bd.transform_input(x).shape == (5, 48)
+
+        rht_pow2 = RHT(16, 48, device="cpu", block_diagonal=False)
+        assert rht_pow2.transform_input(x).shape == (5, 64)
 
     def test_inverse_transform_output_shape(self):
         """inverse_transform_output truncates to m_orig."""

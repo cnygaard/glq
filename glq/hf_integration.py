@@ -119,7 +119,8 @@ class GLQQuantizer(HfQuantizer):
         pass  # glq is bundled — no external deps beyond torch
 
     def _process_model_before_weight_loading(self, model, **kwargs):
-        pretrained_path = getattr(model.config, "_name_or_path", None)
+        cfg = getattr(model, "config", None)
+        pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
         block_diag = _detect_block_diagonal(pretrained_path) if pretrained_path else False
         replaced = replace_with_glq_linear(model, block_diagonal=block_diag)
         if not replaced:

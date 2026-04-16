@@ -178,7 +178,9 @@ class TestQuantizeAndForward4bpw:
 
 class TestNonPowerOf2:
     def test_odd_dimensions(self, codebook):
-        """Non-power-of-2 dimensions should still produce correct output."""
+        """Non-power-of-2 dimensions should still produce correct output.
+        quantize_layer_e8_shell_rht defaults to block_diagonal=True, so the
+        receiving E8RHTLinear must match."""
         torch.manual_seed(42)
         m, n = 10, 48
         W = torch.randn(m, n) * 0.1
@@ -186,7 +188,7 @@ class TestNonPowerOf2:
 
         W_hat, artifacts, _ = quantize_layer_e8_shell_rht(W, H, codebook, bpw=2)
 
-        layer = E8RHTLinear(n, m)
+        layer = E8RHTLinear(n, m, block_diagonal=True)
         _load_artifacts_into_layer(layer, artifacts, codebook)
 
         x = torch.randn(4, n)

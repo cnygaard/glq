@@ -491,7 +491,7 @@ class TestCLIArgparse:
                 assert kwargs['output_dir'] == '/tmp/out'
                 assert kwargs['bpw'] == 2
                 assert kwargs['tune_iters'] == 0
-                assert kwargs['nsamples'] == 16
+                assert kwargs['nsamples'] == 128
                 assert kwargs['seqlen'] == 2048
                 assert kwargs['device'] == 'cuda'
                 assert kwargs['trust_remote_code'] is False
