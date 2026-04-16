@@ -171,6 +171,18 @@ class E8RHTLinear(nn.Module):
         self._wscale_float = 1.0
         self._inv_rs_float = 0.0
 
+        # Eager block-diagonal metadata (CPU int64; read host-side by the C++
+        # wrapper's launch loop). device="cpu" is explicit so HF's meta-device
+        # init context doesn't promote these to meta. Kept as plain attrs so
+        # they're not persisted to state_dict or moved to GPU by .to(cuda).
+        self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+        self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+
+        # Cached empty placeholders (lazy device-keyed init in forward) so that
+        # repeated `torch.empty(0, ...)` calls don't allocate during graph capture.
+        self._empty_i16 = None
+        self._empty_f16 = None
+
     @property
     def weight(self):
         """Proxy so code checking weight.device works (e.g. Mamba).
@@ -350,8 +362,11 @@ class E8RHTLinear(nn.Module):
                 and self._n_stages <= 2
                 and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_linear_cuda')):
-            _empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
-            _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
+            if self._empty_i16 is None or self._empty_i16.device != x.device:
+                self._empty_i16 = torch.empty(0, dtype=torch.int16, device=x.device)
+                self._empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
+            _empty_i16 = self._empty_i16
+            _empty_f16 = self._empty_f16
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else _empty_f16
             if _is_pow2:
                 y = _ik._glq_cuda.glq_fused_linear_cuda(
@@ -366,9 +381,6 @@ class E8RHTLinear(nn.Module):
                     self._inv_rs_float,
                 )
             elif hasattr(_ik._glq_cuda, 'glq_fused_linear_block_diag_cuda'):
-                if not hasattr(self, '_blocks_n_tensor'):
-                    self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64)
-                    self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64)
                 y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
                     x.half().contiguous(), self.SV, self.SU,
                     self.Qidxs, self.codebook.codebook_half,
