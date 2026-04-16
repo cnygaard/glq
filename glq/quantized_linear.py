@@ -14,6 +14,24 @@ except ImportError:
     _triton_available = False
 
 
+def _pack_block_meta(block_sizes):
+    """Pack (col_offset, bs, log_bs, _) per sub-block as CPU int32 (N, 4).
+
+    C++ reinterprets as ``int4*`` for one coalesced load per CTA in
+    ``glq_*_rht_multiblock_kernel``.
+    """
+    n = len(block_sizes)
+    meta = torch.zeros((n, 4), dtype=torch.int32, device="cpu")
+    offset = 0
+    for i, bs in enumerate(block_sizes):
+        meta[i, 0] = offset
+        meta[i, 1] = bs
+        meta[i, 2] = int(math.log2(bs))
+        # meta[i, 3] = 0 (unused padding for int4 alignment)
+        offset += bs
+    return meta
+
+
 # ────────────────────────────────────────────────────────────────
 # Fused RHT kernels: pad+SV+FHT and FHT+SU+unpad in one launch
 # ────────────────────────────────────────────────────────────────
@@ -177,6 +195,14 @@ class E8RHTLinear(nn.Module):
         # they're not persisted to state_dict or moved to GPU by .to(cuda).
         self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
         self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+
+        # Packed metadata for the multiblock FHT kernel: one int4 per sub-block
+        # {col_offset, bs, log_bs, _padding}. Built on CPU here; pushed to GPU
+        # lazily on first forward (cached by device).
+        self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+        self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+        self._blocks_n_meta_gpu = None  # cached (device, tensor)
+        self._blocks_m_meta_gpu = None
 
         # Cached empty placeholders (lazy device-keyed init in forward) so that
         # repeated `torch.empty(0, ...)` calls don't allocate during graph capture.
@@ -381,6 +407,10 @@ class E8RHTLinear(nn.Module):
                     self._inv_rs_float,
                 )
             elif hasattr(_ik._glq_cuda, 'glq_fused_linear_block_diag_cuda'):
+                # Lazily push packed metadata to x.device (cache per device)
+                if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
+                    self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
+                    self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
                 y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
                     x.half().contiguous(), self.SV, self.SU,
                     self.Qidxs, self.codebook.codebook_half,
@@ -388,6 +418,7 @@ class E8RHTLinear(nn.Module):
                     self.in_features, self.out_features,
                     n_pad, m_pad,
                     self._blocks_n_tensor, self._blocks_m_tensor,
+                    self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
                     self.Qidxs2 if has_stage2 else _empty_i16,
                     cb2_tensor,
                     self._inv_rs_float,

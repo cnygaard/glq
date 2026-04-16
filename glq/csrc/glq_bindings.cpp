@@ -105,6 +105,8 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
     int n_pad, int m_pad,
     torch::Tensor blocks_n,
     torch::Tensor blocks_m,
+    torch::Tensor blocks_n_meta,
+    torch::Tensor blocks_m_meta,
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
     float inv_resid_scale

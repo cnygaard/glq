@@ -1826,6 +1826,131 @@ __global__ void glq_output_rht_kernel(
 
 
 /* ─────────────────────────────────────────────────────────────────────
+ * Multi-block FHT kernels (block-diagonal fast path)
+ *
+ * Collapse N per-sub-block input/output RHT launches into a single kernel
+ * with gridDim.y = num_blocks. blockIdx.y selects the sub-block; per-CTA
+ * sub-block metadata is read from a packed int4 array.
+ *
+ * Double-buffer only. Gated by host to max_bs ≤ 8192 (64KB smem per CTA).
+ * ───────────────────────────────────────────────────────────────────── */
+
+__global__ void glq_input_rht_multiblock_kernel(
+    const half* __restrict__ x,        // (B, in_features) fp16
+    const half* __restrict__ sv,       // (n_pad,) fp16 — full sign vector
+    float* __restrict__ out,           // (B, stride_out) fp32 output
+    int in_features,
+    int stride_x,
+    int stride_out,
+    const int4* __restrict__ block_meta  // per sub-block: {col_offset, bs, log_bs, _}
+) {
+    extern __shared__ float smem[];
+
+    int b = blockIdx.x;
+    int blk = blockIdx.y;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    int4 meta = block_meta[blk];
+    int col_offset = meta.x;
+    int bs = meta.y;
+    int log_bs = meta.z;
+    float rsqrt_bs = rsqrtf((float)bs);
+
+    // Step 1: Load x with zero-pad, multiply by SV
+    float* buf = smem;
+    for (int i = tid; i < bs; i += n_threads) {
+        float x_val = (col_offset + i < in_features)
+            ? __half2float(x[b * stride_x + col_offset + i]) : 0.0f;
+        float s = __half2float(sv[col_offset + i]);
+        buf[i] = x_val * s;
+    }
+    __syncthreads();
+
+    // Step 2: FHT butterfly — double-buffer (buf_b is after buf, max_bs elems apart)
+    float* buf_b = smem + bs;
+    float* src = buf;
+    float* dst = buf_b;
+    for (int k = 0; k < log_bs; k++) {
+        for (int i = tid; i < bs; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float my_val = src[i];
+            float partner_val = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        float* tmp = src; src = dst; dst = tmp;
+    }
+    if (log_bs % 2 == 1) {
+        for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
+        __syncthreads();
+    }
+
+    // Step 3: Normalize and store
+    for (int i = tid; i < bs; i += n_threads) {
+        out[b * stride_out + col_offset + i] = buf[i] * rsqrt_bs;
+    }
+}
+
+__global__ void glq_output_rht_multiblock_kernel(
+    const float* __restrict__ y_rht,   // (B, stride_in) fp32
+    const half* __restrict__ su,       // (m_pad,) fp16 — full sign vector
+    half* __restrict__ out,            // (B, stride_out) fp16
+    int out_features,
+    int stride_in,
+    int stride_out,
+    const int4* __restrict__ block_meta
+) {
+    extern __shared__ float smem[];
+
+    int b = blockIdx.x;
+    int blk = blockIdx.y;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    int4 meta = block_meta[blk];
+    int col_offset = meta.x;
+    int bs = meta.y;
+    int log_bs = meta.z;
+    float rsqrt_bs = rsqrtf((float)bs);
+
+    float* buf = smem;
+    for (int i = tid; i < bs; i += n_threads) {
+        buf[i] = y_rht[b * stride_in + col_offset + i];
+    }
+    __syncthreads();
+
+    float* buf_b = smem + bs;
+    float* src = buf;
+    float* dst = buf_b;
+    for (int k = 0; k < log_bs; k++) {
+        for (int i = tid; i < bs; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float my_val = src[i];
+            float partner_val = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        float* tmp = src; src = dst; dst = tmp;
+    }
+    if (log_bs % 2 == 1) {
+        for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
+        __syncthreads();
+    }
+
+    for (int i = tid; i < bs; i += n_threads) {
+        if (col_offset + i < out_features) {
+            float val = buf[i] * rsqrt_bs;
+            float s = __half2float(su[col_offset + i]);
+            out[b * stride_out + col_offset + i] = __float2half(val * s);
+        }
+    }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
  * RHT host wrappers
  * ───────────────────────────────────────────────────────────────────── */
 
@@ -2178,8 +2303,10 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
     int in_features,
     int out_features,
     int n_pad, int m_pad,
-    torch::Tensor blocks_n,    // 1D int64 tensor: [2048, 512, 128]
-    torch::Tensor blocks_m,    // 1D int64 tensor: [2048, 512, 128]
+    torch::Tensor blocks_n,    // 1D int64 CPU: [2048, 512, 128]
+    torch::Tensor blocks_m,    // 1D int64 CPU: [2048, 512, 128]
+    torch::Tensor blocks_n_meta,  // (num_n_blocks, 4) int32 GPU — packed {col_offset, bs, log_bs, _}
+    torch::Tensor blocks_m_meta,  // (num_m_blocks, 4) int32 GPU
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
     float inv_resid_scale
@@ -2190,7 +2317,7 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
-    // ---- Step 1: Input RHT — loop over n-blocks ----
+    // ---- Step 1: Input RHT ----
     auto x_rht = torch::empty({B, n_pad}, torch::dtype(torch::kFloat32).device(x.device()));
     {
         const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
@@ -2199,27 +2326,52 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
         int64_t* bn = blocks_n.data_ptr<int64_t>();
         int num_n_blocks = blocks_n.size(0);
 
-        int col_offset = 0;
+        // Compute max_bs (cheap, ≤ 5 entries)
+        int max_bs_n = 0;
         for (int bi = 0; bi < num_n_blocks; bi++) {
             int bs = (int)bn[bi];
-            int log_bs = __builtin_ctz(bs);  // log2 for power-of-2
-            int in_feat_block = min(in_features - col_offset, bs);
-            int threads = min(bs, 1024);
-            int double_buf = 2 * bs * (int)sizeof(float);
-            int single_buf = bs * (int)sizeof(float);
-            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
-            int smem = use_single ? single_buf : double_buf;
+            if (bs > max_bs_n) max_bs_n = bs;
+        }
+
+        // Multiblock fast path: max_bs ≤ 8192 keeps double-buffer smem ≤ 64KB;
+        // metadata tensor must be provided on GPU.
+        bool use_multiblock = (max_bs_n <= 8192) && (blocks_n_meta.numel() > 0)
+                              && blocks_n_meta.is_cuda();
+        if (use_multiblock) {
+            int threads = min(max_bs_n, 1024);
+            int smem = 2 * max_bs_n * (int)sizeof(float);
             if (smem > 48 * 1024) {
-                cudaFuncSetAttribute(glq_input_rht_kernel,
+                cudaFuncSetAttribute(glq_input_rht_multiblock_kernel,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             }
-            glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+            dim3 grid(B, num_n_blocks);
+            glq_input_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
                 x_ptr, sv_ptr, x_rht_ptr,
-                in_features, in_features, 1.0f / sqrtf((float)bs),
-                bs, log_bs, use_single,
-                col_offset, n_pad
+                in_features, in_features, n_pad,
+                (const int4*)blocks_n_meta.data_ptr<int32_t>()
             );
-            col_offset += bs;
+        } else {
+            int col_offset = 0;
+            for (int bi = 0; bi < num_n_blocks; bi++) {
+                int bs = (int)bn[bi];
+                int log_bs = __builtin_ctz(bs);
+                int threads = min(bs, 1024);
+                int double_buf = 2 * bs * (int)sizeof(float);
+                int single_buf = bs * (int)sizeof(float);
+                int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+                int smem = use_single ? single_buf : double_buf;
+                if (smem > 48 * 1024) {
+                    cudaFuncSetAttribute(glq_input_rht_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                }
+                glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+                    x_ptr, sv_ptr, x_rht_ptr,
+                    in_features, in_features, 1.0f / sqrtf((float)bs),
+                    bs, log_bs, use_single,
+                    col_offset, n_pad
+                );
+                col_offset += bs;
+            }
         }
     }
 
@@ -2300,7 +2452,7 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
         }
     }
 
-    // ---- Step 3: Output RHT — loop over m-blocks ----
+    // ---- Step 3: Output RHT ----
     auto y = torch::empty({B, out_features}, torch::dtype(torch::kFloat16).device(x.device()));
     {
         const half* su_ptr = (const half*)su.data_ptr<c10::Half>();
@@ -2309,26 +2461,49 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
         int64_t* bm = blocks_m.data_ptr<int64_t>();
         int num_m_blocks = blocks_m.size(0);
 
-        int col_offset = 0;
+        int max_bs_m = 0;
         for (int bi = 0; bi < num_m_blocks; bi++) {
             int bs = (int)bm[bi];
-            int log_bs = __builtin_ctz(bs);
-            int threads = min(bs, 1024);
-            int double_buf = 2 * bs * (int)sizeof(float);
-            int single_buf = bs * (int)sizeof(float);
-            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
-            int smem = use_single ? single_buf : double_buf;
+            if (bs > max_bs_m) max_bs_m = bs;
+        }
+
+        bool use_multiblock = (max_bs_m <= 8192) && (blocks_m_meta.numel() > 0)
+                              && blocks_m_meta.is_cuda();
+        if (use_multiblock) {
+            int threads = min(max_bs_m, 1024);
+            int smem = 2 * max_bs_m * (int)sizeof(float);
             if (smem > 48 * 1024) {
-                cudaFuncSetAttribute(glq_output_rht_kernel,
+                cudaFuncSetAttribute(glq_output_rht_multiblock_kernel,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             }
-            glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+            dim3 grid(B, num_m_blocks);
+            glq_output_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
                 y_rht_ptr, su_ptr, y_ptr,
-                out_features, bs, log_bs, 1.0f / sqrtf((float)bs),
-                use_single,
-                col_offset, m_pad, out_features
+                out_features, m_pad, out_features,
+                (const int4*)blocks_m_meta.data_ptr<int32_t>()
             );
-            col_offset += bs;
+        } else {
+            int col_offset = 0;
+            for (int bi = 0; bi < num_m_blocks; bi++) {
+                int bs = (int)bm[bi];
+                int log_bs = __builtin_ctz(bs);
+                int threads = min(bs, 1024);
+                int double_buf = 2 * bs * (int)sizeof(float);
+                int single_buf = bs * (int)sizeof(float);
+                int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+                int smem = use_single ? single_buf : double_buf;
+                if (smem > 48 * 1024) {
+                    cudaFuncSetAttribute(glq_output_rht_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                }
+                glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+                    y_rht_ptr, su_ptr, y_ptr,
+                    out_features, bs, log_bs, 1.0f / sqrtf((float)bs),
+                    use_single,
+                    col_offset, m_pad, out_features
+                );
+                col_offset += bs;
+            }
         }
     }
 
