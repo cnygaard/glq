@@ -318,6 +318,16 @@ class E8RHTLinear(nn.Module):
                 self.block_diagonal = True
                 self.blocks_m = _block_decompose(actual_m)
                 self.blocks_n = _block_decompose(actual_n)
+                # Rebuild Phase A/B metadata: __init__ built these from the
+                # pow2 default if _detect_block_diagonal missed the checkpoint
+                # (e.g. local path). Stale metadata would cause OOB reads in
+                # the fused block-diag kernel once we reach it.
+                self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+                self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+                self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+                self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+                self._blocks_n_meta_gpu = None
+                self._blocks_m_meta_gpu = None
                 return
         if self.Qidxs.shape[0] == self.m_pad:
             return
@@ -375,7 +385,11 @@ class E8RHTLinear(nn.Module):
         x = x.reshape(-1, self.in_features)
         B = x.shape[0]
         dtype = x.dtype
-        use_fused = x.is_cuda and _triton_available and B <= 64
+        # The B>=2 Tensor Core branch in glq_fused_linear{,_block_diag}_cuda
+        # scales with B via dynamic scratch alloc and a 3-D grid; a static
+        # B cap here was vestigial and starved lm-eval / prefill (flattened
+        # B=seq*batch easily exceeds 64).
+        use_fused = x.is_cuda and _triton_available
         _nvtx = torch.cuda.nvtx if x.is_cuda else None
         has_stage2 = self._has_stage2
 
