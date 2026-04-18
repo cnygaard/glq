@@ -269,6 +269,48 @@ class TestPadIfNeeded:
         assert (layer.SU[16:] == 1).all()
         assert (layer.SV[32:] == 1).all()
 
+    def test_block_diag_detection_syncs_metadata(self, codebook):
+        """Block-diag auto-detection from non-pow2 checkpoint buffers must
+        rebuild the Phase A/B metadata tensors, or the fused CUDA kernel
+        reads OOB (Phase C.2 regression guard)."""
+        # Construct a pow2-default layer the way HF from_pretrained does when
+        # _detect_block_diagonal misses the checkpoint.
+        layer = E8RHTLinear(576, 576)  # block_diagonal=False → m_pad=n_pad=1024
+        assert layer.blocks_n == [1024]
+        assert layer._blocks_n_tensor.tolist() == [1024]
+        assert layer._blocks_n_meta_cpu[:, 1].tolist() == [1024]
+
+        # Simulate loading a block-diag checkpoint: register the true non-pow2
+        # buffer shapes (72 = 576 / 8).
+        layer.register_buffer('Qidxs',  torch.zeros(576, 72, dtype=torch.int16))
+        layer.register_buffer('Qidxs2', torch.zeros(576, 72, dtype=torch.int16))
+        layer.register_buffer('Qidxs3', torch.zeros(576, 72, dtype=torch.int16))
+        layer.register_buffer('Qidxs4', torch.zeros(576, 72, dtype=torch.int16))
+        layer.register_buffer('SU',     torch.ones(576,     dtype=torch.float16))
+        layer.register_buffer('SV',     torch.ones(576,     dtype=torch.float16))
+
+        layer._pad_if_needed()
+
+        # Primary flags + decomposition reflect the checkpoint.
+        assert layer.block_diagonal is True
+        assert layer.m_pad == 576
+        assert layer.n_pad == 576
+        assert layer.blocks_m == [512, 64]
+        assert layer.blocks_n == [512, 64]
+
+        # Phase A/B metadata must match — otherwise the fused kernel would
+        # iterate bs=1024 against a 576-element SV/SU and read past the end.
+        assert layer._blocks_n_tensor.tolist() == [512, 64]
+        assert layer._blocks_m_tensor.tolist() == [512, 64]
+        # Packed int4 metadata: columns are (col_offset, bs, log_bs, _pad).
+        assert layer._blocks_n_meta_cpu[:, 0].tolist() == [0, 512]  # col offsets
+        assert layer._blocks_n_meta_cpu[:, 1].tolist() == [512, 64]  # bs
+        assert layer._blocks_n_meta_cpu[:, 2].tolist() == [9, 6]     # log2(bs)
+        assert layer._blocks_m_meta_cpu[:, 1].tolist() == [512, 64]
+        # GPU meta cache must be invalidated so the next forward pushes fresh.
+        assert layer._blocks_n_meta_gpu is None
+        assert layer._blocks_m_meta_gpu is None
+
 
 class TestWeightProperty:
     def test_weight_device(self):
