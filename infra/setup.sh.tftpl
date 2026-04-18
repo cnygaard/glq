@@ -7,7 +7,7 @@ exec > >(tee /var/log/glq-setup.log) 2>&1
 # Root EBS is only 100 GB — use NVMe for everything large.
 
 NVME=/opt/dlami/nvme
-VENV=$NVME/venv
+VENV=/home/ubuntu/venv
 HF_CACHE=$NVME/hf_cache
 
 echo "=== GLQ setup starting ==="
@@ -34,18 +34,27 @@ source $VENV/bin/activate
 
 # Core deps — vLLM 0.16 needs torch 2.9.1
 pip install -q pip --upgrade
-pip install -q vllm==0.16.0
+pip install -q vllm==0.19.0
 pip install -q 'glq[quantize]==${glq_version}' ninja wheel
 # mamba-ssm and causal-conv1d need CUDA_HOME for building
 export CUDA_HOME=/usr/local/cuda-12.9
-pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
-pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
 unset CUDA_HOME
 # Pin torch LAST — mamba-ssm may pull a newer version as a dependency
 pip install -q torch==2.9.1+cu128 torchvision==0.24.1+cu128 torchaudio==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128
-
-# HF cache on NVMe
+pip install 'fast_hadamard_transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git' --no-build-isolation 
+pip install "mistral-common[hf-hub]"
+pip install 'transformers>=5.0' 'huggingface_hub>=0.30'
+pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
+pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
+pip install -q lm-eval
+# HF cache on NVMe. Symlink ~/.cache/huggingface to the NVMe location so
+# tooling that ignores HF_HOME (non-interactive ssh, services, any subprocess
+# that doesn't inherit an interactive shell env) still lands on the fast disk.
+# The root EBS is only 100 GB — a single large model download will fill it.
 mkdir -p $HF_CACHE
+mkdir -p ~/.cache
+rm -rf ~/.cache/huggingface
+ln -s $HF_CACHE ~/.cache/huggingface
 echo "export HF_HOME=$HF_CACHE" >> ~/.bashrc
 echo "source $VENV/bin/activate" >> ~/.bashrc
 
@@ -57,5 +66,7 @@ ln -sf $VENV/bin/ninja /usr/local/bin/ninja
 
 sudo echo "export PATH=\"/opt/dlami/nvme/venv/bin:$PATH\"" > /etc/profile.d/ninja.sh
 sudo chmod 755 /etc/profile.d/ninja.sh
+sudo apt-get install -y -qq nsight-systems-2025.3
+sudo apt-get install -y -qq mosh
 
 echo "=== GLQ setup done ==="

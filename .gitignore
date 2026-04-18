@@ -19,6 +19,7 @@ venv/
 *.tfstate
 *.tfstate.backup
 .terraform/
+.env
 
 # Infrastructure (not published)
 infra/
