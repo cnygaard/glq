@@ -671,6 +671,12 @@ def glq_dequant_matmul(
     codebook2: torch.Tensor = None,
     inv_resid_scale: float = 0.0,
     codebook_packed: torch.Tensor = None,
+    Qidxs3: torch.Tensor = None,
+    codebook3: torch.Tensor = None,
+    inv_resid_scale2: float = 0.0,
+    Qidxs4: torch.Tensor = None,
+    codebook4: torch.Tensor = None,
+    inv_resid_scale3: float = 0.0,
 ) -> torch.Tensor:
     """Fused dequant+matmul: Y = X @ dequant(Qidxs)^T * Wscale.
 
@@ -687,6 +693,11 @@ def glq_dequant_matmul(
         codebook2: (K2, 8) secondary codebook for 3/4bpw, or None
         inv_resid_scale: 1.0 / resid_scale for 3/4bpw
         codebook_packed: (K,) uint32 packed codebook, or None
+        Qidxs3, codebook3, inv_resid_scale2:
+            Stage-3 RVQ (5/6bpw) — codebook3 reuses the primary E8
+            codebook in practice. ``None`` disables stage 3.
+        Qidxs4, codebook4, inv_resid_scale3:
+            Stage-4 RVQ (7/8bpw). ``None`` disables stage 4.
 
     Returns:
         Y: (B, M) output in fp32
@@ -705,6 +716,8 @@ def glq_dequant_matmul(
     cb = codebook.half().contiguous()
 
     has_stage2 = Qidxs2 is not None and codebook2 is not None
+    has_stage3 = Qidxs3 is not None and codebook3 is not None
+    has_stage4 = Qidxs4 is not None and codebook4 is not None
 
     if has_stage2:
         q2 = Qidxs2.contiguous()
@@ -723,6 +736,18 @@ def glq_dequant_matmul(
         _empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
         _empty_i32 = torch.empty(0, dtype=torch.int32, device=x.device)
         _use_ops = hasattr(torch.ops, 'glq') and hasattr(torch.ops.glq, 'dequant_matvec')
+        if has_stage3:
+            q3 = Qidxs3.contiguous()
+            cb3 = codebook3.half().contiguous()
+        else:
+            q3, cb3 = _empty_i16, _empty_f16
+        if has_stage4:
+            q4 = Qidxs4.contiguous()
+            cb4 = codebook4.half().contiguous()
+        else:
+            q4, cb4 = _empty_i16, _empty_f16
+        irs2 = inv_resid_scale2 if has_stage3 else 0.0
+        irs3 = inv_resid_scale3 if has_stage4 else 0.0
         if B == 1:
             _q2 = q2 if has_stage2 else _empty_i16
             _cb2 = cb2 if has_stage2 else _empty_f16
@@ -733,7 +758,8 @@ def glq_dequant_matmul(
                 y = _glq_cuda.glq_dequant_matvec_cuda(x_fp16[0], Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32)
             return y.unsqueeze(0)  # (M,) → (1, M)
         else:
-            if not has_stage2 and codebook_packed is not None:
+            if (not has_stage2 and not has_stage3 and not has_stage4
+                    and codebook_packed is not None):
                 if _use_ops:
                     y = torch.ops.glq.dequant_matmul_packed(x_fp16, Qidxs, codebook_packed, Wscale)
                 else:
@@ -745,14 +771,14 @@ def glq_dequant_matmul(
             if _use_ops:
                 y = torch.ops.glq.dequant_matmul(
                     x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32,
-                    _empty_i16, _empty_f16, 0.0,
-                    _empty_i16, _empty_f16, 0.0,
+                    q3, cb3, irs2,
+                    q4, cb4, irs3,
                 )
             else:
                 y = _glq_cuda.glq_dequant_matmul_cuda(
                     x_fp16, Qidxs, cb, Wscale, _q2, _cb2, _irs, _empty_i32,
-                    _empty_i16, _empty_f16, 0.0,
-                    _empty_i16, _empty_f16, 0.0,
+                    q3, cb3, irs2,
+                    q4, cb4, irs3,
                 )
             return y
 
