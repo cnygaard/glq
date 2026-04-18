@@ -188,6 +188,8 @@ class E8RHTLinear(nn.Module):
         # Cached scalar values (set in set_codebook, avoids GPU→CPU sync per forward)
         self._wscale_float = 1.0
         self._inv_rs_float = 0.0
+        self._inv_rs2_float = 0.0
+        self._inv_rs3_float = 0.0
 
         # Eager block-diagonal metadata (CPU int64; read host-side by the C++
         # wrapper's launch loop). device="cpu" is explicit so HF's meta-device
@@ -245,6 +247,8 @@ class E8RHTLinear(nn.Module):
         # Cache scalar values to avoid GPU→CPU sync on every forward pass
         self._wscale_float = self.Wscale.item()
         self._inv_rs_float = self.inv_resid_scale.item() if self._has_stage2 else 0.0
+        self._inv_rs2_float = self.inv_resid_scale2.item() if self._n_stages >= 3 else 0.0
+        self._inv_rs3_float = self.inv_resid_scale3.item() if self._n_stages >= 4 else 0.0
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys, error_msgs):
@@ -399,7 +403,7 @@ class E8RHTLinear(nn.Module):
         m_pad = self.m_pad
         _is_pow2 = not self.block_diagonal
         if (use_fused and n_pad <= 32768 and m_pad <= 32768
-                and self._n_stages <= 2
+                and self._n_stages <= 4
                 and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_linear_cuda')):
             if self._empty_i16 is None or self._empty_i16.device != x.device:
@@ -407,11 +411,23 @@ class E8RHTLinear(nn.Module):
                 self._empty_f16 = torch.empty(0, dtype=torch.float16, device=x.device)
             _empty_i16 = self._empty_i16
             _empty_f16 = self._empty_f16
+            n_stages = self._n_stages
             cb2_tensor = self.codebook2.codebook_half if has_stage2 else _empty_f16
+            # Stages 3+ always use the primary (full) E8 codebook, matching the
+            # Python fallback at `_extra_stages` below. Indices into a 65536-entry
+            # codebook → pass cb3_size=0 path (global codebook gather) — no smem
+            # staging for stages 3/4.
+            primary_cb = self.codebook.codebook_half
+            q3_tensor = self.Qidxs3 if n_stages >= 3 else _empty_i16
+            cb3_tensor = primary_cb if n_stages >= 3 else _empty_f16
+            q4_tensor = self.Qidxs4 if n_stages >= 4 else _empty_i16
+            cb4_tensor = primary_cb if n_stages >= 4 else _empty_f16
+            irs2_float = self._inv_rs2_float
+            irs3_float = self._inv_rs3_float
             if _is_pow2:
                 y = _ik._glq_cuda.glq_fused_linear_cuda(
                     x.half().contiguous(), self.SV, self.SU,
-                    self.Qidxs, self.codebook.codebook_half,
+                    self.Qidxs, primary_cb,
                     self._wscale_float,
                     self.in_features, self.out_features,
                     n_pad, m_pad,
@@ -419,6 +435,8 @@ class E8RHTLinear(nn.Module):
                     self.Qidxs2 if has_stage2 else _empty_i16,
                     cb2_tensor,
                     self._inv_rs_float,
+                    q3_tensor, cb3_tensor, irs2_float,
+                    q4_tensor, cb4_tensor, irs3_float,
                 )
             elif hasattr(_ik._glq_cuda, 'glq_fused_linear_block_diag_cuda'):
                 # Lazily push packed metadata to x.device (cache per device)
@@ -427,7 +445,7 @@ class E8RHTLinear(nn.Module):
                     self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
                 y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
                     x.half().contiguous(), self.SV, self.SU,
-                    self.Qidxs, self.codebook.codebook_half,
+                    self.Qidxs, primary_cb,
                     self._wscale_float,
                     self.in_features, self.out_features,
                     n_pad, m_pad,
@@ -436,6 +454,8 @@ class E8RHTLinear(nn.Module):
                     self.Qidxs2 if has_stage2 else _empty_i16,
                     cb2_tensor,
                     self._inv_rs_float,
+                    q3_tensor, cb3_tensor, irs2_float,
+                    q4_tensor, cb4_tensor, irs3_float,
                 )
             else:
                 y = None  # fall through to fallback

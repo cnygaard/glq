@@ -24,7 +24,13 @@ torch::Tensor glq_dequant_matmul_cuda(
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
     float inv_resid_scale,
-    torch::Tensor codebook_abs  // unused, kept for ABI compat
+    torch::Tensor codebook_abs,  // unused, kept for ABI compat
+    torch::Tensor qidxs3,
+    torch::Tensor codebook3,
+    float inv_resid_scale2,
+    torch::Tensor qidxs4,
+    torch::Tensor codebook4,
+    float inv_resid_scale3
 );
 
 torch::Tensor glq_dequant_matvec_packed_cuda(
@@ -90,7 +96,13 @@ torch::Tensor glq_fused_linear_cuda(
     int log_n, int log_m,
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor qidxs3,
+    torch::Tensor codebook3,
+    float inv_resid_scale2,
+    torch::Tensor qidxs4,
+    torch::Tensor codebook4,
+    float inv_resid_scale3
 );
 
 torch::Tensor glq_fused_linear_block_diag_cuda(
@@ -109,7 +121,13 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
     torch::Tensor blocks_m_meta,
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor qidxs3,
+    torch::Tensor codebook3,
+    float inv_resid_scale2,
+    torch::Tensor qidxs4,
+    torch::Tensor codebook4,
+    float inv_resid_scale3
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

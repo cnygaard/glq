@@ -46,15 +46,21 @@
 
 #define ROWS_PER_WARP 4
 
-template <bool HAS_STAGE2>
+template <int NUM_STAGES>
 __global__ void glq_matvec_kernel(
     float* __restrict__ output,         // (M,) fp32
     const half* __restrict__ x,         // (N,) fp16 input vector
     const int16_t* __restrict__ qidxs,  // (M, N_BLOCKS) primary indices
     const half* __restrict__ codebook,  // (65536, 8) primary codebook
-    const int16_t* __restrict__ qidxs2, // (M, N_BLOCKS) secondary indices [if HAS_STAGE2]
-    const half* __restrict__ codebook2, // (K2, 8) secondary codebook [if HAS_STAGE2]
-    float inv_resid_scale,              // 1/resid_scale [if HAS_STAGE2]
+    const int16_t* __restrict__ qidxs2, // (M, N_BLOCKS) secondary indices [stage 2+]
+    const half* __restrict__ codebook2, // (K2, 8) secondary codebook [stage 2+]
+    float inv_resid_scale,              // 1/resid_scale [stage 2+]
+    const int16_t* __restrict__ qidxs3, // (M, N_BLOCKS) tertiary indices [stage 3+]
+    const half* __restrict__ codebook3, // tertiary codebook [stage 3+]
+    float inv_resid_scale2,             // 1/resid_scale2 [stage 3+]
+    const int16_t* __restrict__ qidxs4, // (M, N_BLOCKS) quaternary indices [stage 4]
+    const half* __restrict__ codebook4, // quaternary codebook [stage 4]
+    float inv_resid_scale3,             // 1/resid_scale3 [stage 4]
     float wscale,                       // global scale factor
     int M,                              // output rows
     int N_BLOCKS                        // N / 8
@@ -102,8 +108,8 @@ __global__ void glq_matvec_kernel(
                 cb_val = __half2float(codebook[idx * 8 + elem]);
             }
 
-            // 4. Two-stage residual
-            if (HAS_STAGE2) {
+            // 4. Residual stages
+            if constexpr (NUM_STAGES >= 2) {
                 uint16_t idx2 = 0;
                 if (valid && elem == 0) {
                     idx2 = (uint16_t)qidxs2[my_row * N_BLOCKS + j];
@@ -111,6 +117,26 @@ __global__ void glq_matvec_kernel(
                 idx2 = __shfl_sync(FULL_MASK, idx2, row_in_warp * 8);
                 if (valid) {
                     cb_val += __half2float(codebook2[idx2 * 8 + elem]) * inv_resid_scale;
+                }
+            }
+            if constexpr (NUM_STAGES >= 3) {
+                uint16_t idx3 = 0;
+                if (valid && elem == 0) {
+                    idx3 = (uint16_t)qidxs3[my_row * N_BLOCKS + j];
+                }
+                idx3 = __shfl_sync(FULL_MASK, idx3, row_in_warp * 8);
+                if (valid) {
+                    cb_val += __half2float(codebook3[idx3 * 8 + elem]) * inv_resid_scale2;
+                }
+            }
+            if constexpr (NUM_STAGES >= 4) {
+                uint16_t idx4 = 0;
+                if (valid && elem == 0) {
+                    idx4 = (uint16_t)qidxs4[my_row * N_BLOCKS + j];
+                }
+                idx4 = __shfl_sync(FULL_MASK, idx4, row_in_warp * 8);
+                if (valid) {
+                    cb_val += __half2float(codebook4[idx4 * 8 + elem]) * inv_resid_scale3;
                 }
             }
 
@@ -151,7 +177,7 @@ __global__ void glq_matvec_kernel(
 
 #define BLOCKS_PER_SPLIT_DEFAULT 64
 
-template <bool HAS_STAGE2>
+template <int NUM_STAGES>
 __global__ void __launch_bounds__(256)
 glq_matvec_splitk_kernel(
     float* __restrict__ output,         // (M,) fp32, pre-zeroed
@@ -161,16 +187,24 @@ glq_matvec_splitk_kernel(
     const int16_t* __restrict__ qidxs2,
     const half* __restrict__ codebook2,
     float inv_resid_scale,
+    const int16_t* __restrict__ qidxs3,
+    const half* __restrict__ codebook3,
+    float inv_resid_scale2,
+    const int16_t* __restrict__ qidxs4,
+    const half* __restrict__ codebook4,
+    float inv_resid_scale3,
     float wscale,
     int M,
     int N_BLOCKS,
     int bps,                            // blocks per split (adaptive)
     int cb2_size                        // secondary codebook entries (0 if no stage2)
 ) {
-    // Stage small secondary codebook into shared memory (256 entries = 4KB)
+    // Stage small secondary codebook into shared memory (256 entries = 4KB).
+    // Stages 3+ always use the primary (65536-entry) codebook, so no smem
+    // staging there — cb3/cb4 go through the global path.
     extern __shared__ half smem_cb2[];
 
-    if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
+    if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
         int tid_flat = threadIdx.y * 32 + threadIdx.x;
         int total = cb2_size * 8;
         for (int i = tid_flat; i < total; i += 256) {
@@ -220,7 +254,7 @@ glq_matvec_splitk_kernel(
             cb_val_1 = __half2float(codebook[idx_1 * 8 + elem]);
         }
 
-        if (HAS_STAGE2) {
+        if constexpr (NUM_STAGES >= 2) {
             const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
             uint16_t idx2_0 = 0, idx2_1 = 0;
             if (valid && elem == 0) {
@@ -232,6 +266,32 @@ glq_matvec_splitk_kernel(
             if (valid) {
                 cb_val_0 += __half2float(cb2[idx2_0 * 8 + elem]) * inv_resid_scale;
                 cb_val_1 += __half2float(cb2[idx2_1 * 8 + elem]) * inv_resid_scale;
+            }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            uint16_t idx3_0 = 0, idx3_1 = 0;
+            if (valid && elem == 0) {
+                idx3_0 = (uint16_t)qidxs3[my_row * N_BLOCKS + j];
+                idx3_1 = (uint16_t)qidxs3[my_row * N_BLOCKS + j + 1];
+            }
+            idx3_0 = __shfl_sync(FULL_MASK, idx3_0, row_in_warp * 8);
+            idx3_1 = __shfl_sync(FULL_MASK, idx3_1, row_in_warp * 8);
+            if (valid) {
+                cb_val_0 += __half2float(codebook3[idx3_0 * 8 + elem]) * inv_resid_scale2;
+                cb_val_1 += __half2float(codebook3[idx3_1 * 8 + elem]) * inv_resid_scale2;
+            }
+        }
+        if constexpr (NUM_STAGES >= 4) {
+            uint16_t idx4_0 = 0, idx4_1 = 0;
+            if (valid && elem == 0) {
+                idx4_0 = (uint16_t)qidxs4[my_row * N_BLOCKS + j];
+                idx4_1 = (uint16_t)qidxs4[my_row * N_BLOCKS + j + 1];
+            }
+            idx4_0 = __shfl_sync(FULL_MASK, idx4_0, row_in_warp * 8);
+            idx4_1 = __shfl_sync(FULL_MASK, idx4_1, row_in_warp * 8);
+            if (valid) {
+                cb_val_0 += __half2float(codebook4[idx4_0 * 8 + elem]) * inv_resid_scale3;
+                cb_val_1 += __half2float(codebook4[idx4_1 * 8 + elem]) * inv_resid_scale3;
             }
         }
 
@@ -259,12 +319,24 @@ glq_matvec_splitk_kernel(
         idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
         float cb_val = 0.0f;
         if (valid) { cb_val = __half2float(codebook[idx * 8 + elem]); }
-        if (HAS_STAGE2) {
+        if constexpr (NUM_STAGES >= 2) {
             const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
             uint16_t idx2 = 0;
             if (valid && elem == 0) { idx2 = (uint16_t)qidxs2[my_row * N_BLOCKS + j]; }
             idx2 = __shfl_sync(FULL_MASK, idx2, row_in_warp * 8);
             if (valid) { cb_val += __half2float(cb2[idx2 * 8 + elem]) * inv_resid_scale; }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            uint16_t idx3 = 0;
+            if (valid && elem == 0) { idx3 = (uint16_t)qidxs3[my_row * N_BLOCKS + j]; }
+            idx3 = __shfl_sync(FULL_MASK, idx3, row_in_warp * 8);
+            if (valid) { cb_val += __half2float(codebook3[idx3 * 8 + elem]) * inv_resid_scale2; }
+        }
+        if constexpr (NUM_STAGES >= 4) {
+            uint16_t idx4 = 0;
+            if (valid && elem == 0) { idx4 = (uint16_t)qidxs4[my_row * N_BLOCKS + j]; }
+            idx4 = __shfl_sync(FULL_MASK, idx4, row_in_warp * 8);
+            if (valid) { cb_val += __half2float(codebook4[idx4 * 8 + elem]) * inv_resid_scale3; }
         }
         float prod = cb_val * x_val;
         prod += __shfl_xor_sync(FULL_MASK, prod, 4);
@@ -288,7 +360,7 @@ glq_matvec_splitk_kernel(
  * split-K. Body is identical to glq_matvec_splitk_kernel except the
  * final write: one unique (k_split, m) slot per CTA, plain store.
  * ───────────────────────────────────────────────────────────────────── */
-template <bool HAS_STAGE2>
+template <int NUM_STAGES>
 __global__ void __launch_bounds__(256)
 glq_matvec_splitk_scratch_kernel(
     float* __restrict__ scratch,        // (k_splits, M) fp32, overwritten
@@ -298,6 +370,12 @@ glq_matvec_splitk_scratch_kernel(
     const int16_t* __restrict__ qidxs2,
     const half* __restrict__ codebook2,
     float inv_resid_scale,
+    const int16_t* __restrict__ qidxs3,
+    const half* __restrict__ codebook3,
+    float inv_resid_scale2,
+    const int16_t* __restrict__ qidxs4,
+    const half* __restrict__ codebook4,
+    float inv_resid_scale3,
     float wscale,
     int M,
     int N_BLOCKS,
@@ -306,7 +384,7 @@ glq_matvec_splitk_scratch_kernel(
 ) {
     extern __shared__ half smem_cb2[];
 
-    if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
+    if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
         int tid_flat = threadIdx.y * 32 + threadIdx.x;
         int total = cb2_size * 8;
         for (int i = tid_flat; i < total; i += 256) {
@@ -353,7 +431,7 @@ glq_matvec_splitk_scratch_kernel(
             cb_val_1 = __half2float(codebook[idx_1 * 8 + elem]);
         }
 
-        if (HAS_STAGE2) {
+        if constexpr (NUM_STAGES >= 2) {
             const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
             uint16_t idx2_0 = 0, idx2_1 = 0;
             if (valid && elem == 0) {
@@ -365,6 +443,32 @@ glq_matvec_splitk_scratch_kernel(
             if (valid) {
                 cb_val_0 += __half2float(cb2[idx2_0 * 8 + elem]) * inv_resid_scale;
                 cb_val_1 += __half2float(cb2[idx2_1 * 8 + elem]) * inv_resid_scale;
+            }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            uint16_t idx3_0 = 0, idx3_1 = 0;
+            if (valid && elem == 0) {
+                idx3_0 = (uint16_t)qidxs3[my_row * N_BLOCKS + j];
+                idx3_1 = (uint16_t)qidxs3[my_row * N_BLOCKS + j + 1];
+            }
+            idx3_0 = __shfl_sync(FULL_MASK, idx3_0, row_in_warp * 8);
+            idx3_1 = __shfl_sync(FULL_MASK, idx3_1, row_in_warp * 8);
+            if (valid) {
+                cb_val_0 += __half2float(codebook3[idx3_0 * 8 + elem]) * inv_resid_scale2;
+                cb_val_1 += __half2float(codebook3[idx3_1 * 8 + elem]) * inv_resid_scale2;
+            }
+        }
+        if constexpr (NUM_STAGES >= 4) {
+            uint16_t idx4_0 = 0, idx4_1 = 0;
+            if (valid && elem == 0) {
+                idx4_0 = (uint16_t)qidxs4[my_row * N_BLOCKS + j];
+                idx4_1 = (uint16_t)qidxs4[my_row * N_BLOCKS + j + 1];
+            }
+            idx4_0 = __shfl_sync(FULL_MASK, idx4_0, row_in_warp * 8);
+            idx4_1 = __shfl_sync(FULL_MASK, idx4_1, row_in_warp * 8);
+            if (valid) {
+                cb_val_0 += __half2float(codebook4[idx4_0 * 8 + elem]) * inv_resid_scale3;
+                cb_val_1 += __half2float(codebook4[idx4_1 * 8 + elem]) * inv_resid_scale3;
             }
         }
 
@@ -391,12 +495,24 @@ glq_matvec_splitk_scratch_kernel(
         idx = __shfl_sync(FULL_MASK, idx, row_in_warp * 8);
         float cb_val = 0.0f;
         if (valid) { cb_val = __half2float(codebook[idx * 8 + elem]); }
-        if (HAS_STAGE2) {
+        if constexpr (NUM_STAGES >= 2) {
             const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
             uint16_t idx2 = 0;
             if (valid && elem == 0) { idx2 = (uint16_t)qidxs2[my_row * N_BLOCKS + j]; }
             idx2 = __shfl_sync(FULL_MASK, idx2, row_in_warp * 8);
             if (valid) { cb_val += __half2float(cb2[idx2 * 8 + elem]) * inv_resid_scale; }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            uint16_t idx3 = 0;
+            if (valid && elem == 0) { idx3 = (uint16_t)qidxs3[my_row * N_BLOCKS + j]; }
+            idx3 = __shfl_sync(FULL_MASK, idx3, row_in_warp * 8);
+            if (valid) { cb_val += __half2float(codebook3[idx3 * 8 + elem]) * inv_resid_scale2; }
+        }
+        if constexpr (NUM_STAGES >= 4) {
+            uint16_t idx4 = 0;
+            if (valid && elem == 0) { idx4 = (uint16_t)qidxs4[my_row * N_BLOCKS + j]; }
+            idx4 = __shfl_sync(FULL_MASK, idx4, row_in_warp * 8);
+            if (valid) { cb_val += __half2float(codebook4[idx4 * 8 + elem]) * inv_resid_scale3; }
         }
         float prod = cb_val * x_val;
         prod += __shfl_xor_sync(FULL_MASK, prod, 4);
@@ -463,7 +579,7 @@ glq_reduce_splits_kernel(
 
 #define TC_BPS_DEFAULT 64
 
-template <bool HAS_STAGE2>
+template <int NUM_STAGES>
 __global__ void __launch_bounds__(256, 2)
 glq_matmul_tc_kernel(
     float* __restrict__ output,         // (B_dim, M) fp32, pre-zeroed
@@ -473,6 +589,12 @@ glq_matmul_tc_kernel(
     const int16_t* __restrict__ qidxs2,
     const half* __restrict__ codebook2,
     float inv_resid_scale,
+    const int16_t* __restrict__ qidxs3,
+    const half* __restrict__ codebook3,
+    float inv_resid_scale2,
+    const int16_t* __restrict__ qidxs4,
+    const half* __restrict__ codebook4,
+    float inv_resid_scale3,
     float wscale,
     int B_dim,
     int M,
@@ -482,9 +604,10 @@ glq_matmul_tc_kernel(
     int bps,                            // blocks per K-split (adaptive)
     int cb2_size                        // secondary codebook entries (0 if no stage2)
 ) {
-    // Stage small secondary codebook into shared memory (256 entries = 4KB)
+    // Stage small secondary codebook into shared memory (256 entries = 4KB).
+    // Stages 3+ always use the primary (65536-entry) codebook — no smem staging.
     extern __shared__ half smem_cb2[];
-    if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
+    if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
         int tid_flat = threadIdx.y * 32 + threadIdx.x;
         int total = cb2_size * 8;
         for (int i = tid_flat; i < total; i += 256) {
@@ -534,16 +657,42 @@ glq_matmul_tc_kernel(
         half bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
         half bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
 
-        if (HAS_STAGE2 && m_valid) {
-            // Use shared memory for small codebook2, global for large
-            const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
-            uint16_t idx2_j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
-            bv0 = __float2half(__half2float(bv0) + __half2float(cb2[idx2_j * 8 + k_elem]) * inv_resid_scale);
-            bv1 = __float2half(__half2float(bv1) + __half2float(cb2[idx2_j * 8 + k_elem + 1]) * inv_resid_scale);
-            if (j1_valid) {
-                uint16_t idx2_j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
-                bv2 = __float2half(__half2float(bv2) + __half2float(cb2[idx2_j1 * 8 + k_elem]) * inv_resid_scale);
-                bv3 = __float2half(__half2float(bv3) + __half2float(cb2[idx2_j1 * 8 + k_elem + 1]) * inv_resid_scale);
+        if constexpr (NUM_STAGES >= 2) {
+            if (m_valid) {
+                // Use shared memory for small codebook2, global for large
+                const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+                uint16_t idx2_j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(cb2[idx2_j * 8 + k_elem]) * inv_resid_scale);
+                bv1 = __float2half(__half2float(bv1) + __half2float(cb2[idx2_j * 8 + k_elem + 1]) * inv_resid_scale);
+                if (j1_valid) {
+                    uint16_t idx2_j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(cb2[idx2_j1 * 8 + k_elem]) * inv_resid_scale);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(cb2[idx2_j1 * 8 + k_elem + 1]) * inv_resid_scale);
+                }
+            }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            if (m_valid) {
+                uint16_t idx3_j = (uint16_t)qidxs3[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(codebook3[idx3_j * 8 + k_elem]) * inv_resid_scale2);
+                bv1 = __float2half(__half2float(bv1) + __half2float(codebook3[idx3_j * 8 + k_elem + 1]) * inv_resid_scale2);
+                if (j1_valid) {
+                    uint16_t idx3_j1 = (uint16_t)qidxs3[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(codebook3[idx3_j1 * 8 + k_elem]) * inv_resid_scale2);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(codebook3[idx3_j1 * 8 + k_elem + 1]) * inv_resid_scale2);
+                }
+            }
+        }
+        if constexpr (NUM_STAGES >= 4) {
+            if (m_valid) {
+                uint16_t idx4_j = (uint16_t)qidxs4[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(codebook4[idx4_j * 8 + k_elem]) * inv_resid_scale3);
+                bv1 = __float2half(__half2float(bv1) + __half2float(codebook4[idx4_j * 8 + k_elem + 1]) * inv_resid_scale3);
+                if (j1_valid) {
+                    uint16_t idx4_j1 = (uint16_t)qidxs4[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(codebook4[idx4_j1 * 8 + k_elem]) * inv_resid_scale3);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(codebook4[idx4_j1 * 8 + k_elem + 1]) * inv_resid_scale3);
+                }
             }
         }
 
@@ -616,7 +765,7 @@ glq_matmul_tc_kernel(
  * glq_reduce_splits_2d_kernel sums across the k_splits axis in fixed
  * order, giving bit-exact run-to-run results.
  * ───────────────────────────────────────────────────────────────────── */
-template <bool HAS_STAGE2>
+template <int NUM_STAGES>
 __global__ void __launch_bounds__(256, 2)
 glq_matmul_tc_scratch_kernel(
     float* __restrict__ scratch,        // (k_splits * B_dim * M) fp32, overwritten
@@ -626,6 +775,12 @@ glq_matmul_tc_scratch_kernel(
     const int16_t* __restrict__ qidxs2,
     const half* __restrict__ codebook2,
     float inv_resid_scale,
+    const int16_t* __restrict__ qidxs3,
+    const half* __restrict__ codebook3,
+    float inv_resid_scale2,
+    const int16_t* __restrict__ qidxs4,
+    const half* __restrict__ codebook4,
+    float inv_resid_scale3,
     float wscale,
     int B_dim,
     int M,
@@ -636,7 +791,7 @@ glq_matmul_tc_scratch_kernel(
     int cb2_size
 ) {
     extern __shared__ half smem_cb2[];
-    if (HAS_STAGE2 && cb2_size > 0 && cb2_size <= 256) {
+    if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
         int tid_flat = threadIdx.y * 32 + threadIdx.x;
         int total = cb2_size * 8;
         for (int i = tid_flat; i < total; i += 256) {
@@ -683,15 +838,41 @@ glq_matmul_tc_scratch_kernel(
         half bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
         half bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
 
-        if (HAS_STAGE2 && m_valid) {
-            const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
-            uint16_t idx2_j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
-            bv0 = __float2half(__half2float(bv0) + __half2float(cb2[idx2_j * 8 + k_elem]) * inv_resid_scale);
-            bv1 = __float2half(__half2float(bv1) + __half2float(cb2[idx2_j * 8 + k_elem + 1]) * inv_resid_scale);
-            if (j1_valid) {
-                uint16_t idx2_j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
-                bv2 = __float2half(__half2float(bv2) + __half2float(cb2[idx2_j1 * 8 + k_elem]) * inv_resid_scale);
-                bv3 = __float2half(__half2float(bv3) + __half2float(cb2[idx2_j1 * 8 + k_elem + 1]) * inv_resid_scale);
+        if constexpr (NUM_STAGES >= 2) {
+            if (m_valid) {
+                const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+                uint16_t idx2_j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(cb2[idx2_j * 8 + k_elem]) * inv_resid_scale);
+                bv1 = __float2half(__half2float(bv1) + __half2float(cb2[idx2_j * 8 + k_elem + 1]) * inv_resid_scale);
+                if (j1_valid) {
+                    uint16_t idx2_j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(cb2[idx2_j1 * 8 + k_elem]) * inv_resid_scale);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(cb2[idx2_j1 * 8 + k_elem + 1]) * inv_resid_scale);
+                }
+            }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            if (m_valid) {
+                uint16_t idx3_j = (uint16_t)qidxs3[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(codebook3[idx3_j * 8 + k_elem]) * inv_resid_scale2);
+                bv1 = __float2half(__half2float(bv1) + __half2float(codebook3[idx3_j * 8 + k_elem + 1]) * inv_resid_scale2);
+                if (j1_valid) {
+                    uint16_t idx3_j1 = (uint16_t)qidxs3[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(codebook3[idx3_j1 * 8 + k_elem]) * inv_resid_scale2);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(codebook3[idx3_j1 * 8 + k_elem + 1]) * inv_resid_scale2);
+                }
+            }
+        }
+        if constexpr (NUM_STAGES >= 4) {
+            if (m_valid) {
+                uint16_t idx4_j = (uint16_t)qidxs4[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(codebook4[idx4_j * 8 + k_elem]) * inv_resid_scale3);
+                bv1 = __float2half(__half2float(bv1) + __half2float(codebook4[idx4_j * 8 + k_elem + 1]) * inv_resid_scale3);
+                if (j1_valid) {
+                    uint16_t idx4_j1 = (uint16_t)qidxs4[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(codebook4[idx4_j1 * 8 + k_elem]) * inv_resid_scale3);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(codebook4[idx4_j1 * 8 + k_elem + 1]) * inv_resid_scale3);
+                }
             }
         }
 
@@ -1163,6 +1344,20 @@ __global__ void glq_matvec_packed_kernel(
  * Host wrappers (pybind11 entry points)
  * ───────────────────────────────────────────────────────────────────── */
 
+// Dispatch macro: instantiate the templated kernel for NUM_STAGES ∈ {1..4}.
+// KERNEL_CALL(NS) must be a statement that launches the kernel using NS
+// as the NUM_STAGES template parameter.
+#define DISPATCH_NUM_STAGES(NS_VAL, KERNEL_CALL) \
+    do { \
+        switch (NS_VAL) { \
+            case 1: KERNEL_CALL(1); break; \
+            case 2: KERNEL_CALL(2); break; \
+            case 3: KERNEL_CALL(3); break; \
+            case 4: KERNEL_CALL(4); break; \
+            default: TORCH_CHECK(false, "num_stages must be 1-4"); \
+        } \
+    } while (0)
+
 torch::Tensor glq_dequant_matvec_cuda(
     torch::Tensor x,           // (N,) fp16
     torch::Tensor qidxs,       // (M, N_BLOCKS) int16
@@ -1227,7 +1422,7 @@ torch::Tensor glq_dequant_matvec_cuda(
             CHECK_INPUT(codebook2);
             int cb2_size = codebook2.size(0);
             int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-            glq_matvec_splitk_scratch_kernel<true><<<grid, block, smem, stream>>>(
+            glq_matvec_splitk_scratch_kernel<2><<<grid, block, smem, stream>>>(
                 scratch,
                 (const half*)x.data_ptr<c10::Half>(),
                 qidxs.data_ptr<int16_t>(),
@@ -1235,14 +1430,18 @@ torch::Tensor glq_dequant_matvec_cuda(
                 qidxs2.data_ptr<int16_t>(),
                 (const half*)codebook2.data_ptr<c10::Half>(),
                 inv_resid_scale,
+                nullptr, nullptr, 0.0f,
+                nullptr, nullptr, 0.0f,
                 wscale, M, N_BLOCKS, bps, cb2_size
             );
         } else {
-            glq_matvec_splitk_scratch_kernel<false><<<grid, block, 0, stream>>>(
+            glq_matvec_splitk_scratch_kernel<1><<<grid, block, 0, stream>>>(
                 scratch,
                 (const half*)x.data_ptr<c10::Half>(),
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
+                nullptr, nullptr, 0.0f,
+                nullptr, nullptr, 0.0f,
                 nullptr, nullptr, 0.0f,
                 wscale, M, N_BLOCKS, bps, 0
             );
@@ -1262,7 +1461,7 @@ torch::Tensor glq_dequant_matvec_cuda(
         if (has_stage2) {
             CHECK_INPUT(qidxs2);
             CHECK_INPUT(codebook2);
-            glq_matvec_kernel<true><<<grid, block, 0, stream>>>(
+            glq_matvec_kernel<2><<<grid, block, 0, stream>>>(
                 output.data_ptr<float>(),
                 (const half*)x.data_ptr<c10::Half>(),
                 qidxs.data_ptr<int16_t>(),
@@ -1270,14 +1469,18 @@ torch::Tensor glq_dequant_matvec_cuda(
                 qidxs2.data_ptr<int16_t>(),
                 (const half*)codebook2.data_ptr<c10::Half>(),
                 inv_resid_scale,
+                nullptr, nullptr, 0.0f,
+                nullptr, nullptr, 0.0f,
                 wscale, M, N_BLOCKS
             );
         } else {
-            glq_matvec_kernel<false><<<grid, block, 0, stream>>>(
+            glq_matvec_kernel<1><<<grid, block, 0, stream>>>(
                 output.data_ptr<float>(),
                 (const half*)x.data_ptr<c10::Half>(),
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
+                nullptr, nullptr, 0.0f,
+                nullptr, nullptr, 0.0f,
                 nullptr, nullptr, 0.0f,
                 wscale, M, N_BLOCKS
             );
@@ -1296,7 +1499,13 @@ torch::Tensor glq_dequant_matmul_cuda(
     torch::Tensor qidxs2,      // (M, N_BLOCKS) int16 or empty
     torch::Tensor codebook2,   // (K2, 8) fp16 or empty
     float inv_resid_scale,
-    torch::Tensor codebook_abs // unused, kept for ABI compat
+    torch::Tensor codebook_abs, // unused, kept for ABI compat
+    torch::Tensor qidxs3,      // stage 3 indices or empty
+    torch::Tensor codebook3,   // stage 3 codebook (typically same as primary) or empty
+    float inv_resid_scale2,    // 1/resid_scale2
+    torch::Tensor qidxs4,      // stage 4 indices or empty
+    torch::Tensor codebook4,   // stage 4 codebook (typically same as primary) or empty
+    float inv_resid_scale3     // 1/resid_scale3
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(qidxs);
@@ -1322,6 +1531,9 @@ torch::Tensor glq_dequant_matmul_cuda(
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
+    bool has_stage3 = has_stage2 && (qidxs3.numel() > 0 && inv_resid_scale2 != 0.0f);
+    bool has_stage4 = has_stage3 && (qidxs4.numel() > 0 && inv_resid_scale3 != 0.0f);
+    int num_stages = 1 + (has_stage2 ? 1 : 0) + (has_stage3 ? 1 : 0) + (has_stage4 ? 1 : 0);
 
     const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
     const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
@@ -1330,10 +1542,25 @@ torch::Tensor glq_dequant_matmul_cuda(
 
     const int16_t* q2_ptr = has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr;
     const half* cb2_ptr = has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q3_ptr = has_stage3 ? qidxs3.data_ptr<int16_t>() : nullptr;
+    const half* cb3_ptr = has_stage3 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q4_ptr = has_stage4 ? qidxs4.data_ptr<int16_t>() : nullptr;
+    const half* cb4_ptr = has_stage4 ? (const half*)codebook4.data_ptr<c10::Half>() : nullptr;
+    float irs = has_stage2 ? inv_resid_scale : 0.0f;
+    float irs2 = has_stage3 ? inv_resid_scale2 : 0.0f;
+    float irs3 = has_stage4 ? inv_resid_scale3 : 0.0f;
 
     if (has_stage2) {
         CHECK_INPUT(qidxs2);
         CHECK_INPUT(codebook2);
+    }
+    if (has_stage3) {
+        CHECK_INPUT(qidxs3);
+        CHECK_INPUT(codebook3);
+    }
+    if (has_stage4) {
+        CHECK_INPUT(qidxs4);
+        CHECK_INPUT(codebook4);
     }
 
     // Deterministic scratch+reduce split-K for the B>=2 path. Same pattern as
@@ -1359,19 +1586,18 @@ torch::Tensor glq_dequant_matmul_cuda(
     size_t scratch_bytes = (size_t)k_splits * B_dim * M * sizeof(float);
     float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
-    if (has_stage2) {
-        int cb2_size = codebook2.size(0);
-        int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-        glq_matmul_tc_scratch_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
-            scratch, x_ptr, q_ptr, cb_ptr,
-            q2_ptr, cb2_ptr, inv_resid_scale,
-            wscale, B_dim, M, N, N_BLOCKS, N, bps, cb2_size);
-    } else {
-        glq_matmul_tc_scratch_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
-            scratch, x_ptr, q_ptr, cb_ptr,
-            nullptr, nullptr, 0.0f,
-            wscale, B_dim, M, N, N_BLOCKS, N, bps, 0);
-    }
+    int cb2_size = has_stage2 ? codebook2.size(0) : 0;
+    int smem = (has_stage2 && cb2_size <= 256) ? cb2_size * 8 * (int)sizeof(half) : 0;
+
+#define LAUNCH_TC_MATMUL(NS)                                                              \
+    glq_matmul_tc_scratch_kernel<NS><<<tc_grid, tc_block, smem, stream>>>(                \
+        scratch, x_ptr, q_ptr, cb_ptr,                                                    \
+        q2_ptr, cb2_ptr, irs,                                                             \
+        q3_ptr, cb3_ptr, irs2,                                                            \
+        q4_ptr, cb4_ptr, irs3,                                                            \
+        wscale, B_dim, M, N, N_BLOCKS, N, bps, cb2_size)
+    DISPATCH_NUM_STAGES(num_stages, LAUNCH_TC_MATMUL);
+#undef LAUNCH_TC_MATMUL
 
     int BM = B_dim * M;
     int reduce_threads = 256;
@@ -2076,7 +2302,12 @@ static void launch_matvec_splitk(
     float* output, const half* x, const int16_t* qidxs,
     const half* codebook, float wscale,
     const int16_t* qidxs2, const half* codebook2,
-    float inv_resid_scale, bool has_stage2,
+    float inv_resid_scale,
+    const int16_t* qidxs3, const half* codebook3,
+    float inv_resid_scale2,
+    const int16_t* qidxs4, const half* codebook4,
+    float inv_resid_scale3,
+    int num_stages,
     int M, int N_BLOCKS, int cb2_size,
     int num_sms, cudaStream_t stream
 );
@@ -2102,7 +2333,13 @@ torch::Tensor glq_fused_linear_cuda(
     int log_n, int log_m,
     torch::Tensor qidxs2,      // empty or (M_pad, N_BLOCKS) int16
     torch::Tensor codebook2,   // empty or (K2, 8) fp16
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor qidxs3,      // stage 3 indices or empty
+    torch::Tensor codebook3,   // stage 3 codebook or empty
+    float inv_resid_scale2,
+    torch::Tensor qidxs4,      // stage 4 indices or empty
+    torch::Tensor codebook4,   // stage 4 codebook or empty
+    float inv_resid_scale3
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(qidxs);
@@ -2112,6 +2349,19 @@ torch::Tensor glq_fused_linear_cuda(
     int M = qidxs.size(0);
     int N_BLOCKS = qidxs.size(1);
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
+    bool has_stage3 = has_stage2 && (qidxs3.numel() > 0 && inv_resid_scale2 != 0.0f);
+    bool has_stage4 = has_stage3 && (qidxs4.numel() > 0 && inv_resid_scale3 != 0.0f);
+    int num_stages = 1 + (has_stage2 ? 1 : 0) + (has_stage3 ? 1 : 0) + (has_stage4 ? 1 : 0);
+
+    const int16_t* q2_ptr = has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr;
+    const half* cb2_ptr = has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q3_ptr = has_stage3 ? qidxs3.data_ptr<int16_t>() : nullptr;
+    const half* cb3_ptr = has_stage3 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q4_ptr = has_stage4 ? qidxs4.data_ptr<int16_t>() : nullptr;
+    const half* cb4_ptr = has_stage4 ? (const half*)codebook4.data_ptr<c10::Half>() : nullptr;
+    float irs = has_stage2 ? inv_resid_scale : 0.0f;
+    float irs2 = has_stage3 ? inv_resid_scale2 : 0.0f;
+    float irs3 = has_stage4 ? inv_resid_scale3 : 0.0f;
 
     at::DeviceGuard guard(x.device());
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
@@ -2181,9 +2431,10 @@ torch::Tensor glq_fused_linear_cuda(
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
                 wscale,
-                has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr,
-                has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr,
-                inv_resid_scale, has_stage2,
+                q2_ptr, cb2_ptr, irs,
+                q3_ptr, cb3_ptr, irs2,
+                q4_ptr, cb4_ptr, irs3,
+                num_stages,
                 M, N_BLOCKS, cb2_size, num_sms, stream
             );
         } else {
@@ -2207,29 +2458,21 @@ torch::Tensor glq_fused_linear_cuda(
             size_t scratch_bytes = (size_t)k_splits * B * M * sizeof(float);
             float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
-            if (has_stage2) {
-                int cb2_size = codebook2.size(0);
-                int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-                glq_matmul_tc_scratch_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
-                    scratch,
-                    (const half*)x_rht_half.data_ptr<c10::Half>(),
-                    qidxs.data_ptr<int16_t>(),
-                    (const half*)codebook.data_ptr<c10::Half>(),
-                    qidxs2.data_ptr<int16_t>(),
-                    (const half*)codebook2.data_ptr<c10::Half>(),
-                    inv_resid_scale,
-                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size
-                );
-            } else {
-                glq_matmul_tc_scratch_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
-                    scratch,
-                    (const half*)x_rht_half.data_ptr<c10::Half>(),
-                    qidxs.data_ptr<int16_t>(),
-                    (const half*)codebook.data_ptr<c10::Half>(),
-                    nullptr, nullptr, 0.0f,
-                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, 0
-                );
-            }
+            int cb2_size = has_stage2 ? codebook2.size(0) : 0;
+            int smem = (has_stage2 && cb2_size <= 256) ? cb2_size * 8 * (int)sizeof(half) : 0;
+
+#define LAUNCH_FUSED_TC(NS)                                                               \
+            glq_matmul_tc_scratch_kernel<NS><<<tc_grid, tc_block, smem, stream>>>(        \
+                scratch,                                                                  \
+                (const half*)x_rht_half.data_ptr<c10::Half>(),                            \
+                qidxs.data_ptr<int16_t>(),                                                \
+                (const half*)codebook.data_ptr<c10::Half>(),                              \
+                q2_ptr, cb2_ptr, irs,                                                     \
+                q3_ptr, cb3_ptr, irs2,                                                    \
+                q4_ptr, cb4_ptr, irs3,                                                    \
+                wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size)
+            DISPATCH_NUM_STAGES(num_stages, LAUNCH_FUSED_TC);
+#undef LAUNCH_FUSED_TC
 
             int BM = B * M;
             int reduce_threads = 256;
@@ -2309,12 +2552,32 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
     torch::Tensor blocks_m_meta,  // (num_m_blocks, 4) int32 GPU
     torch::Tensor qidxs2,
     torch::Tensor codebook2,
-    float inv_resid_scale
+    float inv_resid_scale,
+    torch::Tensor qidxs3,      // stage 3 indices or empty
+    torch::Tensor codebook3,   // stage 3 codebook or empty
+    float inv_resid_scale2,
+    torch::Tensor qidxs4,      // stage 4 indices or empty
+    torch::Tensor codebook4,   // stage 4 codebook or empty
+    float inv_resid_scale3
 ) {
     int B = x.size(0);
     int M = qidxs.size(0);
     int N_BLOCKS = qidxs.size(1);
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);
+    bool has_stage3 = has_stage2 && (qidxs3.numel() > 0 && inv_resid_scale2 != 0.0f);
+    bool has_stage4 = has_stage3 && (qidxs4.numel() > 0 && inv_resid_scale3 != 0.0f);
+    int num_stages = 1 + (has_stage2 ? 1 : 0) + (has_stage3 ? 1 : 0) + (has_stage4 ? 1 : 0);
+
+    const int16_t* q2_ptr = has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr;
+    const half* cb2_ptr = has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q3_ptr = has_stage3 ? qidxs3.data_ptr<int16_t>() : nullptr;
+    const half* cb3_ptr = has_stage3 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q4_ptr = has_stage4 ? qidxs4.data_ptr<int16_t>() : nullptr;
+    const half* cb4_ptr = has_stage4 ? (const half*)codebook4.data_ptr<c10::Half>() : nullptr;
+    float irs = has_stage2 ? inv_resid_scale : 0.0f;
+    float irs2 = has_stage3 ? inv_resid_scale2 : 0.0f;
+    float irs3 = has_stage4 ? inv_resid_scale3 : 0.0f;
+
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
     // ---- Step 1: Input RHT ----
@@ -2394,9 +2657,10 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
                 qidxs.data_ptr<int16_t>(),
                 (const half*)codebook.data_ptr<c10::Half>(),
                 wscale,
-                has_stage2 ? qidxs2.data_ptr<int16_t>() : nullptr,
-                has_stage2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr,
-                inv_resid_scale, has_stage2,
+                q2_ptr, cb2_ptr, irs,
+                q3_ptr, cb3_ptr, irs2,
+                q4_ptr, cb4_ptr, irs3,
+                num_stages,
                 M, N_BLOCKS, cb2_size, num_sms, stream
             );
         } else {
@@ -2418,29 +2682,21 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
             size_t scratch_bytes = (size_t)k_splits * B * M * sizeof(float);
             float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
-            if (has_stage2) {
-                int cb2_size = codebook2.size(0);
-                int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-                glq_matmul_tc_scratch_kernel<true><<<tc_grid, tc_block, smem, stream>>>(
-                    scratch,
-                    (const half*)x_rht_half.data_ptr<c10::Half>(),
-                    qidxs.data_ptr<int16_t>(),
-                    (const half*)codebook.data_ptr<c10::Half>(),
-                    qidxs2.data_ptr<int16_t>(),
-                    (const half*)codebook2.data_ptr<c10::Half>(),
-                    inv_resid_scale,
-                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size
-                );
-            } else {
-                glq_matmul_tc_scratch_kernel<false><<<tc_grid, tc_block, 0, stream>>>(
-                    scratch,
-                    (const half*)x_rht_half.data_ptr<c10::Half>(),
-                    qidxs.data_ptr<int16_t>(),
-                    (const half*)codebook.data_ptr<c10::Half>(),
-                    nullptr, nullptr, 0.0f,
-                    wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, 0
-                );
-            }
+            int cb2_size = has_stage2 ? codebook2.size(0) : 0;
+            int smem = (has_stage2 && cb2_size <= 256) ? cb2_size * 8 * (int)sizeof(half) : 0;
+
+#define LAUNCH_BD_TC(NS)                                                                  \
+            glq_matmul_tc_scratch_kernel<NS><<<tc_grid, tc_block, smem, stream>>>(        \
+                scratch,                                                                  \
+                (const half*)x_rht_half.data_ptr<c10::Half>(),                            \
+                qidxs.data_ptr<int16_t>(),                                                \
+                (const half*)codebook.data_ptr<c10::Half>(),                              \
+                q2_ptr, cb2_ptr, irs,                                                     \
+                q3_ptr, cb3_ptr, irs2,                                                    \
+                q4_ptr, cb4_ptr, irs3,                                                    \
+                wscale, B, M, n_pad, N_BLOCKS, n_pad, bps, cb2_size)
+            DISPATCH_NUM_STAGES(num_stages, LAUNCH_BD_TC);
+#undef LAUNCH_BD_TC
 
             int BM = B * M;
             int reduce_threads = 256;
@@ -2564,7 +2820,12 @@ static void launch_matvec_splitk(
     float* output, const half* x, const int16_t* qidxs,
     const half* codebook, float wscale,
     const int16_t* qidxs2, const half* codebook2,
-    float inv_resid_scale, bool has_stage2,
+    float inv_resid_scale,
+    const int16_t* qidxs3, const half* codebook3,
+    float inv_resid_scale2,
+    const int16_t* qidxs4, const half* codebook4,
+    float inv_resid_scale3,
+    int num_stages,
     int M, int N_BLOCKS, int cb2_size,
     int num_sms, cudaStream_t stream
 ) {
@@ -2586,16 +2847,19 @@ static void launch_matvec_splitk(
     size_t scratch_bytes = (size_t)k_splits * M * sizeof(float);
     float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
-    if (has_stage2) {
-        int smem = (cb2_size <= 256) ? cb2_size * 8 * sizeof(half) : 0;
-        glq_matvec_splitk_scratch_kernel<true><<<grid, block, smem, stream>>>(
-            scratch, x, qidxs, codebook, qidxs2, codebook2,
-            inv_resid_scale, wscale, M, N_BLOCKS, bps, cb2_size);
-    } else {
-        glq_matvec_splitk_scratch_kernel<false><<<grid, block, 0, stream>>>(
-            scratch, x, qidxs, codebook, nullptr, nullptr, 0.0f,
-            wscale, M, N_BLOCKS, bps, 0);
-    }
+    int smem = (num_stages >= 2 && cb2_size > 0 && cb2_size <= 256)
+                   ? cb2_size * 8 * (int)sizeof(half)
+                   : 0;
+
+#define LAUNCH_SPLITK_MATVEC(NS)                                                 \
+    glq_matvec_splitk_scratch_kernel<NS><<<grid, block, smem, stream>>>(         \
+        scratch, x, qidxs, codebook,                                             \
+        qidxs2, codebook2, inv_resid_scale,                                      \
+        qidxs3, codebook3, inv_resid_scale2,                                     \
+        qidxs4, codebook4, inv_resid_scale3,                                     \
+        wscale, M, N_BLOCKS, bps, cb2_size)
+    DISPATCH_NUM_STAGES(num_stages, LAUNCH_SPLITK_MATVEC);
+#undef LAUNCH_SPLITK_MATVEC
 
     // Deterministic reduction: sum scratch[0:k_splits, m] → output[m]
     int reduce_threads = 256;
@@ -2790,7 +3054,11 @@ torch::Tensor glq_fused_moe_cuda(
                 w13_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w13_ws,
                 w13_s2 ? w13_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
                 w13_s2 ? cb2_ptr : nullptr,
-                w13_irs, w13_s2, M_w13, NB_w13, cb2_size, num_sms, stream);
+                w13_irs,
+                nullptr, nullptr, 0.0f,
+                nullptr, nullptr, 0.0f,
+                w13_s2 ? 2 : 1,
+                M_w13, NB_w13, cb2_size, num_sms, stream);
 
             // ---- w13: output RHT ----
             launch_output_rht(
@@ -2832,7 +3100,11 @@ torch::Tensor glq_fused_moe_cuda(
                 w2_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w2_ws,
                 w2_s2 ? w2_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
                 w2_s2 ? cb2_ptr : nullptr,
-                w2_irs, w2_s2, M_w2, NB_w2, cb2_size, num_sms, stream);
+                w2_irs,
+                nullptr, nullptr, 0.0f,
+                nullptr, nullptr, 0.0f,
+                w2_s2 ? 2 : 1,
+                M_w2, NB_w2, cb2_size, num_sms, stream);
 
             // ---- w2: output RHT ----
             launch_output_rht(

@@ -93,6 +93,8 @@ def _call_fused_kernel(layer, x, *, use_multiblock):
         layer._blocks_n_tensor, layer._blocks_m_tensor,
         bn_meta, bm_meta,
         qidxs2, cb2, inv_rs,
+        empty_i16, empty_f16, 0.0,
+        empty_i16, empty_f16, 0.0,
     )
 
 
@@ -191,6 +193,87 @@ class TestCUDAGraphCapture:
         torch.cuda.synchronize()
         diff = (y_graph_out.float() - y_eager_new.float()).abs().max().item()
         assert diff == 0.0, f"graph replay not bit-exact vs eager: max_abs={diff}"
+
+
+def _make_random_nstage_bd_layer(in_features, out_features, codebook,
+                                  num_stages, seed=0):
+    """Populate an E8RHTLinear(block_diagonal=True) with N random RVQ stages.
+
+    num_stages ∈ {1, 2, 3, 4}. All stages use the primary 65536-entry
+    codebook, matching how real GLQ 5-8 bpw checkpoints are quantized.
+    """
+    torch.manual_seed(seed)
+    layer = E8RHTLinear(in_features, out_features, block_diagonal=True).cuda()
+
+    m_pad, n_pad = layer.m_pad, layer.n_pad
+    n_blocks_col = n_pad // 8
+
+    layer.Qidxs.copy_(torch.randint(-32768, 32768, (m_pad, n_blocks_col),
+                                    dtype=torch.int16, device="cuda"))
+    layer.SV.copy_((torch.randint(0, 2, (n_pad,), device="cuda").float() * 2 - 1).half())
+    layer.SU.copy_((torch.randint(0, 2, (m_pad,), device="cuda").float() * 2 - 1).half())
+    layer.Wscale.copy_(torch.tensor(0.1))
+    if num_stages >= 2:
+        layer.Qidxs2.copy_(torch.randint(-32768, 32768, (m_pad, n_blocks_col),
+                                         dtype=torch.int16, device="cuda"))
+        layer.inv_resid_scale.copy_(torch.tensor(0.25))
+    if num_stages >= 3:
+        layer.Qidxs3.copy_(torch.randint(-32768, 32768, (m_pad, n_blocks_col),
+                                         dtype=torch.int16, device="cuda"))
+        layer.inv_resid_scale2.copy_(torch.tensor(0.0625))
+    if num_stages >= 4:
+        layer.Qidxs4.copy_(torch.randint(-32768, 32768, (m_pad, n_blocks_col),
+                                         dtype=torch.int16, device="cuda"))
+        layer.inv_resid_scale3.copy_(torch.tensor(0.015625))
+
+    # Stages 3+ reuse the primary codebook (65536 entries) just like real
+    # GLQ 5-8 bpw checkpoints — see Python fallback in quantized_linear.py.
+    layer.set_codebook(codebook, codebook2=codebook)
+    assert layer._n_stages == num_stages, (
+        f"expected _n_stages={num_stages}, got {layer._n_stages}"
+    )
+    return layer
+
+
+class TestNStageEquivalence:
+    """Fused N-stage (num_stages=3, 4) path must match the PyTorch fallback."""
+
+    @pytest.mark.parametrize("num_stages", [3, 4])
+    @pytest.mark.parametrize("B", BATCH_SIZES)
+    def test_fused_matches_python_fallback(self, codebook_cuda, num_stages, B):
+        # Use a small block-diag shape (2 sub-blocks) so the test is cheap
+        # while still exercising the fused block-diag + n-stage path.
+        in_f, out_f = 576, 576
+
+        # Build two identical layers: one for fused, one for PyTorch fallback.
+        # The fallback trigger is `n_stages > 2` against the triton gate at
+        # forward():500, combined with skipping the fused C++ branch.
+        layer_fused = _make_random_nstage_bd_layer(
+            in_f, out_f, codebook_cuda, num_stages=num_stages, seed=B * 10 + num_stages
+        )
+        layer_ref = _make_random_nstage_bd_layer(
+            in_f, out_f, codebook_cuda, num_stages=num_stages, seed=B * 10 + num_stages
+        )
+        # Force layer_ref onto the PyTorch fallback: bump n_stages past the
+        # fused gate (<= 4) so forward() falls through to the dense-matmul
+        # fallback at the else-branch of line ~500 (PyTorch, supports N stages).
+        # Saving the original so we can restore it after the comparison.
+        layer_ref._n_stages = 99
+
+        x = torch.randn(B, in_f, dtype=torch.float16, device="cuda") * 0.1
+
+        y_fused = layer_fused(x)
+        y_ref = layer_ref(x)
+
+        assert y_fused.shape == (B, out_f)
+        assert y_ref.shape == (B, out_f)
+
+        max_abs = (y_fused.float() - y_ref.float()).abs().max().item()
+        ref_scale = y_ref.float().abs().max().item() + 1e-9
+        assert max_abs / ref_scale < 5e-3, (
+            f"fused vs fallback diverged for num_stages={num_stages} B={B}: "
+            f"max_abs={max_abs:.5f} (rel={max_abs/ref_scale:.2e})"
+        )
 
 
 class TestLargeBlockFallback:
