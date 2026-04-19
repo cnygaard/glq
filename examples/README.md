@@ -5,6 +5,7 @@ Example scripts for quantizing and running GLQ models.
 ## Quantization
 
 - [`quantize_model.py`](quantize_model.py) — Quantize any HuggingFace model to GLQ format
+- [`quantize_mixed_precision.md`](quantize_mixed_precision.md) — Pedagogic walkthrough of the two-pass sensitivity-allocated mixed-precision workflow (the one behind most published `-3.5bpw`/`-4.5bpw`/`-6bpw` models)
 
 ## Inference
 
