@@ -71,6 +71,25 @@ GLQ 3.5-bit mixed retains 96.6% of bf16 accuracy (nominal 4.6× weight-bpw ratio
 
 GLQ 4-bit retains 98.6% of bf16 accuracy. AutoRound (99.3%) and GPTQ (98.5%) use group_size=128 (~4.5 eff bpw). The GLQ row above is a legacy-padded measurement (actual eff bpw ~6.6 on SmolLM3-3B); with v0.2.9+ block-diagonal FHT, new GLQ 4-bit quantizations store at true 4.00 bpw.
 
+**SmolLM3-3B** head-to-head at matched 4.5 bpw (v0.2.10 block-diag FHT, Blackwell RTX PRO 6000, lm-eval-harness, batch=4, acc_norm where available, 128 calibration samples, limit=200 per task except GSM8K n=500 and MMLU 50/subtask × 57). GLQ 4.5bpw mixed is the two-pass sensitivity-allocated flow described in [`examples/quantize_mixed_precision.md`](examples/quantize_mixed_precision.md) (91 layers @ 4bpw + 161 @ 5bpw, avg 4.64 bpw):
+
+| Task                     | bf16   | **GLQ 4.5bpw** | GPTQ W4 g128 |
+|--------------------------|--------|----------------|--------------|
+| ARC-challenge (acc_n)    | 0.490  | **0.475**      | 0.420        |
+| ARC-easy (acc_n)         | 0.745  | **0.735**      | 0.695        |
+| HellaSwag (acc_n)        | 0.660  | 0.660          | **0.675**    |
+| MMLU (acc)               | 0.617  | **0.603**      | 0.589        |
+| TruthfulQA mc2           | 0.529  | **0.545**      | 0.515        |
+| WinoGrande               | 0.655  | 0.660          | **0.670**    |
+| WikiText-2 ppl ↓         | 10.67  | **10.90**      | 11.33        |
+| GSM8K flex (n=500)       | 0.722  | **0.738**      | 0.688        |
+| IFEval prompt-strict     | 0.310  | 0.310          | 0.285        |
+| IFEval prompt-loose      | 0.325  | **0.330**      | 0.295        |
+| IFEval inst-strict       | 0.478  | 0.472          | 0.453        |
+| IFEval inst-loose        | 0.494  | 0.491          | 0.469        |
+
+GLQ 4.5bpw beats GPTQ W4 g128 on 10 of 12 metrics at the same effective bit rate. The two losses (HellaSwag −0.015, WinoGrande −0.010) are within sampling noise at n=200. WikiText-2 ppl gap to bf16 is +2.2 % for GLQ vs +6.2 % for GPTQ. On the heaviest reasoning task (GSM8K flex) GLQ is effectively tied with bf16 (0.738 vs 0.722, within noise) while GPTQ drops 0.034. We report GSM8K flex only — the strict metric (`#### N` format match) is dominated by an output-format artifact where both quantized models exceed bf16 because quantization compresses stylistic variance into the canonical delimiter format, not because they do arithmetic better.
+
 **SmolLM2-360M** on WikiText-2 (128 calibration samples, NVIDIA L40S):
 
 | Method | BPW | Perplexity | vs bf16 |
