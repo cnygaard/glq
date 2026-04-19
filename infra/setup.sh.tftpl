@@ -12,7 +12,9 @@ HF_CACHE=$NVME/hf_cache
 
 echo "=== GLQ setup starting ==="
 
-apt-get update -qq && apt-get install -y -qq python3-venv > /dev/null 2>&1
+apt-get update -qq && apt-get install -y -qq python3-venv libpcre3-dev > /dev/null 2>&1
+# libpcre3-dev is a build-time dep of pypcre, which gptqmodel's setup.py
+# imports at metadata-generation time (see user-block install below).
 
 # Fix CUDA: DLAMI hardcodes older cuda paths in /etc/environment and /etc/profile.d/dlami.sh.
 # Replace them with /usr/local/cuda/bin so the symlink controls which version is used.
@@ -47,6 +49,13 @@ pip install 'transformers>=5.0' 'huggingface_hub>=0.30'
 pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
 pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
 pip install -q lm-eval
+# gptqmodel's setup.py does `import pcre` at metadata-generation time.
+# pypcre (python bindings for libpcre3-dev, installed above at the root
+# apt step) satisfies that. --no-build-isolation so the build env sees
+# pypcre in the venv instead of a fresh sandbox.
+pip install -q pypcre
+pip install -q gptqmodel --no-build-isolation
+pip install -q optimum  # required by HF transformers to *load* GPTQ models
 # HF cache on NVMe. Symlink ~/.cache/huggingface to the NVMe location so
 # tooling that ignores HF_HOME (non-interactive ssh, services, any subprocess
 # that doesn't inherit an interactive shell env) still lands on the fast disk.
