@@ -34,7 +34,13 @@ export PATH=/usr/local/cuda/bin:$PATH
 python3 -m venv $VENV
 source $VENV/bin/activate
 
-# Core deps — vLLM 0.16 needs torch 2.9.1
+# Core deps. vLLM 0.19.0 pins torch==2.10.0 but NemotronH's custom cpp
+# extensions want torch >= 2.11, so we pin 2.11 and accept vllm-version drift.
+# Must match the host CUDA — the DLAMI ships cuda-12.9, so we use the cu128
+# wheel index (forward-compat within 12.x). Without +cu128 / --index-url pip
+# pulls the default cu130 wheel, which then fails with a cuda-version mismatch
+# when fast_hadamard_transform / mamba-ssm / causal-conv1d try to build
+# against it with CUDA_HOME=/usr/local/cuda-12.9.
 pip install -q pip --upgrade
 pip install -q vllm==0.19.0
 pip install -q 'glq[quantize]==${glq_version}' ninja wheel
@@ -42,13 +48,13 @@ pip install -q 'glq[quantize]==${glq_version}' ninja wheel
 export CUDA_HOME=/usr/local/cuda-12.9
 unset CUDA_HOME
 # Pin torch LAST — mamba-ssm may pull a newer version as a dependency
-pip install -q torch==2.9.1+cu128 torchvision==0.24.1+cu128 torchaudio==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128
-pip install 'fast_hadamard_transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git' --no-build-isolation 
+pip install -q torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+pip install 'fast_hadamard_transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git' --no-build-isolation
 pip install "mistral-common[hf-hub]"
 pip install 'transformers>=5.0' 'huggingface_hub>=0.30'
 pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
 pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
-pip install -q lm-eval
+pip install -q lm-eval langdetect immutabledict
 # gptqmodel's setup.py does `import pcre` at metadata-generation time.
 # pypcre (python bindings for libpcre3-dev, installed above at the root
 # apt step) satisfies that. --no-build-isolation so the build env sees
