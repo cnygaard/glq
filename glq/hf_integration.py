@@ -106,6 +106,133 @@ def replace_with_glq_linear(model, block_diagonal=False):
     return has_replaced
 
 
+def _patch_nemotron_h_decode_cache(model):
+    """Make `use_cache=True` actually thread the cache for NemotronH models.
+
+    NVIDIA's `modeling_nemotron_h.py` (shipped via trust_remote_code) has five
+    latent bugs that together force generate() to silently fall back to
+    no-cache decode (re-prefill every step, O(N²) total work):
+
+    1. `prepare_inputs_for_generation` returns the cache under key
+       `past_key_values`, but `NemotronHForCausalLM.forward` accepts it as
+       `cache_params=` — the value lands in `**kwargs` and is ignored.
+    2. `NemotronHCausalLMOutput` exposes the cache as `cache_params`, but
+       generate's `_extract_past_from_model_output` only looks for
+       `past_key_values` — between-step threading breaks.
+    3. `cuda_kernels_forward` and `torch_forward` reference
+       `cache_params.conv_kernel_size`, which is not a field on
+       `HybridMambaAttentionDynamicCache`.
+    4. `cache.update_conv_state` and `cache.update_ssm_state` read
+       `self.conv_states.device` / `self.ssm_states.device`, but those are
+       Python lists of tensors, not tensors.
+    5. `torch_forward` reads `cache_params.ssm_states.device` (same
+       list-not-tensor issue) when allocating an intermediate buffer.
+
+    All five are pure modeling-side bugs (independent of GLQ). Fixing them
+    speeds up the bf16 baseline by ~2x and the GLQ build by ~2.2x on
+    Nemotron-Cascade-2-30B-A3B at long-prompt decode (RTX PRO 6000 Blackwell,
+    transformers 4.56). The patch is idempotent and silently no-ops on
+    non-NemotronH models or on a future NVIDIA release that fixes any of
+    these inline.
+    """
+    import sys
+    import types
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    # Find the remote modeling module that provided this model's classes.
+    cls_mod = type(model).__module__
+    if "modeling_nemotron_h" not in cls_mod:
+        return  # not a NemotronH variant — nothing to do
+    nh = sys.modules.get(cls_mod)
+    if nh is None or not hasattr(nh, "HybridMambaAttentionDynamicCache"):
+        return
+
+    HybridCache = nh.HybridMambaAttentionDynamicCache
+
+    # ---- Bugs 3 + 4: cache class needs conv_kernel_size + per-layer device ----
+    if not getattr(HybridCache, "_glq_patched", False):
+
+        class _DeviceProxy(list):
+            """List of cache tensors that also exposes a `.device` property."""
+            @property
+            def device(self):
+                for t in self:
+                    if isinstance(t, torch.Tensor):
+                        return t.device
+                return torch.device("cpu")
+
+            def zero_(self):
+                for t in self:
+                    if isinstance(t, torch.Tensor) and t.numel() > 0:
+                        t.zero_()
+                return self
+
+        _orig_init = HybridCache.__init__
+
+        def _patched_init(self, config, batch_size, dtype=torch.float16, device=None):
+            _orig_init(self, config, batch_size, dtype=dtype, device=device)
+            self.conv_kernel_size = config.conv_kernel  # bug 3
+            self.conv_states = _DeviceProxy(self.conv_states)  # bug 4 + 5
+            self.ssm_states = _DeviceProxy(self.ssm_states)
+
+        def _patched_update_conv_state(self, layer_idx, new_conv_state, cache_init=False):
+            target_dev = self.conv_states[layer_idx].device
+            if cache_init:
+                self.conv_states[layer_idx] = new_conv_state.to(target_dev)
+            else:
+                self.conv_states[layer_idx] = self.conv_states[layer_idx].roll(shifts=-1, dims=-1)
+                self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(target_dev)
+            return self.conv_states[layer_idx]
+
+        def _patched_update_ssm_state(self, layer_idx, new_ssm_state):
+            self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states[layer_idx].device)
+            return self.ssm_states[layer_idx]
+
+        HybridCache.__init__ = _patched_init
+        HybridCache.update_conv_state = _patched_update_conv_state
+        HybridCache.update_ssm_state = _patched_update_ssm_state
+        HybridCache._glq_patched = True
+
+    # ---- Bug 1: rename returned dict key past_key_values -> cache_params ----
+    if not getattr(model, "_glq_prep_patched", False):
+        _orig_prep = model.prepare_inputs_for_generation
+
+        def _patched_prep(self, *args, **kwargs):
+            out = _orig_prep(*args, **kwargs)
+            if "past_key_values" in out and "cache_params" not in out:
+                out["cache_params"] = out.pop("past_key_values")
+            return out
+
+        model.prepare_inputs_for_generation = types.MethodType(_patched_prep, model)
+        model._glq_prep_patched = True
+
+    # ---- Bug 2: alias cache_params -> past_key_values on forward output ----
+    model_cls = type(model)
+    if not getattr(model_cls, "_glq_fwd_patched", False):
+        _orig_fwd = model_cls.forward
+
+        def _patched_fwd(self, *args, **kwargs):
+            out = _orig_fwd(self, *args, **kwargs)
+            if hasattr(out, "cache_params") and getattr(out, "past_key_values", None) is None:
+                try:
+                    object.__setattr__(out, "past_key_values", out.cache_params)
+                    if isinstance(out, dict):
+                        out["past_key_values"] = out.cache_params
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+
+        model_cls.forward = _patched_fwd
+        model_cls._glq_fwd_patched = True
+
+    log.info(
+        "glq: patched NemotronH decode-cache (5 bugs in NVIDIA modeling file). "
+        "use_cache=True now threads cache across generate() steps."
+    )
+
+
 @register_quantizer("glq")
 class GLQQuantizer(HfQuantizer):
     """HuggingFace quantizer for GLQ (E8 shell codebook + RHT)."""
@@ -174,6 +301,11 @@ class GLQQuantizer(HfQuantizer):
             from .kv_cache import GLQQuantizedCache
             config = model.config
             model._glq_kv_cache_factory = lambda: GLQQuantizedCache(config)
+
+        # NemotronH (Nemotron-Cascade, Nemotron-3-Nano, etc.) has 5 latent
+        # bugs in NVIDIA's remote modeling file that silently force
+        # use_cache=False at generate time. Patch them in-place if present.
+        _patch_nemotron_h_decode_cache(model)
 
         return model
 
