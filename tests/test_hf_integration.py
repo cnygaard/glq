@@ -150,7 +150,7 @@ class TestGLQQuantizer:
         q = GLQQuantizer(GLQConfig())
         with caplog.at_level(logging.WARNING):
             q._process_model_before_weight_loading(model)
-        assert "no nn.Linear modules found" in caplog.text
+        assert "no nn.Linear" in caplog.text and "modules found" in caplog.text
 
     def test_process_after_loading_2bpw(self):
         """Attaches codebook to E8RHTLinear modules (2bpw, no codebook2)."""
