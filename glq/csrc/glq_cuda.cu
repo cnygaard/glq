@@ -2936,6 +2936,114 @@ static void launch_output_rht(
 }
 
 
+// Helper: launch block-diagonal input RHT (sibling of launch_input_rht for non-pow2 dims).
+// Reuses glq_input_rht_multiblock_kernel / glq_input_rht_kernel — no new GPU kernels.
+static void launch_input_rht_block_diag(
+    const half* x, const half* sv, float* out,
+    int in_features, int n_pad,
+    int B,
+    const int64_t* blocks_n_host, int num_n_blocks,
+    const int4* blocks_n_meta_dev, bool meta_on_gpu,
+    cudaStream_t stream
+) {
+    int max_bs = 0;
+    for (int bi = 0; bi < num_n_blocks; bi++) {
+        int bs = (int)blocks_n_host[bi];
+        if (bs > max_bs) max_bs = bs;
+    }
+    bool use_multiblock = (max_bs <= 8192) && meta_on_gpu;
+    if (use_multiblock) {
+        int threads = min(max_bs, 1024);
+        int smem = 2 * max_bs * (int)sizeof(float);
+        if (smem > 48 * 1024) {
+            cudaFuncSetAttribute(glq_input_rht_multiblock_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+        dim3 grid(B, num_n_blocks);
+        glq_input_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
+            x, sv, out,
+            in_features, in_features, n_pad,
+            blocks_n_meta_dev
+        );
+    } else {
+        int col_offset = 0;
+        for (int bi = 0; bi < num_n_blocks; bi++) {
+            int bs = (int)blocks_n_host[bi];
+            int log_bs = __builtin_ctz(bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_input_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+            glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+                x, sv, out,
+                in_features, in_features, 1.0f / sqrtf((float)bs),
+                bs, log_bs, use_single,
+                col_offset, n_pad
+            );
+            col_offset += bs;
+        }
+    }
+}
+
+// Helper: launch block-diagonal output RHT (sibling of launch_output_rht).
+static void launch_output_rht_block_diag(
+    const float* y_rht, const half* su, half* out,
+    int out_features, int m_pad,
+    int B,
+    const int64_t* blocks_m_host, int num_m_blocks,
+    const int4* blocks_m_meta_dev, bool meta_on_gpu,
+    cudaStream_t stream
+) {
+    int max_bs = 0;
+    for (int bi = 0; bi < num_m_blocks; bi++) {
+        int bs = (int)blocks_m_host[bi];
+        if (bs > max_bs) max_bs = bs;
+    }
+    bool use_multiblock = (max_bs <= 8192) && meta_on_gpu;
+    if (use_multiblock) {
+        int threads = min(max_bs, 1024);
+        int smem = 2 * max_bs * (int)sizeof(float);
+        if (smem > 48 * 1024) {
+            cudaFuncSetAttribute(glq_output_rht_multiblock_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+        dim3 grid(B, num_m_blocks);
+        glq_output_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
+            y_rht, su, out,
+            out_features, m_pad, out_features,
+            blocks_m_meta_dev
+        );
+    } else {
+        int col_offset = 0;
+        for (int bi = 0; bi < num_m_blocks; bi++) {
+            int bs = (int)blocks_m_host[bi];
+            int log_bs = __builtin_ctz(bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_output_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+            glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+                y_rht, su, out,
+                out_features, bs, log_bs, 1.0f / sqrtf((float)bs),
+                use_single,
+                col_offset, m_pad, out_features
+            );
+            col_offset += bs;
+        }
+    }
+}
+
+
 /* ─────────────────────────────────────────────────────────────────────
  * Fused MoE: full expert dispatch in one C++ call
  *
@@ -2970,7 +3078,14 @@ torch::Tensor glq_fused_moe_cuda(
     int n_pad_w2, int m_pad_w2,
     int log_n_w13, int log_m_w13,
     int log_n_w2, int log_m_w2,
-    int activation_type  // 0=silu(gated), 5=relu2_no_mul, etc.
+    int activation_type,  // 0=silu(gated), 5=relu2_no_mul, etc.
+    // Stage-3 RVQ (optional). Pass empty tensors for 2-stage.
+    // The stage-3 codebook is shared between w13 and w2 (mirrors glq_fused_linear_cuda).
+    torch::Tensor w13_Qidxs3,           // empty or (E, m_pad_w13, n_blocks_w13) int16
+    torch::Tensor w13_inv_rs2,          // empty or (E,) fp32 — stage-3 scale per expert
+    torch::Tensor w2_Qidxs3,            // empty or (E, m_pad_w2, n_blocks_w2) int16
+    torch::Tensor w2_inv_rs2,           // empty or (E,) fp32 — stage-3 scale per expert
+    torch::Tensor codebook3             // empty or (K3, 8) fp16 — shared between w13/w2
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(w13_Qidxs);
@@ -2984,6 +3099,8 @@ torch::Tensor glq_fused_moe_cuda(
     int NB_w2 = w2_Qidxs.size(2);
     bool w13_has_s2 = (w13_Qidxs2.numel() > 0);
     bool w2_has_s2 = (w2_Qidxs2.numel() > 0);
+    bool w13_has_s3 = (w13_Qidxs3.numel() > 0 && w13_inv_rs2.numel() > 0);
+    bool w2_has_s3 = (w2_Qidxs3.numel() > 0 && w2_inv_rs2.numel() > 0);
     int cb2_size = codebook2.numel() > 0 ? (int)codebook2.size(0) : 0;
 
     at::DeviceGuard guard(x.device());
@@ -3031,6 +3148,7 @@ torch::Tensor glq_fused_moe_cuda(
 
     const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
     const half* cb2_ptr = codebook2.numel() > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const half* cb3_ptr = codebook3.numel() > 0 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
 
     for (int t = 0; t < num_tokens; t++) {
         for (int k = 0; k < top_k; k++) {
@@ -3041,10 +3159,18 @@ torch::Tensor glq_fused_moe_cuda(
             float w13_ws = w13_Wscale[eidx].item<float>();
             float w13_irs = w13_has_s2 ? w13_inv_rs[eidx].item<float>() : 0.0f;
             bool w13_s2 = (w13_irs != 0.0f);
+            // Stage-3 only valid if stage-2 is active for this expert
+            float w13_irs2 = (w13_s2 && w13_has_s3) ? w13_inv_rs2[eidx].item<float>() : 0.0f;
+            bool w13_s3 = (w13_irs2 != 0.0f);
 
             float w2_ws = w2_Wscale[eidx].item<float>();
             float w2_irs = w2_has_s2 ? w2_inv_rs[eidx].item<float>() : 0.0f;
             bool w2_s2 = (w2_irs != 0.0f);
+            float w2_irs2 = (w2_s2 && w2_has_s3) ? w2_inv_rs2[eidx].item<float>() : 0.0f;
+            bool w2_s3 = (w2_irs2 != 0.0f);
+
+            int w13_num_stages = 1 + (w13_s2 ? 1 : 0) + (w13_s3 ? 1 : 0);
+            int w2_num_stages = 1 + (w2_s2 ? 1 : 0) + (w2_s3 ? 1 : 0);
 
             // ---- w13: dequant+matmul (input RHT already done) ----
             y_rht_w13.zero_();
@@ -3055,9 +3181,11 @@ torch::Tensor glq_fused_moe_cuda(
                 w13_s2 ? w13_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
                 w13_s2 ? cb2_ptr : nullptr,
                 w13_irs,
+                w13_s3 ? w13_Qidxs3[eidx].data_ptr<int16_t>() : nullptr,
+                w13_s3 ? cb3_ptr : nullptr,
+                w13_irs2,
                 nullptr, nullptr, 0.0f,
-                nullptr, nullptr, 0.0f,
-                w13_s2 ? 2 : 1,
+                w13_num_stages,
                 M_w13, NB_w13, cb2_size, num_sms, stream);
 
             // ---- w13: output RHT ----
@@ -3101,9 +3229,11 @@ torch::Tensor glq_fused_moe_cuda(
                 w2_s2 ? w2_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
                 w2_s2 ? cb2_ptr : nullptr,
                 w2_irs,
+                w2_s3 ? w2_Qidxs3[eidx].data_ptr<int16_t>() : nullptr,
+                w2_s3 ? cb3_ptr : nullptr,
+                w2_irs2,
                 nullptr, nullptr, 0.0f,
-                nullptr, nullptr, 0.0f,
-                w2_s2 ? 2 : 1,
+                w2_num_stages,
                 M_w2, NB_w2, cb2_size, num_sms, stream);
 
             // ---- w2: output RHT ----
@@ -3112,6 +3242,269 @@ torch::Tensor glq_fused_moe_cuda(
                 (const half*)w2_SU[eidx].data_ptr<c10::Half>(),
                 (half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
                 hidden_size, m_pad_w2, log_m_w2, rsqrt_m_w2, 1, stream);
+
+            // ---- Weighted accumulate ----
+            {
+                int n = hidden_size;
+                int blocks = (n + 255) / 256;
+                weighted_add_kernel<<<blocks, 256, 0, stream>>>(
+                    (half*)output.data_ptr<c10::Half>() + t * hidden_size,
+                    (const half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
+                    ew, n);
+            }
+        }
+    }
+
+    return output;
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Block-diagonal sibling of glq_fused_moe_cuda for non-pow2 expert dims
+ * (e.g. Nemotron-Cascade-2: hidden=5280, intermediate=1856, latent=2688).
+ *
+ * Replaces launch_input_rht / launch_output_rht (which assume a pow2 FHT
+ * with a single log_n) by per-projection block decomposition metadata,
+ * reusing the same multiblock / per-block FHT kernels as
+ * glq_fused_linear_block_diag_cuda. Dequant+matmul (launch_matvec_splitk)
+ * is dimension-agnostic and is called identically.
+ * ───────────────────────────────────────────────────────────────────── */
+
+torch::Tensor glq_fused_moe_block_diag_cuda(
+    torch::Tensor x,                    // (num_tokens, hidden) fp16
+    torch::Tensor topk_ids,             // (num_tokens, top_k) int64
+    torch::Tensor topk_weights,         // (num_tokens, top_k) fp32
+    // w13 (gate_up_proj) weights — all experts stacked
+    torch::Tensor w13_Qidxs,            // (E, m_pad_w13, n_blocks_w13) int16
+    torch::Tensor w13_SU,               // (E, m_pad_w13) fp16
+    torch::Tensor w13_SV,               // (n_pad_w13,) fp16 — shared
+    torch::Tensor w13_Wscale,           // (E,) fp32
+    torch::Tensor w13_Qidxs2,           // empty or (E, m_pad_w13, n_blocks_w13)
+    torch::Tensor w13_inv_rs,           // (E,) fp32
+    // w2 (down_proj) weights — all experts stacked
+    torch::Tensor w2_Qidxs,
+    torch::Tensor w2_SU,
+    torch::Tensor w2_SV,                // (n_pad_w2,) fp16 — shared
+    torch::Tensor w2_Wscale,
+    torch::Tensor w2_Qidxs2,
+    torch::Tensor w2_inv_rs,
+    // Codebooks
+    torch::Tensor codebook,
+    torch::Tensor codebook2,
+    // Dimensions
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13,
+    int n_pad_w2, int m_pad_w2,
+    // Block-diag metadata — replaces log_n_/log_m_ scalar args.
+    // Each projection has separate n-axis (input RHT) and m-axis (output RHT) decomposition.
+    torch::Tensor blocks_n_w13,         // 1D int64 CPU
+    torch::Tensor blocks_m_w13,         // 1D int64 CPU
+    torch::Tensor blocks_n_w13_meta,    // (num_blocks, 4) int32 GPU
+    torch::Tensor blocks_m_w13_meta,    // (num_blocks, 4) int32 GPU
+    torch::Tensor blocks_n_w2,
+    torch::Tensor blocks_m_w2,
+    torch::Tensor blocks_n_w2_meta,
+    torch::Tensor blocks_m_w2_meta,
+    int activation_type,
+    // Stage-3 RVQ (optional). Pass empty tensors for 2-stage.
+    torch::Tensor w13_Qidxs3,
+    torch::Tensor w13_inv_rs2,
+    torch::Tensor w2_Qidxs3,
+    torch::Tensor w2_inv_rs2,
+    torch::Tensor codebook3
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(w13_Qidxs);
+    CHECK_INPUT(codebook);
+
+    int num_tokens = x.size(0);
+    int top_k = topk_ids.size(1);
+    int M_w13 = w13_Qidxs.size(1);
+    int NB_w13 = w13_Qidxs.size(2);
+    int M_w2 = w2_Qidxs.size(1);
+    int NB_w2 = w2_Qidxs.size(2);
+    bool w13_has_s2 = (w13_Qidxs2.numel() > 0);
+    bool w2_has_s2 = (w2_Qidxs2.numel() > 0);
+    bool w13_has_s3 = (w13_Qidxs3.numel() > 0 && w13_inv_rs2.numel() > 0);
+    bool w2_has_s3 = (w2_Qidxs3.numel() > 0 && w2_inv_rs2.numel() > 0);
+    int cb2_size = codebook2.numel() > 0 ? (int)codebook2.size(0) : 0;
+
+    at::DeviceGuard guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    static int num_sms = 0;
+    if (num_sms == 0) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, x.get_device());
+        num_sms = prop.multiProcessorCount;
+    }
+
+    auto opts_f32 = torch::dtype(torch::kFloat32).device(x.device());
+    auto opts_f16 = torch::dtype(torch::kFloat16).device(x.device());
+
+    // Output accumulator (zeroed for weighted add)
+    auto output = torch::zeros({num_tokens, hidden_size}, opts_f16);
+
+    // Resolve block-diag metadata pointers up front
+    const int64_t* bn_w13 = blocks_n_w13.data_ptr<int64_t>();
+    int n_n_w13 = (int)blocks_n_w13.size(0);
+    const int4* bn_w13_meta = blocks_n_w13_meta.numel() > 0
+                                  ? (const int4*)blocks_n_w13_meta.data_ptr<int32_t>()
+                                  : nullptr;
+    bool bn_w13_meta_gpu = (bn_w13_meta != nullptr) && blocks_n_w13_meta.is_cuda();
+
+    const int64_t* bm_w13 = blocks_m_w13.data_ptr<int64_t>();
+    int n_m_w13 = (int)blocks_m_w13.size(0);
+    const int4* bm_w13_meta = blocks_m_w13_meta.numel() > 0
+                                  ? (const int4*)blocks_m_w13_meta.data_ptr<int32_t>()
+                                  : nullptr;
+    bool bm_w13_meta_gpu = (bm_w13_meta != nullptr) && blocks_m_w13_meta.is_cuda();
+
+    const int64_t* bn_w2 = blocks_n_w2.data_ptr<int64_t>();
+    int n_n_w2 = (int)blocks_n_w2.size(0);
+    const int4* bn_w2_meta = blocks_n_w2_meta.numel() > 0
+                                 ? (const int4*)blocks_n_w2_meta.data_ptr<int32_t>()
+                                 : nullptr;
+    bool bn_w2_meta_gpu = (bn_w2_meta != nullptr) && blocks_n_w2_meta.is_cuda();
+
+    const int64_t* bm_w2 = blocks_m_w2.data_ptr<int64_t>();
+    int n_m_w2 = (int)blocks_m_w2.size(0);
+    const int4* bm_w2_meta = blocks_m_w2_meta.numel() > 0
+                                 ? (const int4*)blocks_m_w2_meta.data_ptr<int32_t>()
+                                 : nullptr;
+    bool bm_w2_meta_gpu = (bm_w2_meta != nullptr) && blocks_m_w2_meta.is_cuda();
+
+    // Shared input RHT: same x and w13_SV for all experts (block-diag along n-axis).
+    auto x_rht = torch::empty({num_tokens, n_pad_w13}, opts_f32);
+    launch_input_rht_block_diag(
+        (const half*)x.data_ptr<c10::Half>(),
+        (const half*)w13_SV.data_ptr<c10::Half>(),
+        x_rht.data_ptr<float>(),
+        hidden_size, n_pad_w13,
+        num_tokens,
+        bn_w13, n_n_w13,
+        bn_w13_meta, bn_w13_meta_gpu,
+        stream);
+    auto x_rht_half = x_rht.to(torch::kFloat16);
+
+    // Reusable per-expert buffers
+    auto y_rht_w13 = torch::empty({num_tokens, M_w13}, opts_f32);
+    auto h_w13 = torch::empty({num_tokens, w13_out_features}, opts_f16);
+    auto h_act = torch::empty({num_tokens, intermediate_size}, opts_f16);
+    auto h_rht = torch::empty({num_tokens, n_pad_w2}, opts_f32);
+    auto y_rht_w2 = torch::empty({num_tokens, M_w2}, opts_f32);
+    auto expert_out = torch::empty({num_tokens, hidden_size}, opts_f16);
+
+    // Read expert IDs to CPU (tiny sync — 2 int64s for top-2)
+    auto topk_ids_cpu = topk_ids.cpu();
+    auto topk_w_cpu = topk_weights.cpu();
+
+    const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
+    const half* cb2_ptr = codebook2.numel() > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const half* cb3_ptr = codebook3.numel() > 0 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
+
+    for (int t = 0; t < num_tokens; t++) {
+        for (int k = 0; k < top_k; k++) {
+            int eidx = topk_ids_cpu[t][k].item<int64_t>();
+            float ew = topk_w_cpu[t][k].item<float>();
+            if (ew == 0.0f) continue;
+
+            float w13_ws = w13_Wscale[eidx].item<float>();
+            float w13_irs = w13_has_s2 ? w13_inv_rs[eidx].item<float>() : 0.0f;
+            bool w13_s2 = (w13_irs != 0.0f);
+            float w13_irs2 = (w13_s2 && w13_has_s3) ? w13_inv_rs2[eidx].item<float>() : 0.0f;
+            bool w13_s3 = (w13_irs2 != 0.0f);
+
+            float w2_ws = w2_Wscale[eidx].item<float>();
+            float w2_irs = w2_has_s2 ? w2_inv_rs[eidx].item<float>() : 0.0f;
+            bool w2_s2 = (w2_irs != 0.0f);
+            float w2_irs2 = (w2_s2 && w2_has_s3) ? w2_inv_rs2[eidx].item<float>() : 0.0f;
+            bool w2_s3 = (w2_irs2 != 0.0f);
+
+            int w13_num_stages = 1 + (w13_s2 ? 1 : 0) + (w13_s3 ? 1 : 0);
+            int w2_num_stages = 1 + (w2_s2 ? 1 : 0) + (w2_s3 ? 1 : 0);
+
+            // ---- w13: dequant+matmul (input RHT already done) ----
+            y_rht_w13.zero_();
+            launch_matvec_splitk(
+                y_rht_w13.data_ptr<float>() + t * M_w13,
+                (const half*)x_rht_half.data_ptr<c10::Half>() + t * n_pad_w13,
+                w13_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w13_ws,
+                w13_s2 ? w13_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
+                w13_s2 ? cb2_ptr : nullptr,
+                w13_irs,
+                w13_s3 ? w13_Qidxs3[eidx].data_ptr<int16_t>() : nullptr,
+                w13_s3 ? cb3_ptr : nullptr,
+                w13_irs2,
+                nullptr, nullptr, 0.0f,
+                w13_num_stages,
+                M_w13, NB_w13, cb2_size, num_sms, stream);
+
+            // ---- w13: output RHT (block-diag along m-axis) ----
+            launch_output_rht_block_diag(
+                y_rht_w13.data_ptr<float>() + t * M_w13,
+                (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
+                (half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
+                w13_out_features, m_pad_w13,
+                1,
+                bm_w13, n_m_w13,
+                bm_w13_meta, bm_w13_meta_gpu,
+                stream);
+
+            // ---- Activation ----
+            {
+                int n_act = (activation_type < 3) ? w13_out_features / 2 : w13_out_features;
+                int blocks = (n_act + 255) / 256;
+                const half* act_in = (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features;
+                half* act_out = (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size;
+
+                if (activation_type == 5) {  // relu2_no_mul
+                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
+                } else if (activation_type == 0) {  // silu (gated)
+                    silu_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
+                } else {
+                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
+                }
+            }
+
+            // ---- w2: input RHT (block-diag, per-expert input is h_act) ----
+            launch_input_rht_block_diag(
+                (const half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
+                (const half*)w2_SV.data_ptr<c10::Half>(),
+                h_rht.data_ptr<float>() + t * n_pad_w2,
+                intermediate_size, n_pad_w2,
+                1,
+                bn_w2, n_n_w2,
+                bn_w2_meta, bn_w2_meta_gpu,
+                stream);
+            auto h_rht_half = h_rht.to(torch::kFloat16);
+
+            // ---- w2: dequant+matmul ----
+            y_rht_w2.zero_();
+            launch_matvec_splitk(
+                y_rht_w2.data_ptr<float>() + t * M_w2,
+                (const half*)h_rht_half.data_ptr<c10::Half>() + t * n_pad_w2,
+                w2_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w2_ws,
+                w2_s2 ? w2_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
+                w2_s2 ? cb2_ptr : nullptr,
+                w2_irs,
+                w2_s3 ? w2_Qidxs3[eidx].data_ptr<int16_t>() : nullptr,
+                w2_s3 ? cb3_ptr : nullptr,
+                w2_irs2,
+                nullptr, nullptr, 0.0f,
+                w2_num_stages,
+                M_w2, NB_w2, cb2_size, num_sms, stream);
+
+            // ---- w2: output RHT (block-diag along m-axis) ----
+            launch_output_rht_block_diag(
+                y_rht_w2.data_ptr<float>() + t * M_w2,
+                (const half*)w2_SU[eidx].data_ptr<c10::Half>(),
+                (half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
+                hidden_size, m_pad_w2,
+                1,
+                bm_w2, n_m_w2,
+                bm_w2_meta, bm_w2_meta_gpu,
+                stream);
 
             // ---- Weighted accumulate ----
             {

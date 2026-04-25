@@ -10,11 +10,19 @@ one for `up_proj` and one for `down_proj`.
 
 This keeps the native model's routing intact and lets each expert use the
 full N-stage RVQ inference path that `E8RHTLinear` already supports
-(`glq_fused_linear_cuda` handles 1–4 stages). The per-expert Python overhead
-is acceptable as a v1: the sensitivity allocator can put 5bpw experts
-(3-stage RVQ) next to 4bpw experts (2-stage RVQ) within the same MoE layer,
-and the existing `glq_fused_moe_cuda` kernel only handles 2-stage. A v2
-fused-kernel path can be added later for layers with uniform-bpw experts.
+(`glq_fused_linear_cuda` handles 1–4 stages).
+
+**Forward path selection** (in priority order):
+
+1. ``glq_fused_moe_block_diag_cuda`` — single C++ call dispatching all active
+   experts in one host-side step. Block-diagonal RHT, supports stages 1–3.
+   Used when the kernel ext is available, the codebook(s) are attached,
+   the block-decomposition metadata is on GPU, and no expert exceeds
+   stage-3 (which holds for our 4.5bpw checkpoint).
+2. Per-expert Python loop fallback — calls each expert's
+   `_ExpertPair.{up,down}_proj` (each E8RHTLinear), which itself uses
+   the well-optimized single-linear `glq_fused_linear_block_diag_cuda`.
+   Always works; slower because of the per-expert dispatch overhead.
 
 The internal child-module layout matches the trust-remote-code checkpoint
 key layout exactly: `experts.{i}.up_proj.Qidxs`, `experts.{i}.down_proj.SU`,
@@ -23,10 +31,20 @@ key remapping.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
 from .quantized_linear import E8RHTLinear
+
+
+def _is_relu2(act_fn) -> bool:
+    """Heuristic: detect whether an activation is the relu² (squared-relu)
+    that NemotronH uses in its non-gated MoE. Used to pick the kernel's
+    activation_type=5 (relu2_no_mul) path."""
+    name = type(act_fn).__name__.lower()
+    return "relu2" in name or "relusquared" in name
 
 
 class _ExpertPair(nn.Module):
@@ -102,6 +120,146 @@ class E8RHTFusedExperts(nn.Module):
     def __len__(self) -> int:
         return self.num_experts
 
+    # ------------------------------------------------------------------ fused-kernel path
+
+    def _try_build_stacked(self) -> bool:
+        """Lazily stack per-expert GLQ buffers into ``(E, ...)`` tensors that
+        the fused MoE kernel consumes. Idempotent: rebuilds only on first
+        call after weights are loaded.
+
+        Returns True if the stacked buffers are ready.
+        """
+        if getattr(self, "_stacked_ready", False):
+            return True
+        # All per-expert E8RHTLinears must be on a CUDA device with codebook(s)
+        # attached (set by GLQQuantizer._process_model_after_weight_loading).
+        e0 = self[0]
+        if e0.up_proj.codebook is None:
+            return False
+        if not e0.up_proj.Qidxs.is_cuda:
+            return False
+
+        device = e0.up_proj.Qidxs.device
+        E = self.num_experts
+
+        def _stack(attr: str, target_dtype=None):
+            tensors = [getattr(self[i].up_proj, attr) for i in range(E)]
+            return torch.stack(tensors).to(device=device).contiguous()
+
+        def _stack_down(attr: str):
+            tensors = [getattr(self[i].down_proj, attr) for i in range(E)]
+            return torch.stack(tensors).to(device=device).contiguous()
+
+        # w13 (= up_proj) stacked tensors
+        self._w13_Qidxs = _stack("Qidxs")
+        self._w13_SU = _stack("SU")
+        self._w13_SV = e0.up_proj.SV.contiguous()  # shared across experts
+        self._w13_Wscale = _stack("Wscale").float()
+        self._w13_Qidxs2 = _stack("Qidxs2")
+        self._w13_inv_resid_scale = _stack("inv_resid_scale").float()
+        self._w13_Qidxs3 = _stack("Qidxs3")
+        self._w13_inv_resid_scale2 = _stack("inv_resid_scale2").float()
+
+        # w2 (= down_proj) stacked tensors
+        self._w2_Qidxs = _stack_down("Qidxs")
+        self._w2_SU = _stack_down("SU")
+        self._w2_SV = e0.down_proj.SV.contiguous()  # shared across experts
+        self._w2_Wscale = _stack_down("Wscale").float()
+        self._w2_Qidxs2 = _stack_down("Qidxs2")
+        self._w2_inv_resid_scale = _stack_down("inv_resid_scale").float()
+        self._w2_Qidxs3 = _stack_down("Qidxs3")
+        self._w2_inv_resid_scale2 = _stack_down("inv_resid_scale2").float()
+
+        # Block-decomposition metadata — same for every expert in this layer
+        # because the dims (in/out) match. Take from expert 0.
+        self._w13_blocks_n = e0.up_proj._blocks_n_tensor
+        self._w13_blocks_m = e0.up_proj._blocks_m_tensor
+        self._w13_blocks_n_meta = e0.up_proj._blocks_n_meta_cpu.to(device, non_blocking=True)
+        self._w13_blocks_m_meta = e0.up_proj._blocks_m_meta_cpu.to(device, non_blocking=True)
+        self._w2_blocks_n = e0.down_proj._blocks_n_tensor
+        self._w2_blocks_m = e0.down_proj._blocks_m_tensor
+        self._w2_blocks_n_meta = e0.down_proj._blocks_n_meta_cpu.to(device, non_blocking=True)
+        self._w2_blocks_m_meta = e0.down_proj._blocks_m_meta_cpu.to(device, non_blocking=True)
+
+        # Padded dim cache (used to pick fused vs fallback path)
+        self._n_pad_w13 = e0.up_proj.n_pad
+        self._m_pad_w13 = e0.up_proj.m_pad
+        self._n_pad_w2 = e0.down_proj.n_pad
+        self._m_pad_w2 = e0.down_proj.m_pad
+
+        # Codebook references — shared global instances attached by
+        # _process_model_after_weight_loading on every E8RHTLinear.
+        self._codebook = e0.up_proj.codebook
+        self._codebook2 = e0.up_proj.codebook2  # may be None for pure 2bpw
+
+        self._stacked_ready = True
+        return True
+
+    # Above this many tokens, the per-expert Python loop wins because it
+    # batches all tokens routed to the same expert into one Tensor-Core
+    # matmul (B=N), while the fused kernel iterates (token, top_k) pairs
+    # sequentially with B=1. Empirically: kernel wins for B=1 decode,
+    # loses on multi-token prefill (RTX PRO 6000 Blackwell, Cascade-2).
+    _FUSED_KERNEL_MAX_TOKENS = 4
+
+    def _try_fused_forward(self, hidden_states, top_k_index, top_k_weights):
+        """Single-call kernel path. Returns the output tensor on success,
+        ``None`` on any unsupported case (caller falls back to Python loop)."""
+        if hidden_states.dim() != 2:
+            return None
+        if not hidden_states.is_cuda:
+            return None
+        # Skip the kernel for multi-token batches — see _FUSED_KERNEL_MAX_TOKENS.
+        if hidden_states.shape[0] > self._FUSED_KERNEL_MAX_TOKENS:
+            return None
+        if not self._try_build_stacked():
+            return None
+
+        # Padded dims must be ≤ 16384 (kernel constraint).
+        if max(self._n_pad_w13, self._m_pad_w13,
+               self._n_pad_w2, self._m_pad_w2) > 16384:
+            return None
+
+        from . import inference_kernel as _ik
+        if not _ik._try_load_cuda_ext():
+            return None
+        glq_cuda = _ik._glq_cuda
+        if not hasattr(glq_cuda, "glq_fused_moe_block_diag_cuda"):
+            return None
+
+        # NemotronH uses non-gated relu² → activation_type=5.
+        activation_type = 5 if _is_relu2(self.act_fn) else 0
+
+        # Codebook tensors — reuse shared E8 codebook for stages 1 & 3
+        # (same convention as glq_fused_linear_cuda's stage-3 path).
+        cb_half = self._codebook.codebook_half
+        cb2_half = (self._codebook2.codebook_half
+                    if self._codebook2 is not None else torch.empty(0, dtype=torch.float16, device=cb_half.device))
+        # Stage-3 always uses the primary 65536-entry codebook.
+        cb3_half = cb_half
+
+        return glq_cuda.glq_fused_moe_block_diag_cuda(
+            hidden_states.half().contiguous(),
+            top_k_index.contiguous(),
+            top_k_weights.float().contiguous(),
+            self._w13_Qidxs, self._w13_SU, self._w13_SV,
+            self._w13_Wscale, self._w13_Qidxs2, self._w13_inv_resid_scale,
+            self._w2_Qidxs, self._w2_SU, self._w2_SV,
+            self._w2_Wscale, self._w2_Qidxs2, self._w2_inv_resid_scale,
+            cb_half, cb2_half,
+            self.input_dim, self.intermediate_dim, self.intermediate_dim,
+            self._n_pad_w13, self._m_pad_w13,
+            self._n_pad_w2, self._m_pad_w2,
+            self._w13_blocks_n, self._w13_blocks_m,
+            self._w13_blocks_n_meta, self._w13_blocks_m_meta,
+            self._w2_blocks_n, self._w2_blocks_m,
+            self._w2_blocks_n_meta, self._w2_blocks_m_meta,
+            activation_type,
+            self._w13_Qidxs3, self._w13_inv_resid_scale2,
+            self._w2_Qidxs3, self._w2_inv_resid_scale2,
+            cb3_half,
+        )
+
     def forward(self, hidden_states: torch.Tensor,
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor) -> torch.Tensor:
@@ -111,6 +269,12 @@ class E8RHTFusedExperts(nn.Module):
         top_k_index:   ``(num_tokens, top_k)`` int64
         top_k_weights: ``(num_tokens, top_k)`` float — summed routing weights
         """
+        # Try the fused single-call path first.
+        fused_out = self._try_fused_forward(hidden_states, top_k_index, top_k_weights)
+        if fused_out is not None:
+            return fused_out.to(hidden_states.dtype)
+
+        # ---------- Python per-expert fallback ----------
         final_hidden_states = torch.zeros_like(
             hidden_states, dtype=top_k_weights.dtype)
 
