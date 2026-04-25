@@ -3145,6 +3145,25 @@ torch::Tensor glq_fused_moe_cuda(
     // Read expert IDs to CPU (tiny sync — 2 int64s for top-2)
     auto topk_ids_cpu = topk_ids.cpu();
     auto topk_w_cpu = topk_weights.cpu();
+    const int64_t* topk_ids_p = topk_ids_cpu.data_ptr<int64_t>();
+    const float* topk_w_p = topk_w_cpu.data_ptr<float>();
+
+    // v3a: hoist per-expert scalar reads (Wscale / inv_rs / inv_rs2) to CPU
+    // ONCE up here. Each `.item<float>()` inside the per-expert loop was
+    // a cudaStreamSynchronize (~7 µs); with ~6 reads × 8 experts × 23 layers
+    // this dominated the host-side budget per decoded token.
+    auto w13_Wscale_cpu = w13_Wscale.cpu();
+    auto w2_Wscale_cpu = w2_Wscale.cpu();
+    const float* w13_ws_p = w13_Wscale_cpu.data_ptr<float>();
+    const float* w2_ws_p = w2_Wscale_cpu.data_ptr<float>();
+    auto w13_inv_rs_cpu = w13_has_s2 ? w13_inv_rs.cpu() : torch::Tensor();
+    auto w2_inv_rs_cpu = w2_has_s2 ? w2_inv_rs.cpu() : torch::Tensor();
+    const float* w13_irs_p = w13_has_s2 ? w13_inv_rs_cpu.data_ptr<float>() : nullptr;
+    const float* w2_irs_p = w2_has_s2 ? w2_inv_rs_cpu.data_ptr<float>() : nullptr;
+    auto w13_inv_rs2_cpu = w13_has_s3 ? w13_inv_rs2.cpu() : torch::Tensor();
+    auto w2_inv_rs2_cpu = w2_has_s3 ? w2_inv_rs2.cpu() : torch::Tensor();
+    const float* w13_irs2_p = w13_has_s3 ? w13_inv_rs2_cpu.data_ptr<float>() : nullptr;
+    const float* w2_irs2_p = w2_has_s3 ? w2_inv_rs2_cpu.data_ptr<float>() : nullptr;
 
     const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
     const half* cb2_ptr = codebook2.numel() > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
@@ -3152,21 +3171,21 @@ torch::Tensor glq_fused_moe_cuda(
 
     for (int t = 0; t < num_tokens; t++) {
         for (int k = 0; k < top_k; k++) {
-            int eidx = topk_ids_cpu[t][k].item<int64_t>();
-            float ew = topk_w_cpu[t][k].item<float>();
+            int eidx = (int)topk_ids_p[t * top_k + k];
+            float ew = topk_w_p[t * top_k + k];
             if (ew == 0.0f) continue;
 
-            float w13_ws = w13_Wscale[eidx].item<float>();
-            float w13_irs = w13_has_s2 ? w13_inv_rs[eidx].item<float>() : 0.0f;
+            float w13_ws = w13_ws_p[eidx];
+            float w13_irs = w13_irs_p ? w13_irs_p[eidx] : 0.0f;
             bool w13_s2 = (w13_irs != 0.0f);
             // Stage-3 only valid if stage-2 is active for this expert
-            float w13_irs2 = (w13_s2 && w13_has_s3) ? w13_inv_rs2[eidx].item<float>() : 0.0f;
+            float w13_irs2 = (w13_s2 && w13_irs2_p) ? w13_irs2_p[eidx] : 0.0f;
             bool w13_s3 = (w13_irs2 != 0.0f);
 
-            float w2_ws = w2_Wscale[eidx].item<float>();
-            float w2_irs = w2_has_s2 ? w2_inv_rs[eidx].item<float>() : 0.0f;
+            float w2_ws = w2_ws_p[eidx];
+            float w2_irs = w2_irs_p ? w2_irs_p[eidx] : 0.0f;
             bool w2_s2 = (w2_irs != 0.0f);
-            float w2_irs2 = (w2_s2 && w2_has_s3) ? w2_inv_rs2[eidx].item<float>() : 0.0f;
+            float w2_irs2 = (w2_s2 && w2_irs2_p) ? w2_irs2_p[eidx] : 0.0f;
             bool w2_s3 = (w2_irs2 != 0.0f);
 
             int w13_num_stages = 1 + (w13_s2 ? 1 : 0) + (w13_s3 ? 1 : 0);
@@ -3398,6 +3417,23 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
     // Read expert IDs to CPU (tiny sync — 2 int64s for top-2)
     auto topk_ids_cpu = topk_ids.cpu();
     auto topk_w_cpu = topk_weights.cpu();
+    const int64_t* topk_ids_p = topk_ids_cpu.data_ptr<int64_t>();
+    const float* topk_w_p = topk_w_cpu.data_ptr<float>();
+
+    // v3a: hoist per-expert scalars to CPU once. Same rationale as
+    // glq_fused_moe_cuda above — eliminates ~6 syncs per (token, expert).
+    auto w13_Wscale_cpu = w13_Wscale.cpu();
+    auto w2_Wscale_cpu = w2_Wscale.cpu();
+    const float* w13_ws_p = w13_Wscale_cpu.data_ptr<float>();
+    const float* w2_ws_p = w2_Wscale_cpu.data_ptr<float>();
+    auto w13_inv_rs_cpu = w13_has_s2 ? w13_inv_rs.cpu() : torch::Tensor();
+    auto w2_inv_rs_cpu = w2_has_s2 ? w2_inv_rs.cpu() : torch::Tensor();
+    const float* w13_irs_p = w13_has_s2 ? w13_inv_rs_cpu.data_ptr<float>() : nullptr;
+    const float* w2_irs_p = w2_has_s2 ? w2_inv_rs_cpu.data_ptr<float>() : nullptr;
+    auto w13_inv_rs2_cpu = w13_has_s3 ? w13_inv_rs2.cpu() : torch::Tensor();
+    auto w2_inv_rs2_cpu = w2_has_s3 ? w2_inv_rs2.cpu() : torch::Tensor();
+    const float* w13_irs2_p = w13_has_s3 ? w13_inv_rs2_cpu.data_ptr<float>() : nullptr;
+    const float* w2_irs2_p = w2_has_s3 ? w2_inv_rs2_cpu.data_ptr<float>() : nullptr;
 
     const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
     const half* cb2_ptr = codebook2.numel() > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
@@ -3405,20 +3441,20 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
 
     for (int t = 0; t < num_tokens; t++) {
         for (int k = 0; k < top_k; k++) {
-            int eidx = topk_ids_cpu[t][k].item<int64_t>();
-            float ew = topk_w_cpu[t][k].item<float>();
+            int eidx = (int)topk_ids_p[t * top_k + k];
+            float ew = topk_w_p[t * top_k + k];
             if (ew == 0.0f) continue;
 
-            float w13_ws = w13_Wscale[eidx].item<float>();
-            float w13_irs = w13_has_s2 ? w13_inv_rs[eidx].item<float>() : 0.0f;
+            float w13_ws = w13_ws_p[eidx];
+            float w13_irs = w13_irs_p ? w13_irs_p[eidx] : 0.0f;
             bool w13_s2 = (w13_irs != 0.0f);
-            float w13_irs2 = (w13_s2 && w13_has_s3) ? w13_inv_rs2[eidx].item<float>() : 0.0f;
+            float w13_irs2 = (w13_s2 && w13_irs2_p) ? w13_irs2_p[eidx] : 0.0f;
             bool w13_s3 = (w13_irs2 != 0.0f);
 
-            float w2_ws = w2_Wscale[eidx].item<float>();
-            float w2_irs = w2_has_s2 ? w2_inv_rs[eidx].item<float>() : 0.0f;
+            float w2_ws = w2_ws_p[eidx];
+            float w2_irs = w2_irs_p ? w2_irs_p[eidx] : 0.0f;
             bool w2_s2 = (w2_irs != 0.0f);
-            float w2_irs2 = (w2_s2 && w2_has_s3) ? w2_inv_rs2[eidx].item<float>() : 0.0f;
+            float w2_irs2 = (w2_s2 && w2_irs2_p) ? w2_irs2_p[eidx] : 0.0f;
             bool w2_s3 = (w2_irs2 != 0.0f);
 
             int w13_num_stages = 1 + (w13_s2 ? 1 : 0) + (w13_s3 ? 1 : 0);
