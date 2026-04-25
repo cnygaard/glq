@@ -48,14 +48,21 @@ class _ExpertPair(nn.Module):
 class E8RHTFusedExperts(nn.Module):
     """Mimics `NemotronHExperts.forward(hidden_states, top_k_index, top_k_weights)`.
 
-    Holds an `nn.ModuleList` of `_ExpertPair`s indexed by expert id. NemotronH's
-    MoE is **non-gated** (only up_proj followed by activation followed by
-    down_proj), unlike Mixtral.
+    Per-expert `_ExpertPair`s live at the top level under integer-string
+    keys (`self._modules["0"]`, `"1"`, ... `"127"`), so state-dict keys
+    load straight as `experts.{i}.up_proj.Qidxs` matching the
+    trust-remote-code checkpoint layout. We hand-populate `_modules` rather
+    than subclassing `nn.ModuleList` because `nn.ModuleList`'s `__setattr__`
+    auto-numbers any submodule attribute (including `act_fn`), which would
+    collide with the expert indices.
 
-    State-dict keys it accepts (matched directly through HF's normal loader):
+    NemotronH's MoE is **non-gated** (only up_proj followed by activation
+    followed by down_proj), unlike Mixtral.
 
-        experts.{i}.up_proj.Qidxs / SU / SV / Wscale / Qidxs2 / inv_resid_scale / ...
-        experts.{i}.down_proj.Qidxs / SU / SV / Wscale / ...
+    State-dict keys accepted (matched directly through HF's normal loader):
+
+        {i}.up_proj.Qidxs / SU / SV / Wscale / Qidxs2 / inv_resid_scale / ...
+        {i}.down_proj.Qidxs / SU / SV / Wscale / ...
     """
 
     def __init__(self, config, block_diagonal: bool = True):
@@ -63,26 +70,37 @@ class E8RHTFusedExperts(nn.Module):
         self.num_experts = int(config.n_routed_experts)
         self.hidden_dim = int(config.hidden_size)
         self.intermediate_dim = int(config.moe_intermediate_size)
-
-        # NemotronH supports an optional latent projection in front of the MoE
-        # block — when set, the experts run in latent space rather than hidden.
         latent = getattr(config, "moe_latent_size", None)
         self.input_dim = int(latent) if latent is not None else self.hidden_dim
         self.output_dim = self.input_dim
 
-        # Lazy-import keeps this module importable without the full
-        # transformers stack (also helpful for unit tests with stub configs).
+        # Lazy-import to avoid hard-deps at unit-test time.
         from transformers.activations import ACT2FN
+        # `act_fn` is a regular submodule attribute. Activations like
+        # ReLUSquaredActivation are `nn.Module` instances but carry no
+        # learnable parameters, so they don't add state-dict keys.
         self.act_fn = ACT2FN[config.mlp_hidden_act]
 
-        # Per-expert quantized linears. Layout deliberately mirrors the
-        # trust-remote-code expert structure so saved state-dict keys load
-        # without renaming.
-        self.experts = nn.ModuleList([
-            _ExpertPair(self.input_dim, self.intermediate_dim, self.output_dim,
-                        block_diagonal=block_diagonal)
-            for _ in range(self.num_experts)
-        ])
+        # Populate `_modules` directly so the per-expert children appear
+        # under integer-string keys at the top level. nn.Module's
+        # __setattr__ machinery then exposes `self["0"]`-style access via
+        # `__getattr__` (and we provide explicit `__getitem__` below).
+        for i in range(self.num_experts):
+            pair = _ExpertPair(
+                self.input_dim, self.intermediate_dim, self.output_dim,
+                block_diagonal=block_diagonal,
+            )
+            self._modules[str(i)] = pair
+
+    def __getitem__(self, idx: int) -> _ExpertPair:
+        return self._modules[str(idx)]  # type: ignore[return-value]
+
+    def __iter__(self):
+        for i in range(self.num_experts):
+            yield self._modules[str(i)]
+
+    def __len__(self) -> int:
+        return self.num_experts
 
     def forward(self, hidden_states: torch.Tensor,
                 top_k_index: torch.Tensor,
@@ -113,7 +131,7 @@ class E8RHTFusedExperts(nn.Module):
                 continue
 
             current_state = hidden_states[token_idx]
-            pair = self.experts[expert_idx]
+            pair = self[expert_idx]  # ModuleList __getitem__
             # up_proj -> activation -> down_proj. No gating.
             h = pair.up_proj(current_state)
             h = self.act_fn(h)

@@ -49,8 +49,9 @@ class TestE8RHTFusedExpertsConstruction:
     def test_builds_with_expected_children(self):
         cfg = _make_stub_config(num_experts=4, hidden=64, intermediate=32)
         m = E8RHTFusedExperts(cfg, block_diagonal=True)
-        assert len(m.experts) == 4
-        for pair in m.experts:
+        # ModuleList __len__ counts the per-expert pairs
+        assert len(m) == 4
+        for pair in m:
             assert isinstance(pair, _ExpertPair)
             # Per-expert E8RHTLinears with the right dims
             assert pair.up_proj.in_features == 64
@@ -58,18 +59,23 @@ class TestE8RHTFusedExpertsConstruction:
             assert pair.down_proj.in_features == 32
             assert pair.down_proj.out_features == 64
 
-    def test_state_dict_keys_match_per_expert_layout(self):
+    def test_state_dict_keys_live_at_top_level(self):
+        """Per-expert keys live directly at `<i>.up_proj.<buf>` so the
+        saved trust-remote-code keys (`mixer.experts.<i>.up_proj.<buf>`)
+        load straight in once the prefix rename runs."""
         cfg = _make_stub_config(num_experts=2, hidden=32, intermediate=16)
         m = E8RHTFusedExperts(cfg, block_diagonal=True)
         keys = set(m.state_dict().keys())
-        # Per-expert paths exist for both up_proj and down_proj
-        assert "experts.0.up_proj.Qidxs" in keys
-        assert "experts.0.up_proj.SU" in keys
-        assert "experts.0.down_proj.Qidxs2" in keys
-        assert "experts.1.down_proj.inv_resid_scale" in keys
+        # No nested `experts.` segment — entries live at top level
+        assert "0.up_proj.Qidxs" in keys
+        assert "0.up_proj.SU" in keys
+        assert "0.down_proj.Qidxs2" in keys
+        assert "1.down_proj.inv_resid_scale" in keys
         # Sanity: stage-3 buffers also present (zero-init for unused stages)
-        assert "experts.0.up_proj.Qidxs3" in keys
-        assert "experts.1.up_proj.inv_resid_scale2" in keys
+        assert "0.up_proj.Qidxs3" in keys
+        assert "1.up_proj.inv_resid_scale2" in keys
+        # Negative: an extra "experts." segment would be a regression.
+        assert not any(k.startswith("experts.") for k in keys)
 
 
 class TestForwardSemantics:
@@ -93,7 +99,7 @@ class TestForwardSemantics:
                 called.append((self.idx, self.role, x.shape[0]))
                 return x  # identity
 
-        for i, pair in enumerate(m.experts):
+        for i, pair in enumerate(m):  # ModuleList iteration
             pair.up_proj = _Tag(i, "up")
             pair.down_proj = _Tag(i, "down")
         # nn.Module attribute setter rejects bare lambdas — assign through
@@ -214,4 +220,5 @@ class TestReplaceHelper:
         n = _replace_nemotron_h_experts(m, block_diagonal=True)
         assert n == 1
         assert isinstance(m.experts, E8RHTFusedExperts)
-        assert len(m.experts.experts) == 2
+        # ModuleList __len__ over the 2 per-expert pairs.
+        assert len(m.experts) == 2
