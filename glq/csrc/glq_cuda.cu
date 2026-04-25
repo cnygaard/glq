@@ -2177,6 +2177,176 @@ __global__ void glq_output_rht_multiblock_kernel(
 
 
 /* ─────────────────────────────────────────────────────────────────────
+ * v3b cut 2: fused output-RHT + activation kernel.
+ *
+ * Identical to glq_output_rht_multiblock_kernel up to the final-store
+ * loop, where it applies an element-wise activation before writing into
+ * the activation output buffer (h_act). For NemotronH-style relu2_no_mul
+ * (activation_type == 5), the output dimension equals out_features so
+ * the store layout matches one-to-one. We do NOT support gated
+ * activations (silu_gated, type 0) here — those need to read partner
+ * elements that may live in a different threadblock and are therefore
+ * not safe to fuse across multiblock boundaries.
+ *
+ * activation_type semantics:
+ *     5  (relu2_no_mul):  out[idx] = max(v,0)^2          (v = val * s)
+ *     other (>=3):        out[idx] = max(v,0)^2 (default fallback)
+ * stride_out is the element-stride of the activation buffer
+ * (intermediate_size for w13 in MoE).
+ * ───────────────────────────────────────────────────────────────────── */
+
+__global__ void glq_output_rht_act_multiblock_kernel(
+    const float* __restrict__ y_rht,   // (B, stride_in) fp32
+    const half* __restrict__ su,       // (m_pad,) fp16 — full sign vector
+    half* __restrict__ out,            // (B, stride_out) fp16 (activation buffer)
+    int out_features,
+    int stride_in,
+    int stride_out,
+    const int4* __restrict__ block_meta,
+    int activation_type
+) {
+    extern __shared__ float smem[];
+
+    int b = blockIdx.x;
+    int blk = blockIdx.y;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    int4 meta = block_meta[blk];
+    int col_offset = meta.x;
+    int bs = meta.y;
+    int log_bs = meta.z;
+    float rsqrt_bs = rsqrtf((float)bs);
+
+    float* buf = smem;
+    for (int i = tid; i < bs; i += n_threads) {
+        buf[i] = y_rht[b * stride_in + col_offset + i];
+    }
+    __syncthreads();
+
+    float* buf_b = smem + bs;
+    float* src = buf;
+    float* dst = buf_b;
+    for (int k = 0; k < log_bs; k++) {
+        for (int i = tid; i < bs; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float my_val = src[i];
+            float partner_val = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+        }
+        __syncthreads();
+        float* tmp = src; src = dst; dst = tmp;
+    }
+    if (log_bs % 2 == 1) {
+        for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
+        __syncthreads();
+    }
+
+    // Final store: SU-sign + scale + activation
+    for (int i = tid; i < bs; i += n_threads) {
+        int j = col_offset + i;
+        if (j < out_features) {
+            float val = buf[i] * rsqrt_bs;
+            float s = __half2float(su[j]);
+            float v = val * s;
+            // Default and activation_type==5: relu2_no_mul (max(v,0)^2)
+            float vp = fmaxf(v, 0.0f);
+            float act = vp * vp;
+            // Future: branch for other element-wise activations here.
+            // (Gated silu cannot be safely fused — handled outside.)
+            out[b * stride_out + j] = __float2half(act);
+        }
+    }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Per-block (non-multiblock) sibling: same fusion but for one block at
+ * a time. Kept in case a model lands in the per-block fallback path of
+ * launch_output_rht_act_block_diag (max_bs > 8192 or meta on CPU).
+ * ───────────────────────────────────────────────────────────────────── */
+
+__global__ void glq_output_rht_act_kernel(
+    const float* __restrict__ y_rht,
+    const half* __restrict__ su,
+    half* __restrict__ out,
+    int out_features,
+    int m_pad,
+    int log_m,
+    float rsqrt_m,
+    int use_single_buffer,
+    int col_offset,
+    int stride_in,
+    int stride_out,
+    int activation_type
+) {
+    extern __shared__ float smem[];
+    float* buf = smem;
+
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    for (int i = tid; i < m_pad; i += n_threads) {
+        buf[i] = y_rht[b * stride_in + col_offset + i];
+    }
+    __syncthreads();
+
+    if (use_single_buffer) {
+        float reg[16];
+        int elems_per_thread = m_pad / n_threads;
+        for (int k = 0; k < log_m; k++) {
+            for (int e = 0; e < elems_per_thread; e++) {
+                int i = tid + e * n_threads;
+                int partner = i ^ (1 << k);
+                float my_val = buf[i];
+                float partner_val = buf[partner];
+                bool lo = (i & (1 << k)) == 0;
+                reg[e] = lo ? (my_val + partner_val) : (partner_val - my_val);
+            }
+            __syncthreads();
+            for (int e = 0; e < elems_per_thread; e++) {
+                buf[tid + e * n_threads] = reg[e];
+            }
+            __syncthreads();
+        }
+    } else {
+        float* buf_b = smem + m_pad;
+        float* src = buf;
+        float* dst = buf_b;
+        for (int k = 0; k < log_m; k++) {
+            for (int i = tid; i < m_pad; i += n_threads) {
+                int partner = i ^ (1 << k);
+                float my_val = src[i];
+                float partner_val = src[partner];
+                bool lo = (i & (1 << k)) == 0;
+                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
+            }
+            __syncthreads();
+            float* tmp = src; src = dst; dst = tmp;
+        }
+        if (log_m % 2 == 1) {
+            for (int i = tid; i < m_pad; i += n_threads) buf[i] = buf_b[i];
+            __syncthreads();
+        }
+    }
+
+    for (int i = tid; i < m_pad; i += n_threads) {
+        int j = col_offset + i;
+        if (j < out_features) {
+            float val = buf[i] * rsqrt_m;
+            float s = __half2float(su[j]);
+            float v = val * s;
+            float vp = fmaxf(v, 0.0f);
+            float act = vp * vp;
+            out[b * stride_out + j] = __float2half(act);
+        }
+    }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
  * RHT host wrappers
  * ───────────────────────────────────────────────────────────────────── */
 
@@ -3043,6 +3213,67 @@ static void launch_output_rht_block_diag(
     }
 }
 
+// v3b cut 2: block-diagonal output-RHT helper that fuses an element-wise
+// activation into the final-store pass. Mirrors launch_output_rht_block_diag
+// but writes into the activation output buffer (h_act) with stride
+// stride_out_act (typically intermediate_size). Only safe for
+// non-gated activations (relu2_no_mul, type 5; default fallback).
+static void launch_output_rht_act_block_diag(
+    const float* y_rht, const half* su, half* out_act,
+    int out_features, int m_pad,
+    int B,
+    const int64_t* blocks_m_host, int num_m_blocks,
+    const int4* blocks_m_meta_dev, bool meta_on_gpu,
+    int activation_type,
+    cudaStream_t stream
+) {
+    int max_bs = 0;
+    for (int bi = 0; bi < num_m_blocks; bi++) {
+        int bs = (int)blocks_m_host[bi];
+        if (bs > max_bs) max_bs = bs;
+    }
+    bool use_multiblock = (max_bs <= 8192) && meta_on_gpu;
+    int stride_out_act = out_features;
+    if (use_multiblock) {
+        int threads = min(max_bs, 1024);
+        int smem = 2 * max_bs * (int)sizeof(float);
+        if (smem > 48 * 1024) {
+            cudaFuncSetAttribute(glq_output_rht_act_multiblock_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+        dim3 grid(B, num_m_blocks);
+        glq_output_rht_act_multiblock_kernel<<<grid, threads, smem, stream>>>(
+            y_rht, su, out_act,
+            out_features, m_pad, stride_out_act,
+            blocks_m_meta_dev,
+            activation_type
+        );
+    } else {
+        int col_offset = 0;
+        for (int bi = 0; bi < num_m_blocks; bi++) {
+            int bs = (int)blocks_m_host[bi];
+            int log_bs = __builtin_ctz(bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024) {
+                cudaFuncSetAttribute(glq_output_rht_act_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+            glq_output_rht_act_kernel<<<B, threads, smem, stream>>>(
+                y_rht, su, out_act,
+                out_features, bs, log_bs, 1.0f / sqrtf((float)bs),
+                use_single,
+                col_offset, m_pad, stride_out_act,
+                activation_type
+            );
+            col_offset += bs;
+        }
+    }
+}
+
 
 /* ─────────────────────────────────────────────────────────────────────
  * Fused MoE: full expert dispatch in one C++ call
@@ -3192,7 +3423,8 @@ torch::Tensor glq_fused_moe_cuda(
             int w2_num_stages = 1 + (w2_s2 ? 1 : 0) + (w2_s3 ? 1 : 0);
 
             // ---- w13: dequant+matmul (input RHT already done) ----
-            y_rht_w13.zero_();
+            // v3b cut 1: no zero_() — launch_matvec_splitk uses scratch+reduce,
+            // and glq_reduce_splits_kernel writes (not adds) to y_rht_w13.
             launch_matvec_splitk(
                 y_rht_w13.data_ptr<float>() + t * M_w13,
                 (const half*)x_rht_half.data_ptr<c10::Half>() + t * n_pad_w13,
@@ -3240,7 +3472,7 @@ torch::Tensor glq_fused_moe_cuda(
             auto h_rht_half = h_rht.to(torch::kFloat16);
 
             // ---- w2: dequant+matmul ----
-            y_rht_w2.zero_();
+            // v3b cut 1: scratch+reduce path writes y_rht_w2; no zero_() needed.
             launch_matvec_splitk(
                 y_rht_w2.data_ptr<float>() + t * M_w2,
                 (const half*)h_rht_half.data_ptr<c10::Half>() + t * n_pad_w2,
@@ -3461,7 +3693,7 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
             int w2_num_stages = 1 + (w2_s2 ? 1 : 0) + (w2_s3 ? 1 : 0);
 
             // ---- w13: dequant+matmul (input RHT already done) ----
-            y_rht_w13.zero_();
+            // v3b cut 1: no zero_() — scratch+reduce writes y_rht_w13.
             launch_matvec_splitk(
                 y_rht_w13.data_ptr<float>() + t * M_w13,
                 (const half*)x_rht_half.data_ptr<c10::Half>() + t * n_pad_w13,
@@ -3476,19 +3708,37 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
                 w13_num_stages,
                 M_w13, NB_w13, cb2_size, num_sms, stream);
 
-            // ---- w13: output RHT (block-diag along m-axis) ----
-            launch_output_rht_block_diag(
-                y_rht_w13.data_ptr<float>() + t * M_w13,
-                (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
-                (half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
-                w13_out_features, m_pad_w13,
-                1,
-                bm_w13, n_m_w13,
-                bm_w13_meta, bm_w13_meta_gpu,
-                stream);
-
-            // ---- Activation ----
-            {
+            // ---- w13: output RHT (block-diag along m-axis) + activation FUSED ----
+            // v3b cut 2: when activation is element-wise (relu2_no_mul or any
+            // non-gated default), fuse into the output-RHT final-store, writing
+            // directly into h_act and skipping h_w13 + a separate kernel launch.
+            // Gated activations (silu_gated, type=0) read out[i + half_n] which
+            // may not be ready in another threadblock yet — fall back to the
+            // 2-launch path for those.
+            bool act_fusable = (activation_type != 0)
+                && (m_pad_w13 <= 8192) && bm_w13_meta_gpu;
+            if (act_fusable) {
+                launch_output_rht_act_block_diag(
+                    y_rht_w13.data_ptr<float>() + t * M_w13,
+                    (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
+                    (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
+                    w13_out_features, m_pad_w13,
+                    1,
+                    bm_w13, n_m_w13,
+                    bm_w13_meta, bm_w13_meta_gpu,
+                    activation_type,
+                    stream);
+            } else {
+                launch_output_rht_block_diag(
+                    y_rht_w13.data_ptr<float>() + t * M_w13,
+                    (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
+                    (half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
+                    w13_out_features, m_pad_w13,
+                    1,
+                    bm_w13, n_m_w13,
+                    bm_w13_meta, bm_w13_meta_gpu,
+                    stream);
+                // ---- Activation (separate launch) ----
                 int n_act = (activation_type < 3) ? w13_out_features / 2 : w13_out_features;
                 int blocks = (n_act + 255) / 256;
                 const half* act_in = (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features;
@@ -3516,7 +3766,7 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
             auto h_rht_half = h_rht.to(torch::kFloat16);
 
             // ---- w2: dequant+matmul ----
-            y_rht_w2.zero_();
+            // v3b cut 1: scratch+reduce writes y_rht_w2; no zero_() needed.
             launch_matvec_splitk(
                 y_rht_w2.data_ptr<float>() + t * M_w2,
                 (const half*)h_rht_half.data_ptr<c10::Half>() + t * n_pad_w2,
