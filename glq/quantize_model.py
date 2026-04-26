@@ -194,14 +194,28 @@ def get_rotary_emb(text_model, profile=None):
     return None
 
 
-def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None):
+def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
+                          per_layer_inputs=None, sample_idx=None,
+                          shared_kv_cache=None):
     """Build layer forward kwargs based on model profile.
 
     For Gemma 4, the rotary embedding is per-layer-type ("sliding_attention" vs
     "full_attention"), so we look up the layer's type from ``cfg.text_config.layer_types``
-    and pass it to ``rotary_emb`` to get the right ``(cos, sin)`` tuple. Each layer
-    also takes ``per_layer_input`` (None when ``hidden_size_per_layer_input == 0``,
-    which holds for the 31B variant) and a mutable ``shared_kv_states`` dict.
+    and pass it to ``rotary_emb`` to get the right ``(cos, sin)`` tuple.
+
+    For E2B/E4B (``hidden_size_per_layer_input > 0``) the caller passes a
+    pre-computed ``per_layer_inputs`` tensor of shape
+    ``[n_samples, T, num_layers, ple_dim]`` plus the current ``sample_idx`` so we
+    can slice ``per_layer_inputs[sample_idx:sample_idx+1, :, layer_idx, :]``.
+    For the 31B variant (``hidden_size_per_layer_input == 0``) ``per_layer_inputs``
+    stays ``None`` and ``per_layer_input`` is passed as ``None``.
+
+    For E2B/E4B (``num_kv_shared_layers > 0``) reader layers expect a populated
+    ``shared_kv_states[kv_shared_layer_index]``. The caller maintains
+    ``shared_kv_cache: dict[producer_idx, list[(K, V) per sample]]`` populated by
+    earlier producer-layer forwards; we look up the entry for ``sample_idx`` and
+    pass it in. For 31B (``num_kv_shared_layers == 0``) no readers exist so an
+    empty dict is fine.
     """
     seq_len = h.shape[1]
     cache_position = torch.arange(seq_len, device=h.device)
@@ -212,12 +226,25 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None):
     if profile.get('forward_kwargs') == 'gemma4':
         position_ids = cache_position.unsqueeze(0)
         layer_type = cfg.text_config.layer_types[layer_idx]
+        # Per-Layer Embedding: slice the precomputed per_layer_inputs tensor.
+        if per_layer_inputs is not None and sample_idx is not None:
+            ple = per_layer_inputs[sample_idx:sample_idx+1, :, layer_idx, :]
+        else:
+            ple = None  # 31B: hidden_size_per_layer_input == 0, layer ignores it
+        # KV sharing: hand each reader layer the cached K/V from its producer.
+        # The dict is also writable so producer-layer forwards populate it
+        # (we extract those entries after the call to refresh the cache).
+        shared_kv = {}
+        if shared_kv_cache is not None and sample_idx is not None:
+            for producer_idx, samples in shared_kv_cache.items():
+                if sample_idx < len(samples):
+                    shared_kv[producer_idx] = samples[sample_idx]
         return dict(
             position_ids=position_ids,
             position_embeddings=rotary_emb(h, position_ids=position_ids,
                                           layer_type=layer_type),
-            shared_kv_states={},  # mutable dict per calibration sample; OK to be empty
-            per_layer_input=None,  # 31B has hidden_size_per_layer_input == 0
+            shared_kv_states=shared_kv,
+            per_layer_input=ple,
             past_key_values=None,
         )
 
@@ -661,6 +688,99 @@ def quantize(
             hidden_states.append(embed(calib_ids[i:i+1].to(device)))
     hidden_states = torch.cat(hidden_states, dim=0)
 
+    # ---- Gemma-4 Per-Layer Embedding (PLE) precomputation ----
+    # E2B / E4B have hidden_size_per_layer_input > 0 and feed each decoder
+    # layer a per-layer slice of an embedding tensor that depends on
+    # input_ids and inputs_embeds. The 31B variant has it set to 0 so this
+    # block is a no-op there. We compute the full
+    # [n_samples, T, num_layers, ple_dim] tensor once and slice per-layer in
+    # _build_forward_kwargs.
+    per_layer_inputs = None
+    if is_gemma4 and getattr(cfg.text_config, "hidden_size_per_layer_input", 0) > 0:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm
+        text_cfg = cfg.text_config
+        ple_dim = text_cfg.hidden_size_per_layer_input
+        n_layers_cfg = text_cfg.num_hidden_layers
+        # Load the three top-of-language_model PLE submodules from safetensors.
+        ptl_w = _load_tensor_from_shards(
+            weight_map, shard_paths,
+            "model.language_model.embed_tokens_per_layer.weight")
+        # Gemma4TextScaledWordEmbedding multiplies by sqrt(embed_dim) on lookup.
+        # The weight dim is num_layers * ple_dim.
+        embed_per_layer = nn.Embedding(
+            ptl_w.shape[0], ptl_w.shape[1], _weight=ptl_w).to(device)
+        embed_per_layer_scale = ple_dim ** 0.5
+
+        proj_w = _load_tensor_from_shards(
+            weight_map, shard_paths,
+            "model.language_model.per_layer_model_projection.weight")
+        per_layer_proj = nn.Linear(
+            proj_w.shape[1], proj_w.shape[0], bias=False).to(device)
+        per_layer_proj.weight.data = proj_w.to(device)
+
+        norm_w = _load_tensor_from_shards(
+            weight_map, shard_paths,
+            "model.language_model.per_layer_projection_norm.weight")
+        per_layer_norm = Gemma4RMSNorm(ple_dim, eps=text_cfg.rms_norm_eps).to(device)
+        per_layer_norm.weight.data = norm_w.to(device)
+
+        # Per modeling_gemma4: scales used to combine token-identity + context.
+        proj_scale = text_cfg.hidden_size ** -0.5  # 1/sqrt(hidden_size)
+        input_scale = 2.0 ** -0.5  # 1/sqrt(2) — half of (token + context)
+
+        per_layer_inputs_chunks = []
+        with torch.no_grad():
+            for i in range(calib_ids.shape[0]):
+                ids = calib_ids[i:i+1].to(device)
+                emb_in = hidden_states[i:i+1]
+                # token-identity component
+                ple_token = embed_per_layer(ids) * embed_per_layer_scale
+                ple_token = ple_token.reshape(
+                    *ids.shape, n_layers_cfg, ple_dim)
+                # context component (depends on inputs_embeds)
+                ple_ctx = per_layer_proj(emb_in) * proj_scale
+                ple_ctx = ple_ctx.reshape(
+                    *emb_in.shape[:-1], n_layers_cfg, ple_dim)
+                ple_ctx = per_layer_norm(ple_ctx)
+                ple = (ple_ctx + ple_token) * input_scale
+                per_layer_inputs_chunks.append(ple)
+        per_layer_inputs = torch.cat(per_layer_inputs_chunks, dim=0)
+        print(f"  PLE precomputed: {tuple(per_layer_inputs.shape)} "
+              f"(n_samples × T × num_layers × ple_dim)")
+        del embed_per_layer, per_layer_proj, per_layer_norm, ptl_w, proj_w, norm_w
+        gc.collect()
+        if use_gpu:
+            torch.cuda.empty_cache()
+
+    # ---- Gemma-4 KV-sharing cache ----
+    # E2B / E4B have num_kv_shared_layers > 0: layers from
+    # first_kv_shared_layer_idx onward are READERS that look up K/V from an
+    # earlier same-type PRODUCER layer via shared_kv_states[producer_idx].
+    # We populate this cache during each producer layer's post-quantization
+    # propagation forward, then replay into reader-layer forwards.
+    shared_kv_cache = None
+    producer_layer_indices = set()
+    if is_gemma4 and getattr(cfg.text_config, "num_kv_shared_layers", 0) > 0:
+        text_cfg = cfg.text_config
+        first_kv_shared = text_cfg.num_hidden_layers - text_cfg.num_kv_shared_layers
+        # Producers' kv_shared_layer_index is the most recent earlier same-type
+        # layer. Replicate Gemma4TextAttention.__init__ logic to find them.
+        for reader_idx in range(first_kv_shared, text_cfg.num_hidden_layers):
+            prev_layers = text_cfg.layer_types[:reader_idx]
+            if not prev_layers:
+                continue
+            same_type = text_cfg.layer_types[reader_idx]
+            # last index of same_type in prev_layers
+            try:
+                producer_idx = (len(prev_layers) - 1
+                                - prev_layers[::-1].index(same_type))
+            except ValueError:
+                continue
+            producer_layer_indices.add(producer_idx)
+        shared_kv_cache = {}  # {producer_idx: list[(K, V) per sample]}
+        print(f"  KV-sharing: {len(producer_layer_indices)} producer layers, "
+              f"{text_cfg.num_kv_shared_layers} reader layers")
+
     if streaming:
         del embed, embed_weight
         gc.collect()
@@ -721,7 +841,10 @@ def quantize(
         with torch.no_grad():
             for i in range(hidden_states.shape[0]):
                 h = hidden_states[i:i+1]
-                kwargs = _build_forward_kwargs(profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg)
+                kwargs = _build_forward_kwargs(
+                    profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg,
+                    per_layer_inputs=per_layer_inputs, sample_idx=i,
+                    shared_kv_cache=shared_kv_cache)
                 layer(h, **kwargs)
 
         # Finalize Hessians to CPU to free GPU for quantization
@@ -853,12 +976,28 @@ def quantize(
 
         # Forward calibration through quantized layer
         new_hidden = []
+        # Initialize this layer's slot in the cache if it's a Gemma-4 producer.
+        is_producer = (shared_kv_cache is not None
+                       and layer_idx in producer_layer_indices)
+        if is_producer and layer_idx not in shared_kv_cache:
+            shared_kv_cache[layer_idx] = []
         with torch.no_grad():
             for i in range(hidden_states.shape[0]):
                 h = hidden_states[i:i+1]
-                kwargs = _build_forward_kwargs(profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg)
+                kwargs = _build_forward_kwargs(
+                    profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg,
+                    per_layer_inputs=per_layer_inputs, sample_idx=i,
+                    shared_kv_cache=shared_kv_cache)
                 out = layer(h, **kwargs)
                 new_hidden.append(out[0] if isinstance(out, tuple) else out)
+                # Capture K/V from a producer layer's post-quantization
+                # forward. Gemma4TextAttention writes
+                # ``shared_kv_states[self.layer_idx] = (K, V)`` for non-reader
+                # layers, so the same dict object we passed in now has the
+                # entry. Move to CPU to bound GPU memory across samples.
+                if is_producer and layer_idx in kwargs['shared_kv_states']:
+                    K, V = kwargs['shared_kv_states'][layer_idx]
+                    shared_kv_cache[layer_idx].append((K.cpu(), V.cpu()))
         hidden_states = torch.cat(new_hidden, dim=0)
 
         if streaming:
