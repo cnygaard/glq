@@ -112,6 +112,21 @@ _MODEL_PROFILES = {
         'trust_remote_code': True,
         'forward_kwargs': 'nemotron_h',
     },
+    'Gemma4ForConditionalGeneration': {
+        # Multimodal — language decoder lives at model.language_model. The
+        # streaming branch in `quantize()` drives the right block class
+        # (Gemma4TextDecoderLayer) and overrides `sd_prefix` directly, so
+        # the layers_attr / embed_attr / sd_prefix entries here are the
+        # non-streaming defaults that we don't currently exercise on the
+        # 31B model (it doesn't fit). Kept correct for future small Gemma
+        # 4 variants.
+        'layers_attr': 'model.language_model.layers',
+        'embed_attr': 'model.language_model.embed_tokens',
+        'rotary_attr': 'model.language_model.rotary_emb',
+        'sd_prefix': 'model.language_model.layers',
+        'trust_remote_code': False,
+        'forward_kwargs': 'gemma4',
+    },
 }
 
 _DEFAULT_PROFILE = {
@@ -179,13 +194,32 @@ def get_rotary_emb(text_model, profile=None):
     return None
 
 
-def _build_forward_kwargs(profile, h, rotary_emb):
-    """Build layer forward kwargs based on model profile."""
+def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None):
+    """Build layer forward kwargs based on model profile.
+
+    For Gemma 4, the rotary embedding is per-layer-type ("sliding_attention" vs
+    "full_attention"), so we look up the layer's type from ``cfg.text_config.layer_types``
+    and pass it to ``rotary_emb`` to get the right ``(cos, sin)`` tuple. Each layer
+    also takes ``per_layer_input`` (None when ``hidden_size_per_layer_input == 0``,
+    which holds for the 31B variant) and a mutable ``shared_kv_states`` dict.
+    """
     seq_len = h.shape[1]
     cache_position = torch.arange(seq_len, device=h.device)
 
     if profile.get('forward_kwargs') == 'nemotron_h':
         return dict(cache_params=None, cache_position=cache_position)
+
+    if profile.get('forward_kwargs') == 'gemma4':
+        position_ids = cache_position.unsqueeze(0)
+        layer_type = cfg.text_config.layer_types[layer_idx]
+        return dict(
+            position_ids=position_ids,
+            position_embeddings=rotary_emb(h, position_ids=position_ids,
+                                          layer_type=layer_type),
+            shared_kv_states={},  # mutable dict per calibration sample; OK to be empty
+            per_layer_input=None,  # 31B has hidden_size_per_layer_input == 0
+            past_key_values=None,
+        )
 
     position_ids = cache_position.unsqueeze(0)
     kwargs = dict(position_ids=position_ids, cache_position=cache_position,
@@ -482,6 +516,10 @@ def quantize(
     # Ministral3RotaryEmbedding as the multimodal variant. Careful: "Mistral3"
     # is NOT a substring of "Ministral3" (the latter has an extra 'n').
     is_ministral3_text = arch == "Ministral3ForCausalLM"
+    # Gemma 4 is multimodal (Gemma4ForConditionalGeneration). The language
+    # decoder lives at `model.language_model` and saved keys are prefixed
+    # `model.language_model.layers.…`. We quantize the text decoder only.
+    is_gemma4 = "Gemma4ForConditional" in arch
 
     if streaming:
         # Streaming mode: don't load model into RAM. Instead, instantiate
@@ -494,6 +532,13 @@ def quantize(
             _text = _model.model.language_model
             _layers = get_decoder_layers(_text, profile)
             sd_prefix = "language_model.model.layers"
+        elif is_gemma4:
+            from transformers import Gemma4ForConditionalGeneration
+            with torch.device("meta"):
+                _model = Gemma4ForConditionalGeneration(cfg)
+            _text = _model.model.language_model
+            _layers = list(_text.layers)
+            sd_prefix = "model.language_model.layers"
         else:
             with torch.device("meta"):
                 _model = AutoModelForCausalLM.from_config(
@@ -562,8 +607,8 @@ def quantize(
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
-    # Mistral3 streaming overrides sd_prefix in the streaming block above
-    if not (streaming and is_mistral3):
+    # Mistral3 / Gemma4 streaming overrides sd_prefix in the streaming block above
+    if not (streaming and (is_mistral3 or is_gemma4)):
         sd_prefix = profile['sd_prefix']
     rotary_emb = None
 
@@ -571,6 +616,8 @@ def quantize(
         # Load embedding from safetensors
         if is_mistral3:
             embed_key = "language_model.model.embed_tokens.weight"
+        elif is_gemma4:
+            embed_key = "model.language_model.embed_tokens.weight"
         else:
             embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
             embed_key = f"{embed_attr}.weight"
@@ -588,6 +635,12 @@ def quantize(
             text_cfg = cfg.text_config if is_mistral3 else cfg
             from transformers.models.ministral3.modeling_ministral3 import Ministral3RotaryEmbedding
             rotary_emb = Ministral3RotaryEmbedding(config=text_cfg)
+            if use_gpu:
+                rotary_emb.to(device)
+        elif is_gemma4:
+            # Gemma4 text decoder needs a Gemma4-specific rotary embedding.
+            from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
+            rotary_emb = Gemma4TextRotaryEmbedding(config=cfg.text_config)
             if use_gpu:
                 rotary_emb.to(device)
     else:
@@ -641,7 +694,7 @@ def quantize(
         if streaming:
             layer_state = _load_layer_state(
                 weight_map, shard_paths, layer_idx, sd_prefix)
-            layer_cfg = cfg.text_config if is_mistral3 else cfg
+            layer_cfg = cfg.text_config if (is_mistral3 or is_gemma4) else cfg
             layer = BlockClass(layer_cfg, layer_idx)
             layer.load_state_dict(layer_state, strict=False)
             del layer_state
@@ -668,7 +721,7 @@ def quantize(
         with torch.no_grad():
             for i in range(hidden_states.shape[0]):
                 h = hidden_states[i:i+1]
-                kwargs = _build_forward_kwargs(profile, h, rotary_emb)
+                kwargs = _build_forward_kwargs(profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg)
                 layer(h, **kwargs)
 
         # Finalize Hessians to CPU to free GPU for quantization
@@ -803,7 +856,7 @@ def quantize(
         with torch.no_grad():
             for i in range(hidden_states.shape[0]):
                 h = hidden_states[i:i+1]
-                kwargs = _build_forward_kwargs(profile, h, rotary_emb)
+                kwargs = _build_forward_kwargs(profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg)
                 out = layer(h, **kwargs)
                 new_hidden.append(out[0] if isinstance(out, tuple) else out)
         hidden_states = torch.cat(new_hidden, dim=0)

@@ -63,33 +63,114 @@ class GLQConfig(QuantizationConfigMixin):
 MODULES_TO_NOT_CONVERT = ["lm_head"]
 
 
-def _detect_block_diagonal(pretrained_path):
-    """Peek at checkpoint to detect block-diagonal quantization."""
+def _peek_qidxs_keys(pretrained_path):
+    """Open the saved safetensors (single-file or sharded) and return every
+    key ending in ``.Qidxs`` plus the shape of one such tensor.
+
+    Returns (key_list, sample_shape) or ([], None) on failure.
+    """
+    from safetensors import safe_open
+    from transformers.utils.hub import cached_file
+
+    keys = []
+    sample_shape = None
+    # Try sharded layout first (model.safetensors.index.json + N shards),
+    # fall back to single model.safetensors.
     try:
-        from safetensors import safe_open
-        from transformers.utils.hub import cached_file
-        st_path = cached_file(pretrained_path, "model.safetensors",
-                              _raise_exceptions_for_missing_entries=False)
+        idx_path = cached_file(
+            pretrained_path, "model.safetensors.index.json",
+            _raise_exceptions_for_missing_entries=False)
+    except Exception:
+        idx_path = None
+    if idx_path is not None:
+        try:
+            import json
+            with open(idx_path) as f:
+                idx = json.load(f)
+            seen_files = set()
+            for k, fname in idx.get("weight_map", {}).items():
+                if k.endswith(".Qidxs"):
+                    keys.append(k)
+                    if sample_shape is None and fname not in seen_files:
+                        seen_files.add(fname)
+                        try:
+                            shard_path = cached_file(
+                                pretrained_path, fname,
+                                _raise_exceptions_for_missing_entries=False)
+                            if shard_path is not None:
+                                with safe_open(shard_path, framework="pt") as st:
+                                    if k in st.keys():
+                                        sample_shape = st.get_tensor(k).shape
+                        except Exception:
+                            pass
+            return keys, sample_shape
+        except Exception:
+            pass
+
+    try:
+        st_path = cached_file(
+            pretrained_path, "model.safetensors",
+            _raise_exceptions_for_missing_entries=False)
         if st_path is None:
-            return False
+            return [], None
         with safe_open(st_path, framework="pt") as st:
             for k in st.keys():
                 if k.endswith(".Qidxs"):
-                    t = st.get_tensor(k)
-                    m = t.shape[0]
-                    is_pow2 = m > 0 and (m & (m - 1)) == 0
-                    return not is_pow2
+                    keys.append(k)
+                    if sample_shape is None:
+                        sample_shape = st.get_tensor(k).shape
     except Exception:
         pass
-    return False
+    return keys, sample_shape
 
 
-def replace_with_glq_linear(model, block_diagonal=False):
-    """Replace nn.Linear modules with E8RHTLinear on meta device."""
+def _detect_block_diagonal(pretrained_path):
+    """Peek at checkpoint to detect block-diagonal quantization."""
+    _, sample_shape = _peek_qidxs_keys(pretrained_path)
+    if sample_shape is None or sample_shape[0] <= 0:
+        return False
+    m = sample_shape[0]
+    is_pow2 = (m & (m - 1)) == 0
+    return not is_pow2
+
+
+def _collect_quantized_layer_names(pretrained_path):
+    """Return the set of nn.Linear module names that were GLQ-quantized.
+
+    Reads the saved safetensors and strips ``.Qidxs`` from every key whose
+    name ends that way. The resulting names match the dotted-path format
+    used by ``model.named_modules()`` so the load-side replacer can scope
+    its work to exactly the layers that have GLQ payload.
+
+    Returns ``None`` if the safetensors can't be opened — caller should
+    fall back to "replace everything" for backward compatibility with
+    older callers that didn't rely on this scoping.
+    """
+    keys, _ = _peek_qidxs_keys(pretrained_path)
+    if not keys:
+        return None
+    return {k[:-len(".Qidxs")] for k in keys}
+
+
+def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None):
+    """Replace nn.Linear modules with E8RHTLinear on meta device.
+
+    When ``quantized_layers`` is provided, only ``nn.Linear`` modules whose
+    fully-qualified name appears in the set are replaced. Modules outside
+    the set (e.g. a multimodal model's vision encoder when only the
+    language decoder was quantized) are left as plain ``nn.Linear`` so
+    their bf16 weights load normally and the auxiliary capability
+    (vision/audio/etc.) stays intact. ``None`` (the default) preserves the
+    original behaviour of replacing every ``nn.Linear`` not in the
+    ``MODULES_TO_NOT_CONVERT`` exclusion list — used as the fallback when
+    the checkpoint can't be peeked.
+    """
     has_replaced = False
     for name, module in list(model.named_modules()):
         skip = any(excl in name for excl in MODULES_TO_NOT_CONVERT)
         if skip or not isinstance(module, nn.Linear):
+            continue
+        if quantized_layers is not None and name not in quantized_layers:
             continue
 
         with torch.device("meta"):
@@ -249,6 +330,15 @@ class GLQQuantizer(HfQuantizer):
         cfg = getattr(model, "config", None)
         pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
         block_diag = _detect_block_diagonal(pretrained_path) if pretrained_path else False
+        # Scope the nn.Linear -> E8RHTLinear replacement to exactly the
+        # layers that have GLQ payload in the saved safetensors. Multimodal
+        # models (e.g. Gemma-4) only quantize the language decoder; vision
+        # / audio towers stay as plain nn.Linear with their bf16 weights.
+        # Falls back to "replace everything" if the safetensors can't be
+        # peeked (older callers / non-pretrained loads).
+        quantized_layers = (
+            _collect_quantized_layer_names(pretrained_path) if pretrained_path else None
+        )
         # NemotronH on the native HF integration packs experts into stacked
         # tensors (see transformers/models/nemotron_h/modeling_nemotron_h.py
         # NemotronHExperts). Swap them for E8RHTFusedExperts before walking
@@ -259,7 +349,8 @@ class GLQQuantizer(HfQuantizer):
         n_fused = _replace_nemotron_h_experts(model, block_diagonal=block_diag)
         if n_fused:
             install_nemotron_h_state_dict_renames(model)
-        replaced = replace_with_glq_linear(model, block_diagonal=block_diag)
+        replaced = replace_with_glq_linear(
+            model, block_diagonal=block_diag, quantized_layers=quantized_layers)
         if not replaced and not n_fused:
             import logging
             logging.getLogger(__name__).warning(
