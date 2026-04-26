@@ -170,10 +170,32 @@ def replace_with_glq_embedding(model, quantized_layers=None):
             continue
         if name not in quantized_layers:
             continue
+        # Gemma4TextScaledWordEmbedding (and friends) multiply by an
+        # ``embed_scale`` factor inside forward. Carry that scale through to
+        # E8RHTEmbedding so the replacement produces the same magnitude.
+        # Some implementations register embed_scale as a buffer (which lives
+        # on meta during preprocess); recover the original constant from the
+        # embedding_dim instead in that case (matches how Gemma-4 sets it).
+        raw_scale = getattr(module, "embed_scale", 1.0)
+        if isinstance(raw_scale, torch.Tensor):
+            try:
+                embed_scale = float(raw_scale.detach().cpu().item())
+            except Exception:
+                # Meta tensor or otherwise unreadable. Gemma4 PLE scale is
+                # sqrt(hidden_size_per_layer_input) which equals
+                # sqrt(embedding_dim / num_hidden_layers).
+                tc = getattr(getattr(model, "config", None), "text_config", None)
+                if tc is not None and getattr(tc, "hidden_size_per_layer_input", 0) > 0:
+                    embed_scale = float(tc.hidden_size_per_layer_input) ** 0.5
+                else:
+                    embed_scale = 1.0
+        else:
+            embed_scale = float(raw_scale)
         with torch.device("meta"):
             new_module = E8RHTEmbedding(
                 num_embeddings=module.num_embeddings,
                 embedding_dim=module.embedding_dim,
+                embed_scale=embed_scale,
             )
         new_module.requires_grad_(False)
         model.set_submodule(name, new_module)

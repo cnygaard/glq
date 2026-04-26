@@ -1076,12 +1076,19 @@ def quantize(
         vocab_size_ple, embed_dim_ple = ple_w.shape
         print(f"\nQuantizing PLE embedding {tuple(ple_w.shape)} at {ple_embed_bpw}bpw...")
         # Rows are independent (apply_left=False) so we chunk by rows to bound
-        # GPU memory: a chunk of 16k rows × 16k embed × fp32 = ~1 GB.
+        # GPU memory: a chunk of 16k rows × 16k embed × fp32 = ~1 GB. Each
+        # chunk's LDLQ calibrates its own Wscale + inv_resid_scale; we save
+        # both as per-row tensors so E8RHTEmbedding applies the right scale
+        # to each row at lookup (using a single chunk[0] scalar would alias
+        # rows from later chunks and ~destroy embedding quality).
         chunk_rows = 16384
         ple_qidxs_chunks = []
         ple_qidxs2_chunks = []
         H_id = torch.eye(embed_dim_ple, dtype=torch.float32, device=device)
-        ple_arts_seed = None
+        ple_sv = None  # SV is RHT-seeded identically for every chunk
+        ple_su = None
+        ple_wscale_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
+        ple_inv_rs_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
         ple_sqnr_chunks = []
         for r0 in range(0, vocab_size_ple, chunk_rows):
             r1 = min(r0 + chunk_rows, vocab_size_ple)
@@ -1093,30 +1100,30 @@ def quantize(
             ple_qidxs_chunks.append(arts_chunk['Qidxs'].cpu())
             if 'Qidxs2' in arts_chunk:
                 ple_qidxs2_chunks.append(arts_chunk['Qidxs2'].cpu())
-            if ple_arts_seed is None:
-                # Capture SV / Wscale / inv_resid_scale from the first chunk.
-                # SV is RHT-seeded the same way for every chunk (same n).
-                # Wscale and inv_resid_scale are calibrated per chunk; we use
-                # the first chunk's values and keep all chunks aligned with
-                # the same scales by passing the same codebook + RHT seed.
-                ple_arts_seed = {
-                    'SV': arts_chunk['SV'],
-                    'SU': arts_chunk['SU'],  # ones tensor — kept for round-trip
-                    'Wscale': arts_chunk['Wscale'],
-                }
-                if 'inv_resid_scale' in arts_chunk:
-                    ple_arts_seed['inv_resid_scale'] = arts_chunk['inv_resid_scale']
+            ple_wscale_per_row[r0:r1] = arts_chunk['Wscale'].cpu().float()
+            ple_inv_rs_per_row[r0:r1] = (
+                arts_chunk['inv_resid_scale'].cpu().float()
+                if 'inv_resid_scale' in arts_chunk
+                else torch.zeros(()))
+            if ple_sv is None:
+                ple_sv = arts_chunk['SV']
+                ple_su = arts_chunk['SU']
             ple_sqnr_chunks.append(met_chunk['sqnr'])
             del chunk
             if use_gpu:
                 torch.cuda.empty_cache()
-        ple_arts = dict(ple_arts_seed)
-        ple_arts['Qidxs'] = torch.cat(ple_qidxs_chunks, dim=0)
+        ple_arts = {
+            'SV': ple_sv,
+            'SU': ple_su,
+            'Wscale': ple_wscale_per_row,           # [vocab] not scalar
+            'Qidxs': torch.cat(ple_qidxs_chunks, dim=0),
+        }
         if ple_qidxs2_chunks:
             ple_arts['Qidxs2'] = torch.cat(ple_qidxs2_chunks, dim=0)
+            ple_arts['inv_resid_scale'] = ple_inv_rs_per_row  # [vocab]
         avg_chunk_sqnr = sum(ple_sqnr_chunks) / len(ple_sqnr_chunks)
         print(f"  PLE embed avg SQNR={avg_chunk_sqnr:.2f} dB "
-              f"({len(ple_qidxs_chunks)} chunks)")
+              f"({len(ple_qidxs_chunks)} chunks, per-row Wscale)")
         all_artifacts[ple_embed_prefix] = ple_arts
         all_sqnr.append(avg_chunk_sqnr)
         del ple_w, H_id, ple_qidxs_chunks, ple_qidxs2_chunks

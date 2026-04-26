@@ -631,10 +631,16 @@ class E8RHTEmbedding(nn.Module):
     iterates state-dict keys doesn't choke; it's never read.
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 embed_scale: float = 1.0):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        # ``Gemma4TextScaledWordEmbedding`` (and analogues) multiply lookups
+        # by sqrt(embedding_dim) inside their forward. We replicate that
+        # post-dequant so substituted modules preserve the original output
+        # magnitude. Default 1.0 = plain ``nn.Embedding``.
+        self.embed_scale = float(embed_scale)
         # n_pad must be a power of 2 for the non-block FHT path. The PLE
         # weight in Gemma-4 has embedding_dim = num_layers * ple_dim, which is
         # already a power of 2 for E2B (35 * 256 → not pow2; we'll round up).
@@ -645,16 +651,21 @@ class E8RHTEmbedding(nn.Module):
         self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
         # SU kept ones-shaped + 1-elem for state-dict round-trip; never used.
         self.register_buffer('SU', torch.ones(1, dtype=torch.float16))
-        self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
-        # Optional residual stage (3+ bpw)
+        # Per-row Wscale (vocab-sized): chunked quant calibrates one Wscale
+        # per chunk and we map row → chunk via index. A single scalar fails
+        # because chunks from different parts of the embedding have different
+        # row-magnitude statistics → severe quality loss when one scalar is
+        # forced on all rows.
+        self.register_buffer('Wscale',
+            torch.ones(num_embeddings, dtype=torch.float32))
+        # Optional residual stage (3+ bpw) — also per-row scale
         self.register_buffer('Qidxs2',
             torch.zeros(num_embeddings, self.n_pad // 8, dtype=torch.int16))
-        self.register_buffer('inv_resid_scale', torch.zeros((), dtype=torch.float32))
+        self.register_buffer('inv_resid_scale',
+            torch.zeros(num_embeddings, dtype=torch.float32))
         self.codebook = None
         self.codebook2 = None
         self._n_stages = 1
-        self._wscale_float = None
-        self._inv_rs_float = 0.0
         self._rsqrt_n = self.n_pad ** -0.5
 
     def set_codebook(self, codebook, codebook2=None):
@@ -662,15 +673,11 @@ class E8RHTEmbedding(nn.Module):
         self.codebook = codebook
         self.codebook2 = codebook2
         if self.Wscale.device.type == "meta":
-            self._wscale_float = None
             return
-        self._wscale_float = self.Wscale.item()
+        # Detect 2-stage usage from any non-zero per-row inv_resid_scale.
         self._n_stages = 1
-        if codebook2 is not None and self.inv_resid_scale.abs().item() > 0:
+        if codebook2 is not None and self.inv_resid_scale.abs().any().item():
             self._n_stages = 2
-            self._inv_rs_float = self.inv_resid_scale.item()
-        else:
-            self._inv_rs_float = 0.0
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys, error_msgs):
@@ -714,7 +721,9 @@ class E8RHTEmbedding(nn.Module):
             idx2 = rows2.reshape(-1).long() & 0xFFFF
             deq2 = cb2.index_select(0, idx2)
             deq2 = deq2.reshape(flat_ids.shape[0], self.n_pad).float()
-            deq = deq + deq2 * self._inv_rs_float
+            # Per-row residual scale ([vocab]) → broadcast over n_pad axis
+            inv_rs = self.inv_resid_scale.index_select(0, flat_ids).unsqueeze(-1)
+            deq = deq + deq2 * inv_rs.float()
 
         # Inverse right-side RHT: undo FHT + SV scale.
         # Forward quant did: W_t = FHT_cols(W_padded * SV) (no normalization).
@@ -722,9 +731,15 @@ class E8RHTEmbedding(nn.Module):
         # then multiply by SV. (RHT.inverse_transform_weights does not divide
         # by N, so neither do we — empirical roundtrip with E8RHTLinear's
         # `dequantize()` confirms this matches the reconstruction.)
-        deq = deq * self._wscale_float
+        # Per-row Wscale: broadcast over n_pad axis.
+        wscale = self.Wscale.index_select(0, flat_ids).unsqueeze(-1)
+        deq = deq * wscale.float()
         deq = fast_hadamard_transform(deq)
         deq = deq * self.SV.float()
+        # Scaled-word-embedding scale (e.g. sqrt(hidden_size_per_layer_input)
+        # for Gemma-4's PLE). 1.0 for plain nn.Embedding.
+        if self.embed_scale != 1.0:
+            deq = deq * self.embed_scale
 
         # Trim to true embedding_dim and cast to caller's compute dtype.
         # Match what hf_integration set on the module (or fall back to SV's
