@@ -258,9 +258,19 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
 
 # ---- per-layer quantization ----
 
-def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
+def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
+                                apply_left=True, block_diagonal=True):
     """
     Quantize a single linear layer with E8 Shell + RHT + LDLQ.
+
+    When ``apply_left=False`` the row-direction RHT is skipped (SU=1, no
+    left FHT). Used by the embedding-quant path so each row stays
+    independent and per-row dequant at lookup is trivial.
+
+    ``block_diagonal`` controls whether non-pow2 dimensions are split into
+    a sum of pow2 FHT blocks (saves storage but the per-row kernel must
+    match) or padded to the next power of 2 (~simpler, small storage cost
+    on most shapes).
 
     Returns:
         W_hat: dequantized weight matrix (for error propagation to next layer)
@@ -277,7 +287,7 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0):
     diag = torch.arange(H_f.shape[-1], device=dev)
     H_f[diag, diag] += damp
 
-    rht = RHT(m, n, device=dev, block_diagonal=True)
+    rht = RHT(m, n, device=dev, block_diagonal=block_diagonal, apply_left=apply_left)
     W_tilde = rht.transform_weights(W_f)
     H_tilde = rht.transform_hessian(H_f)
 
@@ -1042,6 +1052,77 @@ def quantize(
         total_time = time.perf_counter() - t_start
         print(f"\nProfiling pass completed in {total_time/60:.1f}m")
         return 0
+
+    # ---- Gemma-4 PLE embedding quantization ----
+    # E2B / E4B keep a [vocab × num_layers·ple_dim] embedding (~4.4 GB at bf16
+    # on E2B). We quantize it independently after the main loop using the
+    # same E8 codebook but right-only RHT so per-row gather at inference is
+    # trivial. Skipped on profiling passes (they uniformly use 2 bpw and
+    # exit early before reaching here).
+    if (streaming and is_gemma4
+            and getattr(cfg.text_config, "hidden_size_per_layer_input", 0) > 0):
+        ple_embed_prefix = "model.language_model.embed_tokens_per_layer"
+        ple_embed_bpw = 4  # 2 stages, ~half the disk of 2bpw embed for noticeably better SQNR
+        # Free hidden_states + per_layer_inputs since we only need the embed
+        # weight from disk for this final step. KV cache is already on CPU.
+        del hidden_states
+        if per_layer_inputs is not None:
+            del per_layer_inputs
+        gc.collect()
+        if use_gpu:
+            torch.cuda.empty_cache()
+        ple_w = _load_tensor_from_shards(
+            weight_map, shard_paths, f"{ple_embed_prefix}.weight")
+        vocab_size_ple, embed_dim_ple = ple_w.shape
+        print(f"\nQuantizing PLE embedding {tuple(ple_w.shape)} at {ple_embed_bpw}bpw...")
+        # Rows are independent (apply_left=False) so we chunk by rows to bound
+        # GPU memory: a chunk of 16k rows × 16k embed × fp32 = ~1 GB.
+        chunk_rows = 16384
+        ple_qidxs_chunks = []
+        ple_qidxs2_chunks = []
+        H_id = torch.eye(embed_dim_ple, dtype=torch.float32, device=device)
+        ple_arts_seed = None
+        ple_sqnr_chunks = []
+        for r0 in range(0, vocab_size_ple, chunk_rows):
+            r1 = min(r0 + chunk_rows, vocab_size_ple)
+            chunk = ple_w[r0:r1].to(device)
+            _, arts_chunk, met_chunk = quantize_layer_e8_shell_rht(
+                chunk, H_id, codebook,
+                bpw=ple_embed_bpw, tune_iters=0,
+                apply_left=False, block_diagonal=False)
+            ple_qidxs_chunks.append(arts_chunk['Qidxs'].cpu())
+            if 'Qidxs2' in arts_chunk:
+                ple_qidxs2_chunks.append(arts_chunk['Qidxs2'].cpu())
+            if ple_arts_seed is None:
+                # Capture SV / Wscale / inv_resid_scale from the first chunk.
+                # SV is RHT-seeded the same way for every chunk (same n).
+                # Wscale and inv_resid_scale are calibrated per chunk; we use
+                # the first chunk's values and keep all chunks aligned with
+                # the same scales by passing the same codebook + RHT seed.
+                ple_arts_seed = {
+                    'SV': arts_chunk['SV'],
+                    'SU': arts_chunk['SU'],  # ones tensor — kept for round-trip
+                    'Wscale': arts_chunk['Wscale'],
+                }
+                if 'inv_resid_scale' in arts_chunk:
+                    ple_arts_seed['inv_resid_scale'] = arts_chunk['inv_resid_scale']
+            ple_sqnr_chunks.append(met_chunk['sqnr'])
+            del chunk
+            if use_gpu:
+                torch.cuda.empty_cache()
+        ple_arts = dict(ple_arts_seed)
+        ple_arts['Qidxs'] = torch.cat(ple_qidxs_chunks, dim=0)
+        if ple_qidxs2_chunks:
+            ple_arts['Qidxs2'] = torch.cat(ple_qidxs2_chunks, dim=0)
+        avg_chunk_sqnr = sum(ple_sqnr_chunks) / len(ple_sqnr_chunks)
+        print(f"  PLE embed avg SQNR={avg_chunk_sqnr:.2f} dB "
+              f"({len(ple_qidxs_chunks)} chunks)")
+        all_artifacts[ple_embed_prefix] = ple_arts
+        all_sqnr.append(avg_chunk_sqnr)
+        del ple_w, H_id, ple_qidxs_chunks, ple_qidxs2_chunks
+        gc.collect()
+        if use_gpu:
+            torch.cuda.empty_cache()
 
     total_time = time.perf_counter() - t_start
     avg_sqnr = sum(all_sqnr) / len(all_sqnr) if all_sqnr else 0

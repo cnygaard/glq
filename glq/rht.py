@@ -37,10 +37,14 @@ class RHT:
     """
 
     def __init__(self, m: int, n: int, device='cpu', seed=42,
-                 block_diagonal: bool = True):
+                 block_diagonal: bool = True, apply_left: bool = True):
         self.m_orig, self.n_orig = m, n
         self.device = device
         self.block_diagonal = block_diagonal
+        # When apply_left=False, the row-direction (SU + left FHT) is omitted
+        # so rows of the transformed matrix stay independent — required for
+        # per-row gather such as embedding lookup.
+        self.apply_left = apply_left
 
         if block_diagonal:
             self.blocks_m = _block_decompose(m)
@@ -54,7 +58,12 @@ class RHT:
             self.n_pad = self.blocks_n[0]
 
         gen = torch.Generator(device='cpu').manual_seed(seed)
-        self.su = (torch.randint(0, 2, (self.m_pad,), generator=gen).float() * 2 - 1).to(device)
+        if apply_left:
+            self.su = (torch.randint(0, 2, (self.m_pad,), generator=gen).float() * 2 - 1).to(device)
+        else:
+            # Identity-equivalent — never read by callers, but kept for API
+            # symmetry with the apply_left=True branch.
+            self.su = torch.ones(self.m_pad, device=device)
         self.sv = (torch.randint(0, 2, (self.n_pad,), generator=gen).float() * 2 - 1).to(device)
 
     def _fht_cols(self, X: torch.Tensor) -> torch.Tensor:
@@ -70,7 +79,11 @@ class RHT:
         return block_diagonal_fht(X.T.contiguous(), self.blocks_m).T
 
     def transform_weights(self, W: torch.Tensor) -> torch.Tensor:
-        """Apply RHT to weight matrix. Returns (m_pad, n_pad)."""
+        """Apply RHT to weight matrix. Returns (m_pad, n_pad).
+
+        When ``apply_left=False`` only the column (right) Hadamard + SV are
+        applied — rows stay independent.
+        """
         m, n = W.shape
         dtype = W.dtype
 
@@ -80,9 +93,10 @@ class RHT:
         W_t = W_padded * self.sv.unsqueeze(0).to(dtype)
         W_t = self._fht_cols(W_t)
 
-        W_t = W_t.T.contiguous()
-        W_t = W_t * self.su.unsqueeze(0).to(dtype)
-        W_t = self._fht_rows(W_t.T.contiguous())
+        if self.apply_left:
+            W_t = W_t.T.contiguous()
+            W_t = W_t * self.su.unsqueeze(0).to(dtype)
+            W_t = self._fht_rows(W_t.T.contiguous())
 
         return W_t
 
@@ -103,15 +117,19 @@ class RHT:
         return H_pad
 
     def inverse_transform_weights(self, W_tilde: torch.Tensor) -> torch.Tensor:
-        """Inverse RHT. Returns (m_orig, n_orig)."""
+        """Inverse RHT. Returns (m_orig, n_orig).
+
+        When ``apply_left=False`` only the column (right) Hadamard + SV are
+        undone.
+        """
         dtype = W_tilde.dtype
 
         W_t = self._fht_cols(W_tilde.clone())
         W_t = W_t * self.sv.unsqueeze(0).to(dtype)
 
-        W_t = self._fht_rows(W_t)
-
-        W_t = W_t * self.su.unsqueeze(1).to(dtype)
+        if self.apply_left:
+            W_t = self._fht_rows(W_t)
+            W_t = W_t * self.su.unsqueeze(1).to(dtype)
 
         return W_t[:self.m_orig, :self.n_orig]
 

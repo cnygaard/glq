@@ -606,3 +606,133 @@ class E8RHTLinear(nn.Module):
     def extra_repr(self) -> str:
         return (f'in_features={self.in_features}, out_features={self.out_features}, '
                 f'bias={self.bias is not None}, m_pad={self.m_pad}, n_pad={self.n_pad}')
+
+
+# ────────────────────────────────────────────────────────────────
+# E8RHTEmbedding — quantized embedding with per-row gather
+# ────────────────────────────────────────────────────────────────
+
+class E8RHTEmbedding(nn.Module):
+    """nn.Embedding equivalent with E8 + right-side-only RHT compressed weight.
+
+    Used for Gemma-4 ``embed_tokens_per_layer``: a [vocab × num_layers·ple_dim]
+    table that's ~4 GB at bf16 for E2B. Storing it via per-row GLQ + on-demand
+    dequant at lookup cuts that to ~1 GB on disk and in GPU.
+
+    Quantization (in ``quantize_model``): right-side RHT only — SV scale plus
+    column FHT. Rows stay independent so a single ``forward(input_ids)`` only
+    needs to dequant the rows actually requested.
+
+    Storage matches ``E8RHTLinear`` for state-dict compatibility:
+        ``Qidxs`` [vocab, n_pad/8] int16, ``SV`` [n_pad] fp16,
+        ``Wscale`` scalar, optional ``Qidxs2`` + ``inv_resid_scale`` for 3+ bpw.
+
+    ``SU`` is registered as a 1-element ones tensor purely so legacy code that
+    iterates state-dict keys doesn't choke; it's never read.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        # n_pad must be a power of 2 for the non-block FHT path. The PLE
+        # weight in Gemma-4 has embedding_dim = num_layers * ple_dim, which is
+        # already a power of 2 for E2B (35 * 256 → not pow2; we'll round up).
+        self.n_pad = 1 << (embedding_dim - 1).bit_length() if embedding_dim > 0 else 1
+
+        self.register_buffer('Qidxs',
+            torch.zeros(num_embeddings, self.n_pad // 8, dtype=torch.int16))
+        self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
+        # SU kept ones-shaped + 1-elem for state-dict round-trip; never used.
+        self.register_buffer('SU', torch.ones(1, dtype=torch.float16))
+        self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
+        # Optional residual stage (3+ bpw)
+        self.register_buffer('Qidxs2',
+            torch.zeros(num_embeddings, self.n_pad // 8, dtype=torch.int16))
+        self.register_buffer('inv_resid_scale', torch.zeros((), dtype=torch.float32))
+        self.codebook = None
+        self.codebook2 = None
+        self._n_stages = 1
+        self._wscale_float = None
+        self._inv_rs_float = 0.0
+        self._rsqrt_n = self.n_pad ** -0.5
+
+    def set_codebook(self, codebook, codebook2=None):
+        """Attach the shared E8ShellCodebook(s). Mirrors E8RHTLinear API."""
+        self.codebook = codebook
+        self.codebook2 = codebook2
+        if self.Wscale.device.type == "meta":
+            self._wscale_float = None
+            return
+        self._wscale_float = self.Wscale.item()
+        self._n_stages = 1
+        if codebook2 is not None and self.inv_resid_scale.abs().item() > 0:
+            self._n_stages = 2
+            self._inv_rs_float = self.inv_resid_scale.item()
+        else:
+            self._inv_rs_float = 0.0
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        """Inject zero defaults for stage-2 buffers absent from 2bpw checkpoints."""
+        primary = prefix + 'Qidxs'
+        if primary in state_dict:
+            for suffix, default_fn in [
+                ('Qidxs2', lambda: torch.zeros(self.num_embeddings,
+                                              self.n_pad // 8, dtype=torch.int16)),
+                ('inv_resid_scale', lambda: torch.zeros((), dtype=torch.float32)),
+            ]:
+                key = prefix + suffix
+                if key not in state_dict:
+                    state_dict[key] = default_fn()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Gather + dequant per-row. ``input_ids`` shape: [...]; returns [..., embedding_dim]."""
+        if self.codebook is None:
+            raise RuntimeError("E8RHTEmbedding.set_codebook() must be called first")
+
+        dev = self.Qidxs.device
+        flat_ids = input_ids.reshape(-1).to(dev)  # [B]
+        # Gather the row of int16 codebook indices.
+        rows1 = self.Qidxs.index_select(0, flat_ids)            # [B, n_pad/8]
+        # Codebook can live on CPU (shared across many quantized modules);
+        # move to our device on first lookup so index_select doesn't trip.
+        cb1 = self.codebook.codebook.to(dev) if self.codebook.codebook.device != dev else self.codebook.codebook
+        # Reinterpret int16 as uint16: codebook has 65536 entries, indices
+        # >= 32768 round-trip through signed int16 as negative values. Mask
+        # to 16 bits to get the unsigned codebook index back.
+        idx1 = rows1.reshape(-1).long() & 0xFFFF
+        deq1 = cb1.index_select(0, idx1)                        # [B*(n_pad/8), 8]
+        deq = deq1.reshape(flat_ids.shape[0], self.n_pad).float()
+
+        if self._n_stages >= 2 and self.codebook2 is not None:
+            rows2 = self.Qidxs2.index_select(0, flat_ids)
+            cb2 = self.codebook2.codebook.to(dev) if self.codebook2.codebook.device != dev else self.codebook2.codebook
+            idx2 = rows2.reshape(-1).long() & 0xFFFF
+            deq2 = cb2.index_select(0, idx2)
+            deq2 = deq2.reshape(flat_ids.shape[0], self.n_pad).float()
+            deq = deq + deq2 * self._inv_rs_float
+
+        # Inverse right-side RHT: undo FHT + SV scale.
+        # Forward quant did: W_t = FHT_cols(W_padded * SV) (no normalization).
+        # Reuse RHT.inverse_transform_weights's convention here: apply FHT
+        # then multiply by SV. (RHT.inverse_transform_weights does not divide
+        # by N, so neither do we — empirical roundtrip with E8RHTLinear's
+        # `dequantize()` confirms this matches the reconstruction.)
+        deq = deq * self._wscale_float
+        deq = fast_hadamard_transform(deq)
+        deq = deq * self.SV.float()
+
+        # Trim to true embedding_dim and cast to caller's compute dtype.
+        # Match what hf_integration set on the module (or fall back to SV's
+        # current dtype, which gets cast to the model dtype by from_pretrained).
+        out_dtype = getattr(self, "_compute_dtype", self.SV.dtype)
+        out = deq[..., :self.embedding_dim].to(out_dtype)
+        return out.reshape(*input_ids.shape, self.embedding_dim)
+
+    def extra_repr(self) -> str:
+        return (f'num_embeddings={self.num_embeddings}, '
+                f'embedding_dim={self.embedding_dim}, n_pad={self.n_pad}')

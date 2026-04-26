@@ -17,7 +17,7 @@ from transformers.quantizers.auto import register_quantization_config, register_
 from transformers.quantizers.base import HfQuantizer
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
-from .quantized_linear import E8RHTLinear
+from .quantized_linear import E8RHTLinear, E8RHTEmbedding
 from .codebook import E8ShellCodebook
 
 
@@ -150,6 +150,35 @@ def _collect_quantized_layer_names(pretrained_path):
     if not keys:
         return None
     return {k[:-len(".Qidxs")] for k in keys}
+
+
+def replace_with_glq_embedding(model, quantized_layers=None):
+    """Replace nn.Embedding modules with E8RHTEmbedding when checkpoint has GLQ
+    payload for them.
+
+    Used by Gemma-4 E2B/E4B where ``embed_tokens_per_layer`` (a [vocab × ~9k]
+    table) gets right-side-only RHT-quantized to cut its 4 GB bf16 footprint
+    to ~1 GB on disk and in GPU. ``quantized_layers`` is the set returned by
+    ``_collect_quantized_layer_names`` and is matched verbatim against
+    ``model.named_modules()`` paths.
+    """
+    if quantized_layers is None:
+        return False
+    has_replaced = False
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Embedding):
+            continue
+        if name not in quantized_layers:
+            continue
+        with torch.device("meta"):
+            new_module = E8RHTEmbedding(
+                num_embeddings=module.num_embeddings,
+                embedding_dim=module.embedding_dim,
+            )
+        new_module.requires_grad_(False)
+        model.set_submodule(name, new_module)
+        has_replaced = True
+    return has_replaced
 
 
 def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None):
@@ -351,6 +380,10 @@ class GLQQuantizer(HfQuantizer):
             install_nemotron_h_state_dict_renames(model)
         replaced = replace_with_glq_linear(
             model, block_diagonal=block_diag, quantized_layers=quantized_layers)
+        # Gemma-4 PLE embedding (and any other quantized nn.Embedding) gets
+        # swapped to E8RHTEmbedding when the saved checkpoint has its GLQ
+        # payload. No-op for older single-modal checkpoints.
+        replace_with_glq_embedding(model, quantized_layers=quantized_layers)
         if not replaced and not n_fused:
             import logging
             logging.getLogger(__name__).warning(
@@ -392,9 +425,21 @@ class GLQQuantizer(HfQuantizer):
         elif max_bpw >= 3:
             codebook2 = codebook.make_small(256)
 
+        # Detect the compute dtype the rest of the model is using so the
+        # E8RHTEmbedding output matches (Gemma-4 lm_head is bf16; F.linear
+        # rejects mismatched dtypes). Some test mocks have no `config`.
+        cfg = getattr(model, "config", None)
+        compute_dtype = (getattr(cfg, "torch_dtype", None)
+                         or getattr(cfg, "dtype", None)
+                         or torch.bfloat16) if cfg is not None else torch.bfloat16
+        if isinstance(compute_dtype, str):
+            compute_dtype = getattr(torch, compute_dtype, torch.bfloat16)
+
         for module in model.modules():
-            if isinstance(module, E8RHTLinear):
+            if isinstance(module, (E8RHTLinear, E8RHTEmbedding)):
                 module.set_codebook(codebook, codebook2=codebook2)
+            if isinstance(module, E8RHTEmbedding):
+                module._compute_dtype = compute_dtype
 
         # INT8 KV cache: attach factory so model.generate() uses it
         kv_bits = getattr(self.quantization_config, 'kv_cache_bits', 16)
