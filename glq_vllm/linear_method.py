@@ -10,6 +10,7 @@ Supports:
 
 import math
 import os
+import sys
 from typing import Callable
 
 import torch
@@ -20,6 +21,8 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from glq.codebook import E8ShellCodebook
 from glq import inference_kernel as _ik
 from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext
+from glq.hadamard import _block_decompose
+from glq.quantized_linear import _pack_block_meta
 
 # CUDA C FHT kernels are 1.3-1.6× faster than Triton. JIT-compiled on first use.
 _VLLM_USE_TRITON = False
@@ -111,6 +114,25 @@ def _glq_pad(n):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _detect_block_diag(m_pad: int, n_pad: int):
+    """Return (is_block_diag, blocks_m, blocks_n) for a given buffer shape.
+
+    Block-diagonal checkpoints (Phase B, post-glq v0.2.9) land non-power-of-2
+    ``m_pad``/``n_pad`` equal to the true ``out_features``/``in_features``.
+    Legacy pow2 checkpoints land the padded size. Decomposing the exact dim
+    into a sum of power-of-2 blocks lets the fused kernel run the multiblock
+    FHT without padding waste.
+    """
+    is_bd = not (_is_pow2(m_pad) and _is_pow2(n_pad))
+    blocks_m = _block_decompose(m_pad) if is_bd else [m_pad]
+    blocks_n = _block_decompose(n_pad) if is_bd else [n_pad]
+    return is_bd, blocks_m, blocks_n
+
+
 def _glq_weight_loader(param, loaded_weight, *args, **kwargs):
     """GLQ weight loader — handles per-expert, shared, and standard params."""
     expert_id = kwargs.get('expert_id')
@@ -169,6 +191,16 @@ def _register_glq_buffers(layer, prefix, out_size, in_size):
     setattr(layer, f'Qidxs2{p}', _make_glq_param(
         torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
     setattr(layer, f'inv_resid_scale{p}', _make_glq_param(
+        torch.zeros((), dtype=torch.float32)))
+    # Phase D: N-stage RVQ for 5-8 bpw. Zero-init buffers are safe to ship —
+    # forward() only reads them when _glq_n_stages >= 3 / >= 4.
+    setattr(layer, f'Qidxs3{p}', _make_glq_param(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+    setattr(layer, f'inv_resid_scale2{p}', _make_glq_param(
+        torch.zeros((), dtype=torch.float32)))
+    setattr(layer, f'Qidxs4{p}', _make_glq_param(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+    setattr(layer, f'inv_resid_scale3{p}', _make_glq_param(
         torch.zeros((), dtype=torch.float32)))
     return m_pad, n_pad
 
@@ -279,11 +311,18 @@ class GLQShardedParameter(BasevLLMParameter):
 
 def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
                      has_stage2, inv_rs, Qidxs2, out_features, in_features,
-                     m_pad, n_pad, log_n, log_m):
+                     m_pad, n_pad, log_n, log_m,
+                     Qidxs3=None, inv_rs2=0.0, Qidxs4=None, inv_rs3=0.0,
+                     block_diag_meta=None):
     """Run input RHT → dequant+matmul → output RHT for explicit tensors.
 
-    Uses torch.ops.glq.* custom ops when registered (for torch.compile/CUDA graph
-    compatibility), falling back to direct CUDA C or Triton calls.
+    Block-diagonal (Phase B) path: when ``block_diag_meta`` is provided, dispatches
+    to the single-call ``glq_fused_linear_block_diag_cuda`` which handles
+    input-RHT + dequant+matmul + output-RHT for non-power-of-2 dims in one
+    host call. Pow2 path falls through to the legacy 3-call sequence.
+
+    Stages 3-4 (Phase D, 5-8 bpw) reuse the primary 65536-entry E8 codebook —
+    matches the convention in glq.quantized_linear's fallback path.
     """
     dtype = x.dtype
     B = x.shape[0]
@@ -300,6 +339,56 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         SV = SV.to(device)
     if Qidxs2 is not None and Qidxs2.device != x.device:
         Qidxs2 = Qidxs2.to(device)
+    if Qidxs3 is not None and Qidxs3.device != x.device:
+        Qidxs3 = Qidxs3.to(device)
+    if Qidxs4 is not None and Qidxs4.device != x.device:
+        Qidxs4 = Qidxs4.to(device)
+
+    primary_cb = cb.codebook_half
+    cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
+
+    if _GLQ_DEBUG:
+        print(f"GLQ_DEBUG _glq_apply_shard: m_pad={m_pad} n_pad={n_pad} "
+              f"bd_meta={'set' if block_diag_meta is not None else 'NONE'} "
+              f"_use_cuda_c={_use_cuda_c}", file=sys.stderr, flush=True)
+    # ── Block-diagonal fast path (Phase B + D) ──────────────────────
+    if (block_diag_meta is not None and _use_cuda_c
+            and hasattr(_ik._glq_cuda, "glq_fused_linear_block_diag_cuda")
+            and n_pad <= 32768 and m_pad <= 32768):
+        _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
+        _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+        bn_tensor = block_diag_meta["blocks_n_tensor"]  # CPU int64
+        bm_tensor = block_diag_meta["blocks_m_tensor"]
+        # Lazy push of packed metadata to GPU (cache on the meta dict so
+        # repeated forwards reuse it).
+        bn_meta = block_diag_meta.get("blocks_n_meta_gpu")
+        bm_meta = block_diag_meta.get("blocks_m_meta_gpu")
+        if bn_meta is None or bn_meta.device != device:
+            bn_meta = block_diag_meta["blocks_n_meta_cpu"].to(device, non_blocking=True)
+            bm_meta = block_diag_meta["blocks_m_meta_cpu"].to(device, non_blocking=True)
+            block_diag_meta["blocks_n_meta_gpu"] = bn_meta
+            block_diag_meta["blocks_m_meta_gpu"] = bm_meta
+        q2 = Qidxs2 if has_stage2 else _empty_i16
+        cb2_arg = cb2_half if has_stage2 and cb2_half is not None else _empty_f16
+        q3 = Qidxs3 if Qidxs3 is not None else _empty_i16
+        cb3_arg = primary_cb if Qidxs3 is not None else _empty_f16
+        q4 = Qidxs4 if Qidxs4 is not None else _empty_i16
+        cb4_arg = primary_cb if Qidxs4 is not None else _empty_f16
+        y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
+            x.half().contiguous(), SV, SU,
+            Qidxs, primary_cb,
+            float(wscale),
+            in_features, out_features,
+            n_pad, m_pad,
+            bn_tensor, bm_tensor,
+            bn_meta, bm_meta,
+            q2, cb2_arg, float(inv_rs) if has_stage2 else 0.0,
+            q3, cb3_arg, float(inv_rs2) if Qidxs3 is not None else 0.0,
+            q4, cb4_arg, float(inv_rs3) if Qidxs4 is not None else 0.0,
+        )
+        if dtype != torch.float16:
+            y = y.to(dtype)
+        return y
 
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
@@ -324,12 +413,16 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 
     # Dequant + matmul (always through glq_dequant_matmul which handles dispatch)
     cb_packed = getattr(cb, 'codebook_packed', None)
-    cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
+    # Phase D: stages 3/4 reuse the primary 65536-entry codebook.
+    cb3_arg = primary_cb if Qidxs3 is not None else None
+    cb4_arg = primary_cb if Qidxs4 is not None else None
 
     y_rht = glq_dequant_matmul(
-        x_rht, Qidxs, cb.codebook_half, wscale,
+        x_rht, Qidxs, primary_cb, wscale,
         Qidxs2=Qidxs2, codebook2=cb2_half,
-        inv_resid_scale=inv_rs, codebook_packed=cb_packed)
+        inv_resid_scale=inv_rs, codebook_packed=cb_packed,
+        Qidxs3=Qidxs3, codebook3=cb3_arg, inv_resid_scale2=inv_rs2,
+        Qidxs4=Qidxs4, codebook4=cb4_arg, inv_resid_scale3=inv_rs3)
 
     if _GLQ_DEBUG:
         torch.cuda.synchronize()
@@ -361,8 +454,7 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 
 
 def _glq_apply_single(x, layer, prefix, cb, cb2, device):
-    """Run input RHT → dequant+matmul → output RHT for one set of GLQ buffers."""
-    dtype = x.dtype
+    """Apply one set of GLQ buffers stored on the layer under `{name}{prefix}`."""
     Qidxs = getattr(layer, f'Qidxs{prefix}').to(device)
     SU = getattr(layer, f'SU{prefix}').to(device)
     SV = getattr(layer, f'SV{prefix}').to(device)
@@ -376,49 +468,27 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
     out_features = getattr(layer, f'_glq_out{prefix}')
     in_features = getattr(layer, f'_glq_in{prefix}')
 
-    B = x.shape[0]
-
-    # Input RHT
-    x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
-    if n_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
-        _ik._glq_cuda.glq_input_rht_cuda(
-            x.half().contiguous(), SV, x_rht,
-            in_features, in_features,
-            1.0 / math.sqrt(n_pad), n_pad, log_n)
-    else:
-        from glq.quantized_linear import _input_rht_kernel
-        _input_rht_kernel[(B,)](
-            x, SV, x_rht, in_features, x.stride(0),
-            1.0 / math.sqrt(n_pad), N=n_pad, LOG_N=log_n, num_warps=8)
-
-    # Dequant + matmul
-    cb_packed = getattr(cb, 'codebook_packed', None)
     Qidxs2 = getattr(layer, f'Qidxs2{prefix}').to(device) if has_stage2 else None
-    cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
-
-    y_rht = glq_dequant_matmul(
-        x_rht, Qidxs, cb.codebook_half, wscale,
-        Qidxs2=Qidxs2, codebook2=cb2_half,
-        inv_resid_scale=inv_rs, codebook_packed=cb_packed)
-
-    # Output RHT
-    if m_pad <= 16384 and _ik._glq_cuda is not None and not _VLLM_USE_TRITON:
-        y = torch.empty(B, out_features, dtype=torch.float16, device=device)
-        _ik._glq_cuda.glq_output_rht_cuda(
-            y_rht, SU, y, out_features, m_pad,
-            log_m, 1.0 / math.sqrt(m_pad))
-        if dtype != torch.float16:
-            y = y.to(dtype)
-    else:
-        from glq.quantized_linear import _output_rht_kernel
-        output_fp16 = (dtype == torch.float16)
-        y = torch.empty(B, out_features, dtype=dtype, device=device)
-        _output_rht_kernel[(B,)](
-            y_rht, SU, y, out_features, y_rht.stride(0), y.stride(0),
-            1.0 / math.sqrt(m_pad),
-            OUTPUT_FP16=output_fp16, M=m_pad, LOG_M=log_m, num_warps=8)
-
-    return y
+    # Phase D N-stage: stage 3/4 tensors when _glq_n_stages >= 3 / 4.
+    n_stages = getattr(layer, f'_glq_n_stages{prefix}', 2 if has_stage2 else 1)
+    inv_rs2 = getattr(layer, f'_glq_inv_rs2{prefix}', 0.0)
+    inv_rs3 = getattr(layer, f'_glq_inv_rs3{prefix}', 0.0)
+    Qidxs3 = (getattr(layer, f'Qidxs3{prefix}').to(device)
+              if n_stages >= 3 else None)
+    Qidxs4 = (getattr(layer, f'Qidxs4{prefix}').to(device)
+              if n_stages >= 4 else None)
+    # Phase B block-diagonal metadata — set by process_weights_after_loading.
+    block_diag_meta = getattr(layer, f'_glq_bd_meta{prefix}', None)
+    return _glq_apply_shard(
+        x, device, cb, cb2,
+        Qidxs=Qidxs, SU=SU, SV=SV, wscale=wscale,
+        has_stage2=has_stage2, inv_rs=inv_rs, Qidxs2=Qidxs2,
+        out_features=out_features, in_features=in_features,
+        m_pad=m_pad, n_pad=n_pad, log_n=log_n, log_m=log_m,
+        Qidxs3=Qidxs3, inv_rs2=inv_rs2,
+        Qidxs4=Qidxs4, inv_rs3=inv_rs3,
+        block_diag_meta=block_diag_meta,
+    )
 
 
 class GLQLinearMethod(LinearMethodBase):
@@ -477,6 +547,15 @@ class GLQLinearMethod(LinearMethodBase):
                 output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
             layer.inv_resid_scale = GLQShardedParameter(
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
+            # Phase D: stage 3/4 buffers per shard. Zero-init for 2-stage models.
+            layer.Qidxs3 = GLQShardedParameter(
+                output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
+            layer.inv_resid_scale2 = GLQShardedParameter(
+                [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
+            layer.Qidxs4 = GLQShardedParameter(
+                output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
+            layer.inv_resid_scale3 = GLQShardedParameter(
+                [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
 
             layer.glq_n_pad = n_pad
 
@@ -499,47 +578,42 @@ class GLQLinearMethod(LinearMethodBase):
         device = next(layer.parameters()).device
         bpw = getattr(layer, 'glq_bpw', 2)
 
-        # Mamba layers: dequant to dense weight for compatibility
-        # (Mamba mixer overwrites weight_loader, causing weight loading conflict)
-        if (hasattr(layer, 'weight') and layer.weight.numel() <= 1
-                and hasattr(layer, 'Qidxs') and not getattr(layer, 'glq_is_fused', False)):
-            from .dequant import dequantize_glq_weight, get_codebook, get_codebook2
-            cb = get_codebook()
-            inv_rs = layer.inv_resid_scale.item() if hasattr(layer, 'inv_resid_scale') else 0.0
-            cb2 = get_codebook2(4) if inv_rs != 0.0 else None
-            weight = dequantize_glq_weight(
-                layer.Qidxs.data.cpu(), layer.SU.data.cpu(), layer.SV.data.cpu(),
-                layer.Wscale.data.cpu(), cb,
-                Qidxs2=layer.Qidxs2.data.cpu() if inv_rs != 0.0 else None,
-                inv_resid_scale=inv_rs, codebook2=cb2,
-                out_features=layer.glq_out_features, in_features=layer.glq_in_features,
-            )
-            layer.weight = torch.nn.Parameter(weight.to(device), requires_grad=False)
-            layer._glq_use_dense = True
-            # Clean up GLQ buffers
-            for attr in ['Qidxs', 'SU', 'SV', 'Wscale', 'Qidxs2', 'inv_resid_scale']:
-                if hasattr(layer, attr):
-                    delattr(layer, attr)
-            return
+        # NOTE: a previous Mamba dequant fallback (matched on
+        # ``layer.weight.numel() <= 1``) accidentally caught our own dummy
+        # weight stub from ``create_weights``, dequantising every non-fused
+        # GLQ linear back to bf16 and silently bypassing the kernel path.
+        # That fallback was removed (sglang fork reverted the equivalent
+        # commit). If a future model genuinely needs dense fallback, gate
+        # it on a model-specific class check rather than a generic numel
+        # heuristic.
 
         # Ensure shared codebook is on the right device
-        # Determine max_bpw across all shards
+        # Determine max_bpw across all shards. Stage 3/4 imply 5+ bpw.
         max_bpw = 2
         if getattr(layer, 'glq_is_fused', False):
             for i in range(layer.glq_num_shards):
                 inv_rs = layer.inv_resid_scale.get_shard(i).item()
-                if inv_rs != 0.0:
+                inv_rs2 = (layer.inv_resid_scale2.get_shard(i).item()
+                           if hasattr(layer, 'inv_resid_scale2') else 0.0)
+                if inv_rs2 != 0.0:
+                    max_bpw = max(max_bpw, max(bpw, 5))
+                elif inv_rs != 0.0:
                     max_bpw = max(max_bpw, bpw)
         else:
             inv_rs = layer.inv_resid_scale.item()
-            if inv_rs != 0.0:
+            inv_rs2 = (layer.inv_resid_scale2.item()
+                       if hasattr(layer, 'inv_resid_scale2') else 0.0)
+            if inv_rs2 != 0.0:
+                max_bpw = max(bpw, 5)
+            elif inv_rs != 0.0:
                 max_bpw = bpw
 
         _ensure_codebook(device, max_bpw=max_bpw)
         _try_load_cuda_ext()
 
-        # Ensure all weight tensors are on GPU
-        for attr in ['Qidxs', 'SU', 'SV', 'Wscale', 'Qidxs2', 'inv_resid_scale']:
+        # Ensure all weight tensors are on GPU (includes Phase D stage 3/4).
+        for attr in ['Qidxs', 'SU', 'SV', 'Wscale', 'Qidxs2', 'inv_resid_scale',
+                     'Qidxs3', 'inv_resid_scale2', 'Qidxs4', 'inv_resid_scale3']:
             t = getattr(layer, attr, None)
             if t is not None and hasattr(t, 'device') and t.device != device:
                 setattr(layer, attr, torch.nn.Parameter(t.data.to(device), requires_grad=False))
@@ -547,32 +621,82 @@ class GLQLinearMethod(LinearMethodBase):
         # Cache scalars for all shards
         if getattr(layer, 'glq_is_fused', False):
             layer._glq_shard_meta = []
-            n_pad = layer.glq_n_pad
+            # Phase B: recover actual (possibly non-pow2) shard shapes from the
+            # loaded per-shard Qidxs buffers. At register time we sized to pow2;
+            # the weight loader overwrote with whatever the checkpoint contained.
             for i in range(layer.glq_num_shards):
                 out_sz = layer.glq_shard_sizes[i]
-                m_pad = _glq_pad(out_sz)
+                qidxs_i = layer.Qidxs.get_shard(i)
+                if qidxs_i.dim() == 2:
+                    m_pad = qidxs_i.shape[0]
+                    n_pad = qidxs_i.shape[1] * 8
+                else:
+                    m_pad = _glq_pad(out_sz)
+                    n_pad = layer.glq_n_pad
                 inv_rs_val = layer.inv_resid_scale.get_shard(i).item()
+                # Phase D: detect active stage count from non-zero inv_resid_scale*.
+                inv_rs2_val = (layer.inv_resid_scale2.get_shard(i).item()
+                               if hasattr(layer, 'inv_resid_scale2') else 0.0)
+                inv_rs3_val = (layer.inv_resid_scale3.get_shard(i).item()
+                               if hasattr(layer, 'inv_resid_scale3') else 0.0)
+                if inv_rs3_val != 0.0:
+                    n_stages = 4
+                elif inv_rs2_val != 0.0:
+                    n_stages = 3
+                elif inv_rs_val != 0.0:
+                    n_stages = 2
+                else:
+                    n_stages = 1
+                is_bd, blocks_m, blocks_n = _detect_block_diag(m_pad, n_pad)
+                bd_meta = None
+                if is_bd:
+                    bd_meta = {
+                        "blocks_n_tensor": torch.tensor(blocks_n, dtype=torch.int64, device='cpu'),
+                        "blocks_m_tensor": torch.tensor(blocks_m, dtype=torch.int64, device='cpu'),
+                        "blocks_n_meta_cpu": _pack_block_meta(blocks_n),
+                        "blocks_m_meta_cpu": _pack_block_meta(blocks_m),
+                        "blocks_n_meta_gpu": None,
+                        "blocks_m_meta_gpu": None,
+                    }
                 layer._glq_shard_meta.append({
                     'wscale': layer.Wscale.get_shard(i).item(),
                     'has_stage2': inv_rs_val != 0.0,
                     'inv_rs': inv_rs_val,
+                    'n_stages': n_stages,
+                    'inv_rs2': inv_rs2_val,
+                    'inv_rs3': inv_rs3_val,
                     'out': out_sz,
                     'in': layer.glq_in_features,
                     'm_pad': m_pad,
                     'n_pad': n_pad,
-                    'log_n': int(math.log2(n_pad)),
-                    'log_m': int(math.log2(m_pad)),
+                    'log_n': int(math.log2(n_pad)) if _is_pow2(n_pad) else 0,
+                    'log_m': int(math.log2(m_pad)) if _is_pow2(m_pad) else 0,
+                    'bd_meta': bd_meta,
                 })
         else:
             inv_rs = layer.inv_resid_scale.item()
             layer._glq_wscale = layer.Wscale.item()
             layer._glq_has_stage2 = inv_rs != 0.0
             layer._glq_inv_rs = inv_rs
+            # Phase D: detect N-stage from non-zero inv_resid_scale*.
+            inv_rs2 = (layer.inv_resid_scale2.item()
+                       if hasattr(layer, 'inv_resid_scale2') else 0.0)
+            inv_rs3 = (layer.inv_resid_scale3.item()
+                       if hasattr(layer, 'inv_resid_scale3') else 0.0)
+            if inv_rs3 != 0.0:
+                layer._glq_n_stages = 4
+            elif inv_rs2 != 0.0:
+                layer._glq_n_stages = 3
+            elif inv_rs != 0.0:
+                layer._glq_n_stages = 2
+            else:
+                layer._glq_n_stages = 1
+            layer._glq_inv_rs2 = inv_rs2
+            layer._glq_inv_rs3 = inv_rs3
             # Update dims from actual loaded Qidxs shape (auto-resize may have changed them)
             if hasattr(layer, 'Qidxs') and layer.Qidxs.dim() == 2:
                 layer._glq_m_pad = layer.Qidxs.shape[0]
                 layer._glq_n_pad = layer.Qidxs.shape[1] * 8
-                # out/in features = unpadded from original create_weights
                 layer._glq_out = layer.glq_out_features
                 layer._glq_in = layer.glq_in_features
             else:
@@ -580,8 +704,28 @@ class GLQLinearMethod(LinearMethodBase):
                 layer._glq_n_pad = layer.glq_n_pad
                 layer._glq_out = layer.glq_out_features
                 layer._glq_in = layer.glq_in_features
-            layer._glq_log_n = int(math.log2(layer._glq_n_pad))
-            layer._glq_log_m = int(math.log2(layer._glq_m_pad))
+            # Phase B: detect block-diag from the loaded (possibly non-pow2)
+            # buffer shape, build block decomposition + packed metadata so
+            # the forward path can dispatch to glq_fused_linear_block_diag_cuda.
+            is_bd, blocks_m, blocks_n = _detect_block_diag(
+                layer._glq_m_pad, layer._glq_n_pad)
+            if is_bd:
+                layer._glq_bd_meta = {
+                    "blocks_n_tensor": torch.tensor(blocks_n, dtype=torch.int64, device='cpu'),
+                    "blocks_m_tensor": torch.tensor(blocks_m, dtype=torch.int64, device='cpu'),
+                    "blocks_n_meta_cpu": _pack_block_meta(blocks_n),
+                    "blocks_m_meta_cpu": _pack_block_meta(blocks_m),
+                    "blocks_n_meta_gpu": None,
+                    "blocks_m_meta_gpu": None,
+                }
+                layer._glq_log_n = (int(math.log2(layer._glq_n_pad))
+                                    if _is_pow2(layer._glq_n_pad) else 0)
+                layer._glq_log_m = (int(math.log2(layer._glq_m_pad))
+                                    if _is_pow2(layer._glq_m_pad) else 0)
+            else:
+                layer._glq_bd_meta = None
+                layer._glq_log_n = int(math.log2(layer._glq_n_pad))
+                layer._glq_log_m = int(math.log2(layer._glq_m_pad))
 
         # Remove weight_loader from params — no longer needed after loading,
         # and function references prevent vLLM v1 serialization
@@ -614,6 +758,11 @@ class GLQLinearMethod(LinearMethodBase):
             shard_outputs = []
             for i in range(layer.glq_num_shards):
                 meta = layer._glq_shard_meta[i]
+                n_stages = meta.get('n_stages', 2 if meta['has_stage2'] else 1)
+                Qidxs3 = (layer.Qidxs3.get_shard(i)
+                          if n_stages >= 3 and hasattr(layer, 'Qidxs3') else None)
+                Qidxs4 = (layer.Qidxs4.get_shard(i)
+                          if n_stages >= 4 and hasattr(layer, 'Qidxs4') else None)
                 y_shard = _glq_apply_shard(
                     x, device, cb, cb2,
                     Qidxs=layer.Qidxs.get_shard(i),
@@ -629,6 +778,9 @@ class GLQLinearMethod(LinearMethodBase):
                     n_pad=meta['n_pad'],
                     log_n=meta['log_n'],
                     log_m=meta['log_m'],
+                    Qidxs3=Qidxs3, inv_rs2=meta.get('inv_rs2', 0.0),
+                    Qidxs4=Qidxs4, inv_rs3=meta.get('inv_rs3', 0.0),
+                    block_diag_meta=meta.get('bd_meta'),
                 )
                 shard_outputs.append(y_shard)
             y = torch.cat(shard_outputs, dim=-1)

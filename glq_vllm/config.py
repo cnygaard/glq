@@ -3,7 +3,7 @@
 from typing import Any
 
 import torch
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from .linear_method import GLQLinearMethod
@@ -38,10 +38,47 @@ class GLQvLLMConfig(QuantizationConfig):
             layer_bpw=config.get("layer_bpw", None),
         )
 
+    def _lookup_bpw(self, prefix: str) -> int | None:
+        """Return the bpw for ``prefix`` from ``layer_bpw``, or None.
+
+        vLLM rewrites checkpoint names twice on the way to the layer
+        prefix passed here, so we try every form a checkpoint key
+        could legally take:
+
+        - ``language_model.`` strip (Gemma-4 text-only path collapses
+          ``model.language_model.*`` to ``model.*``).
+        - Stacked merge: q/k/v_proj into ``qkv_proj`` and
+          gate/up_proj into ``gate_up_proj``. The whitelist lists the
+          unmerged sublayers; the prefix here is the merged name.
+        """
+        if prefix in self.layer_bpw:
+            return self.layer_bpw[prefix]
+        forms = {prefix}
+        if prefix.startswith("model.") and ".language_model." not in prefix:
+            forms.add("model.language_model." + prefix[len("model."):])
+        merge_map = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
+                     ".gate_up_proj": (".gate_proj", ".up_proj")}
+        best = None
+        for f in forms:
+            for merged, parts in merge_map.items():
+                if f.endswith(merged):
+                    root = f[:-len(merged)]
+                    for p in parts:
+                        b = self.layer_bpw.get(root + p)
+                        if b is not None:
+                            best = max(best or 0, int(b))
+            if f in self.layer_bpw:
+                best = max(best or 0, int(self.layer_bpw[f]))
+        return best
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):
-            bpw = self.layer_bpw.get(prefix, self.bpw)
-            return GLQLinearMethod(self, bpw=bpw)
+            bpw = self._lookup_bpw(prefix)
+            if self.layer_bpw and bpw is None:
+                # Layer is bf16 in the checkpoint — return default so
+                # vLLM loads `.weight` instead of expecting GLQ buffers.
+                return UnquantizedLinearMethod()
+            return GLQLinearMethod(self, bpw=bpw if bpw is not None else self.bpw)
 
         # FusedMoE layers — lazy import to avoid circular deps
         try:
