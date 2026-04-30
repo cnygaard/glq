@@ -33,6 +33,23 @@ _codebook = None
 _codebook2_small = None
 _codebook_device = None
 
+# Per-device cache of empty sentinel tensors used in the block-diag fast
+# path (passed to the kernel as ``cb_packed`` / ``Qidxs2`` etc. when the
+# corresponding stage is inactive). Allocating ``torch.empty(0, ...)`` on
+# every apply was ~8 extra dispatches per layer.
+_empty_sentinels: dict[torch.device, tuple] = {}
+
+
+def _get_empty_sentinels(device):
+    s = _empty_sentinels.get(device)
+    if s is None:
+        s = (
+            torch.empty(0, dtype=torch.int16, device=device),
+            torch.empty(0, dtype=torch.float16, device=device),
+        )
+        _empty_sentinels[device] = s
+    return s
+
 
 def _ensure_codebook(device, max_bpw: int = 2):
     """Lazy-load codebook and move to target device. Upgrades cb2 if higher bpw needed."""
@@ -330,19 +347,9 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     _use_cuda_c = _ik._glq_cuda is not None and not _VLLM_USE_TRITON
     _GLQ_DEBUG = os.environ.get("GLQ_DEBUG") == "1"
 
-    # Ensure weight tensors on device (safety net for fused QKV / first profile_run)
-    if Qidxs.device != x.device:
-        Qidxs = Qidxs.to(device)
-    if SU.device != x.device:
-        SU = SU.to(device)
-    if SV.device != x.device:
-        SV = SV.to(device)
-    if Qidxs2 is not None and Qidxs2.device != x.device:
-        Qidxs2 = Qidxs2.to(device)
-    if Qidxs3 is not None and Qidxs3.device != x.device:
-        Qidxs3 = Qidxs3.to(device)
-    if Qidxs4 is not None and Qidxs4.device != x.device:
-        Qidxs4 = Qidxs4.to(device)
+    # Weight tensors are guaranteed on GPU after process_weights_after_loading
+    # (it walks GLQShardedParameter._shard_data too); skipping the per-call
+    # ``.to(device)`` guards saves ~6 dispatches per layer.
 
     primary_cb = cb.codebook_half
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
@@ -355,19 +362,11 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     if (block_diag_meta is not None and _use_cuda_c
             and hasattr(_ik._glq_cuda, "glq_fused_linear_block_diag_cuda")
             and n_pad <= 32768 and m_pad <= 32768):
-        _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
-        _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+        _empty_i16, _empty_f16 = _get_empty_sentinels(device)
         bn_tensor = block_diag_meta["blocks_n_tensor"]  # CPU int64
         bm_tensor = block_diag_meta["blocks_m_tensor"]
-        # Lazy push of packed metadata to GPU (cache on the meta dict so
-        # repeated forwards reuse it).
-        bn_meta = block_diag_meta.get("blocks_n_meta_gpu")
-        bm_meta = block_diag_meta.get("blocks_m_meta_gpu")
-        if bn_meta is None or bn_meta.device != device:
-            bn_meta = block_diag_meta["blocks_n_meta_cpu"].to(device, non_blocking=True)
-            bm_meta = block_diag_meta["blocks_m_meta_cpu"].to(device, non_blocking=True)
-            block_diag_meta["blocks_n_meta_gpu"] = bn_meta
-            block_diag_meta["blocks_m_meta_gpu"] = bm_meta
+        bn_meta = block_diag_meta["blocks_n_meta_gpu"]
+        bm_meta = block_diag_meta["blocks_m_meta_gpu"]
         q2 = Qidxs2 if has_stage2 else _empty_i16
         cb2_arg = cb2_half if has_stage2 and cb2_half is not None else _empty_f16
         q3 = Qidxs3 if Qidxs3 is not None else _empty_i16
@@ -454,10 +453,14 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 
 
 def _glq_apply_single(x, layer, prefix, cb, cb2, device):
-    """Apply one set of GLQ buffers stored on the layer under `{name}{prefix}`."""
-    Qidxs = getattr(layer, f'Qidxs{prefix}').to(device)
-    SU = getattr(layer, f'SU{prefix}').to(device)
-    SV = getattr(layer, f'SV{prefix}').to(device)
+    """Apply one set of GLQ buffers stored on the layer under `{name}{prefix}`.
+
+    Tensors are guaranteed to live on ``device`` after
+    ``process_weights_after_loading`` — no per-call ``.to(device)``.
+    """
+    Qidxs = getattr(layer, f'Qidxs{prefix}')
+    SU = getattr(layer, f'SU{prefix}')
+    SV = getattr(layer, f'SV{prefix}')
     wscale = getattr(layer, f'_glq_wscale{prefix}')
     has_stage2 = getattr(layer, f'_glq_has_stage2{prefix}')
     inv_rs = getattr(layer, f'_glq_inv_rs{prefix}')
@@ -468,15 +471,13 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
     out_features = getattr(layer, f'_glq_out{prefix}')
     in_features = getattr(layer, f'_glq_in{prefix}')
 
-    Qidxs2 = getattr(layer, f'Qidxs2{prefix}').to(device) if has_stage2 else None
+    Qidxs2 = getattr(layer, f'Qidxs2{prefix}') if has_stage2 else None
     # Phase D N-stage: stage 3/4 tensors when _glq_n_stages >= 3 / 4.
     n_stages = getattr(layer, f'_glq_n_stages{prefix}', 2 if has_stage2 else 1)
     inv_rs2 = getattr(layer, f'_glq_inv_rs2{prefix}', 0.0)
     inv_rs3 = getattr(layer, f'_glq_inv_rs3{prefix}', 0.0)
-    Qidxs3 = (getattr(layer, f'Qidxs3{prefix}').to(device)
-              if n_stages >= 3 else None)
-    Qidxs4 = (getattr(layer, f'Qidxs4{prefix}').to(device)
-              if n_stages >= 4 else None)
+    Qidxs3 = getattr(layer, f'Qidxs3{prefix}') if n_stages >= 3 else None
+    Qidxs4 = getattr(layer, f'Qidxs4{prefix}') if n_stages >= 4 else None
     # Phase B block-diagonal metadata — set by process_weights_after_loading.
     block_diag_meta = getattr(layer, f'_glq_bd_meta{prefix}', None)
     return _glq_apply_shard(
@@ -612,10 +613,23 @@ class GLQLinearMethod(LinearMethodBase):
         _try_load_cuda_ext()
 
         # Ensure all weight tensors are on GPU (includes Phase D stage 3/4).
+        # For ``GLQShardedParameter``, the per-shard buffers live in
+        # ``_shard_data`` (a Python list); moving the outer ``.data`` to
+        # GPU does not propagate, so we walk the list explicitly.
+        # Without this, every ``layer.Qidxs.get_shard(i)`` call returns
+        # a CPU tensor and ``_glq_apply_shard`` triggers an implicit
+        # ``.to(device)`` per call → ~1600 redundant ``aten::copy_``
+        # dispatches per decode token on Gemma-4-E2B.
         for attr in ['Qidxs', 'SU', 'SV', 'Wscale', 'Qidxs2', 'inv_resid_scale',
                      'Qidxs3', 'inv_resid_scale2', 'Qidxs4', 'inv_resid_scale3']:
             t = getattr(layer, attr, None)
-            if t is not None and hasattr(t, 'device') and t.device != device:
+            if t is None:
+                continue
+            if isinstance(t, GLQShardedParameter):
+                for i, sd in enumerate(t._shard_data):
+                    if sd.device != device:
+                        t._shard_data[i] = sd.to(device)
+            elif hasattr(t, 'device') and t.device != device:
                 setattr(layer, attr, torch.nn.Parameter(t.data.to(device), requires_grad=False))
 
         # Cache scalars for all shards
@@ -653,10 +667,8 @@ class GLQLinearMethod(LinearMethodBase):
                     bd_meta = {
                         "blocks_n_tensor": torch.tensor(blocks_n, dtype=torch.int64, device='cpu'),
                         "blocks_m_tensor": torch.tensor(blocks_m, dtype=torch.int64, device='cpu'),
-                        "blocks_n_meta_cpu": _pack_block_meta(blocks_n),
-                        "blocks_m_meta_cpu": _pack_block_meta(blocks_m),
-                        "blocks_n_meta_gpu": None,
-                        "blocks_m_meta_gpu": None,
+                        "blocks_n_meta_gpu": _pack_block_meta(blocks_n).to(device, non_blocking=True),
+                        "blocks_m_meta_gpu": _pack_block_meta(blocks_m).to(device, non_blocking=True),
                     }
                 layer._glq_shard_meta.append({
                     'wscale': layer.Wscale.get_shard(i).item(),
@@ -713,10 +725,8 @@ class GLQLinearMethod(LinearMethodBase):
                 layer._glq_bd_meta = {
                     "blocks_n_tensor": torch.tensor(blocks_n, dtype=torch.int64, device='cpu'),
                     "blocks_m_tensor": torch.tensor(blocks_m, dtype=torch.int64, device='cpu'),
-                    "blocks_n_meta_cpu": _pack_block_meta(blocks_n),
-                    "blocks_m_meta_cpu": _pack_block_meta(blocks_m),
-                    "blocks_n_meta_gpu": None,
-                    "blocks_m_meta_gpu": None,
+                    "blocks_n_meta_gpu": _pack_block_meta(blocks_n).to(device, non_blocking=True),
+                    "blocks_m_meta_gpu": _pack_block_meta(blocks_m).to(device, non_blocking=True),
                 }
                 layer._glq_log_n = (int(math.log2(layer._glq_n_pad))
                                     if _is_pow2(layer._glq_n_pad) else 0)
