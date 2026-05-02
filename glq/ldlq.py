@@ -274,23 +274,50 @@ def quantize_ldlq_codebook_2stage(
             hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
             R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
 
-    for _ in range(tune_iters):
-        for k in reversed(range(num_blocks)):
-            kb, ke = k * b, (k + 1) * b
-            residual_full = Wr - hatWr
-            H_col = H_reg[:, kb:ke]
-            H_diag_inv = torch.linalg.inv(H_reg[kb:ke, kb:ke])
-            feedback = residual_full @ H_col @ H_diag_inv
-            target = hatWr[:, kb:ke] + feedback
+    if tune_iters > 0:
+        # Reusable fp16 buffers for the fused-NN+decode path. Same shapes
+        # as the main loop's per-block buffers, allocated once outside the
+        # iter/block loops.
+        if use_cuda:
+            tune_target = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_resid = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_dec1 = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_dec2 = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_idx1 = torch.empty(m, dtype=torch.int64, device=device)
+            tune_idx2 = torch.empty(m, dtype=torch.int64, device=device)
+            resid_scale_h = torch.tensor(resid_scale, dtype=torch.float16, device=device)
+            inv_rs_h = torch.tensor(1.0 / resid_scale, dtype=torch.float16, device=device)
 
-            dec1, idx1 = codebook1.quantize(target)
-            all_indices1[:, k] = idx1
+        for _ in range(tune_iters):
+            for k in reversed(range(num_blocks)):
+                kb, ke = k * b, (k + 1) * b
+                residual_full = Wr - hatWr
+                H_col = H_reg[:, kb:ke]
+                H_diag_inv = torch.linalg.inv(H_reg[kb:ke, kb:ke])
+                feedback = residual_full @ H_col @ H_diag_inv
+                target = hatWr[:, kb:ke] + feedback
 
-            residual = target - dec1
-            dec2, idx2 = codebook2.quantize(residual * resid_scale)
-            all_indices2[:, k] = idx2
+                if use_cuda:
+                    tune_target.copy_(target)  # fp32 → fp16 cast
+                    codebook1.quantize_fast(tune_target,
+                                            decoded_out=tune_dec1, idx_out=tune_idx1)
+                    all_indices1[:, k] = tune_idx1
 
-            hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
+                    torch.sub(tune_target, tune_dec1, out=tune_resid)
+                    tune_resid.mul_(resid_scale_h)
+                    codebook2.quantize_fast(tune_resid,
+                                            decoded_out=tune_dec2, idx_out=tune_idx2)
+                    all_indices2[:, k] = tune_idx2
+
+                    hatWr[:, kb:ke] = (tune_dec1.float()
+                                       + tune_dec2.float() / resid_scale)
+                else:
+                    dec1, idx1 = codebook1.quantize(target)
+                    all_indices1[:, k] = idx1
+                    residual = target - dec1
+                    dec2, idx2 = codebook2.quantize(residual * resid_scale)
+                    all_indices2[:, k] = idx2
+                    hatWr[:, kb:ke] = dec1 + dec2 / resid_scale
 
     W_hat = hatWr * Wscale
 
@@ -464,6 +491,56 @@ def quantize_ldlq_codebook_nstage(
 
             hatWr[:, kb:ke] = recon
             R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
+
+    # N-stage tune_iters: refine the allocation by re-running the per-block
+    # quantization with Hessian-weighted feedback computed from the current
+    # reconstruction. Mirrors the 2-stage tune loop. ``quantize_fast`` keeps
+    # this cheap on CUDA; the CPU fallback uses the slower ``quantize``.
+    if tune_iters > 0:
+        if use_cuda:
+            tune_target = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_resid = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_dec = torch.empty(m, b, dtype=torch.float16, device=device)
+            tune_idx = torch.empty(m, dtype=torch.int64, device=device)
+            resid_scales_h = [
+                torch.tensor(rs, dtype=torch.float16, device=device)
+                for rs in resid_scales
+            ]
+
+        for _ in range(tune_iters):
+            for k in reversed(range(num_blocks)):
+                kb, ke = k * b, (k + 1) * b
+                residual_full = Wr - hatWr
+                H_col = H_reg[:, kb:ke]
+                H_diag_inv = torch.linalg.inv(H_reg[kb:ke, kb:ke])
+                feedback = residual_full @ H_col @ H_diag_inv
+                target = hatWr[:, kb:ke] + feedback
+
+                if use_cuda:
+                    tune_target.copy_(target)  # fp32 → fp16 cast
+                    recon = torch.zeros(m, b, dtype=torch.float32, device=device)
+                    for s in range(n_stages):
+                        src = tune_target if s == 0 else tune_resid
+                        codebooks[s].quantize_fast(src,
+                                                   decoded_out=tune_dec,
+                                                   idx_out=tune_idx)
+                        all_indices[s][:, k] = tune_idx
+                        recon.add_(tune_dec.float(), alpha=cum_inv_rs[s])
+                        if s < n_stages - 1:
+                            torch.sub(src, tune_dec, out=tune_resid)
+                            tune_resid.mul_(resid_scales_h[s])
+                    hatWr[:, kb:ke] = recon
+                else:
+                    recon = torch.zeros(m, b, dtype=W.dtype, device=device)
+                    residual = target.clone()
+                    for s in range(n_stages):
+                        src = target if s == 0 else residual
+                        dec, idx = codebooks[s].quantize(src)
+                        all_indices[s][:, k] = idx
+                        recon += dec * cum_inv_rs[s]
+                        if s < n_stages - 1:
+                            residual = (src - dec) * resid_scales[s]
+                    hatWr[:, kb:ke] = recon
 
     W_hat = hatWr * Wscale
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "glq"
-version = "0.2.14"
+version = "0.2.15"
 description = "E8 lattice codebook quantization for LLM weights"
 readme = "README.md"
 license = "Apache-2.0"
@@ -37,4 +37,4 @@ markers = [
 include = ["glq*", "glq_vllm*"]
 
 [tool.setuptools.package-data]
-glq = ["*.pt"]
+glq = ["*.pt", "csrc/*.cu", "csrc/*.cpp", "csrc/*.h", "csrc/*.cuh"]

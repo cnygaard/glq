@@ -3,7 +3,12 @@
 import pytest
 import torch
 
-from glq.ldlq import block_LDL, quantize_ldlq_codebook, quantize_ldlq_codebook_2stage
+from glq.ldlq import (
+    block_LDL,
+    quantize_ldlq_codebook,
+    quantize_ldlq_codebook_2stage,
+    quantize_ldlq_codebook_nstage,
+)
 from glq.codebook import E8ShellCodebook
 
 
@@ -171,3 +176,50 @@ class TestQuantizeLDLQ2Stage:
         r2 = quantize_ldlq_codebook_2stage(
             W, H, cb, cb_small, resid_scale=cb.resid_scale, tune_iters=2)
         assert r2["proxy_loss"] <= r0["proxy_loss"] * 1.01
+
+
+class TestQuantizeLDLQNStage:
+    @pytest.fixture(scope="class")
+    def codebooks(self):
+        cb = E8ShellCodebook.build(device="cpu", verbose=False)
+        cb_small = cb.make_small(256)
+        return cb, cb_small
+
+    def test_nstage_5bpw_runs(self, codebooks):
+        """5bpw (3 stages, last small) emits one indices tensor per stage."""
+        cb, cb_small = codebooks
+        torch.manual_seed(0)
+        W = torch.randn(4, 32)
+        H = torch.eye(32)
+        result = quantize_ldlq_codebook_nstage(
+            W, H,
+            codebooks=[cb, cb, cb_small],
+            resid_scales=[cb.resid_scale, cb.resid_scale],
+            tune_iters=0,
+        )
+        assert len(result["all_indices"]) == 3
+        assert result["W_hat"].shape == (4, 32)
+
+    def test_nstage_tune_reduces_proxy_loss(self, codebooks):
+        """tune_iters must actually run for the n-stage path — historically the
+        loop was missing entirely, so ``tune_iters=8`` was a silent no-op."""
+        cb, _ = codebooks
+        torch.manual_seed(42)
+        W = torch.randn(8, 64)
+        A = torch.randn(64, 64)
+        H = A @ A.T + 0.1 * torch.eye(64)
+        kwargs = dict(
+            W=W, H=H,
+            codebooks=[cb, cb, cb],  # 6bpw
+            resid_scales=[cb.resid_scale, cb.resid_scale],
+        )
+        r0 = quantize_ldlq_codebook_nstage(tune_iters=0, **kwargs)
+        r4 = quantize_ldlq_codebook_nstage(tune_iters=4, **kwargs)
+        assert r4["proxy_loss"] <= r0["proxy_loss"] * 1.01
+        # And the indices should actually have been overwritten by tune
+        # (otherwise the tune loop is a no-op).
+        any_diff = any(
+            not torch.equal(a0, a4)
+            for a0, a4 in zip(r0["all_indices"], r4["all_indices"])
+        )
+        assert any_diff, "tune_iters=4 produced identical indices to tune_iters=0"

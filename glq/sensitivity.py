@@ -38,7 +38,20 @@ def allocate_bpw(
     current_bits = base * total_weights
 
     # Greedy: repeatedly pick the upgrade (layer, target_bpw) with best
-    # sensitivity-per-bit, considering all possible jumps (2→3, 2→4, 3→4).
+    # marginal sensitivity-per-bit. Each added bit halves the quantization-
+    # noise variance, so the proxy_loss (Hessian-trace-derived L2
+    # reconstruction error) decays roughly 4× per added bit:
+    #
+    #     proxy(b) ≈ sensitivity * 4 ** -(b - allowed[0])
+    #
+    # The marginal reduction from raising bpw cur → target_bpw is therefore
+    # the difference between those two proxy values, divided by the cost in
+    # bits. Without this decay term the gain is constant for a given layer
+    # — the allocator drains its first-best layer to ``max_bpw`` before
+    # touching any other, producing a bimodal allocation (most layers at
+    # min/max, ≤1 layer at any intermediate bpw). Empirically observed on
+    # Gemma-4-31B (205@3, 1@4, 204@5) and Gemma-4-E2B (88@3, 1@4, 186@5)
+    # at target=3.5/min=3/max=5.
     while True:
         best_gain = -1
         best_name = None
@@ -53,7 +66,9 @@ def allocate_bpw(
                 extra = (target_bpw - cur) * layer_sizes[name]
                 if current_bits + extra > budget:
                     continue
-                gain = sensitivities[name] / extra  # proxy_loss per bit
+                proxy_at_cur = sensitivities[name] * (4.0 ** -(cur - allowed[0]))
+                proxy_at_target = sensitivities[name] * (4.0 ** -(target_bpw - allowed[0]))
+                gain = (proxy_at_cur - proxy_at_target) / extra
                 if gain > best_gain:
                     best_gain = gain
                     best_name = name
