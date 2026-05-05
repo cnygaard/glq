@@ -44,6 +44,65 @@ def test_glq_config_registration():
 # ── Test 2: Config parsing (no GPU needed) ──────────────────────────────
 
 @requires_vllm
+@requires_gpu
+def test_fused_kernel_custom_ops_registered():
+    """All 9 GLQ pybind entrypoints are registered as torch.ops.glq.*.
+
+    The 6 dequant + RHT kernels were registered first; the 3 fused-linear /
+    fused-MoE entrypoints were added later so vLLM's torch.compile (mode>=3)
+    can trace through them as opaque ops. Without this registration,
+    dynamo crashes with ``Attempted to call function marked as skipped`` on
+    the pybind11 functions.
+    """
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    expected = [
+        "dequant_matvec", "dequant_matmul",
+        "dequant_matvec_packed", "dequant_matmul_packed",
+        "input_rht", "output_rht",
+        "fused_linear", "fused_linear_block_diag", "fused_moe_block_diag",
+    ]
+    missing = [op for op in expected if not hasattr(torch.ops.glq, op)]
+    assert not missing, f"unregistered: {missing}"
+
+
+@requires_vllm
+def test_fused_linear_fake_shape():
+    """Fake implementation must match the live kernel's output shape so
+    torch.compile shape inference doesn't disagree with runtime.
+
+    Uses meta-device tensors so the fake impl runs without needing the
+    real kernel — exercises only the shape inference path.
+    """
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear"):
+        pytest.skip("fused_linear not registered (no CUDA ext loaded)")
+
+    B, in_features, out_features = 2, 1024, 768
+    n_pad, m_pad = 1024, 1024
+    meta = torch.device("meta")
+    x = torch.empty(B, in_features, dtype=torch.float16, device=meta)
+    sv = torch.empty(n_pad, dtype=torch.float16, device=meta)
+    su = torch.empty(m_pad, dtype=torch.float16, device=meta)
+    qidxs = torch.empty(m_pad, n_pad // 8, dtype=torch.int16, device=meta)
+    cb = torch.empty(65536, 8, dtype=torch.float16, device=meta)
+    empty_i16 = torch.empty(0, dtype=torch.int16, device=meta)
+    empty_f16 = torch.empty(0, dtype=torch.float16, device=meta)
+
+    fy = torch.ops.glq.fused_linear(
+        x, sv, su, qidxs, cb, 1.0,
+        in_features, out_features, n_pad, m_pad, 10, 10,
+        empty_i16, empty_f16, 0.0,
+        empty_i16, empty_f16, 0.0,
+        empty_i16, empty_f16, 0.0,
+    )
+    assert fy.shape == (B, out_features), f"got {tuple(fy.shape)}"
+    assert fy.dtype == torch.float16
+    assert fy.device.type == "meta"
+
+
+@requires_vllm
 def test_glq_config_from_config():
     """GLQvLLMConfig should parse bpw and layer_bpw from dict."""
     from glq_vllm.config import GLQvLLMConfig

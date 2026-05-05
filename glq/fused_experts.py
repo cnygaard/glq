@@ -238,7 +238,10 @@ class E8RHTFusedExperts(nn.Module):
         # Stage-3 always uses the primary 65536-entry codebook.
         cb3_half = cb_half
 
-        return glq_cuda.glq_fused_moe_block_diag_cuda(
+        # Prefer torch.ops.glq.fused_moe_block_diag when registered (by
+        # glq_vllm) so torch.compile can trace it as an opaque op.
+        # Falls back to direct pybind11 binding otherwise.
+        args = (
             hidden_states.half().contiguous(),
             top_k_index.contiguous(),
             top_k_weights.float().contiguous(),
@@ -259,6 +262,10 @@ class E8RHTFusedExperts(nn.Module):
             self._w2_Qidxs3, self._w2_inv_resid_scale2,
             cb3_half,
         )
+        if (hasattr(torch.ops, "glq")
+                and hasattr(torch.ops.glq, "fused_moe_block_diag")):
+            return torch.ops.glq.fused_moe_block_diag(*args)
+        return glq_cuda.glq_fused_moe_block_diag_cuda(*args)
 
     def forward(self, hidden_states: torch.Tensor,
                 top_k_index: torch.Tensor,

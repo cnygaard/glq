@@ -373,18 +373,33 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         cb3_arg = primary_cb if Qidxs3 is not None else _empty_f16
         q4 = Qidxs4 if Qidxs4 is not None else _empty_i16
         cb4_arg = primary_cb if Qidxs4 is not None else _empty_f16
-        y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
-            x.half().contiguous(), SV, SU,
-            Qidxs, primary_cb,
-            float(wscale),
-            in_features, out_features,
-            n_pad, m_pad,
-            bn_tensor, bm_tensor,
-            bn_meta, bm_meta,
-            q2, cb2_arg, float(inv_rs) if has_stage2 else 0.0,
-            q3, cb3_arg, float(inv_rs2) if Qidxs3 is not None else 0.0,
-            q4, cb4_arg, float(inv_rs3) if Qidxs4 is not None else 0.0,
-        )
+        # Prefer torch.ops.glq.fused_linear_block_diag when registered so
+        # vLLM's torch.compile (mode>=3) can trace through this dispatch as
+        # an opaque op. Falls back to direct pybind11 if the custom_op
+        # surface isn't available (e.g., older glq_vllm install or CPU).
+        x_half = x.half().contiguous()
+        wscale_f = float(wscale)
+        irs_f = float(inv_rs) if has_stage2 else 0.0
+        irs2_f = float(inv_rs2) if Qidxs3 is not None else 0.0
+        irs3_f = float(inv_rs3) if Qidxs4 is not None else 0.0
+        if _use_custom_ops and hasattr(torch.ops.glq, "fused_linear_block_diag"):
+            y = torch.ops.glq.fused_linear_block_diag(
+                x_half, SV, SU, Qidxs, primary_cb, wscale_f,
+                in_features, out_features, n_pad, m_pad,
+                bn_tensor, bm_tensor, bn_meta, bm_meta,
+                q2, cb2_arg, irs_f,
+                q3, cb3_arg, irs2_f,
+                q4, cb4_arg, irs3_f,
+            )
+        else:
+            y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
+                x_half, SV, SU, Qidxs, primary_cb, wscale_f,
+                in_features, out_features, n_pad, m_pad,
+                bn_tensor, bm_tensor, bn_meta, bm_meta,
+                q2, cb2_arg, irs_f,
+                q3, cb3_arg, irs2_f,
+                q4, cb4_arg, irs3_f,
+            )
         if dtype != torch.float16:
             y = y.to(dtype)
         return y

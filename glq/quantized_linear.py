@@ -424,39 +424,52 @@ class E8RHTLinear(nn.Module):
             cb4_tensor = primary_cb if n_stages >= 4 else _empty_f16
             irs2_float = self._inv_rs2_float
             irs3_float = self._inv_rs3_float
+            # Prefer torch.ops.glq.* dispatch when registered (by glq_vllm,
+            # if installed) so torch.compile can trace these kernels as
+            # opaque ops. Falls back to direct pybind11 otherwise — same
+            # binding, just visible to dynamo.
+            _have_custom = (hasattr(torch.ops, "glq")
+                            and hasattr(torch.ops.glq, "fused_linear"))
+            x_half = x.half().contiguous()
+            q2_arg = self.Qidxs2 if has_stage2 else _empty_i16
             if _is_pow2:
-                y = _ik._glq_cuda.glq_fused_linear_cuda(
-                    x.half().contiguous(), self.SV, self.SU,
+                args = (
+                    x_half, self.SV, self.SU,
                     self.Qidxs, primary_cb,
                     self._wscale_float,
                     self.in_features, self.out_features,
                     n_pad, m_pad,
                     int(math.log2(n_pad)), int(math.log2(m_pad)),
-                    self.Qidxs2 if has_stage2 else _empty_i16,
-                    cb2_tensor,
-                    self._inv_rs_float,
+                    q2_arg, cb2_tensor, self._inv_rs_float,
                     q3_tensor, cb3_tensor, irs2_float,
                     q4_tensor, cb4_tensor, irs3_float,
                 )
+                if _have_custom:
+                    y = torch.ops.glq.fused_linear(*args)
+                else:
+                    y = _ik._glq_cuda.glq_fused_linear_cuda(*args)
             elif hasattr(_ik._glq_cuda, 'glq_fused_linear_block_diag_cuda'):
                 # Lazily push packed metadata to x.device (cache per device)
                 if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
                     self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
                     self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
-                y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
-                    x.half().contiguous(), self.SV, self.SU,
+                args = (
+                    x_half, self.SV, self.SU,
                     self.Qidxs, primary_cb,
                     self._wscale_float,
                     self.in_features, self.out_features,
                     n_pad, m_pad,
                     self._blocks_n_tensor, self._blocks_m_tensor,
                     self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
-                    self.Qidxs2 if has_stage2 else _empty_i16,
-                    cb2_tensor,
-                    self._inv_rs_float,
+                    q2_arg, cb2_tensor, self._inv_rs_float,
                     q3_tensor, cb3_tensor, irs2_float,
                     q4_tensor, cb4_tensor, irs3_float,
                 )
+                if _have_custom and hasattr(torch.ops.glq,
+                                             "fused_linear_block_diag"):
+                    y = torch.ops.glq.fused_linear_block_diag(*args)
+                else:
+                    y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(*args)
             else:
                 y = None  # fall through to fallback
             if y is not None:
