@@ -1,0 +1,107 @@
+name: Build & publish Docker image
+
+# Builds and pushes ghcr.io/<owner>/glq-env. Mirrors publish.yml's flow
+# but for the container artifact instead of the PyPI wheel.
+#
+# Tagging strategy (driven by docker/metadata-action):
+#   push to main      → latest, sha-<short>
+#   push of tag v*    → latest, <tag>, <major>.<minor>, sha-<short>
+#   workflow_dispatch → sha-<short> only
+#
+# Security note: the only ``run:`` step reads from a checked-in file
+# (pyproject.toml). No untrusted github.event.* inputs are interpolated
+# into shell, so injection risk is nil.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/glq-env
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # needed to push to ghcr.io
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Standard ubuntu-latest only has ~14 GB free; the CUDA base image
+      # plus pip's torch/vllm wheels easily exceed that. Free up ~30 GB by
+      # removing pre-installed runtimes we don't need.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Read the GLQ package version from pyproject.toml so the image
+      # ships with the version that matches the source tree.
+      - name: Read GLQ version from pyproject.toml
+        id: glq_ver
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "GLQ_VERSION=$v"
+
+      - name: Extract image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=glq-env
+            org.opencontainers.image.description=GLQ runtime + dev environment (CUDA 12.8, torch 2.11, vLLM, transformers, lm-eval)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GLQ_VERSION=${{ steps.glq_ver.outputs.version }}
+          # GHA-backed buildx cache: shared across runs of this workflow,
+          # cuts subsequent rebuilds from ~30 min to ~5 min when only the
+          # final layers change (e.g. glq version bump).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build single-arch (linux/amd64) — multi-arch is meaningless
+          # for a CUDA image and saves ~30 min build time.
+          platforms: linux/amd64
+          provenance: false  # skip SLSA attestation for now

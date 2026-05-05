@@ -1,0 +1,54 @@
+# Keep build context small — exclude everything not needed by the
+# Dockerfile. The Dockerfile itself doesn't COPY anything into the
+# image, but Docker still scans the context, so trimming it speeds up
+# `docker build`. More importantly, if future versions of the
+# Dockerfile add ``COPY . .`` for dev workflows, secret files in the
+# context would be embedded into the image — these patterns prevent
+# that from happening accidentally.
+
+# === SECRETS — keep these at the top, never weaken ===
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+.aws
+.ssh
+.netrc
+hf_token*
+infra/*.pem
+infra/.terraform
+infra/terraform.tfstate*
+infra/.terraform.lock.hcl
+
+# === Standard exclusions ===
+.git
+.github
+.venv
+.coverage
+__pycache__
+*.pyc
+*.pyo
+*.so
+build
+dist
+*.egg-info
+
+# Heavy submodules / vendored sources that aren't needed for the
+# runtime image (the image installs glq from PyPI).
+ATLAS
+Optimizing-GPU-Kernels
+mamba
+sglang
+
+# Prototype / scratch files
+golay-leech-quant-prototype*.py
+modelcard
+=0.2.7
+
+# Local model checkpoints + benchmark caches (huge)
+*.safetensors
+*.pt
+hf_cache
+benchmarks/results
+cache_params,
