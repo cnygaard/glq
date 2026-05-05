@@ -1218,14 +1218,22 @@ def quantize(
     else:
         effective_bpw = bpw
 
+    # Always emit `layer_bpw` (even uniform-bpw) so vLLM/sglang's GLQ
+    # whitelist can distinguish quantized linears from bf16-only siblings
+    # (e.g. Gemma-4 ``per_layer_model_projection``). Without it, the
+    # plugin defaults to "quantize everything that's a Linear", which
+    # silently zero-fills bf16 layers it has no GLQ buffers for.
+    if bpw_map is not None:
+        layer_bpw_out = dict(bpw_map)
+    else:
+        layer_bpw_out = {p: int(bpw) for p in all_artifacts.keys()}
     config_dict["quantization_config"] = {
         "quant_method": "glq",
         "codebook": "e8_shell",
         "codesz": 8,
         "bpw": effective_bpw,
+        "layer_bpw": layer_bpw_out,
     }
-    if bpw_map is not None:
-        config_dict["quantization_config"]["layer_bpw"] = bpw_map
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:

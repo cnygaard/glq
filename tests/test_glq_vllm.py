@@ -55,6 +55,61 @@ def test_glq_config_from_config():
     assert torch.float16 in cfg.get_supported_act_dtypes()
 
 
+# ── Test 2b: _lookup_bpw across vLLM prefix transforms ─────────────────
+
+@requires_vllm
+def test_lookup_bpw_prefix_forms():
+    """Whitelist must match the same logical layer across the prefix forms
+    vLLM produces at runtime:
+
+    - text-only ``Gemma4ForCausalLM`` strips ``model.language_model.`` to ``model.``
+    - multimodal ``Gemma4ForConditionalGeneration`` rewrites
+      ``model.language_model.X`` to ``language_model.model.X``
+    - stacked-merge: ``qkv_proj`` matches when any of q/k/v are listed unmerged
+
+    Storing keys in safetensors-checkpoint form (``model.language_model.X``)
+    and asking the whitelist to map every runtime form back to it is the
+    convention quantize_model writes.
+    """
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 4,
+        "layer_bpw": {
+            # checkpoint-form keys, as quantize_model writes them
+            "model.language_model.layers.0.mlp.down_proj": 4,
+            "model.language_model.layers.0.self_attn.q_proj": 4,
+            "model.language_model.layers.0.self_attn.k_proj": 4,
+            "model.language_model.layers.0.self_attn.v_proj": 4,
+            "model.language_model.layers.0.per_layer_input_gate": 4,
+        },
+    })
+
+    # Direct match.
+    assert cfg._lookup_bpw("model.language_model.layers.0.mlp.down_proj") == 4
+    # Text-only Gemma-4 path: vLLM strips `language_model.` so prefix is
+    # `model.layers.0...`. Whitelist re-adds the missing `language_model.`.
+    assert cfg._lookup_bpw("model.layers.0.mlp.down_proj") == 4
+    # Multimodal Gemma-4 path: vLLM mapper renames
+    # `model.language_model.X` -> `language_model.model.X`.
+    assert cfg._lookup_bpw("language_model.model.layers.0.mlp.down_proj") == 4
+    assert cfg._lookup_bpw(
+        "language_model.model.layers.0.per_layer_input_gate") == 4
+    # Stacked-merge: vLLM packs q/k/v into qkv_proj at runtime; whitelist
+    # finds at least one of the three subnames and returns the max bpw.
+    assert cfg._lookup_bpw("model.layers.0.self_attn.qkv_proj") == 4
+    assert cfg._lookup_bpw(
+        "language_model.model.layers.0.self_attn.qkv_proj") == 4
+
+    # Layer absent from whitelist returns None, so get_quant_method falls
+    # through to UnquantizedLinearMethod (e.g. Gemma-4
+    # `per_layer_model_projection`, which is bf16 in the checkpoint).
+    assert cfg._lookup_bpw(
+        "model.language_model.per_layer_model_projection") is None
+    assert cfg._lookup_bpw(
+        "language_model.model.per_layer_model_projection") is None
+    assert cfg._lookup_bpw("model.per_layer_model_projection") is None
+
+
 # ── Test 3: Dequant correctness (CPU, no vLLM server) ──────────────────
 
 @pytest.mark.skipif(

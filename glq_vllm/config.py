@@ -45,8 +45,11 @@ class GLQvLLMConfig(QuantizationConfig):
         prefix passed here, so we try every form a checkpoint key
         could legally take:
 
-        - ``language_model.`` strip (Gemma-4 text-only path collapses
-          ``model.language_model.*`` to ``model.*``).
+        - Text-only Gemma-4 path collapses ``model.language_model.*`` to
+          ``model.*`` (handled by adding the inverse form).
+        - Multimodal Gemma-4 path (``Gemma4ForConditionalGeneration``)
+          rewrites ``model.language_model.*`` to ``language_model.model.*``;
+          translate it back so the checkpoint-form key still matches.
         - Stacked merge: q/k/v_proj into ``qkv_proj`` and
           gate/up_proj into ``gate_up_proj``. The whitelist lists the
           unmerged sublayers; the prefix here is the merged name.
@@ -56,6 +59,9 @@ class GLQvLLMConfig(QuantizationConfig):
         forms = {prefix}
         if prefix.startswith("model.") and ".language_model." not in prefix:
             forms.add("model.language_model." + prefix[len("model."):])
+        if prefix.startswith("language_model.model."):
+            forms.add("model.language_model."
+                      + prefix[len("language_model.model."):])
         merge_map = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
                      ".gate_up_proj": (".gate_proj", ".up_proj")}
         best = None
