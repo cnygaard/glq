@@ -12,18 +12,18 @@
 # - cudnn-devel includes nvcc, headers, and libs needed for JIT-compiling
 #   our CUDA C extension and for building mamba-ssm / causal-conv1d
 #
-# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.2.16 .
+# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.2.17 .
 # Run:     docker run --gpus all -it --rm \
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
-#              ghcr.io/cnygaard/glq-env:0.2.16
+#              ghcr.io/cnygaard/glq-env:0.2.17
 ARG CUDA_VERSION=12.8.0
 ARG UBUNTU_VERSION=24.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
 
 # Build args (re-declared after FROM so they're in scope).
-ARG GLQ_VERSION=0.2.16
+ARG GLQ_VERSION=0.2.17
 ARG VLLM_VERSION=0.20.0
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
