@@ -12,18 +12,18 @@
 # - cudnn-devel includes nvcc, headers, and libs needed for JIT-compiling
 #   our CUDA C extension and for building mamba-ssm / causal-conv1d
 #
-# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.2.17 .
+# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.2.18 .
 # Run:     docker run --gpus all -it --rm \
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
-#              ghcr.io/cnygaard/glq-env:0.2.17
+#              ghcr.io/cnygaard/glq-env:0.2.18
 ARG CUDA_VERSION=12.8.0
 ARG UBUNTU_VERSION=24.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
 
 # Build args (re-declared after FROM so they're in scope).
-ARG GLQ_VERSION=0.2.17
+ARG GLQ_VERSION=0.2.18
 ARG VLLM_VERSION=0.20.0
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
@@ -102,11 +102,11 @@ ENV CUDA_HOME=/usr/local/cuda
 # These take ~10-15 min wall on a 8-core build. Allow it to fail silently
 # (matching our setup.sh.tftpl behavior) so the rest of the image still
 # builds; users who don't need Mamba/SSM models can ignore the warning.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install causal-conv1d --no-build-isolation \
-        || echo "WARN: causal-conv1d build failed — Mamba models will be unavailable" && \
-    pip install mamba-ssm --no-build-isolation \
-        || echo "WARN: mamba-ssm build failed — Mamba models will be unavailable"
+# RUN --mount=type=cache,target=/root/.cache/pip \
+#     pip install causal-conv1d --no-build-isolation \
+#         || echo "WARN: causal-conv1d build failed — Mamba models will be unavailable" && \
+#     pip install mamba-ssm --no-build-isolation \
+#         || echo "WARN: mamba-ssm build failed — Mamba models will be unavailable"
 
 # Eval + auxiliary tooling.
 # - lm-eval: gsm8k, mmlu, hellaswag, etc.
