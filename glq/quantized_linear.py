@@ -625,6 +625,73 @@ class E8RHTLinear(nn.Module):
 # E8RHTEmbedding — quantized embedding with per-row gather
 # ────────────────────────────────────────────────────────────────
 
+
+@torch.no_grad()
+def _dequant_embedding_rows(
+    input_ids: torch.Tensor,
+    qidxs: torch.Tensor,
+    sv: torch.Tensor,
+    wscale: torch.Tensor,
+    codebook: torch.Tensor,
+    qidxs2: torch.Tensor | None,
+    inv_resid_scale: torch.Tensor | None,
+    codebook2: torch.Tensor | None,
+    n_pad: int,
+    embedding_dim: int,
+    embed_scale: float = 1.0,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Per-row gather + GLQ dequant + inverse RHT + optional embed_scale.
+
+    Single source of truth for both ``E8RHTEmbedding.forward`` (HF path)
+    and ``glq_vllm.embedding_method.GLQEmbeddingMethod.embedding`` (vLLM
+    path). The math is the inverse of the per-row quantization done at
+    ``quantize_model`` time:
+
+        W_t = FHT_cols(W * SV)              # forward quant
+        W   = SV * FHT_cols(W_t)            # we apply this here
+
+    Stage-2 (3+ bpw) adds a per-row residual scaled by
+    ``inv_resid_scale`` before the inverse RHT. ``codebook`` is the
+    65536-entry E8Shell table; indices are stored as int16 and
+    reinterpreted as uint16 to recover values in ``[0, 65536)``.
+
+    Codebook tensors are lazily moved to ``input_ids.device`` (the
+    codebook may live on CPU shared across many modules).
+    """
+    dev = qidxs.device
+    flat_ids = input_ids.reshape(-1).to(dev)
+
+    cb1 = codebook.to(dev) if codebook.device != dev else codebook
+    rows1 = qidxs.index_select(0, flat_ids)                  # [B, n_pad/8]
+    idx1 = rows1.reshape(-1).long() & 0xFFFF                 # int16→uint16
+    deq1 = cb1.index_select(0, idx1)                         # [B*(n_pad/8), 8]
+    deq = deq1.reshape(flat_ids.shape[0], n_pad).float()
+
+    if qidxs2 is not None and codebook2 is not None and inv_resid_scale is not None:
+        cb2 = codebook2.to(dev) if codebook2.device != dev else codebook2
+        rows2 = qidxs2.index_select(0, flat_ids)
+        idx2 = rows2.reshape(-1).long() & 0xFFFF
+        deq2 = cb2.index_select(0, idx2).reshape(flat_ids.shape[0], n_pad).float()
+        # Per-row residual scale [vocab] → broadcast over n_pad axis
+        inv_rs = inv_resid_scale.index_select(0, flat_ids).unsqueeze(-1)
+        deq = deq + deq2 * inv_rs.float()
+
+    # Per-row Wscale → broadcast over n_pad axis, then inverse RHT.
+    ws = wscale.index_select(0, flat_ids).unsqueeze(-1)
+    deq = deq * ws.float()
+    deq = fast_hadamard_transform(deq)
+    deq = deq * sv.float()
+    if embed_scale != 1.0:
+        deq = deq * embed_scale
+
+    # Trim padded n_pad → embedding_dim, cast to output dtype.
+    if out_dtype is None:
+        out_dtype = sv.dtype
+    out = deq[..., :embedding_dim].to(out_dtype)
+    return out.reshape(*input_ids.shape, embedding_dim)
+
+
 class E8RHTEmbedding(nn.Module):
     """nn.Embedding equivalent with E8 + right-side-only RHT compressed weight.
 
@@ -714,52 +781,21 @@ class E8RHTEmbedding(nn.Module):
         if self.codebook is None:
             raise RuntimeError("E8RHTEmbedding.set_codebook() must be called first")
 
-        dev = self.Qidxs.device
-        flat_ids = input_ids.reshape(-1).to(dev)  # [B]
-        # Gather the row of int16 codebook indices.
-        rows1 = self.Qidxs.index_select(0, flat_ids)            # [B, n_pad/8]
-        # Codebook can live on CPU (shared across many quantized modules);
-        # move to our device on first lookup so index_select doesn't trip.
-        cb1 = self.codebook.codebook.to(dev) if self.codebook.codebook.device != dev else self.codebook.codebook
-        # Reinterpret int16 as uint16: codebook has 65536 entries, indices
-        # >= 32768 round-trip through signed int16 as negative values. Mask
-        # to 16 bits to get the unsigned codebook index back.
-        idx1 = rows1.reshape(-1).long() & 0xFFFF
-        deq1 = cb1.index_select(0, idx1)                        # [B*(n_pad/8), 8]
-        deq = deq1.reshape(flat_ids.shape[0], self.n_pad).float()
-
-        if self._n_stages >= 2 and self.codebook2 is not None:
-            rows2 = self.Qidxs2.index_select(0, flat_ids)
-            cb2 = self.codebook2.codebook.to(dev) if self.codebook2.codebook.device != dev else self.codebook2.codebook
-            idx2 = rows2.reshape(-1).long() & 0xFFFF
-            deq2 = cb2.index_select(0, idx2)
-            deq2 = deq2.reshape(flat_ids.shape[0], self.n_pad).float()
-            # Per-row residual scale ([vocab]) → broadcast over n_pad axis
-            inv_rs = self.inv_resid_scale.index_select(0, flat_ids).unsqueeze(-1)
-            deq = deq + deq2 * inv_rs.float()
-
-        # Inverse right-side RHT: undo FHT + SV scale.
-        # Forward quant did: W_t = FHT_cols(W_padded * SV) (no normalization).
-        # Reuse RHT.inverse_transform_weights's convention here: apply FHT
-        # then multiply by SV. (RHT.inverse_transform_weights does not divide
-        # by N, so neither do we — empirical roundtrip with E8RHTLinear's
-        # `dequantize()` confirms this matches the reconstruction.)
-        # Per-row Wscale: broadcast over n_pad axis.
-        wscale = self.Wscale.index_select(0, flat_ids).unsqueeze(-1)
-        deq = deq * wscale.float()
-        deq = fast_hadamard_transform(deq)
-        deq = deq * self.SV.float()
-        # Scaled-word-embedding scale (e.g. sqrt(hidden_size_per_layer_input)
-        # for Gemma-4's PLE). 1.0 for plain nn.Embedding.
-        if self.embed_scale != 1.0:
-            deq = deq * self.embed_scale
-
-        # Trim to true embedding_dim and cast to caller's compute dtype.
-        # Match what hf_integration set on the module (or fall back to SV's
-        # current dtype, which gets cast to the model dtype by from_pretrained).
         out_dtype = getattr(self, "_compute_dtype", self.SV.dtype)
-        out = deq[..., :self.embedding_dim].to(out_dtype)
-        return out.reshape(*input_ids.shape, self.embedding_dim)
+        cb1 = self.codebook.codebook
+        cb2 = self.codebook2.codebook if (
+            self._n_stages >= 2 and self.codebook2 is not None) else None
+        return _dequant_embedding_rows(
+            input_ids,
+            self.Qidxs, self.SV, self.Wscale, cb1,
+            self.Qidxs2 if self._n_stages >= 2 else None,
+            self.inv_resid_scale if self._n_stages >= 2 else None,
+            cb2,
+            n_pad=self.n_pad,
+            embedding_dim=self.embedding_dim,
+            embed_scale=self.embed_scale,
+            out_dtype=out_dtype,
+        )
 
     def extra_repr(self) -> str:
         return (f'num_embeddings={self.num_embeddings}, '

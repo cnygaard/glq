@@ -5,8 +5,13 @@ from typing import Any
 import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 
 from .linear_method import GLQLinearMethod
+from .embedding_method import GLQEmbeddingMethod
 
 
 class GLQvLLMConfig(QuantizationConfig):
@@ -85,6 +90,18 @@ class GLQvLLMConfig(QuantizationConfig):
                 # vLLM loads `.weight` instead of expecting GLQ buffers.
                 return UnquantizedLinearMethod()
             return GLQLinearMethod(self, bpw=bpw if bpw is not None else self.bpw)
+
+        # VocabParallelEmbedding (and subclasses, e.g. ParallelLMHead).
+        # Quantized embeddings — currently only Gemma-4's PLE — appear in
+        # the checkpoint with the same Qidxs/SV/Wscale buffers as a
+        # quantized linear, so they're enumerated in layer_bpw at quant
+        # time. Embeddings absent from the map (main embed_tokens, lm_head)
+        # fall through to UnquantizedEmbeddingMethod.
+        if isinstance(layer, VocabParallelEmbedding):
+            bpw = self._lookup_bpw(prefix)
+            if bpw is None:
+                return UnquantizedEmbeddingMethod()
+            return GLQEmbeddingMethod(self, bpw=bpw)
 
         # FusedMoE layers — lazy import to avoid circular deps
         try:

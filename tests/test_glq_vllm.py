@@ -114,6 +114,77 @@ def test_glq_config_from_config():
     assert torch.float16 in cfg.get_supported_act_dtypes()
 
 
+# ── GLQ embedding-method dispatch + dequant equivalence ───────────────
+
+@requires_vllm
+def test_glq_embedding_method_registered():
+    """get_quant_method returns GLQEmbeddingMethod for VocabParallelEmbedding
+    when the prefix is in layer_bpw, else UnquantizedEmbeddingMethod."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod, VocabParallelEmbedding,
+    )
+    from glq_vllm.config import GLQvLLMConfig
+    from glq_vllm.embedding_method import GLQEmbeddingMethod
+
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 4,
+        "layer_bpw": {
+            # checkpoint-form key, like quantize_model.py emits
+            "model.language_model.embed_tokens_per_layer": 4,
+        },
+    })
+    # Avoid full __init__ (needs torch.distributed setup); just satisfy isinstance.
+    layer = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+
+    # Quantized embedding — runtime prefix is the multimodal mm-rewritten form.
+    method = cfg.get_quant_method(
+        layer, "language_model.model.embed_tokens_per_layer")
+    assert isinstance(method, GLQEmbeddingMethod), type(method).__name__
+    assert method.bpw == 4
+
+    # Unrelated embedding (e.g. main embed_tokens) — not in layer_bpw → unquant.
+    method = cfg.get_quant_method(layer, "language_model.model.embed_tokens")
+    assert isinstance(method, UnquantizedEmbeddingMethod), type(method).__name__
+
+
+def test_glq_embedding_dequant_matches_hf():
+    """``_dequant_embedding_rows`` must reproduce ``E8RHTEmbedding.forward``
+    (with embed_scale=1.0, the convention vLLM uses) byte-for-byte.
+
+    Uses synthetic GLQ buffers + a tiny codebook so the test is fast and
+    needs no GPU.
+    """
+    import glq.hf_integration  # noqa: F401 (registers types)
+    from glq.codebook import E8ShellCodebook
+    from glq.quantized_linear import E8RHTEmbedding, _dequant_embedding_rows
+
+    torch.manual_seed(0)
+    vocab, dim = 64, 32
+    n_pad = 32  # already pow2
+    cb = E8ShellCodebook(device="cpu", verbose=False)
+
+    # Stage-1 only (2bpw equivalent).
+    emb = E8RHTEmbedding(num_embeddings=vocab, embedding_dim=dim,
+                          embed_scale=1.0)
+    emb.set_codebook(cb)
+    emb.Qidxs.copy_(torch.randint(
+        0, 65536, emb.Qidxs.shape, dtype=torch.int32).to(torch.int16))
+    emb.SV.copy_(torch.randn_like(emb.SV))
+    emb.Wscale.copy_(torch.rand_like(emb.Wscale) + 0.1)
+
+    ids = torch.tensor([0, 5, 17, 63, 42], dtype=torch.long)
+    hf_out = emb(ids)
+
+    direct_out = _dequant_embedding_rows(
+        ids,
+        emb.Qidxs, emb.SV, emb.Wscale, cb.codebook,
+        None, None, None,
+        n_pad=n_pad, embedding_dim=dim,
+        embed_scale=1.0, out_dtype=hf_out.dtype,
+    )
+    torch.testing.assert_close(hf_out, direct_out, atol=1e-3, rtol=1e-3)
+
+
 # ── Test 2b: _lookup_bpw across vLLM prefix transforms ─────────────────
 
 @requires_vllm
