@@ -13,6 +13,7 @@ HF_CACHE=$NVME/hf_cache
 echo "=== GLQ setup starting ==="
 
 apt-get update -qq && apt-get install -y -qq python3-venv libpcre3-dev > /dev/null 2>&1
+apt-get install -y -qq pciutils build-essential cmake curl libcurl4-openssl-dev
 # libpcre3-dev is a build-time dep of pypcre, which gptqmodel's setup.py
 # imports at metadata-generation time (see user-block install below).
 
@@ -51,12 +52,21 @@ unset CUDA_HOME
 pip install -q torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 pip install 'fast_hadamard_transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git' --no-build-isolation
 pip install "mistral-common[hf-hub]"
-pip install 'transformers>=5.0' 'huggingface_hub>=0.30'
-pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
-pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
+pip install 'transformers==5.7.0' 'huggingface_hub>=0.30'
+#pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
+#pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
 pip install -q lm-eval langdetect immutabledict
 pip install -q pypcre
+pip install -q py-spy
+pip install -q pytest
+pip install -q ray
+git clone https://github.com/ggml-org/llama.cpp
+cmake llama.cpp -B llama.cpp/build \
+    -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
+cmake --build llama.cpp/build --config Release -j --clean-first --target llama-cli llama-mtmd-cli llama-server llama-gguf-split
+cp llama.cpp/build/bin/llama-* llama.cpp
 pip install -q gptqmodel --no-build-isolation
+pip install -q tenacity
 pip install -q optimum  # required by HF transformers to *load* GPTQ models
 # HF cache on NVMe. Symlink ~/.cache/huggingface to the NVMe location so
 # tooling that ignores HF_HOME (non-interactive ssh, services, any subprocess
