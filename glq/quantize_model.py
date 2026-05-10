@@ -1223,10 +1223,27 @@ def quantize(
     # (e.g. Gemma-4 ``per_layer_model_projection``). Without it, the
     # plugin defaults to "quantize everything that's a Linear", which
     # silently zero-fills bf16 layers it has no GLQ buffers for.
-    if bpw_map is not None:
-        layer_bpw_out = dict(bpw_map)
-    else:
-        layer_bpw_out = {p: int(bpw) for p in all_artifacts.keys()}
+    #
+    # The layer_bpw map MUST cover every entry in ``all_artifacts`` —
+    # any quantized layer absent from the map causes vLLM to load the
+    # layer as bf16 (UnquantizedLinear / UnquantizedEmbedding) and trip a
+    # KeyError on Qidxs at safetensors load. Two layer types can be in
+    # ``all_artifacts`` but absent from a user-supplied ``bpw_map``:
+    #   - ``model.language_model.embed_tokens_per_layer`` (Gemma-4 PLE,
+    #     quantized at a fixed ``ple_embed_bpw=4`` in the streaming path,
+    #     never seen by the sensitivity allocator).
+    #   - any layer the allocator hadn't profiled yet (defensive).
+    # Default the bpw for those to ``ple_embed_bpw=4`` for the embedding
+    # and to the global ``bpw`` for everything else.
+    PLE_PREFIX = "model.language_model.embed_tokens_per_layer"
+    layer_bpw_out: dict[str, int] = {}
+    for p in all_artifacts.keys():
+        if bpw_map is not None and p in bpw_map:
+            layer_bpw_out[p] = int(bpw_map[p])
+        elif p == PLE_PREFIX:
+            layer_bpw_out[p] = 4  # matches ple_embed_bpw above
+        else:
+            layer_bpw_out[p] = int(bpw)
     config_dict["quantization_config"] = {
         "quant_method": "glq",
         "codebook": "e8_shell",
@@ -1256,9 +1273,31 @@ def quantize(
     with open(os.path.join(output_dir, "quantize_config.json"), "w") as f:
         json.dump(quant_meta, f, indent=2)
 
-    # 5. Save tokenizer, preserving the original tokenizer.json pre_tokenizer
-    # and decoder which save_pretrained may corrupt (e.g. Sequence(ByteLevel)
-    # can be flattened to plain ByteLevel or replaced with Metaspace).
+    # 5a. Save processor for multimodal models (e.g. Gemma-4 needs
+    # processor_config.json so vLLM/sglang can load via the gemma4_mm
+    # path). AutoProcessor.from_pretrained raises for pure text models;
+    # swallow that — non-multimodal models legitimately have no
+    # processor.
+    #
+    # Order matters: save the processor BEFORE the tokenizer fixup
+    # block below. ``Processor.save_pretrained`` writes its bundled
+    # tokenizer files, which we then overwrite with the corrected
+    # tokenizer.json (preserving the source pre_tokenizer/decoder).
+    try:
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(model_name)
+        processor.save_pretrained(output_dir)
+        print(f"  saved processor ({type(processor).__name__})")
+    except (ValueError, OSError, ImportError, KeyError):
+        # ValueError: model has no processor (typical for text-only LMs)
+        # OSError:    no processor_config.json on hub
+        # ImportError/KeyError: AutoProcessor can't infer the class
+        pass
+
+    # 5b. Save tokenizer, preserving the original tokenizer.json
+    # pre_tokenizer and decoder which save_pretrained may corrupt (e.g.
+    # Sequence(ByteLevel) can be flattened to plain ByteLevel or
+    # replaced with Metaspace).
     src_tok_json = None
     try:
         from huggingface_hub import hf_hub_download
