@@ -31,11 +31,13 @@ set -euo pipefail
 
 export PATH=/usr/local/cuda/bin:$PATH
 
-# Run as ubuntu but inherit root's cwd (commonly /root, which we cannot
-# write to). The git clone + cmake build of llama.cpp below needs a
-# writable cwd; pin it to $HOME so relative paths land under
-# /home/ubuntu/{llama.cpp,...}.
-cd "\$HOME"
+# Run as ubuntu but inherit root's cwd (commonly /root, which ubuntu
+# cannot write to). The git clone + cmake build of llama.cpp below
+# needs a writable cwd; pin it explicitly. We don't use \$HOME because
+# the outer heredoc shell (running set -u in cloud-init's stripped env)
+# may have HOME unset, and even an escaped reference in a comment can
+# trip variable expansion. Hardcode /home/ubuntu.
+cd /home/ubuntu
 
 # Venv on NVMe
 python3 -m venv $VENV
