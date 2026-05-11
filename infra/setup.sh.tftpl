@@ -31,6 +31,12 @@ set -euo pipefail
 
 export PATH=/usr/local/cuda/bin:$PATH
 
+# Run as ubuntu but inherit root's cwd (commonly /root, which we cannot
+# write to). The git clone + cmake build of llama.cpp below needs a
+# writable cwd; pin it to $HOME so relative paths land under
+# /home/ubuntu/{llama.cpp,...}.
+cd "\$HOME"
+
 # Venv on NVMe
 python3 -m venv $VENV
 source $VENV/bin/activate
