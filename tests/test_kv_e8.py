@@ -318,6 +318,79 @@ def test_kv_quantizer_relaxed_beats_strict_on_real_shape(strict, relaxed):
 
 
 # --------------------------------------------------------------------------- #
+# Sensitivity allocator + bpw_map cache plumbing
+# --------------------------------------------------------------------------- #
+
+def test_allocator_target_budget_respected():
+    """``allocate_kv_bpw`` should land at the target avg bpw (within
+    rounding) and only assign values from the allowed menu."""
+    from glq.kv_sensitivity import allocate_kv_bpw
+
+    n_layers = 32
+    sizes = {i: 1_000_000 for i in range(n_layers)}
+    proxy = {}
+    for i in range(n_layers):
+        sens = 1.0 + (i / n_layers) * 5.0
+        proxy[i] = {2: sens, 4: sens * 0.0625, 8: sens * 1e-6, 16: 0.0}
+
+    alloc = allocate_kv_bpw(proxy, sizes, target_avg_bpw=4.0,
+                            allowed_bpws=(2, 4, 8, 16))
+    total = sum(alloc[i] * sizes[i] for i in alloc)
+    avg = total / sum(sizes.values())
+    assert avg <= 4.0 + 1e-6, f"avg bpw {avg:.3f} exceeded target 4.0"
+    assert avg >= 4.0 - 0.5, (
+        f"avg bpw {avg:.3f} much lower than 4.0 — allocator did not "
+        f"use its budget")
+    for v in alloc.values():
+        assert v in (2, 4, 8, 16)
+
+
+def test_allocator_more_bits_to_sensitive_layers():
+    """Layers with higher MSE@min_bpw should end up at higher bpw."""
+    from glq.kv_sensitivity import allocate_kv_bpw
+
+    sizes = {0: 1_000_000, 1: 1_000_000}
+    proxy = {
+        0: {2: 1000.0, 4: 100.0, 8: 1.0, 16: 0.0},
+        1: {2: 0.001, 4: 0.0001, 8: 1e-6, 16: 0.0},
+    }
+    alloc = allocate_kv_bpw(proxy, sizes, target_avg_bpw=5.0,
+                            allowed_bpws=(2, 4, 8, 16))
+    assert alloc[0] >= alloc[1], (
+        f"sensitive layer {alloc[0]}bpw < insensitive layer {alloc[1]}bpw")
+
+
+def test_glq_quantized_cache_bpw_map_routes_layers():
+    """``GLQQuantizedCache(bpw_map=...)`` should build the right layer
+    type per entry."""
+    pytest.importorskip("transformers.cache_utils")
+    from glq.kv_cache import (
+        GLQQuantizedCache, E8QuantizedLayer, INT8QuantizedLayer,
+        FP16PassthroughLayer,
+    )
+
+    class _Cfg:
+        num_hidden_layers = 4
+
+        def get_text_config(self, decoder=True):
+            return self
+
+    bpw_map = {0: 16, 1: 8, 2: 4, 3: 2}
+    cache = GLQQuantizedCache(_Cfg(), quant_method="e8_relaxed",
+                              bpw_map=bpw_map)
+    expected = {
+        0: FP16PassthroughLayer,
+        1: INT8QuantizedLayer,
+        2: E8QuantizedLayer,
+        3: E8QuantizedLayer,
+    }
+    for i, cls in expected.items():
+        assert isinstance(cache.layers[i], cls), (
+            f"layer {i}: expected {cls.__name__}, got "
+            f"{type(cache.layers[i]).__name__}")
+
+
+# --------------------------------------------------------------------------- #
 # Enumerator sanity
 # --------------------------------------------------------------------------- #
 

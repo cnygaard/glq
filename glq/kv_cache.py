@@ -1,6 +1,6 @@
 """Quantized KV cache for GLQ inference — no external dependencies.
 
-Plugs into HuggingFace's QuantizedCache framework. Three backends:
+Plugs into HuggingFace's QuantizedCache framework. Backends:
 
   * ``int8``       — per-channel INT8 absmax (KIVI-style, default;
                      the original GLQQuantizedCache behavior). 8 bpw.
@@ -10,6 +10,12 @@ Plugs into HuggingFace's QuantizedCache framework. Three backends:
                      sub-Gaussian Hadamard-rotated KV per microbench in
                      ``tests/test_kv_e8.py``. 2 or 4 bpw.
 
+Mixed-precision per layer is supported via ``bpw_map``: pass a dict
+``{layer_idx: bpw}`` to ``GLQQuantizedCache`` and each cache layer gets
+the indicated bpw. Allowed bpw values: 16 (no compression, kept as
+fp16/bf16), 8 (INT8), 4 (E8 RVQ), 2 (E8 stage-1). Layers absent from
+the map fall back to the ``quant_method`` / ``n_stages`` defaults.
+
 Requires transformers >= 4.45 (QuantizedCache API).
 
 Usage:
@@ -18,9 +24,16 @@ Usage:
     # Default INT8 (8 bpw):
     cache = GLQQuantizedCache(model.config)
 
-    # E8 relaxed at 4 bpw (recommended for long context):
+    # Uniform E8 relaxed at 4 bpw:
     cache = GLQQuantizedCache(model.config, quant_method="e8_relaxed",
                               n_stages=2)
+
+    # Mixed: sensitive layers at 4 bpw, the rest at 2 bpw (E8 relaxed),
+    # using the JSON map from ``glq.cli.quantize_kv``:
+    import json
+    bpw_map = {int(k): v for k, v in json.load(open("kv_bpw_map.json")).items()}
+    cache = GLQQuantizedCache(model.config, quant_method="e8_relaxed",
+                              bpw_map=bpw_map)
 
     output = model.generate(**inputs, past_key_values=cache)
 """
@@ -79,6 +92,25 @@ class INT8QuantizedLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
     def _dequantize(self, qtensor):
         quantized, scale = qtensor
         return quantized.to(scale.dtype) * scale
+
+
+class FP16PassthroughLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
+    """No-op quantized layer for layers we want to keep at full precision.
+
+    Used as the bpw=16 entry in a mixed-precision ``bpw_map`` so the
+    sensitivity allocator can leave the most-sensitive layers uncompressed.
+    Encoded form is the input tensor itself.
+    """
+
+    def __init__(self, **kwargs):
+        _check_available()
+        super().__init__(**kwargs)
+
+    def _quantize(self, tensor, axis):
+        return tensor
+
+    def _dequantize(self, qtensor):
+        return qtensor
 
 
 class E8QuantizedLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
@@ -156,23 +188,68 @@ def attach_kv_cache(model, *, quant_method: str = "int8", n_stages: int = 1,
     return model
 
 
+# Allowed bpw values for the ``bpw_map`` mixed-precision API and the menu
+# used by ``glq.kv_sensitivity.allocate_kv_bpw``.
+VALID_KV_BPW = (2, 4, 8, 16)
+
+
+def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
+                         q_group_size: int):
+    """Pick the right ``QuantizedLayer`` subclass for the requested bpw.
+
+    bpw=16 → FP16 passthrough; bpw=8 → INT8 absmax; bpw=4 → E8 RVQ
+    (n_stages=2); bpw=2 → E8 stage-1 only. ``e8_method`` selects strict
+    vs relaxed for the 2/4 bpw paths.
+    """
+    if bpw == 16:
+        return FP16PassthroughLayer(
+            nbits=16, axis_key=0, axis_value=0,
+            q_group_size=q_group_size, residual_length=residual_length)
+    if bpw == 8:
+        return INT8QuantizedLayer(
+            nbits=8, axis_key=0, axis_value=0,
+            q_group_size=q_group_size, residual_length=residual_length)
+    if bpw in (2, 4):
+        if e8_method not in ("e8_strict", "e8_relaxed"):
+            raise ValueError(
+                f"e8_method must be 'e8_strict' or 'e8_relaxed' for "
+                f"bpw={bpw}, got {e8_method!r}")
+        return E8QuantizedLayer(
+            quant_method=e8_method, n_stages=(2 if bpw == 4 else 1),
+            nbits=bpw, axis_key=-1, axis_value=-1,
+            q_group_size=8, residual_length=residual_length)
+    raise ValueError(
+        f"bpw={bpw} is not supported; allowed: {VALID_KV_BPW}")
+
+
 class GLQQuantizedCache:
     """Quantized KV cache using pure PyTorch (no quanto/hqq needed).
 
+    Two ways to specify the per-layer bpw:
+
+    1. **Uniform** (``quant_method`` + ``n_stages``) — all layers use
+       the same backend. Default ``"int8"`` → 8 bpw across all layers.
+    2. **Mixed-precision** (``bpw_map``) — ``{layer_idx: bpw}`` selects
+       a different layer backend per cache layer. Allowed bpw:
+       ``{2, 4, 8, 16}``. ``quant_method`` controls which E8 variant
+       (strict vs relaxed) is used for the 2/4 bpw entries.
+
     Args:
         config: Model's ``PreTrainedConfig``.
-        quant_method: ``"int8"`` (default), ``"e8_strict"``, ``"e8_relaxed"``.
-        nbits: Bits per coordinate for INT8 path (must be 8 there).
-            Ignored for E8 paths — use ``n_stages`` instead.
-        n_stages: For E8 paths, 1 = 2 bpw, 2 = 4 bpw (RVQ). Default 1.
-        q_group_size: Group size for INT8 (64 default). Ignored for E8
-            (always 8).
-        residual_length: Tokens kept in full precision before quantizing
-            (128 default). Same meaning across all methods.
+        quant_method: For uniform: backend selector. For mixed: E8
+            variant. ``"int8"`` (default), ``"e8_strict"``, ``"e8_relaxed"``.
+        nbits: Bits per coordinate for the uniform INT8 path (must be 8).
+            Ignored for E8 paths — use ``n_stages``.
+        n_stages: For uniform E8 paths, 1 = 2 bpw, 2 = 4 bpw (RVQ).
+        bpw_map: ``{int layer_idx: int bpw}`` for mixed-precision. Layers
+            not present in the map fall back to the uniform setting.
+        q_group_size: Group size for INT8 (64 default). Ignored for E8.
+        residual_length: Tokens kept in full precision before quantizing.
     """
 
     def __new__(cls, config, *, quant_method: str = "int8", nbits=8,
-                n_stages: int = 1, q_group_size=64, residual_length=128):
+                n_stages: int = 1, bpw_map: dict | None = None,
+                q_group_size=64, residual_length=128):
         _check_available()
 
         if quant_method == "int8":
@@ -188,25 +265,30 @@ class GLQQuantizedCache:
             config, 'get_text_config') else config
         n_layers = getattr(cfg, 'num_hidden_layers', 32)
 
+        # Default bpw for layers absent from bpw_map (or all layers when
+        # bpw_map is None): derived from quant_method + n_stages.
         if quant_method == "int8":
-            layers = [
-                INT8QuantizedLayer(
-                    nbits=nbits, axis_key=0, axis_value=0,
-                    q_group_size=q_group_size, residual_length=residual_length,
-                )
-                for _ in range(n_layers)
-            ]
+            default_bpw = 8
         else:
-            # E8 path: nbits placeholder (QuantizedLayer requires it).
-            layers = [
-                E8QuantizedLayer(
-                    quant_method=quant_method, n_stages=n_stages,
-                    nbits=4 if n_stages == 2 else 2,
-                    axis_key=-1, axis_value=-1,
-                    q_group_size=8, residual_length=residual_length,
-                )
-                for _ in range(n_layers)
-            ]
+            default_bpw = 4 if n_stages == 2 else 2
+        # For the E8 branch, e8_method is what we requested; for INT8
+        # uniform, force e8_method to "e8_relaxed" as a placeholder
+        # (won't be consulted since default_bpw=8 routes through INT8).
+        e8_method = quant_method if quant_method != "int8" else "e8_relaxed"
+
+        bpw_map = dict(bpw_map) if bpw_map else {}
+        for idx, bpw in bpw_map.items():
+            if bpw not in VALID_KV_BPW:
+                raise ValueError(
+                    f"bpw_map[{idx}]={bpw} not in {VALID_KV_BPW}")
+
+        layers = []
+        for i in range(n_layers):
+            bpw = bpw_map.get(i, default_bpw)
+            layers.append(_build_layer_for_bpw(
+                bpw, e8_method=e8_method, residual_length=residual_length,
+                q_group_size=q_group_size))
+
         # Construct a real QuantizedCache, bypassing backend string requirement
         from transformers.cache_utils import Cache
         obj = QuantizedCache.__new__(QuantizedCache)
