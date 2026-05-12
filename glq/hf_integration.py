@@ -33,6 +33,8 @@ class GLQConfig(QuantizationConfigMixin):
         bpw=2,
         layer_bpw: dict = None,
         kv_cache_bits: int = 16,
+        kv_quant_method: str = "int8",
+        kv_n_stages: int = 1,
         trust_remote_code: bool = False,
         **kwargs,
     ):
@@ -42,6 +44,13 @@ class GLQConfig(QuantizationConfigMixin):
         self.bpw = bpw
         self.layer_bpw = layer_bpw
         self.kv_cache_bits = kv_cache_bits
+        # KV-cache compression method. ``"int8"`` (default) keeps the
+        # original KIVI-style INT8 absmax path. ``"e8_strict"`` and
+        # ``"e8_relaxed"`` route through ``glq.kv_e8.E8KVQuantizer`` —
+        # see ``infra/kv-cache.md`` for the motivation. ``n_stages`` is
+        # the codebook depth for the E8 paths: 1 = 2 bpw, 2 = 4 bpw.
+        self.kv_quant_method = kv_quant_method
+        self.kv_n_stages = kv_n_stages
         self.trust_remote_code = trust_remote_code
 
     def to_dict(self):
@@ -55,6 +64,10 @@ class GLQConfig(QuantizationConfigMixin):
             d["layer_bpw"] = self.layer_bpw
         if self.kv_cache_bits != 16:
             d["kv_cache_bits"] = self.kv_cache_bits
+        if self.kv_quant_method != "int8":
+            d["kv_quant_method"] = self.kv_quant_method
+        if self.kv_n_stages != 1:
+            d["kv_n_stages"] = self.kv_n_stages
         if self.trust_remote_code:
             d["trust_remote_code"] = True
         return d
@@ -463,12 +476,24 @@ class GLQQuantizer(HfQuantizer):
             if isinstance(module, E8RHTEmbedding):
                 module._compute_dtype = compute_dtype
 
-        # INT8 KV cache: attach factory so model.generate() uses it
+        # Quantized KV cache: attach a factory so callers can build
+        # fresh cache instances via ``cache = model._glq_kv_cache_factory()``
+        # and pass them to ``model.generate(past_key_values=cache, ...)``.
+        #
+        # Activation conditions:
+        #   - kv_cache_bits == 8 (legacy INT8 declaration), OR
+        #   - kv_quant_method != "int8" (explicit E8 selection).
+        # In all cases, ``kv_quant_method`` chooses the backend:
+        # "int8" | "e8_strict" | "e8_relaxed".
         kv_bits = getattr(self.quantization_config, 'kv_cache_bits', 16)
-        if kv_bits == 8:
+        kv_method = getattr(self.quantization_config, 'kv_quant_method', 'int8')
+        kv_n_stages = getattr(self.quantization_config, 'kv_n_stages', 1)
+        if kv_bits == 8 or kv_method != "int8":
             from .kv_cache import GLQQuantizedCache
             config = model.config
-            model._glq_kv_cache_factory = lambda: GLQQuantizedCache(config)
+            model._glq_kv_cache_factory = (
+                lambda: GLQQuantizedCache(
+                    config, quant_method=kv_method, n_stages=kv_n_stages))
 
         # NemotronH (Nemotron-Cascade, Nemotron-3-Nano, etc.) has 5 latent
         # bugs in NVIDIA's remote modeling file that silently force
