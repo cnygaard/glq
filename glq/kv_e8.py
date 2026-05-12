@@ -49,8 +49,8 @@ class E8KVQuantizer:
             raise ValueError(
                 f"E8KVQuantizer requires an 8-dimensional codebook; got "
                 f"codesz={codebook.codesz}")
-        if n_stages not in (1, 2):
-            raise ValueError(f"n_stages must be 1 or 2, got {n_stages}")
+        if n_stages not in (1, 2, 3):
+            raise ValueError(f"n_stages must be 1, 2, or 3, got {n_stages}")
         self.codebook = codebook
         self.n_stages = n_stages
         self.dtype = dtype
@@ -110,11 +110,23 @@ class E8KVQuantizer:
             out = {
                 "idx1": idx1.reshape(N, n_groups).to(torch.int16),
             }
-        else:
+        elif self.n_stages == 2:
             _, (idx1, idx2) = self.codebook.quantize_rvq(flat)
             out = {
                 "idx1": idx1.reshape(N, n_groups).to(torch.int16),
                 "idx2": idx2.reshape(N, n_groups).to(torch.int16),
+            }
+        else:  # n_stages == 3 → 6 bpw
+            rs = self.codebook.resid_scale
+            dec1, idx1 = self.codebook.quantize(flat)
+            r1 = (flat - dec1) * rs
+            dec2, idx2 = self.codebook.quantize(r1)
+            r2 = (r1 - dec2) * rs
+            _, idx3 = self.codebook.quantize(r2)
+            out = {
+                "idx1": idx1.reshape(N, n_groups).to(torch.int16),
+                "idx2": idx2.reshape(N, n_groups).to(torch.int16),
+                "idx3": idx3.reshape(N, n_groups).to(torch.int16),
             }
         # Reshape scale back to original leading shape (drop the last
         # singleton dim from amax keepdim=True).
@@ -136,9 +148,17 @@ class E8KVQuantizer:
         orig_dtype = qt["dtype"]
         N, n_groups = idx1.shape
 
-        # Stage 1 lookup (and optional stage 2).
+        # Stage 1 lookup (and optional stage 2 / stage 3).
         flat1 = idx1.flatten()
-        if "idx2" in qt:
+        if "idx3" in qt:
+            flat2 = qt["idx2"].long().flatten()
+            flat3 = qt["idx3"].long().flatten()
+            rs = self.codebook.resid_scale
+            dec = (
+                self.codebook.decode(flat1)
+                + self.codebook.decode(flat2) / rs
+                + self.codebook.decode(flat3) / (rs * rs))
+        elif "idx2" in qt:
             flat2 = qt["idx2"].long().flatten()
             dec = self.codebook.decode_rvq(flat1, flat2)
         else:

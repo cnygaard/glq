@@ -190,7 +190,7 @@ def attach_kv_cache(model, *, quant_method: str = "int8", n_stages: int = 1,
 
 # Allowed bpw values for the ``bpw_map`` mixed-precision API and the menu
 # used by ``glq.kv_sensitivity.allocate_kv_bpw``.
-VALID_KV_BPW = (2, 4, 8, 16)
+VALID_KV_BPW = (2, 4, 6, 8, 16)
 
 
 def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
@@ -209,13 +209,14 @@ def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
         return INT8QuantizedLayer(
             nbits=8, axis_key=0, axis_value=0,
             q_group_size=q_group_size, residual_length=residual_length)
-    if bpw in (2, 4):
+    if bpw in (2, 4, 6):
         if e8_method not in ("e8_strict", "e8_relaxed"):
             raise ValueError(
                 f"e8_method must be 'e8_strict' or 'e8_relaxed' for "
                 f"bpw={bpw}, got {e8_method!r}")
+        n_stages = {2: 1, 4: 2, 6: 3}[bpw]
         return E8QuantizedLayer(
-            quant_method=e8_method, n_stages=(2 if bpw == 4 else 1),
+            quant_method=e8_method, n_stages=n_stages,
             nbits=bpw, axis_key=-1, axis_value=-1,
             q_group_size=8, residual_length=residual_length)
     raise ValueError(
