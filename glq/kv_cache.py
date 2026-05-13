@@ -271,7 +271,14 @@ class GLQQuantizedCache:
         if quant_method == "int8":
             default_bpw = 8
         else:
-            default_bpw = 4 if n_stages == 2 else 2
+            # E8: n_stages → bpw mapping. 1→2 (single codebook lookup),
+            # 2→4 (RVQ), 3→6 (3-stage RVQ).
+            try:
+                default_bpw = {1: 2, 2: 4, 3: 6}[n_stages]
+            except KeyError:
+                raise ValueError(
+                    f"n_stages must be 1, 2, or 3 for E8 paths, "
+                    f"got {n_stages}")
         # For the E8 branch, e8_method is what we requested; for INT8
         # uniform, force e8_method to "e8_relaxed" as a placeholder
         # (won't be consulted since default_bpw=8 routes through INT8).
