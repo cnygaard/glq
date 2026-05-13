@@ -61,9 +61,18 @@ def _check_available():
         )
 
 
-def _get_codebook(quant_method: str, device: str = "cpu"):
-    """Lazily build (and cache) the strict / relaxed codebook."""
+def _get_codebook(quant_method: str, device: str | None = None):
+    """Lazily build (and cache) the strict / relaxed codebook.
+
+    Defaults to ``cuda`` when available so construction (especially
+    ``_compute_opt_scale`` / ``_compute_resid_scale``, which do hundreds
+    of millions of 8D NN distance computations) runs on the GPU. On
+    CPU these take ~3 min for the 65,536-entry codebook; on GPU it's
+    sub-second.
+    """
     global _E8_STRICT_CB, _E8_RELAXED_CB
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     if quant_method == "e8_strict":
         if _E8_STRICT_CB is None or str(_E8_STRICT_CB.device) != str(device):
             from glq.codebook import E8ShellCodebook
@@ -126,11 +135,15 @@ class E8QuantizedLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
         _check_available()
         super().__init__(**kwargs)
         from glq.kv_e8 import E8KVQuantizer
-        cb = _get_codebook(quant_method, device="cpu")
+        # Build the codebook on cuda when available — saves ~3 minutes
+        # per fresh process vs CPU construction (opt_scale/resid_scale
+        # NN sweeps).
+        cb = _get_codebook(quant_method)
         self._quantizer = E8KVQuantizer(cb, n_stages=n_stages)
         self._quant_method = quant_method
         self._n_stages = n_stages
-        # Codebook is moved to the input device lazily on first _quantize.
+        # Codebook may still need a per-call move if the input device
+        # differs from the build device (e.g. multi-GPU).
         self._cb_device_synced = False
 
     def _maybe_move_codebook(self, target_device):
