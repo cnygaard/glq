@@ -15,6 +15,12 @@ def register():
     """Entry point called by vLLM's plugin loader in ALL processes (including engine core).
 
     Registered as vllm.general_plugins entry point in pyproject.toml.
+
+    Also activates the E8 KV-cache monkey-patch when ``GLQ_KV_QUANT`` is
+    set (e.g. ``GLQ_KV_QUANT=e8_relaxed:2`` for 4 bpw RVQ). The patch
+    must be applied in the engine subprocess for vLLM v1; this entry
+    point runs there too, which is why ``glqkv.enable()`` lives here
+    rather than in user code.
     """
     try:
         from vllm.model_executor.layers.quantization import register_quantization_config
@@ -24,6 +30,29 @@ def register():
         _ensure_registered()
     except ImportError:
         pass
+
+    # KV-cache E8 compression — opt-in via env var.
+    # Format: GLQ_KV_QUANT=<quant_method>:<n_stages>
+    #   e.g. GLQ_KV_QUANT=e8_relaxed:1  → 2 bpw
+    #        GLQ_KV_QUANT=e8_relaxed:2  → 4 bpw (RVQ)
+    #        GLQ_KV_QUANT=e8_relaxed:3  → 6 bpw (3-stage RVQ)
+    #        GLQ_KV_QUANT=e8_strict:1   → 2 bpw, strict parity (catastrophic, demo only)
+    import os
+    spec = os.environ.get("GLQ_KV_QUANT")
+    if spec:
+        try:
+            method, n_stages_s = spec.split(":")
+            n_stages = int(n_stages_s)
+            from . import kv_compression
+            kv_compression.enable(quant_method=method, n_stages=n_stages)
+            # Log so we can confirm the patch fired in engine logs.
+            print(f"[glq_vllm] GLQ_KV_QUANT={spec!r} → "
+                  f"KV cache monkey-patch activated "
+                  f"(quant_method={method}, n_stages={n_stages})",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[glq_vllm] failed to activate GLQ_KV_QUANT={spec!r}: {e}",
+                  flush=True)
 
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)
