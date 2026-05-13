@@ -51,30 +51,42 @@ _active_config: dict[str, Any] = {}
 _call_counter: int = 0  # debug: counts how many times the patched fn fires
 
 
-def _get_quantizer(quant_method: str, n_stages: int):
-    """Lazily build the E8KVQuantizer with the given settings."""
+_E8_BPW_RECIPES = {
+    2: (1, 0),   # 1 primary, 0 secondary
+    3: (1, 1),   # 1 primary, 1 secondary (8-bit) → 16+8=24 bits/8 dims
+    4: (2, 0),
+    6: (3, 0),
+}
+
+
+def _get_quantizer(quant_method: str, n_stages: int,
+                   secondary_stages: int = 0):
+    """Lazily build an E8KVQuantizer with the given primary/secondary stages."""
     from glq.kv_cache import _get_codebook
     from glq.kv_e8 import E8KVQuantizer
     cb = _get_codebook(quant_method)  # cuda-default after 666ffcd
-    return E8KVQuantizer(cb, n_stages=n_stages)
+    small = cb.make_small() if secondary_stages > 0 else None
+    return E8KVQuantizer(cb, n_stages=n_stages,
+                        secondary_codebook=small,
+                        secondary_stages=secondary_stages)
 
 
 def _build_bpw_quantizers(quant_method: str, bpws: set[int]):
     """One quantizer per distinct E8 bpw in the map.
 
-    bpw → n_stages: 2→1, 4→2, 6→3. bpw=8 uses inline INT8 absmax (no
-    persistent state needed). bpw=16 is passthrough."""
-    n_stages_for = {2: 1, 4: 2, 6: 3}
+    bpw → (n_primary, n_secondary): see ``_E8_BPW_RECIPES``. bpw=8 uses
+    inline INT8 absmax (no persistent state). bpw=16 is passthrough."""
     out = {}
     for b in bpws:
-        if b in n_stages_for:
-            out[b] = _get_quantizer(quant_method, n_stages_for[b])
+        if b in _E8_BPW_RECIPES:
+            n_p, n_s = _E8_BPW_RECIPES[b]
+            out[b] = _get_quantizer(quant_method, n_p, secondary_stages=n_s)
         elif b in (8, 16):
             out[b] = None
         else:
             raise ValueError(
                 f"bpw={b} not supported in vLLM KV patch; "
-                f"allowed: 2/4/6 (E8 RVQ), 8 (INT8), 16 (passthrough)")
+                f"allowed: 2/3/4/6 (E8 RVQ), 8 (INT8), 16 (passthrough)")
     return out
 
 
@@ -357,7 +369,7 @@ def enable(quant_method: str = "e8_relaxed", n_stages: int = 1,
                 "mode": "uniform",
                 "quant_method": quant_method,
                 "n_stages": n_stages,
-                "bpw": {1: 2, 2: 4, 3: 6}[n_stages],
+                "bpw": _quantizer.bpw,
             }
 
 
