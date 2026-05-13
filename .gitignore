@@ -23,6 +23,7 @@ venv/
 
 # Infrastructure (not published)
 infra/
+infra/kv-cache.md
 
 # Cloned repos (local development only)
 GPTQModel/
@@ -40,6 +41,7 @@ smollm2-*/
 # Logs and results
 *.log
 *.out
+.local-logs/
 
 # Misc
 .claude/
