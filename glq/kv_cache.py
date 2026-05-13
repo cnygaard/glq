@@ -131,7 +131,8 @@ class E8QuantizedLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
     shared across all layers (singleton via ``_get_codebook``).
     """
 
-    def __init__(self, quant_method: str, n_stages: int = 1, **kwargs):
+    def __init__(self, quant_method: str, n_stages: int = 1,
+                 secondary_stages: int = 0, **kwargs):
         _check_available()
         super().__init__(**kwargs)
         from glq.kv_e8 import E8KVQuantizer
@@ -139,9 +140,16 @@ class E8QuantizedLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
         # per fresh process vs CPU construction (opt_scale/resid_scale
         # NN sweeps).
         cb = _get_codebook(quant_method)
-        self._quantizer = E8KVQuantizer(cb, n_stages=n_stages)
+        # 3-bpw and 5-bpw recipes need the 256-entry small codebook on
+        # the same device as the primary.
+        small_cb = cb.make_small() if secondary_stages > 0 else None
+        self._quantizer = E8KVQuantizer(
+            cb, n_stages=n_stages,
+            secondary_codebook=small_cb,
+            secondary_stages=secondary_stages)
         self._quant_method = quant_method
         self._n_stages = n_stages
+        self._secondary_stages = secondary_stages
         # Codebook may still need a per-call move if the input device
         # differs from the build device (e.g. multi-GPU).
         self._cb_device_synced = False
@@ -203,16 +211,21 @@ def attach_kv_cache(model, *, quant_method: str = "int8", n_stages: int = 1,
 
 # Allowed bpw values for the ``bpw_map`` mixed-precision API and the menu
 # used by ``glq.kv_sensitivity.allocate_kv_bpw``.
-VALID_KV_BPW = (2, 4, 6, 8, 16)
+#
+# 2/4/6 are pure E8 (1/2/3 primary 16-bit stages). 3 is E8 primary +
+# one 8-bit secondary stage (16+8=24 bits / 8 dims). 8 is INT8 absmax,
+# 16 is fp16 passthrough.
+VALID_KV_BPW = (2, 3, 4, 6, 8, 16)
 
 
 def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
                          q_group_size: int):
     """Pick the right ``QuantizedLayer`` subclass for the requested bpw.
 
-    bpw=16 → FP16 passthrough; bpw=8 → INT8 absmax; bpw=4 → E8 RVQ
-    (n_stages=2); bpw=2 → E8 stage-1 only. ``e8_method`` selects strict
-    vs relaxed for the 2/4 bpw paths.
+    bpw=16 → FP16 passthrough; bpw=8 → INT8 absmax; bpw=6/4/2 → pure
+    E8 RVQ (3/2/1 primary stages); bpw=3 → E8 primary + one 8-bit
+    secondary stage. ``e8_method`` selects strict vs relaxed for the
+    E8 paths.
     """
     if bpw == 16:
         return FP16PassthroughLayer(
@@ -222,14 +235,18 @@ def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
         return INT8QuantizedLayer(
             nbits=8, axis_key=0, axis_value=0,
             q_group_size=q_group_size, residual_length=residual_length)
-    if bpw in (2, 4, 6):
+    if bpw in (2, 3, 4, 6):
         if e8_method not in ("e8_strict", "e8_relaxed"):
             raise ValueError(
                 f"e8_method must be 'e8_strict' or 'e8_relaxed' for "
                 f"bpw={bpw}, got {e8_method!r}")
-        n_stages = {2: 1, 4: 2, 6: 3}[bpw]
+        # (n_stages, secondary_stages) tuples — 2bpw=1p+0s, 3bpw=1p+1s,
+        # 4bpw=2p+0s, 6bpw=3p+0s.
+        n_primary, n_secondary = {2: (1, 0), 3: (1, 1), 4: (2, 0),
+                                  6: (3, 0)}[bpw]
         return E8QuantizedLayer(
-            quant_method=e8_method, n_stages=n_stages,
+            quant_method=e8_method, n_stages=n_primary,
+            secondary_stages=n_secondary,
             nbits=bpw, axis_key=-1, axis_value=-1,
             q_group_size=8, residual_length=residual_length)
     raise ValueError(

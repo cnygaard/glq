@@ -37,25 +37,50 @@ class E8KVQuantizer:
 
     Args:
         codebook: An ``E8ShellCodebook`` (strict) or ``E8RelaxedCodebook``
-            instance, used for stage-1 nearest-neighbor lookup.
-        n_stages: 1 = 2 bpw (single codebook lookup), 2 = 4 bpw (RVQ).
+            instance, used for primary 16-bit nearest-neighbor lookups.
+        n_stages: 1/2/3 primary 16-bit stages → 2/4/6 bpw.
+        secondary_codebook: Optional 256-entry secondary codebook
+            (``codebook.make_small()``). When set together with
+            ``secondary_stages > 0``, ``secondary_stages`` 8-bit RVQ
+            stages are appended on the residual.
+        secondary_stages: Number of 8-bit secondary stages on top of
+            ``n_stages``. Effective bpw = ``2 * n_stages + secondary_stages``.
         group_size: Must be 8 (the E8 dimension).
     """
 
     GROUP_SIZE = 8
 
-    def __init__(self, codebook, n_stages: int = 1, dtype=torch.float16):
+    def __init__(self, codebook, n_stages: int = 1, dtype=torch.float16,
+                 secondary_codebook=None, secondary_stages: int = 0):
         if codebook.codesz != self.GROUP_SIZE:
             raise ValueError(
                 f"E8KVQuantizer requires an 8-dimensional codebook; got "
                 f"codesz={codebook.codesz}")
         if n_stages not in (1, 2, 3):
             raise ValueError(f"n_stages must be 1, 2, or 3, got {n_stages}")
+        if secondary_stages < 0 or secondary_stages > 2:
+            raise ValueError(
+                f"secondary_stages must be 0, 1, or 2; got {secondary_stages}")
+        if secondary_stages > 0 and secondary_codebook is None:
+            raise ValueError(
+                "secondary_codebook must be provided when secondary_stages>0")
+        if (secondary_codebook is not None
+                and secondary_codebook.codesz != self.GROUP_SIZE):
+            raise ValueError(
+                f"secondary_codebook must be 8-dimensional; got "
+                f"codesz={secondary_codebook.codesz}")
         self.codebook = codebook
+        self.secondary_codebook = secondary_codebook
         self.n_stages = n_stages
+        self.secondary_stages = secondary_stages
         self.dtype = dtype
         # Hadamard built lazily once we see the runtime device.
         self._H = None
+
+    @property
+    def bpw(self) -> int:
+        """Bits-per-weight: 2 per primary stage + 1 per secondary stage."""
+        return 2 * self.n_stages + self.secondary_stages
 
     def _hadamard_on(self, device, dtype):
         if (self._H is None
@@ -103,31 +128,41 @@ class E8KVQuantizer:
         scale = x_rot.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         x_norm = x_rot / scale  # [N, G, 8]
 
-        # Codebook NN over (N*G) 8-vectors.
+        # Codebook NN over (N*G) 8-vectors. Run the primary stage(s)
+        # first; track the residual so optional secondary stages can
+        # refine it further.
         flat = x_norm.reshape(-1, self.GROUP_SIZE)
-        if self.n_stages == 1:
-            _, idx1 = self.codebook.quantize(flat)
-            out = {
-                "idx1": idx1.reshape(N, n_groups).to(torch.int16),
-            }
-        elif self.n_stages == 2:
-            _, (idx1, idx2) = self.codebook.quantize_rvq(flat)
-            out = {
-                "idx1": idx1.reshape(N, n_groups).to(torch.int16),
-                "idx2": idx2.reshape(N, n_groups).to(torch.int16),
-            }
-        else:  # n_stages == 3 → 6 bpw
-            rs = self.codebook.resid_scale
-            dec1, idx1 = self.codebook.quantize(flat)
-            r1 = (flat - dec1) * rs
+        rs = self.codebook.resid_scale
+        out: dict[str, Any] = {}
+
+        # ---- Primary stages (16-bit each) ----
+        dec1, idx1 = self.codebook.quantize(flat)
+        out["idx1"] = idx1.reshape(N, n_groups).to(torch.int16)
+        residual = flat - dec1
+        if self.n_stages >= 2:
+            r1 = residual * rs
             dec2, idx2 = self.codebook.quantize(r1)
-            r2 = (r1 - dec2) * rs
-            _, idx3 = self.codebook.quantize(r2)
-            out = {
-                "idx1": idx1.reshape(N, n_groups).to(torch.int16),
-                "idx2": idx2.reshape(N, n_groups).to(torch.int16),
-                "idx3": idx3.reshape(N, n_groups).to(torch.int16),
-            }
+            out["idx2"] = idx2.reshape(N, n_groups).to(torch.int16)
+            residual = (r1 - dec2)            # in rs-scaled space
+            if self.n_stages >= 3:
+                r2 = residual * rs            # rs^2-scaled
+                dec3, idx3 = self.codebook.quantize(r2)
+                out["idx3"] = idx3.reshape(N, n_groups).to(torch.int16)
+                residual = (r2 - dec3)        # in rs^2-scaled space
+
+        # ---- Secondary 8-bit stages on the residual ----
+        # Boost the residual into unit-ball range (primary's rs is
+        # tuned to do exactly that). The small codebook expects
+        # unit-ball inputs because it's just the lowest-norm shells of
+        # the primary. Between consecutive secondary stages we re-scale
+        # again so each stage sees a residual at the same magnitude.
+        if self.secondary_stages > 0:
+            cur = residual * rs
+            for k in range(1, self.secondary_stages + 1):
+                dec_s, idx_s = self.secondary_codebook.quantize(cur)
+                out[f"idx_s{k}"] = idx_s.reshape(N, n_groups).to(torch.int16)
+                if k < self.secondary_stages:
+                    cur = (cur - dec_s) * rs
         # Reshape scale back to original leading shape (drop the last
         # singleton dim from amax keepdim=True).
         scale_shape = orig_shape[:-1] + (n_groups,)
@@ -148,21 +183,33 @@ class E8KVQuantizer:
         orig_dtype = qt["dtype"]
         N, n_groups = idx1.shape
 
-        # Stage 1 lookup (and optional stage 2 / stage 3).
+        # Primary stage(s). The k-th primary stage decodes in the
+        # rs^(k-1)-scaled space, so we divide by rs^(k-1) on the way out.
         flat1 = idx1.flatten()
-        if "idx3" in qt:
+        rs = self.codebook.resid_scale
+        dec = self.codebook.decode(flat1)
+        n_primary = 1
+        if "idx2" in qt:
             flat2 = qt["idx2"].long().flatten()
-            flat3 = qt["idx3"].long().flatten()
-            rs = self.codebook.resid_scale
-            dec = (
-                self.codebook.decode(flat1)
-                + self.codebook.decode(flat2) / rs
-                + self.codebook.decode(flat3) / (rs * rs))
-        elif "idx2" in qt:
-            flat2 = qt["idx2"].long().flatten()
-            dec = self.codebook.decode_rvq(flat1, flat2)
-        else:
-            dec = self.codebook.decode(flat1)  # [N*G, 8]
+            dec = dec + self.codebook.decode(flat2) / rs
+            n_primary = 2
+            if "idx3" in qt:
+                flat3 = qt["idx3"].long().flatten()
+                dec = dec + self.codebook.decode(flat3) / (rs * rs)
+                n_primary = 3
+
+        # Secondary 8-bit stages refine the last primary's residual.
+        # The encode pipeline scales the residual by rs before each
+        # secondary NN lookup (boost into unit-ball range, since the
+        # small codebook expects that). So the k-th secondary contributes
+        # in the rs^(n_primary - 1 + k)-scaled space, and we divide by
+        # that factor when adding it back.
+        k = 1
+        while f"idx_s{k}" in qt:
+            flat_s = qt[f"idx_s{k}"].long().flatten()
+            divisor = rs ** (n_primary - 1 + k)
+            dec = dec + self.secondary_codebook.decode(flat_s) / divisor
+            k += 1
 
         # Restore per-group shape + scale + inverse Hadamard.
         dec = dec.reshape(N, n_groups, self.GROUP_SIZE)

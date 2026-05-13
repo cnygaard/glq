@@ -257,14 +257,22 @@ def _kv_tensor(batch=1, n_heads=4, seq=64, head_dim=64, seed=0):
     return x
 
 
-@pytest.mark.parametrize("n_stages,bpw", [(1, 2), (2, 4)])
+@pytest.mark.parametrize(
+    "n_primary,n_secondary,bpw",
+    [(1, 0, 2), (1, 1, 3), (2, 0, 4), (3, 0, 6)],
+)
 @pytest.mark.parametrize("codebook_kind", ["strict", "relaxed"])
-def test_kv_quantizer_roundtrip(strict, relaxed, n_stages, bpw, codebook_kind):
+def test_kv_quantizer_roundtrip(strict, relaxed, n_primary, n_secondary, bpw,
+                                codebook_kind):
     """E8KVQuantizer encode → decode should reconstruct KV-shaped tensors
     within a tolerance that depends on bpw."""
     from glq.kv_e8 import E8KVQuantizer
     cb = strict if codebook_kind == "strict" else relaxed
-    quantizer = E8KVQuantizer(cb, n_stages=n_stages)
+    small = cb.make_small() if n_secondary > 0 else None
+    quantizer = E8KVQuantizer(cb, n_stages=n_primary,
+                              secondary_codebook=small,
+                              secondary_stages=n_secondary)
+    assert quantizer.bpw == bpw
 
     x = _kv_tensor(batch=2, n_heads=4, seq=32, head_dim=64)
     qt = quantizer.quantize(x)
@@ -273,24 +281,51 @@ def test_kv_quantizer_roundtrip(strict, relaxed, n_stages, bpw, codebook_kind):
     assert qt["shape"] == tuple(x.shape)
     assert qt["dtype"] == x.dtype
     assert qt["idx1"].dtype == torch.int16
-    assert "idx2" in qt if n_stages == 2 else "idx2" not in qt
+    # Stage presence matches the recipe.
+    assert ("idx2" in qt) == (n_primary >= 2)
+    assert ("idx3" in qt) == (n_primary >= 3)
+    assert ("idx_s1" in qt) == (n_secondary >= 1)
 
     rec = quantizer.dequantize(qt)
     assert rec.shape == x.shape
     assert rec.dtype == x.dtype
 
-    # Reconstruction MSE depends on bpw budget. At 2 bpw, error is large;
-    # at 4 bpw (RVQ), error should be modest.
     err = ((x - rec) ** 2).mean().item()
     var = x.var().item()
     rel = err / (var + 1e-12)
-    print(f"\n  {codebook_kind} {bpw}bpw: MSE={err:.4f} relMSE={rel:.4f}")
-    # Loose tolerance; the headline goal is "decoder works", quality is
+    print(f"\n  {codebook_kind} {bpw}bpw "
+          f"(p={n_primary}+s={n_secondary}): MSE={err:.4f} relMSE={rel:.4f}")
+    # Loose tolerance per tier; the goal is "decoder works", quality is
     # in the separate microbench.
-    if bpw == 4:
-        assert rel < 0.5, f"4 bpw rel MSE = {rel:.4f}, expected < 0.5"
-    else:
-        assert rel < 2.0, f"2 bpw rel MSE = {rel:.4f}, expected < 2.0"
+    tol = {2: 2.0, 3: 1.0, 4: 0.5, 6: 0.1}[bpw]
+    assert rel < tol, f"{bpw} bpw rel MSE = {rel:.4f}, expected < {tol}"
+
+
+def test_kv_quantizer_bpw_ladder_is_monotonic(relaxed):
+    """3 bpw should reconstruct strictly better than 2 bpw (and 4 better
+    than 3) on a fixed synthetic KV-shaped tensor. Sanity check that
+    the secondary stage actually shrinks the residual."""
+    from glq.kv_e8 import E8KVQuantizer
+    cb = relaxed
+    small = cb.make_small()
+    x = _kv_tensor(batch=4, n_heads=8, seq=64, head_dim=64)
+
+    def mse(n_primary, n_secondary):
+        q = E8KVQuantizer(cb, n_stages=n_primary,
+                          secondary_codebook=small,
+                          secondary_stages=n_secondary)
+        rec = q.dequantize(q.quantize(x))
+        return ((x - rec) ** 2).mean().item()
+
+    mse_2 = mse(1, 0)
+    mse_3 = mse(1, 1)
+    mse_4 = mse(2, 0)
+    mse_6 = mse(3, 0)
+    print(f"\n  bpw ladder MSE: 2={mse_2:.4f} 3={mse_3:.4f} "
+          f"4={mse_4:.4f} 6={mse_6:.4f}")
+    assert mse_3 < mse_2, f"3 bpw ({mse_3}) should beat 2 bpw ({mse_2})"
+    assert mse_4 < mse_3, f"4 bpw ({mse_4}) should beat 3 bpw ({mse_3})"
+    assert mse_6 < mse_4, f"6 bpw ({mse_6}) should beat 4 bpw ({mse_4})"
 
 
 def test_kv_quantizer_relaxed_beats_strict_on_real_shape(strict, relaxed):
