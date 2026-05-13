@@ -31,21 +31,45 @@ def register():
     except ImportError:
         pass
 
-    # KV-cache E8 compression — opt-in via env var.
-    # Format: GLQ_KV_QUANT=<quant_method>:<n_stages>
-    #   e.g. GLQ_KV_QUANT=e8_relaxed:1  → 2 bpw
-    #        GLQ_KV_QUANT=e8_relaxed:2  → 4 bpw (RVQ)
-    #        GLQ_KV_QUANT=e8_relaxed:3  → 6 bpw (3-stage RVQ)
-    #        GLQ_KV_QUANT=e8_strict:1   → 2 bpw, strict parity (catastrophic, demo only)
+    # KV-cache E8 compression — opt-in via env vars (mutually exclusive,
+    # GLQ_KV_BPW_MAP wins if both are set).
+    #
+    # Uniform bpw:
+    #   GLQ_KV_QUANT=<quant_method>:<n_stages>
+    #     e.g. GLQ_KV_QUANT=e8_relaxed:1  → 2 bpw
+    #          GLQ_KV_QUANT=e8_relaxed:2  → 4 bpw (RVQ)
+    #          GLQ_KV_QUANT=e8_relaxed:3  → 6 bpw (3-stage RVQ)
+    #
+    # Per-layer mixed bpw (from glq.cli.quantize_kv):
+    #   GLQ_KV_BPW_MAP=/path/to/kv_bpw_map.json
+    #   GLQ_KV_QUANT_METHOD=e8_relaxed                  # optional, default
     import os
+    bpw_map_path = os.environ.get("GLQ_KV_BPW_MAP")
     spec = os.environ.get("GLQ_KV_QUANT")
-    if spec:
+    if bpw_map_path:
+        try:
+            import json
+            raw = json.load(open(bpw_map_path))
+            bpw_map = {int(k): int(v) for k, v in raw.items()}
+            method = os.environ.get("GLQ_KV_QUANT_METHOD", "e8_relaxed")
+            from . import kv_compression
+            kv_compression.enable(quant_method=method, bpw_map=bpw_map)
+            cfg = kv_compression.active_config()
+            print(f"[glq_vllm] GLQ_KV_BPW_MAP={bpw_map_path!r} → "
+                  f"KV cache patch activated (method={method}, "
+                  f"n_layers={cfg.get('n_layers')}, "
+                  f"avg_bpw={cfg.get('bpw_avg'):.2f}, "
+                  f"hist={cfg.get('bpw_hist')})",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[glq_vllm] failed to load GLQ_KV_BPW_MAP="
+                  f"{bpw_map_path!r}: {e}", flush=True)
+    elif spec:
         try:
             method, n_stages_s = spec.split(":")
             n_stages = int(n_stages_s)
             from . import kv_compression
             kv_compression.enable(quant_method=method, n_stages=n_stages)
-            # Log so we can confirm the patch fired in engine logs.
             print(f"[glq_vllm] GLQ_KV_QUANT={spec!r} → "
                   f"KV cache monkey-patch activated "
                   f"(quant_method={method}, n_stages={n_stages})",
