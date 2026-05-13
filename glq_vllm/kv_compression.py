@@ -52,10 +52,13 @@ _call_counter: int = 0  # debug: counts how many times the patched fn fires
 
 
 _E8_BPW_RECIPES = {
-    2: (1, 0),   # 1 primary, 0 secondary
-    3: (1, 1),   # 1 primary, 1 secondary (8-bit) → 16+8=24 bits/8 dims
+    # bpw : (n_primary 16-bit stages, n_secondary 8-bit stages)
+    2: (1, 0),
+    3: (1, 1),   # 16+8 = 24 bits / 8 dims
     4: (2, 0),
+    5: (2, 1),   # 16+16+8 = 40 bits / 8 dims
     6: (3, 0),
+    7: (3, 1),   # 16+16+16+8 = 56 bits / 8 dims
 }
 
 
@@ -86,7 +89,7 @@ def _build_bpw_quantizers(quant_method: str, bpws: set[int]):
         else:
             raise ValueError(
                 f"bpw={b} not supported in vLLM KV patch; "
-                f"allowed: 2/3/4/6 (E8 RVQ), 8 (INT8), 16 (passthrough)")
+                f"allowed: 2/3/4/5/6/7 (E8 RVQ), 8 (INT8), 16 (passthrough)")
     return out
 
 

@@ -212,10 +212,10 @@ def attach_kv_cache(model, *, quant_method: str = "int8", n_stages: int = 1,
 # Allowed bpw values for the ``bpw_map`` mixed-precision API and the menu
 # used by ``glq.kv_sensitivity.allocate_kv_bpw``.
 #
-# 2/4/6 are pure E8 (1/2/3 primary 16-bit stages). 3 is E8 primary +
-# one 8-bit secondary stage (16+8=24 bits / 8 dims). 8 is INT8 absmax,
-# 16 is fp16 passthrough.
-VALID_KV_BPW = (2, 3, 4, 6, 8, 16)
+# 2/4/6 are pure E8 (1/2/3 primary 16-bit stages). 3/5/7 mix in one
+# 8-bit secondary stage on top of 1/2/3 primary stages (n_primary*16+8
+# bits / 8 dims). 8 is INT8 absmax, 16 is fp16 passthrough.
+VALID_KV_BPW = (2, 3, 4, 5, 6, 7, 8, 16)
 
 
 def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
@@ -235,15 +235,18 @@ def _build_layer_for_bpw(bpw: int, *, e8_method: str, residual_length: int,
         return INT8QuantizedLayer(
             nbits=8, axis_key=0, axis_value=0,
             q_group_size=q_group_size, residual_length=residual_length)
-    if bpw in (2, 3, 4, 6):
+    if bpw in (2, 3, 4, 5, 6, 7):
         if e8_method not in ("e8_strict", "e8_relaxed"):
             raise ValueError(
                 f"e8_method must be 'e8_strict' or 'e8_relaxed' for "
                 f"bpw={bpw}, got {e8_method!r}")
-        # (n_stages, secondary_stages) tuples — 2bpw=1p+0s, 3bpw=1p+1s,
-        # 4bpw=2p+0s, 6bpw=3p+0s.
-        n_primary, n_secondary = {2: (1, 0), 3: (1, 1), 4: (2, 0),
-                                  6: (3, 0)}[bpw]
+        # (n_primary, n_secondary) — pure-primary stages give 2/4/6 bpw,
+        # appending one 8-bit secondary stage gives 3/5/7 bpw.
+        n_primary, n_secondary = {
+            2: (1, 0), 3: (1, 1),
+            4: (2, 0), 5: (2, 1),
+            6: (3, 0), 7: (3, 1),
+        }[bpw]
         return E8QuantizedLayer(
             quant_method=e8_method, n_stages=n_primary,
             secondary_stages=n_secondary,

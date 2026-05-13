@@ -259,7 +259,7 @@ def _kv_tensor(batch=1, n_heads=4, seq=64, head_dim=64, seed=0):
 
 @pytest.mark.parametrize(
     "n_primary,n_secondary,bpw",
-    [(1, 0, 2), (1, 1, 3), (2, 0, 4), (3, 0, 6)],
+    [(1, 0, 2), (1, 1, 3), (2, 0, 4), (2, 1, 5), (3, 0, 6), (3, 1, 7)],
 )
 @pytest.mark.parametrize("codebook_kind", ["strict", "relaxed"])
 def test_kv_quantizer_roundtrip(strict, relaxed, n_primary, n_secondary, bpw,
@@ -297,7 +297,7 @@ def test_kv_quantizer_roundtrip(strict, relaxed, n_primary, n_secondary, bpw,
           f"(p={n_primary}+s={n_secondary}): MSE={err:.4f} relMSE={rel:.4f}")
     # Loose tolerance per tier; the goal is "decoder works", quality is
     # in the separate microbench.
-    tol = {2: 2.0, 3: 1.0, 4: 0.5, 6: 0.1}[bpw]
+    tol = {2: 2.0, 3: 1.0, 4: 0.5, 5: 0.2, 6: 0.1, 7: 0.05}[bpw]
     assert rel < tol, f"{bpw} bpw rel MSE = {rel:.4f}, expected < {tol}"
 
 
@@ -320,12 +320,16 @@ def test_kv_quantizer_bpw_ladder_is_monotonic(relaxed):
     mse_2 = mse(1, 0)
     mse_3 = mse(1, 1)
     mse_4 = mse(2, 0)
+    mse_5 = mse(2, 1)
     mse_6 = mse(3, 0)
+    mse_7 = mse(3, 1)
     print(f"\n  bpw ladder MSE: 2={mse_2:.4f} 3={mse_3:.4f} "
-          f"4={mse_4:.4f} 6={mse_6:.4f}")
+          f"4={mse_4:.4f} 5={mse_5:.4f} 6={mse_6:.4f} 7={mse_7:.4f}")
     assert mse_3 < mse_2, f"3 bpw ({mse_3}) should beat 2 bpw ({mse_2})"
     assert mse_4 < mse_3, f"4 bpw ({mse_4}) should beat 3 bpw ({mse_3})"
-    assert mse_6 < mse_4, f"6 bpw ({mse_6}) should beat 4 bpw ({mse_4})"
+    assert mse_5 < mse_4, f"5 bpw ({mse_5}) should beat 4 bpw ({mse_4})"
+    assert mse_6 < mse_5, f"6 bpw ({mse_6}) should beat 5 bpw ({mse_5})"
+    assert mse_7 < mse_6, f"7 bpw ({mse_7}) should beat 6 bpw ({mse_6})"
 
 
 def test_kv_quantizer_relaxed_beats_strict_on_real_shape(strict, relaxed):
