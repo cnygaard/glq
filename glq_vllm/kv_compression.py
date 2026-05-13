@@ -44,21 +44,85 @@ _original_reshape: Any = None
 _original_torch_op: Any = None
 _original_triton: Any = None
 _quantizer: Any = None
+_bpw_quantizers: dict[int, Any] = {}     # bpw -> E8KVQuantizer (or None for passthrough)
+_bpw_list: list[int] = []                # bpw per layer, in vLLM's call order
+_ptr_to_layer_idx: dict[int, int] = {}   # kv_cache.data_ptr() -> position in _bpw_list
 _active_config: dict[str, Any] = {}
 _call_counter: int = 0  # debug: counts how many times the patched fn fires
 
 
 def _get_quantizer(quant_method: str, n_stages: int):
-    """Lazily build (and cache) the E8KVQuantizer with the given settings."""
-    global _quantizer
+    """Lazily build the E8KVQuantizer with the given settings."""
     from glq.kv_cache import _get_codebook
     from glq.kv_e8 import E8KVQuantizer
     cb = _get_codebook(quant_method)  # cuda-default after 666ffcd
     return E8KVQuantizer(cb, n_stages=n_stages)
 
 
-def _roundtrip_kv(key: torch.Tensor, value: torch.Tensor, head_size: int):
-    """Round-trip K, V through the E8 quantizer. Reshape-safe."""
+def _build_bpw_quantizers(quant_method: str, bpws: set[int]):
+    """One quantizer per distinct E8 bpw in the map.
+
+    bpw → n_stages: 2→1, 4→2, 6→3. bpw=8 uses inline INT8 absmax (no
+    persistent state needed). bpw=16 is passthrough."""
+    n_stages_for = {2: 1, 4: 2, 6: 3}
+    out = {}
+    for b in bpws:
+        if b in n_stages_for:
+            out[b] = _get_quantizer(quant_method, n_stages_for[b])
+        elif b in (8, 16):
+            out[b] = None
+        else:
+            raise ValueError(
+                f"bpw={b} not supported in vLLM KV patch; "
+                f"allowed: 2/4/6 (E8 RVQ), 8 (INT8), 16 (passthrough)")
+    return out
+
+
+def _int8_roundtrip(x: torch.Tensor) -> torch.Tensor:
+    """KIVI-style per-channel INT8 absmax round-trip along the last dim.
+
+    Matches the math of ``glq.kv_cache.INT8QuantizedLayer`` but
+    streaming: no persistent scale buffers needed since the cache
+    memory is still fp16 — we just want the lossy round-trip on top
+    of whatever K/V was about to be written."""
+    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+    q = (x / scale).round().clamp(-127, 127)
+    return q * scale
+
+
+def _quantizer_for(kv_cache: torch.Tensor):
+    """Pick the right (quantizer, bpw) for this layer based on the paged
+    cache's data pointer. Builds the ptr→layer-idx mapping lazily by
+    first-seen order — vLLM walks layers in HF topology order, so the
+    n-th distinct pointer we see corresponds to ``_bpw_list[n]``."""
+    if not _bpw_list:
+        return _quantizer, None  # uniform mode (legacy)
+    ptr = kv_cache.data_ptr()
+    idx = _ptr_to_layer_idx.get(ptr)
+    if idx is None:
+        idx = len(_ptr_to_layer_idx)
+        if idx >= len(_bpw_list):
+            # More layers than the map covers — fall back to no compression.
+            return None, 16
+        _ptr_to_layer_idx[ptr] = idx
+    bpw = _bpw_list[idx]
+    return _bpw_quantizers.get(bpw), bpw
+
+
+def _roundtrip_kv(key: torch.Tensor, value: torch.Tensor,
+                  kv_cache: torch.Tensor):
+    """Round-trip K, V through the quantizer chosen for this layer.
+
+    Uniform mode: uses ``_quantizer`` for every call. Mixed-bpw mode:
+    looks up per-layer quantizer via ``_quantizer_for``."""
+    head_size = kv_cache.shape[-1]
+    quant, bpw = _quantizer_for(kv_cache)
+    if quant is None and bpw in (16, None):
+        # 16 bpw or no compression configured for this layer.
+        if _quantizer is None and not _bpw_list:
+            return key, value  # patch not initialised yet
+        if bpw == 16:
+            return key, value
     orig_shape_k = key.shape
     orig_shape_v = value.shape
     if key.dim() == 2:
@@ -67,8 +131,14 @@ def _roundtrip_kv(key: torch.Tensor, value: torch.Tensor, head_size: int):
         num_kv_heads = key.shape[-1] // head_size
         key = key.reshape(-1, num_kv_heads, head_size)
         value = value.reshape(-1, num_kv_heads, head_size)
-    key_rt = _quantizer.dequantize(_quantizer.quantize(key))
-    val_rt = _quantizer.dequantize(_quantizer.quantize(value))
+    if bpw == 8:
+        # INT8 absmax round-trip (per-channel along head dim).
+        key_rt = _int8_roundtrip(key)
+        val_rt = _int8_roundtrip(value)
+    else:
+        q = quant if quant is not None else _quantizer
+        key_rt = q.dequantize(q.quantize(key))
+        val_rt = q.dequantize(q.quantize(value))
     return key_rt.reshape(orig_shape_k), val_rt.reshape(orig_shape_v)
 
 
@@ -99,8 +169,8 @@ def _patched_reshape_and_cache_flash(
     global _call_counter
     _call_counter += 1
     _maybe_log(key, value)
-    if _quantizer is not None:
-        key, value = _roundtrip_kv(key, value, key_cache.shape[-1])
+    if _quantizer is not None or _bpw_list:
+        key, value = _roundtrip_kv(key, value, key_cache)
     return _original_reshape(
         key, value, key_cache, value_cache,
         slot_mapping, kv_cache_dtype, k_scale, v_scale,
@@ -127,8 +197,8 @@ def _patched_torch_op(
     global _call_counter
     _call_counter += 1
     _maybe_log(key, value)
-    if _quantizer is not None:
-        key, value = _roundtrip_kv(key, value, key_cache.shape[-1])
+    if _quantizer is not None or _bpw_list:
+        key, value = _roundtrip_kv(key, value, key_cache)
     return _original_torch_op(
         key, value, key_cache, value_cache,
         slot_mapping, kv_cache_dtype, k_scale, v_scale,
@@ -156,8 +226,8 @@ def _patched_triton(
     global _call_counter
     _call_counter += 1
     _maybe_log(key, value)
-    if _quantizer is not None:
-        key, value = _roundtrip_kv(key, value, key_cache.shape[-1])
+    if _quantizer is not None or _bpw_list:
+        key, value = _roundtrip_kv(key, value, key_cache)
     return _original_triton(
         key, value, key_cache, value_cache,
         slot_mapping, kv_cache_dtype, k_scale, v_scale,
@@ -202,22 +272,47 @@ def _triton_modules_to_patch():
     return mods
 
 
-def enable(quant_method: str = "e8_relaxed", n_stages: int = 1) -> None:
+def enable(quant_method: str = "e8_relaxed", n_stages: int = 1,
+           bpw_map: dict[int, int] | None = None) -> None:
     """Activate E8 KV-cache compression (round-trip mode).
 
-    Args:
-        quant_method: ``"e8_strict"`` or ``"e8_relaxed"`` (latter recommended).
-        n_stages: 1 = 2 bpw single lookup; 2 = 4 bpw RVQ; 3 = 6 bpw 3-stage.
+    Two modes:
+
+    * **Uniform** (``bpw_map=None``) — every layer uses the same
+      ``quant_method`` and ``n_stages``. ``n_stages`` 1/2/3 → 2/4/6 bpw.
+    * **Mixed-precision** (``bpw_map={layer_idx: bpw}``) — each layer
+      gets its own bpw, exactly mirroring ``glq.kv_cache.bpw_map``.
+      Bpw values: 2/4/6 (E8 RVQ via ``quant_method``), 8 (INT8 absmax),
+      16 (passthrough). ``n_stages`` is ignored in this mode.
+
+    Layer-index resolution is by call order: the n-th distinct paged
+    cache pointer we observe corresponds to ``sorted(bpw_map.keys())[n]``.
+    This is robust under vLLM's continuous batching because the
+    per-layer cache buffers are stable across the run.
     """
     global _original_reshape, _original_torch_op, _original_triton
-    global _quantizer, _active_config
+    global _quantizer, _bpw_quantizers, _bpw_list, _ptr_to_layer_idx
+    global _active_config
     with _state_lock:
         import vllm._custom_ops as ops
         if _original_reshape is None:
             _original_reshape = ops.reshape_and_cache_flash
         if _original_torch_op is None:
             _original_torch_op = torch.ops._C_cache_ops.reshape_and_cache_flash
-        _quantizer = _get_quantizer(quant_method, n_stages)
+
+        # Reset per-layer state before reinitialising.
+        _ptr_to_layer_idx.clear()
+        if bpw_map is not None:
+            # Mixed-precision mode: build one quantizer per distinct E8 bpw,
+            # remember the per-layer bpw list in layer-key order.
+            _bpw_list = [bpw_map[k] for k in sorted(bpw_map.keys())]
+            _bpw_quantizers = _build_bpw_quantizers(
+                quant_method, set(_bpw_list))
+            _quantizer = None
+        else:
+            _bpw_list = []
+            _bpw_quantizers = {}
+            _quantizer = _get_quantizer(quant_method, n_stages)
 
         # 1) Python wrapper used by flash_attn backend.
         ops.reshape_and_cache_flash = _patched_reshape_and_cache_flash
@@ -247,17 +342,30 @@ def enable(quant_method: str = "e8_relaxed", n_stages: int = 1) -> None:
             print(f"[glq_vllm.kv_compression] could not patch triton: {e}",
                   flush=True)
 
-        _active_config = {
-            "quant_method": quant_method,
-            "n_stages": n_stages,
-            "bpw": {1: 2, 2: 4, 3: 6}[n_stages],
-        }
+        if bpw_map is not None:
+            avg_bpw = sum(_bpw_list) / len(_bpw_list)
+            _active_config = {
+                "mode": "mixed",
+                "quant_method": quant_method,
+                "n_layers": len(_bpw_list),
+                "bpw_avg": avg_bpw,
+                "bpw_hist": {b: _bpw_list.count(b)
+                             for b in sorted(set(_bpw_list))},
+            }
+        else:
+            _active_config = {
+                "mode": "uniform",
+                "quant_method": quant_method,
+                "n_stages": n_stages,
+                "bpw": {1: 2, 2: 4, 3: 6}[n_stages],
+            }
 
 
 def disable() -> None:
     """Restore vLLM's original ``reshape_and_cache_flash``."""
     global _original_reshape, _original_torch_op, _original_triton
-    global _quantizer, _active_config
+    global _quantizer, _bpw_quantizers, _bpw_list, _ptr_to_layer_idx
+    global _active_config
     with _state_lock:
         if _original_reshape is not None:
             import vllm._custom_ops as ops
@@ -272,6 +380,9 @@ def disable() -> None:
                 if hasattr(mod, "triton_reshape_and_cache_flash"):
                     mod.triton_reshape_and_cache_flash = _original_triton
         _quantizer = None
+        _bpw_quantizers.clear()
+        _bpw_list.clear()
+        _ptr_to_layer_idx.clear()
         _active_config = {}
 
 
