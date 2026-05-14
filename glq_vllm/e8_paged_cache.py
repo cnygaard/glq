@@ -270,6 +270,26 @@ def gather_kv(quantizer, cache: E8PagedKVCache,
     return key, value
 
 
+def remap_block_table(block_table: torch.Tensor,
+                      unique_blocks: torch.Tensor,
+                      num_blocks: int) -> torch.Tensor:
+    """Translate ``block_table`` from absolute block ids into positions
+    within ``unique_blocks``.
+
+    Used together with the compact form of ``gather_kv_to_paged_fp16``:
+    the caller decompresses only the unique blocks the current attention
+    call references, builds a remapped ``block_table`` pointing into the
+    compact output, and hands that pair to ``flash_attn`` (or any other
+    paged-attention kernel that consumes ``block_table``).
+    """
+    remap = torch.full(
+        (num_blocks,), -1, dtype=torch.int32, device=block_table.device)
+    pos = torch.arange(
+        unique_blocks.shape[0], dtype=torch.int32, device=block_table.device)
+    remap[unique_blocks] = pos
+    return remap[block_table.long()].to(block_table.dtype)
+
+
 def gather_kv_to_paged_fp16(quantizer, cache: E8PagedKVCache,
                              block_indices: torch.Tensor | None = None,
                              ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -615,9 +615,25 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
     quant, _ = _quantizer_for_bpw(cache.bpw)
     if quant is None:
         return _original_unified(q=q, k=k, v=v, **kwargs)
+    block_table = kwargs.get("block_table")
     try:
-        from glq_vllm.e8_paged_cache import gather_kv_to_paged_fp16
-        k_e8, v_e8 = gather_kv_to_paged_fp16(quant, cache)
+        from glq_vllm.e8_paged_cache import (
+            gather_kv_to_paged_fp16,
+            remap_block_table,
+        )
+        if block_table is not None and block_table.numel() > 0:
+            # Scoped: decompress only the blocks this batch references.
+            # Bounds the transient fp16 workspace by # unique referenced
+            # blocks instead of cache.num_blocks (typically ~100x smaller
+            # at non-saturated load).
+            unique_blocks = block_table.flatten().unique().long()
+            k_e8, v_e8 = gather_kv_to_paged_fp16(
+                quant, cache, block_indices=unique_blocks)
+            new_block_table = remap_block_table(
+                block_table, unique_blocks, cache.num_blocks)
+            kwargs = {**kwargs, "block_table": new_block_table}
+        else:
+            k_e8, v_e8 = gather_kv_to_paged_fp16(quant, cache)
         if k_e8.dtype != k.dtype:
             k_e8 = k_e8.to(k.dtype)
             v_e8 = v_e8.to(v.dtype)

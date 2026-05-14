@@ -21,6 +21,8 @@ from glq_vllm.e8_paged_cache import (
     E8PagedKVCache,
     _BPW_RECIPE,
     gather_kv,
+    gather_kv_to_paged_fp16,
+    remap_block_table,
     write_kv,
 )
 
@@ -152,6 +154,53 @@ def test_total_bytes_strictly_smaller_than_fp16():
         assert abs(ratio - expected) < 1e-6, \
             f"bpw={bpw}: ratio {ratio:.4f} != expected {expected}"
         assert ratio < 1.0, f"bpw={bpw} not smaller than fp16"
+
+
+def test_remap_block_table_roundtrip():
+    """``remap_block_table`` must rewrite block_table entries so that
+    indexing into ``unique_blocks`` reproduces the original block ids.
+    Catches off-by-one or scatter errors in the remap helper."""
+    num_blocks = 100
+    # Two sequences referencing scattered blocks.
+    block_table = torch.tensor([
+        [5, 17, 42, 7],   # seq 0
+        [42, 91, 3, 17],  # seq 1 (overlaps with seq 0 on blocks 42, 17)
+    ], dtype=torch.int32)
+    unique = block_table.flatten().unique().long()  # [3, 5, 7, 17, 42, 91]
+    new_bt = remap_block_table(block_table, unique, num_blocks)
+    # For every cell, unique[new_bt[i, j]] must equal the original.
+    recovered = unique[new_bt.long()]
+    assert torch.equal(recovered.to(block_table.dtype), block_table)
+
+
+def test_scoped_gather_matches_full_gather():
+    """Decompressing only ``block_indices`` then indexing must match the
+    same blocks taken out of a full decompression. This is the contract
+    Stage 2c-2a relies on for correctness."""
+    from glq.codebook_relaxed import E8RelaxedCodebook
+    cb = E8RelaxedCodebook(device="cpu", verbose=False)
+    quant = _build_quantizer(cb, bpw=3)
+
+    cache = E8PagedKVCache.alloc(
+        num_blocks=12, block_size=16, num_kv_heads=2,
+        head_size=128, bpw=3, device="cpu", dtype=torch.float16)
+    n_tokens = cache.num_blocks * cache.block_size
+    key, value = _random_kv(seed=99, num_tokens=n_tokens,
+                            num_kv_heads=2, head_size=128)
+    slot_mapping = torch.arange(n_tokens, dtype=torch.long)
+    write_kv(quant, key, value, cache, slot_mapping)
+
+    # Reference: decompress everything.
+    k_full, v_full = gather_kv_to_paged_fp16(quant, cache)
+
+    # Scoped: decompress only blocks [3, 7, 9] (any subset).
+    selected = torch.tensor([3, 7, 9], dtype=torch.long)
+    k_compact, v_compact = gather_kv_to_paged_fp16(
+        quant, cache, block_indices=selected)
+
+    assert k_compact.shape == (3, 16, 2, 128)
+    assert torch.equal(k_compact, k_full[selected])
+    assert torch.equal(v_compact, v_full[selected])
 
 
 def test_recipe_dtype_correctness():
