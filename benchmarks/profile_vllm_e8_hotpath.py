@@ -6,21 +6,16 @@ CUDA kernels for ``gather_kv_to_paged_fp16``/dequant, we need to confirm
 that's actually the bottleneck (vs codebook NN, vs Python dispatch, vs
 flash_attn).
 
-What this script does:
-    1. Boot vLLM with the same env-var stack used by the NIAH probe.
-    2. Build a moderate-length prompt (default 4 k tokens — long enough
-       that each decode step touches every block, short enough to keep
-       the profile run under a minute).
-    3. Generate ``--n-decode`` tokens with ``torch.profiler`` recording
-       CPU+CUDA activity.
-    4. Print a top-N table by (cuda_time, self_cpu_time) and dump a
-       Chrome-trace JSON for visual drill-down.
-    5. Also runs cProfile over a separate identical decode to surface
-       pure-Python hotspots (the profiler picks up the C kernel layer
-       cleanly but pure-Python loops show up cleaner under cProfile).
+Key constraint: vLLM v1 runs the model in a separate ``EngineCore``
+subprocess. A ``torch.profiler`` context in *this* process only sees
+RPC poll/wait — not a single kernel. We therefore drive the in-engine
+profiler via ``VLLM_TORCH_PROFILER_DIR`` + ``llm.start_profile()`` /
+``llm.stop_profile()`` so the trace is captured inside the worker that
+actually runs the patched K/V hot path.
 
-The profiler/cProfile overhead is non-zero — only treat the *relative*
-ordering of hotspots as load-bearing, not the absolute decode tok/s.
+We also force ``ignore_eos=True`` + ``min_tokens=n_decode`` because the
+unconstrained chat template often emits EOS after 2-6 tokens, which
+makes the profile too short to be informative.
 
 Usage:
     GLQ_KV_QUANT=e8_relaxed:1 \\
@@ -37,11 +32,9 @@ A/B comparison.
 from __future__ import annotations
 
 import argparse
-import cProfile
-import io
+import glob
 import json
 import os
-import pstats
 import sys
 import time
 
@@ -72,28 +65,22 @@ def _build_prompt(tok, distractor_ids, *, ctx_len: int, seed: int):
 
 
 def _decode_once(llm, msgs, *, n_decode: int):
-    """Run a single chat.generate, no timing — caller wraps in profiler."""
+    """Run a single chat.generate. ``ignore_eos`` + ``min_tokens`` keep
+    the decode going for the full ``n_decode`` count so the profile
+    actually has steady-state decode samples."""
     from vllm import SamplingParams
     out = llm.chat(
         [msgs],
         sampling_params=SamplingParams(
-            max_tokens=n_decode, temperature=0),
+            max_tokens=n_decode,
+            min_tokens=n_decode,
+            temperature=0,
+            ignore_eos=True,
+        ),
         chat_template_kwargs={"enable_thinking": False},
         use_tqdm=False,
     )
     return out[0]
-
-
-def _format_torch_profile(prof, *, top_n: int) -> str:
-    """Pretty-print top events by CUDA self-time."""
-    # Sort by self_cuda_time_total (descending). key_averages gives
-    # aggregated per-op view.
-    table = prof.key_averages().table(
-        sort_by="self_cuda_time_total",
-        row_limit=top_n,
-        max_name_column_width=80,
-    )
-    return table
 
 
 def main():
@@ -114,30 +101,49 @@ def main():
     p.add_argument("--top-n", type=int, default=40)
     p.add_argument("--out-dir", default="/tmp/logs/profile_e8")
     p.add_argument("--label", default=None)
-    p.add_argument("--skip-cprofile", action="store_true",
-                   help="skip the cProfile pass (torch.profiler only)")
+    p.add_argument(
+        "--profiler", choices=("torch", "cuda"), default="torch",
+        help=("torch = vLLM's TorchProfilerWrapper (medium overhead, "
+              "rich stacks/shapes; writes *.pt.trace.json.gz). "
+              "cuda = vLLM's CudaProfilerWrapper (low overhead; gates "
+              "cudaProfilerStart/Stop). Run *under* `nsys profile "
+              "--capture-range=cudaProfilerApi --capture-range-end=stop "
+              "-o trace.nsys-rep python ...` to capture an nsys report "
+              "around only the decode window."))
     args = p.parse_args()
 
     os.environ.setdefault("HF_HOME", "/opt/dlami/nvme/hf_cache")
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    import torch
     from transformers import AutoTokenizer
     from vllm import LLM
 
     label = args.label or _variant_label()
-    os.makedirs(args.out_dir, exist_ok=True)
     print(f"=== vLLM hot-path profile — variant={label} ===", flush=True)
     print(f"  ctx_len={args.ctx_len}  warmup={args.warmup_decode}  "
           f"decode={args.n_decode}", flush=True)
 
     max_model_len = args.max_model_len or (args.ctx_len + 256)
 
+    # vLLM 0.20 wires the engine-side profiler via profiler_config.
+    # llm.start_profile()/stop_profile() RPC into the worker, which
+    # gates the chosen backend:
+    #   * "torch" -> torch.profiler trace JSON in torch_profiler_dir
+    #   * "cuda"  -> cudaProfilerStart/Stop; capture via outer nsys
+    if args.profiler == "torch":
+        profiler_config = {
+            "profiler": "torch",
+            "torch_profiler_dir": args.out_dir,
+        }
+    else:
+        profiler_config = {"profiler": "cuda"}
     t0 = time.time()
     llm = LLM(model=args.model, dtype="bfloat16",
               max_model_len=max_model_len,
               gpu_memory_utilization=args.gpu_mem,
-              enforce_eager=True)
+              enforce_eager=True,
+              profiler_config=profiler_config)
     print(f"  load: {time.time() - t0:.1f}s", flush=True)
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -161,105 +167,77 @@ def main():
         print(f"  warmup decode ({args.warmup_decode} tok): "
               f"{time.time() - t0:.2f}s", flush=True)
 
-    # ---- torch.profiler pass ----
-    print("\n  [1/2] torch.profiler pass ...", flush=True)
-    activities = [torch.profiler.ProfilerActivity.CPU,
-                  torch.profiler.ProfilerActivity.CUDA]
+    # ---- Engine-side profiler pass ----
+    # vLLM v1 runs the model in a worker subprocess. start_profile()/
+    # stop_profile() RPC into that worker; either a torch trace lands
+    # in args.out_dir or (cuda mode) cudaProfilerStart/Stop is gated
+    # and an outer `nsys profile` captures only this window.
+    print(f"\n  [profile] engine-side {args.profiler} profiler pass ...",
+          flush=True)
+    pre_traces = set(glob.glob(os.path.join(args.out_dir, "*.pt.trace.json*")))
+
+    llm.start_profile()
     t0 = time.time()
-    with torch.profiler.profile(
-        activities=activities,
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-    ) as prof:
-        out = _decode_once(llm, msgs, n_decode=args.n_decode)
-    torch_dt = time.time() - t0
+    out = _decode_once(llm, msgs, n_decode=args.n_decode)
+    decode_dt = time.time() - t0
+    llm.stop_profile()
+
+    new_traces: list[str] = []
+    if args.profiler == "torch":
+        # stop_profile() returns before the worker finishes flushing —
+        # poll the trace dir until something new appears.
+        flush_deadline = time.time() + 60.0
+        while time.time() < flush_deadline:
+            new_traces = sorted(set(glob.glob(
+                os.path.join(args.out_dir, "*.pt.trace.json*"))) - pre_traces)
+            if new_traces:
+                break
+            time.sleep(0.5)
+
     n_out = len(out.outputs[0].token_ids)
-    tps = n_out / torch_dt if torch_dt > 0 else 0.0
-    print(f"  torch.profiler: {torch_dt:.2f}s for {n_out} tokens "
+    tps = n_out / decode_dt if decode_dt > 0 else 0.0
+    print(f"  decode: {decode_dt:.2f}s for {n_out} tokens "
           f"({tps:.2f} tok/s, profiler overhead included)", flush=True)
-
-    # Chrome trace
-    chrome_path = os.path.join(args.out_dir, f"trace_{label}.json")
-    prof.export_chrome_trace(chrome_path)
-    print(f"  wrote chrome trace: {chrome_path}", flush=True)
-
-    # Top-N table
-    table = _format_torch_profile(prof, top_n=args.top_n)
-    table_path = os.path.join(args.out_dir, f"torch_top_{label}.txt")
-    with open(table_path, "w") as f:
-        f.write(f"variant: {label}\n")
-        f.write(f"ctx_len: {args.ctx_len}\n")
-        f.write(f"decode tokens: {n_out}\n")
-        f.write(f"wall: {torch_dt:.2f}s ({tps:.2f} tok/s)\n")
-        f.write("\n")
-        f.write(table)
-    print(f"  wrote torch top-{args.top_n}: {table_path}", flush=True)
-
-    # ---- cProfile pass (separate run; profilers don't compose cleanly) ----
-    if not args.skip_cprofile:
-        print("\n  [2/2] cProfile pass ...", flush=True)
-        pr = cProfile.Profile()
-        t0 = time.time()
-        pr.enable()
-        out2 = _decode_once(llm, msgs, n_decode=args.n_decode)
-        pr.disable()
-        cprof_dt = time.time() - t0
-        n_out2 = len(out2.outputs[0].token_ids)
-        tps2 = n_out2 / cprof_dt if cprof_dt > 0 else 0.0
-        print(f"  cProfile: {cprof_dt:.2f}s for {n_out2} tokens "
-              f"({tps2:.2f} tok/s, cProfile overhead included)", flush=True)
-
-        # Top-N by cumulative time, then top-N by tottime
-        for sort_key, suffix in [("cumulative", "cum"), ("tottime", "tot")]:
-            buf = io.StringIO()
-            ps = pstats.Stats(pr, stream=buf).sort_stats(sort_key)
-            ps.print_stats(args.top_n)
-            cprof_path = os.path.join(
-                args.out_dir, f"cprofile_{suffix}_{label}.txt")
-            with open(cprof_path, "w") as f:
-                f.write(f"variant: {label}\n")
-                f.write(f"sort: {sort_key}\n")
-                f.write(f"decode tokens: {n_out2}\n")
-                f.write(f"wall: {cprof_dt:.2f}s ({tps2:.2f} tok/s)\n\n")
-                f.write(buf.getvalue())
-            print(f"  wrote cProfile top-{args.top_n} ({sort_key}): "
-                  f"{cprof_path}", flush=True)
-
-        # Raw stats for later drill-down
-        raw_path = os.path.join(args.out_dir, f"cprofile_raw_{label}.prof")
-        pr.dump_stats(raw_path)
-        print(f"  wrote raw cProfile: {raw_path}  "
-              f"(load via `python -m pstats {raw_path}`)", flush=True)
+    if args.profiler == "torch":
+        if new_traces:
+            print(f"  engine traces ({len(new_traces)}):", flush=True)
+            for p in new_traces:
+                sz = os.path.getsize(p) / (1024 * 1024)
+                print(f"    {p}  ({sz:.1f} MB)", flush=True)
+        else:
+            print("  WARN: no engine trace appeared within 60s — check "
+                  "the worker log for errors.", flush=True)
+    else:
+        print("  cuda profiler stopped — outer `nsys profile "
+              "--capture-range=cudaProfilerApi` should have captured "
+              "this window into its .nsys-rep file.", flush=True)
 
     # ---- Summary JSON ----
     summary = {
         "variant": label,
         "args": vars(args),
-        "torch_profiler": {
-            "wall_sec": torch_dt,
+        "decode": {
+            "wall_sec": decode_dt,
             "decode_tokens": n_out,
             "tok_per_sec": tps,
-            "chrome_trace": chrome_path,
-            "top_table": table_path,
         },
+        "engine_traces": new_traces,
     }
-    if not args.skip_cprofile:
-        summary["cprofile"] = {
-            "wall_sec": cprof_dt,
-            "decode_tokens": n_out2,
-            "tok_per_sec": tps2,
-        }
     json_path = os.path.join(args.out_dir, f"summary_{label}.json")
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n  wrote summary: {json_path}", flush=True)
-
-    # ---- Quick eyeball at the top hotspot ----
-    print("\n  [eyeball] torch.profiler top-10 (self CUDA time):", flush=True)
-    print(prof.key_averages().table(
-        sort_by="self_cuda_time_total", row_limit=10,
-        max_name_column_width=60), flush=True)
+    if args.profiler == "torch":
+        print("\n  Load the trace in chrome://tracing or "
+              "https://ui.perfetto.dev/ — search for "
+              "'gather_kv_to_paged_fp16', 'aten::index', "
+              "'triton_codebook_nn' to find the hot path.",
+              flush=True)
+    else:
+        print("\n  Open the .nsys-rep in Nsight Systems "
+              "(`nsys-ui trace.nsys-rep`) or dump CLI stats with "
+              "`nsys stats --report gputrace,cudaapisum trace.nsys-rep`.",
+              flush=True)
 
 
 if __name__ == "__main__":
