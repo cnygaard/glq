@@ -86,6 +86,11 @@ def register():
         kv_compression.enable_sidecar()
         print("[glq_vllm] GLQ_KV_E8_SIDECAR=1 → E8 paged cache sidecar "
               "enabled (Stage 5.3-2b)", flush=True)
+        # Stage 2c-1: also hook attention reads to use the sidecar.
+        if os.environ.get("GLQ_KV_E8_SIDECAR_READ", "0") != "0":
+            kv_compression.enable_sidecar_read()
+            print("[glq_vllm] GLQ_KV_E8_SIDECAR_READ=1 → attention reads "
+                  "routed through E8 sidecar (Stage 5.3-2c-1)", flush=True)
 
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)

@@ -50,13 +50,23 @@ _ptr_to_layer_idx: dict[int, int] = {}   # kv_cache.data_ptr() -> position in _b
 _active_config: dict[str, Any] = {}
 _call_counter: int = 0  # debug: counts how many times the patched fn fires
 
-# --- Phase 5.3 Stage 2b sidecar (one E8PagedKVCache per layer, by ptr) ---
-# Currently runs *alongside* vLLM's fp16 paged cache for correctness
-# validation. Stage 2c will start hooking attention to read from these
-# directly and free vLLM's fp16 buffer.
-_e8_sidecar: dict[int, Any] = {}         # kv_cache.data_ptr() -> E8PagedKVCache
+# --- Phase 5.3 Stage 2b/2c sidecar (one E8PagedKVCache per layer, by ptr) ---
+# Stage 2b runs alongside vLLM's fp16 paged cache (validation only).
+# Stage 2c-1 adds an attention-forward hook so attention READS go
+# through our sidecar instead of vLLM's roundtripped fp16 cache. With
+# 2c-1 active, attention output is bit-exact to the 2b path (same
+# E8 round-trip math, just routed through a different storage layout).
+# Stage 2c key: (data_ptr, head_size). vLLM v1's KVCacheTensor design
+# shares one paged buffer across multiple logical layers (e.g. Gemma-4
+# full+sliding pairs share a ptr but have different head_size views).
+# Keying by (ptr, head_size) gives us one sidecar per layer-type-per-buffer
+# without losing data when shape changes between layers.
+_e8_sidecar: dict[tuple[int, int], Any] = {}
 _sidecar_enabled: bool = False
+_sidecar_read_enabled: bool = False      # Stage 2c-1: route attention reads
 _sidecar_write_counter: int = 0
+_sidecar_read_counter: int = 0
+_original_unified: Any = None            # vllm.v1.attention.backends.triton_attn.unified_attention
 
 
 _E8_BPW_RECIPES = {
@@ -202,21 +212,16 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
         return
 
     ptr = key_cache.data_ptr()
-    cache = _e8_sidecar.get(ptr)
-    if cache is not None and cache.head_size != head_size:
-        # vLLM occasionally reuses a tensor's storage during warmup, so
-        # the same data_ptr can show up with a different layer's shape.
-        # Drop the stale cache and let the next branch re-allocate.
-        del _e8_sidecar[ptr]
-        cache = None
+    bin_key = (ptr, head_size)
+    cache = _e8_sidecar.get(bin_key)
     if cache is None:
         cache = E8PagedKVCache.alloc(
             num_blocks=num_blocks, block_size=block_size,
             num_kv_heads=num_kv_heads, head_size=head_size, bpw=bpw,
             device=key_cache.device, dtype=key_cache.dtype)
-        _e8_sidecar[ptr] = cache
+        _e8_sidecar[bin_key] = cache
         try:
-            print(f"[glq_vllm.kv_compression] sidecar alloc layer "
+            print(f"[glq_vllm.kv_compression] sidecar alloc bin "
                   f"#{len(_e8_sidecar)}: bpw={bpw} shape="
                   f"{(num_blocks, block_size, num_kv_heads, head_size)} "
                   f"bytes={cache.bytes_total()/1e6:.1f}MB",
@@ -236,11 +241,13 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
         # Sidecar is best-effort during Stage 2b; the main monkey-patch
         # is the correctness path. Don't take the engine down for a
         # shape edge case — log once and disable for this layer.
-        if ptr in _e8_sidecar:
-            del _e8_sidecar[ptr]
+        bin_key = (ptr, head_size)
+        if bin_key in _e8_sidecar:
+            del _e8_sidecar[bin_key]
         try:
             print(f"[glq_vllm.kv_compression] sidecar write failed for "
-                  f"layer ptr={ptr:#x}: {type(e).__name__}: {e}",
+                  f"layer ptr={ptr:#x} head_size={head_size}: "
+                  f"{type(e).__name__}: {e}",
                   flush=True)
         except Exception:
             pass
@@ -541,17 +548,101 @@ def enable_sidecar() -> None:
     _sidecar_enabled = True
 
 
+def enable_sidecar_read() -> None:
+    """Stage 2c-1: route attention K/V reads through the sidecar.
+
+    Monkey-patches ``triton_attn.unified_attention`` so that when
+    vLLM's TritonAttentionImpl.forward calls it with the layer's
+    paged cache, we swap in the decompressed fp16 K/V from the E8
+    sidecar instead. The original ``unified_attention`` kernel
+    handles attention; the only thing different is where its K, V
+    inputs came from.
+
+    Bit-exact in steady state with the Stage 2b path because both
+    feed the kernel ``dequantize(quantize(K))`` — just stored
+    differently. No memory savings yet (sidecar still parallel to
+    vLLM's cache); Stage 2c-2 shrinks vLLM's allocation by
+    declaring our compressed page size in ``AttentionSpec``.
+
+    Requires ``enable_sidecar()`` first."""
+    global _sidecar_read_enabled, _original_unified
+    if not _sidecar_enabled:
+        raise RuntimeError(
+            "enable_sidecar_read requires enable_sidecar to be active")
+    try:
+        import vllm.v1.attention.backends.triton_attn as ta
+    except Exception as e:
+        print(f"[glq_vllm.kv_compression] cannot enable sidecar read: "
+              f"triton_attn unavailable ({e})", flush=True)
+        return
+    if _original_unified is None:
+        _original_unified = ta.unified_attention
+    ta.unified_attention = _patched_unified_attention
+    _sidecar_read_enabled = True
+
+
 def disable_sidecar() -> None:
-    global _sidecar_enabled
+    global _sidecar_enabled, _sidecar_read_enabled
     _sidecar_enabled = False
+    _sidecar_read_enabled = False
     _e8_sidecar.clear()
+    if _original_unified is not None:
+        try:
+            import vllm.v1.attention.backends.triton_attn as ta
+            ta.unified_attention = _original_unified
+        except Exception:
+            pass
+
+
+def _patched_unified_attention(*, q, k, v, **kwargs):
+    """Stage 2c-1 attention-read hook.
+
+    Replaces vLLM's K/V paged-cache tensors with decompressed fp16
+    versions sourced from the E8 sidecar before delegating to
+    ``unified_attention``. Falls back to vLLM's cache on any failure
+    (sidecar not allocated for this layer, quantizer not found, etc.)
+    so a Stage 2c-1 bug never breaks generation — the main monkey-patch
+    keeps vLLM's fp16 cache valid as a safety net.
+    """
+    global _sidecar_read_counter
+    if not _sidecar_read_enabled:
+        return _original_unified(q=q, k=k, v=v, **kwargs)
+    # k shape: [num_blocks, block_size, num_kv_heads, head_size]
+    bin_key = (k.data_ptr(), k.shape[-1])
+    cache = _e8_sidecar.get(bin_key)
+    if cache is None:
+        return _original_unified(q=q, k=k, v=v, **kwargs)
+    quant, _ = _quantizer_for_bpw(cache.bpw)
+    if quant is None:
+        return _original_unified(q=q, k=k, v=v, **kwargs)
+    try:
+        from glq_vllm.e8_paged_cache import gather_kv_to_paged_fp16
+        k_e8, v_e8 = gather_kv_to_paged_fp16(quant, cache)
+        if k_e8.dtype != k.dtype:
+            k_e8 = k_e8.to(k.dtype)
+            v_e8 = v_e8.to(v.dtype)
+    except Exception as e:
+        try:
+            print(f"[glq_vllm.kv_compression] sidecar-read fallback "
+                  f"(ptr={k.data_ptr():#x} head_size={k.shape[-1]}): "
+                  f"{type(e).__name__}: {e}", flush=True)
+        except Exception:
+            pass
+        return _original_unified(q=q, k=k, v=v, **kwargs)
+    _sidecar_read_counter += 1
+    return _original_unified(q=q, k=k_e8, v=v_e8, **kwargs)
+
+
+def sidecar_read_count() -> int:
+    return _sidecar_read_counter
 
 
 def sidecar_stats() -> list[dict[str, Any]]:
-    """Snapshot of every allocated layer's E8PagedKVCache for inspection."""
+    """Snapshot of every allocated bin's E8PagedKVCache for inspection."""
     return [
         {
             "ptr": ptr,
+            "key_head_size": key_head_size,
             "bpw": c.bpw,
             "n_primary": c.n_primary,
             "n_secondary": c.n_secondary,
@@ -562,7 +653,7 @@ def sidecar_stats() -> list[dict[str, Any]]:
             "bytes_total": c.bytes_total(),
             "bytes_per_token_per_head": c.bytes_per_token_per_head(),
         }
-        for ptr, c in _e8_sidecar.items()
+        for (ptr, key_head_size), c in _e8_sidecar.items()
     ]
 
 
@@ -570,14 +661,16 @@ def sidecar_write_count() -> int:
     return _sidecar_write_counter
 
 
-def gather_sidecar_layer(ptr: int, slot_mapping: torch.Tensor):
-    """Decompress a slice of a layer's sidecar cache back to fp16 K, V.
+def gather_sidecar_layer(ptr: int, head_size: int,
+                         slot_mapping: torch.Tensor):
+    """Decompress a slice of a sidecar bin back to fp16 K, V.
 
-    Mostly for verification — Stage 2c will use this in the attention
-    backend to bridge the compressed cache to flash_attn."""
+    The bin is identified by (ptr, head_size) since one vLLM
+    KVCacheTensor can be shared by multiple logical layers with
+    different head_size views.
+    """
     from glq_vllm.e8_paged_cache import gather_kv
-    cache = _e8_sidecar[ptr]
-    # Match the quantizer used at write time.
+    cache = _e8_sidecar[(ptr, head_size)]
     quant, _ = _quantizer_for_bpw(cache.bpw)
     return gather_kv(quant, cache, slot_mapping)
 
