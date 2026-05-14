@@ -268,3 +268,53 @@ def gather_kv(quantizer, cache: E8PagedKVCache,
     key = quantizer.dequantize(qt_k)
     value = quantizer.dequantize(qt_v)
     return key, value
+
+
+def gather_kv_to_paged_fp16(quantizer, cache: E8PagedKVCache,
+                             block_indices: torch.Tensor | None = None,
+                             ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decompress (a subset of) the paged cache to ``flash_attn``-shaped
+    fp16/bf16 paged buffers.
+
+    Args:
+        quantizer: matching ``E8KVQuantizer``.
+        cache: the compressed paged cache.
+        block_indices: ``[num_selected_blocks]`` int64. If ``None``,
+            decompresses every block.
+
+    Returns:
+        ``(k_paged, v_paged)`` of shape
+        ``[num_selected_blocks, block_size, num_kv_heads, head_size]``
+        — the layout that ``flash_attn_with_kvcache`` consumes
+        directly via its ``block_table`` argument.
+    """
+    if block_indices is None:
+        block_indices = torch.arange(
+            cache.num_blocks, device=cache.device, dtype=torch.long)
+    NB = block_indices.shape[0]
+    BS = cache.block_size
+    H = cache.num_kv_heads
+    G = cache.n_groups
+
+    def _gather_side(side: str) -> torch.Tensor:
+        # Build the qt dict for the selected blocks, treating each
+        # block as a (BS, H) batch of group-vectors.
+        def take(name: str):
+            buf = getattr(cache, f"{side}_{name}")
+            return buf[block_indices]  # [NB, BS, H, G]
+
+        qt: dict = {
+            "idx1": take("idx1").reshape(NB * BS * H, G),
+            "shape": (NB, BS, H, cache.head_size),
+            "dtype": cache.dtype,
+        }
+        if cache.n_primary >= 2: qt["idx2"] = take("idx2").reshape(NB * BS * H, G)
+        if cache.n_primary >= 3: qt["idx3"] = take("idx3").reshape(NB * BS * H, G)
+        if cache.n_secondary >= 1:
+            qt["idx_s1"] = take("idx_s1").reshape(NB * BS * H, G)
+        scale_buf = getattr(cache, f"{side}_scale")
+        qt["scale"] = scale_buf[block_indices]            # [NB, BS, H, G]
+
+        return quantizer.dequantize(qt)        # [NB, BS, H, head_size]
+
+    return _gather_side("k"), _gather_side("v")
