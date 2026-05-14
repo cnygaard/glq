@@ -183,7 +183,8 @@ def _roundtrip_kv(key: torch.Tensor, value: torch.Tensor,
 
 
 def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
-                   key_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+                   key_cache: torch.Tensor, slot_mapping: torch.Tensor,
+                   value_cache: torch.Tensor | None = None) -> None:
     """Phase 5.3 Stage 2b: also push the same K/V into our E8PagedKVCache.
 
     Allocates the sidecar lazily the first time we see a given
@@ -235,16 +236,27 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
     bin_key = (ptr, head_size)
     cache = _e8_sidecar.get(bin_key)
     if cache is None:
-        cache = E8PagedKVCache.alloc(
-            num_blocks=num_blocks, block_size=block_size,
-            num_kv_heads=num_kv_heads, head_size=head_size, bpw=bpw,
-            device=key_cache.device, dtype=key_cache.dtype)
+        if _compressed_allocation_active and value_cache is not None:
+            # Stage 2c-2c: build views into vLLM's already-allocated
+            # buffer. No new memory — same bytes interpreted as our
+            # E8 layout (idx1 / idx_s1 / scale / etc.).
+            cache = E8PagedKVCache.from_paged_storage(
+                key_cache, value_cache,
+                head_size=head_size, bpw=bpw, dtype=key_cache.dtype)
+        else:
+            cache = E8PagedKVCache.alloc(
+                num_blocks=num_blocks, block_size=block_size,
+                num_kv_heads=num_kv_heads, head_size=head_size, bpw=bpw,
+                device=key_cache.device, dtype=key_cache.dtype)
         _e8_sidecar[bin_key] = cache
         try:
+            shared = " (views vLLM bytes)" if cache.shares_vllm_storage else ""
+            bytes_str = ("0 MB shared" if cache.shares_vllm_storage
+                         else f"{cache.bytes_total()/1e6:.1f}MB")
             print(f"[glq_vllm.kv_compression] sidecar alloc bin "
                   f"#{len(_e8_sidecar)}: bpw={bpw} shape="
                   f"{(num_blocks, block_size, num_kv_heads, head_size)} "
-                  f"bytes={cache.bytes_total()/1e6:.1f}MB",
+                  f"bytes={bytes_str}{shared}",
                   flush=True)
         except Exception:
             pass
@@ -297,7 +309,7 @@ def _patched_reshape_and_cache_flash(
     _call_counter += 1
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
-        _sidecar_write(key, value, key_cache, slot_mapping)
+        _sidecar_write(key, value, key_cache, slot_mapping, value_cache)
         key, value = _roundtrip_kv(key, value, key_cache)
     return _original_reshape(
         key, value, key_cache, value_cache,
@@ -326,7 +338,7 @@ def _patched_torch_op(
     _call_counter += 1
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
-        _sidecar_write(key, value, key_cache, slot_mapping)
+        _sidecar_write(key, value, key_cache, slot_mapping, value_cache)
         key, value = _roundtrip_kv(key, value, key_cache)
     return _original_torch_op(
         key, value, key_cache, value_cache,
@@ -356,7 +368,7 @@ def _patched_triton(
     _call_counter += 1
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
-        _sidecar_write(key, value, key_cache, slot_mapping)
+        _sidecar_write(key, value, key_cache, slot_mapping, value_cache)
         if _compressed_allocation_active:
             # vLLM's cache is now compressed bytes our code never
             # reads; the original fp16 write would crash. Sidecar has

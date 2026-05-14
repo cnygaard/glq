@@ -156,6 +156,61 @@ def test_total_bytes_strictly_smaller_than_fp16():
         assert ratio < 1.0, f"bpw={bpw} not smaller than fp16"
 
 
+@pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
+def test_from_paged_storage_bit_exact_with_alloc(relaxed, bpw):
+    """A cache built via from_paged_storage (views into a shared buffer)
+    must roundtrip identically to one built via alloc (its own tensors).
+    Locks the layout contract Stage 2c-2c relies on."""
+    from glq_vllm.e8_paged_cache import (
+        gather_kv_to_paged_fp16,
+        write_kv,
+    )
+    from glq_vllm.e8_kv_spec import (
+        E8_BYTES_PER_GROUP,
+        compressed_kv_cache_shape,
+    )
+
+    quant = _build_quantizer(relaxed, bpw)
+    num_blocks, block_size, num_kv_heads, head_size = 4, 16, 2, 128
+    dtype = torch.bfloat16
+    # vLLM's allocated buffer for one layer is [num_blocks, 2, block_size,
+    # num_kv_heads, compressed_elems_per_tok_per_head].
+    shape = compressed_kv_cache_shape(
+        num_blocks, block_size, num_kv_heads, head_size,
+        bpw=bpw, dtype_size=2)
+    raw = torch.zeros(shape, dtype=dtype, device="cpu")
+    k_buf = raw[:, 0]
+    v_buf = raw[:, 1]
+    # Built directly on the vLLM-style buffer (views into raw).
+    shared = E8PagedKVCache.from_paged_storage(
+        k_buf, v_buf, head_size=head_size, bpw=bpw, dtype=dtype)
+    assert shared.shares_vllm_storage is True
+    # Built independently for reference comparison.
+    owned = E8PagedKVCache.alloc(
+        num_blocks=num_blocks, block_size=block_size,
+        num_kv_heads=num_kv_heads, head_size=head_size, bpw=bpw,
+        device="cpu", dtype=dtype)
+
+    # Random K, V to write into both caches; gather back via the same
+    # quantizer and assert bit equality.
+    n_tokens = num_blocks * block_size
+    key, value = _random_kv(seed=bpw + 100, num_tokens=n_tokens,
+                            num_kv_heads=num_kv_heads, head_size=head_size,
+                            dtype=dtype)
+    slot_mapping = torch.arange(n_tokens, dtype=torch.long)
+    write_kv(quant, key, value, owned, slot_mapping)
+    write_kv(quant, key, value, shared, slot_mapping)
+
+    k_owned, v_owned = gather_kv_to_paged_fp16(quant, owned)
+    k_shared, v_shared = gather_kv_to_paged_fp16(quant, shared)
+    assert torch.equal(k_owned, k_shared), (
+        f"K mismatch at bpw={bpw}: "
+        f"max delta={(k_owned-k_shared).abs().max().item():.2e}")
+    assert torch.equal(v_owned, v_shared), (
+        f"V mismatch at bpw={bpw}: "
+        f"max delta={(v_owned-v_shared).abs().max().item():.2e}")
+
+
 def test_remap_block_table_roundtrip():
     """``remap_block_table`` must rewrite block_table entries so that
     indexing into ``unique_blocks`` reproduces the original block ids.

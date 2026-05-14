@@ -141,7 +141,11 @@ class E8PagedKVCache:
         return out
 
     def bytes_total(self) -> int:
-        """Total bytes on card. Sum of all tensor sizes."""
+        """Total *new* bytes on card. Returns 0 for shared-storage caches
+        (built via from_paged_storage) — those views point at memory
+        vLLM already accounts for."""
+        if getattr(self, "_shared_storage", False):
+            return 0
         n = 0
         for t in (self.k_idx1, self.v_idx1, self.k_scale, self.v_scale,
                   self.k_idx2, self.v_idx2, self.k_idx3, self.v_idx3,
@@ -159,6 +163,146 @@ class E8PagedKVCache:
         if self.n_secondary >= 1: b += 1 * self.n_groups   # uint8
         b += self.dtype.itemsize * self.n_groups          # scale fp16/bf16
         return b
+
+    @classmethod
+    def from_paged_storage(cls, k_buf: torch.Tensor, v_buf: torch.Tensor, *,
+                           head_size: int, bpw: int,
+                           dtype: torch.dtype) -> "E8PagedKVCache":
+        """Construct an E8PagedKVCache whose component tensors are
+        strided views into vLLM's already-allocated paged buffer.
+
+        This is the Stage 2c-2c primitive that eliminates parallel
+        allocation: vLLM allocated the right byte count at the
+        compressed page size (Stage 2c-2b), and this method reinterprets
+        those bytes as our idx1/idx_s1/idx2/idx3/scale layout *in place*
+        — no new memory.
+
+        Per (token, head) the byte layout is:
+            [idx1 (n_groups * 2 B int16)]
+            [idx2 (n_groups * 2 B int16)]   if bpw in {4, 5, 6, 7}
+            [idx3 (n_groups * 2 B int16)]   if bpw in {6, 7}
+            [idx_s1 (n_groups * 1 B uint8)] if bpw in {3, 5, 7}
+            [scale (n_groups * 2 B dtype)]
+
+        Args:
+            k_buf, v_buf: vLLM's K, V views — typically the result of
+                ``kv_cache.unbind(1)`` on a layer's paged tensor.
+                Expected shape ``[num_blocks, block_size, num_kv_heads,
+                compressed_elems_per_tok_per_head]`` with the compressed
+                last dim summing to ``bth = n_groups * bytes_per_group``.
+            head_size: the *real* head size (not the compressed
+                last-dim count). Drives ``n_groups``.
+            bpw: 2..7.
+            dtype: dtype of the scale component (matches k_buf.dtype).
+        """
+        if bpw not in _BPW_RECIPE:
+            raise ValueError(f"bpw {bpw} not in {sorted(_BPW_RECIPE)}")
+        if head_size % 8 != 0:
+            raise ValueError(f"head_size {head_size} not divisible by 8")
+        n_primary, n_secondary = _BPW_RECIPE[bpw]
+        n_groups = head_size // 8
+        # bytes per (token, head) — must match the spec's compressed page
+        # math (see e8_kv_spec.compressed_page_size_bytes).
+        from glq_vllm.e8_kv_spec import E8_BYTES_PER_GROUP
+        bytes_per_group = E8_BYTES_PER_GROUP[bpw]
+        bth = n_groups * bytes_per_group
+
+        if k_buf.shape != v_buf.shape:
+            raise ValueError(
+                f"k_buf/v_buf shape mismatch {k_buf.shape} vs {v_buf.shape}")
+        num_blocks, block_size, num_kv_heads, compressed_last = k_buf.shape
+        elem_size = k_buf.dtype.itemsize
+        if compressed_last * elem_size != bth:
+            raise ValueError(
+                f"buffer last dim {compressed_last} * elem_size {elem_size} "
+                f"!= bth {bth}; buffer/spec mismatch at bpw={bpw}, "
+                f"head_size={head_size}")
+
+        # Walk the layout, computing each component's byte offset.
+        # Order matches the write/read code below — keep it stable.
+        layout: list[tuple[str, int, int, torch.dtype]] = []  # (name, off, nbytes, dtype)
+        cur = 0
+        layout.append(("idx1", cur, 2 * n_groups, torch.int16))
+        cur += 2 * n_groups
+        if n_primary >= 2:
+            layout.append(("idx2", cur, 2 * n_groups, torch.int16))
+            cur += 2 * n_groups
+        if n_primary >= 3:
+            layout.append(("idx3", cur, 2 * n_groups, torch.int16))
+            cur += 2 * n_groups
+        if n_secondary >= 1:
+            layout.append(("idx_s1", cur, n_groups, torch.uint8))
+            cur += n_groups
+        layout.append(("scale", cur, 2 * n_groups, dtype))
+        cur += 2 * n_groups
+        if cur != bth:
+            raise RuntimeError(
+                f"layout sum {cur} != bth {bth} (bpw={bpw}); recipe bug")
+
+        # Strides in BYTES for side_buf's outer dims (B, BS, H). These
+        # already encode any V-side interspersion (when side_buf is
+        # ``raw[:, 0]`` or ``raw[:, 1]`` the B stride covers both K and
+        # V worth of bytes), so we don't have to reason about whether
+        # vLLM uses interleaved storage or not — just inherit the
+        # strides from the input.
+        side_byte_strides = [
+            s * k_buf.element_size() for s in k_buf.stride()[:3]
+        ]
+
+        def _make_view(side_buf: torch.Tensor, byte_off: int,
+                       comp_dtype: torch.dtype) -> torch.Tensor:
+            """Build a strided view of one component for one (K or V) side."""
+            storage = side_buf.untyped_storage()
+            base_offset_bytes = side_buf.data_ptr() - storage.data_ptr()
+            comp_elem_size = comp_dtype.itemsize
+            total_offset_bytes = base_offset_bytes + byte_off
+            if total_offset_bytes % comp_elem_size != 0:
+                raise RuntimeError(
+                    f"byte offset {total_offset_bytes} not aligned to "
+                    f"{comp_dtype} (size {comp_elem_size})")
+            # torch.Tensor.set_ takes storage_offset in tensor-dtype
+            # elements, not raw bytes — even when the storage is an
+            # untyped_storage().
+            storage_offset_elems = total_offset_bytes // comp_elem_size
+            # Convert outer-dim byte strides to component-dtype elem strides.
+            outer_strides = tuple(
+                s // comp_elem_size for s in side_byte_strides)
+            # Inside one (B, T, H) chunk the component bytes are packed,
+            # so the last-dim stride is just 1 component elem.
+            strides = (*outer_strides, 1)
+            n_elems_last = (
+                2 * n_groups // comp_elem_size if comp_dtype != torch.uint8
+                else n_groups)
+            size = (num_blocks, block_size, num_kv_heads, n_elems_last)
+            view = torch.empty(0, dtype=comp_dtype, device=side_buf.device)
+            view.set_(storage, storage_offset=storage_offset_elems,
+                      size=size, stride=strides)
+            return view
+
+        obj = cls(
+            num_blocks=num_blocks, block_size=block_size,
+            num_kv_heads=num_kv_heads, head_size=head_size,
+            n_groups=n_groups, bpw=bpw, n_primary=n_primary,
+            n_secondary=n_secondary, device=k_buf.device, dtype=dtype,
+            k_idx1=_make_view(k_buf, layout[0][1], torch.int16),
+            v_idx1=_make_view(v_buf, layout[0][1], torch.int16),
+            # scale always last in layout list
+            k_scale=_make_view(k_buf, layout[-1][1], dtype),
+            v_scale=_make_view(v_buf, layout[-1][1], dtype),
+        )
+        # Optional components by name lookup.
+        for name, off, _, comp_dtype in layout:
+            if name in ("idx1", "scale"):
+                continue
+            setattr(obj, f"k_{name}", _make_view(k_buf, off, comp_dtype))
+            setattr(obj, f"v_{name}", _make_view(v_buf, off, comp_dtype))
+        # Mark as shared so bytes_total can report 0 for memory accounting.
+        obj._shared_storage = True
+        return obj
+
+    @property
+    def shares_vllm_storage(self) -> bool:
+        return getattr(self, "_shared_storage", False)
 
 
 # --------------------------------------------------------------------------- #
