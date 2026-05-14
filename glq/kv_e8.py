@@ -156,11 +156,15 @@ class E8KVQuantizer:
         # unit-ball inputs because it's just the lowest-norm shells of
         # the primary. Between consecutive secondary stages we re-scale
         # again so each stage sees a residual at the same magnitude.
+        # The small codebook has 256 entries → indices fit in uint8.
+        # Storing them as uint8 (not int16) is what actually realises
+        # the 3-bpw / 5-bpw / 7-bpw storage savings on the cache; the
+        # math is otherwise identical to the int16 layout.
         if self.secondary_stages > 0:
             cur = residual * rs
             for k in range(1, self.secondary_stages + 1):
                 dec_s, idx_s = self.secondary_codebook.quantize(cur)
-                out[f"idx_s{k}"] = idx_s.reshape(N, n_groups).to(torch.int16)
+                out[f"idx_s{k}"] = idx_s.reshape(N, n_groups).to(torch.uint8)
                 if k < self.secondary_stages:
                     cur = (cur - dec_s) * rs
         # Reshape scale back to original leading shape (drop the last
