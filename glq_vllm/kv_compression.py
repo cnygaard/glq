@@ -50,6 +50,14 @@ _ptr_to_layer_idx: dict[int, int] = {}   # kv_cache.data_ptr() -> position in _b
 _active_config: dict[str, Any] = {}
 _call_counter: int = 0  # debug: counts how many times the patched fn fires
 
+# --- Phase 5.3 Stage 2b sidecar (one E8PagedKVCache per layer, by ptr) ---
+# Currently runs *alongside* vLLM's fp16 paged cache for correctness
+# validation. Stage 2c will start hooking attention to read from these
+# directly and free vLLM's fp16 buffer.
+_e8_sidecar: dict[int, Any] = {}         # kv_cache.data_ptr() -> E8PagedKVCache
+_sidecar_enabled: bool = False
+_sidecar_write_counter: int = 0
+
 
 _E8_BPW_RECIPES = {
     # bpw : (n_primary 16-bit stages, n_secondary 8-bit stages)
@@ -157,6 +165,87 @@ def _roundtrip_kv(key: torch.Tensor, value: torch.Tensor,
     return key_rt.reshape(orig_shape_k), val_rt.reshape(orig_shape_v)
 
 
+def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
+                   key_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+    """Phase 5.3 Stage 2b: also push the same K/V into our E8PagedKVCache.
+
+    Allocates the sidecar lazily the first time we see a given
+    ``key_cache.data_ptr()`` — vLLM allocates one paged buffer per
+    layer at engine start, and the pointer is stable thereafter.
+
+    Layers at bpw=8 (INT8) and bpw=16 (passthrough) are skipped — the
+    E8 paged layout only covers 2..7 bpw recipes.
+    """
+    global _sidecar_write_counter
+    if not _sidecar_enabled:
+        return
+    quant, bpw = _quantizer_for(key_cache)
+    # Uniform mode: _quantizer_for returns bpw=None. Recover it from
+    # the active config so every layer uses the same uniform bpw.
+    if bpw is None:
+        bpw = _active_config.get("bpw")
+    if bpw not in {2, 3, 4, 5, 6, 7}:
+        return
+    if quant is None:
+        quant = _quantizer
+    if quant is None:
+        return
+    from glq_vllm.e8_paged_cache import (
+        E8PagedKVCache,
+        write_kv,
+    )
+
+    if key_cache.dim() != 4:
+        return  # unexpected layout — skip silently
+    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+    if head_size % 8 != 0:
+        return
+
+    ptr = key_cache.data_ptr()
+    cache = _e8_sidecar.get(ptr)
+    if cache is not None and cache.head_size != head_size:
+        # vLLM occasionally reuses a tensor's storage during warmup, so
+        # the same data_ptr can show up with a different layer's shape.
+        # Drop the stale cache and let the next branch re-allocate.
+        del _e8_sidecar[ptr]
+        cache = None
+    if cache is None:
+        cache = E8PagedKVCache.alloc(
+            num_blocks=num_blocks, block_size=block_size,
+            num_kv_heads=num_kv_heads, head_size=head_size, bpw=bpw,
+            device=key_cache.device, dtype=key_cache.dtype)
+        _e8_sidecar[ptr] = cache
+        try:
+            print(f"[glq_vllm.kv_compression] sidecar alloc layer "
+                  f"#{len(_e8_sidecar)}: bpw={bpw} shape="
+                  f"{(num_blocks, block_size, num_kv_heads, head_size)} "
+                  f"bytes={cache.bytes_total()/1e6:.1f}MB",
+                  flush=True)
+        except Exception:
+            pass
+
+    # Input may arrive flattened as [num_tokens, num_heads*head_size].
+    if key.dim() == 2:
+        num_kv_heads = key.shape[-1] // head_size
+        key = key.reshape(-1, num_kv_heads, head_size)
+        value = value.reshape(-1, num_kv_heads, head_size)
+    try:
+        write_kv(quant, key, value, cache, slot_mapping)
+        _sidecar_write_counter += 1
+    except Exception as e:
+        # Sidecar is best-effort during Stage 2b; the main monkey-patch
+        # is the correctness path. Don't take the engine down for a
+        # shape edge case — log once and disable for this layer.
+        if ptr in _e8_sidecar:
+            del _e8_sidecar[ptr]
+        try:
+            print(f"[glq_vllm.kv_compression] sidecar write failed for "
+                  f"layer ptr={ptr:#x}: {type(e).__name__}: {e}",
+                  flush=True)
+        except Exception:
+            pass
+
+
 def _maybe_log(key, value):
     """Print on the very first call and every 500 calls thereafter, so the
     engine log shows that the patch is exercised without being noisy."""
@@ -185,6 +274,7 @@ def _patched_reshape_and_cache_flash(
     _call_counter += 1
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
+        _sidecar_write(key, value, key_cache, slot_mapping)
         key, value = _roundtrip_kv(key, value, key_cache)
     return _original_reshape(
         key, value, key_cache, value_cache,
@@ -213,6 +303,7 @@ def _patched_torch_op(
     _call_counter += 1
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
+        _sidecar_write(key, value, key_cache, slot_mapping)
         key, value = _roundtrip_kv(key, value, key_cache)
     return _original_torch_op(
         key, value, key_cache, value_cache,
@@ -242,6 +333,7 @@ def _patched_triton(
     _call_counter += 1
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
+        _sidecar_write(key, value, key_cache, slot_mapping)
         key, value = _roundtrip_kv(key, value, key_cache)
     return _original_triton(
         key, value, key_cache, value_cache,
@@ -432,3 +524,66 @@ def call_count() -> int:
 def reset_call_count() -> None:
     global _call_counter
     _call_counter = 0
+
+
+# ---------------------------------------------------------------- #
+# Phase 5.3 Stage 2b sidecar control
+# ---------------------------------------------------------------- #
+
+def enable_sidecar() -> None:
+    """Turn on the E8PagedKVCache sidecar (allocated lazily per layer
+    on the first ``_sidecar_write`` call). The main monkey-patch
+    (Phase 5.1) continues to populate vLLM's fp16 cache so attention
+    still works through vLLM's existing path; the sidecar runs alongside.
+
+    Call after ``enable()`` (or set ``GLQ_KV_E8_SIDECAR=1`` env var)."""
+    global _sidecar_enabled
+    _sidecar_enabled = True
+
+
+def disable_sidecar() -> None:
+    global _sidecar_enabled
+    _sidecar_enabled = False
+    _e8_sidecar.clear()
+
+
+def sidecar_stats() -> list[dict[str, Any]]:
+    """Snapshot of every allocated layer's E8PagedKVCache for inspection."""
+    return [
+        {
+            "ptr": ptr,
+            "bpw": c.bpw,
+            "n_primary": c.n_primary,
+            "n_secondary": c.n_secondary,
+            "num_blocks": c.num_blocks,
+            "block_size": c.block_size,
+            "num_kv_heads": c.num_kv_heads,
+            "head_size": c.head_size,
+            "bytes_total": c.bytes_total(),
+            "bytes_per_token_per_head": c.bytes_per_token_per_head(),
+        }
+        for ptr, c in _e8_sidecar.items()
+    ]
+
+
+def sidecar_write_count() -> int:
+    return _sidecar_write_counter
+
+
+def gather_sidecar_layer(ptr: int, slot_mapping: torch.Tensor):
+    """Decompress a slice of a layer's sidecar cache back to fp16 K, V.
+
+    Mostly for verification — Stage 2c will use this in the attention
+    backend to bridge the compressed cache to flash_attn."""
+    from glq_vllm.e8_paged_cache import gather_kv
+    cache = _e8_sidecar[ptr]
+    # Match the quantizer used at write time.
+    quant, _ = _quantizer_for_bpw(cache.bpw)
+    return gather_kv(quant, cache, slot_mapping)
+
+
+def _quantizer_for_bpw(bpw: int):
+    """Look up a quantizer by bpw alone (uniform or mixed mode)."""
+    if _bpw_list:
+        return _bpw_quantizers.get(bpw), bpw
+    return _quantizer, bpw

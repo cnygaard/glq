@@ -78,6 +78,15 @@ def register():
             print(f"[glq_vllm] failed to activate GLQ_KV_QUANT={spec!r}: {e}",
                   flush=True)
 
+    # Phase 5.3 Stage 2b — optional sidecar E8PagedKVCache for validating
+    # the byte layout under real vLLM traffic. Currently runs alongside
+    # vLLM's fp16 cache (no memory saving yet — Stage 2c will free that).
+    if (bpw_map_path or spec) and os.environ.get("GLQ_KV_E8_SIDECAR", "0") != "0":
+        from . import kv_compression
+        kv_compression.enable_sidecar()
+        print("[glq_vllm] GLQ_KV_E8_SIDECAR=1 → E8 paged cache sidecar "
+              "enabled (Stage 5.3-2b)", flush=True)
+
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)
 register()
