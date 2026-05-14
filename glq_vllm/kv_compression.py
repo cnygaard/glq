@@ -62,6 +62,13 @@ _call_counter: int = 0  # debug: counts how many times the patched fn fires
 # Keying by (ptr, head_size) gives us one sidecar per layer-type-per-buffer
 # without losing data when shape changes between layers.
 _e8_sidecar: dict[tuple[int, int], Any] = {}
+# Stage 2c-2b: when active, vLLM allocates its paged buffer at the
+# compressed size (via the E8 spec override). The original triton
+# reshape_and_cache_flash assumes fp16 layout — calling it on the
+# compressed buffer crashes — so the patched fn skips it.
+_compressed_allocation_active: bool = False
+_original_get_kv_cache_spec: Any = None
+_original_triton_get_kv_cache_shape: Any = None
 _sidecar_enabled: bool = False
 _sidecar_read_enabled: bool = False      # Stage 2c-1: route attention reads
 _sidecar_write_counter: int = 0
@@ -207,7 +214,20 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
 
     if key_cache.dim() != 4:
         return  # unexpected layout — skip silently
-    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+    num_blocks, block_size, num_kv_heads, cache_last_dim = key_cache.shape
+    # Under Stage 2c-2b the cache's last dim is the *compressed*
+    # element count, not head_size. Always derive head_size from the
+    # input K tensor (which the model produces at the model's real
+    # head_size, regardless of how vLLM stores it).
+    if key.dim() == 3:
+        head_size = key.shape[-1]
+    elif key.dim() == 2:
+        # Flattened [tokens, num_kv_heads * head_size]. Without a
+        # compressed-aware fallback we'd need an out-of-band source
+        # of head_size; for now skip this case (rare in the v1 path).
+        return
+    else:
+        return
     if head_size % 8 != 0:
         return
 
@@ -229,11 +249,7 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
         except Exception:
             pass
 
-    # Input may arrive flattened as [num_tokens, num_heads*head_size].
-    if key.dim() == 2:
-        num_kv_heads = key.shape[-1] // head_size
-        key = key.reshape(-1, num_kv_heads, head_size)
-        value = value.reshape(-1, num_kv_heads, head_size)
+    # Key is already 3D here (guarded above when deriving head_size).
     try:
         write_kv(quant, key, value, cache, slot_mapping)
         _sidecar_write_counter += 1
@@ -341,6 +357,11 @@ def _patched_triton(
     _maybe_log(key, value)
     if _quantizer is not None or _bpw_list:
         _sidecar_write(key, value, key_cache, slot_mapping)
+        if _compressed_allocation_active:
+            # vLLM's cache is now compressed bytes our code never
+            # reads; the original fp16 write would crash. Sidecar has
+            # the real data — return without touching vLLM's buffer.
+            return
         key, value = _roundtrip_kv(key, value, key_cache)
     return _original_triton(
         key, value, key_cache, value_cache,
@@ -607,8 +628,12 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
     global _sidecar_read_counter
     if not _sidecar_read_enabled:
         return _original_unified(q=q, k=k, v=v, **kwargs)
-    # k shape: [num_blocks, block_size, num_kv_heads, head_size]
-    bin_key = (k.data_ptr(), k.shape[-1])
+    # Real head_size comes from q (the model produces q at full
+    # head_size regardless of how vLLM stores cache). k.shape[-1] is
+    # unreliable under Stage 2c-2b because vLLM's cache uses the
+    # compressed last-dim.
+    real_head_size = q.shape[-1]
+    bin_key = (k.data_ptr(), real_head_size)
     cache = _e8_sidecar.get(bin_key)
     if cache is None:
         return _original_unified(q=q, k=k, v=v, **kwargs)
@@ -651,6 +676,153 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
 
 def sidecar_read_count() -> int:
     return _sidecar_read_counter
+
+
+# ---------------------------------------------------------------- #
+# Phase 5.3 Stage 2c-2b — compressed allocation in vLLM
+# ---------------------------------------------------------------- #
+
+def enable_compressed_allocation() -> None:
+    """Stage 2c-2b: declare compressed page size to vLLM's allocator.
+
+    Hooks:
+    * ``Attention.get_kv_cache_spec`` returns ``E8FullAttentionSpec`` /
+      ``E8SlidingWindowSpec`` with ``real_page_size_bytes`` set to our
+      compressed page size, so vLLM allocates a ~3-4x smaller paged
+      buffer.
+    * ``TritonAttentionBackend.get_kv_cache_shape`` returns the
+      compact ``(num_blocks, 2, elems_per_block_per_kv)`` shape so
+      ``_reshape_kv_cache``'s view math succeeds at the smaller byte
+      budget.
+    * ``_patched_triton`` skips the original fp16 write — the cache
+      buffer is now compressed bytes our code never touches; only
+      the sidecar carries real K/V.
+
+    Requires ``enable_sidecar()`` and ``enable_sidecar_read()``.
+    """
+    global _compressed_allocation_active
+    global _original_get_kv_cache_spec, _original_triton_get_kv_cache_shape
+
+    if not _sidecar_enabled or not _sidecar_read_enabled:
+        raise RuntimeError(
+            "enable_compressed_allocation requires sidecar + read hooks "
+            "(call enable_sidecar / enable_sidecar_read first)")
+
+    from glq_vllm.e8_kv_spec import (
+        E8FullAttentionSpec,
+        E8SlidingWindowSpec,
+        compressed_kv_cache_shape,
+    )
+    if E8FullAttentionSpec is None or E8SlidingWindowSpec is None:
+        raise RuntimeError(
+            "E8 spec subclasses unavailable (vllm import failed)")
+
+    # -- 1) patch Attention.get_kv_cache_spec --
+    try:
+        from vllm.model_executor.layers.attention.attention import Attention
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec, SlidingWindowSpec,
+        )
+    except ImportError as e:
+        raise RuntimeError(
+            f"compressed allocation requires vllm: {e}") from e
+
+    if _original_get_kv_cache_spec is None:
+        _original_get_kv_cache_spec = Attention.get_kv_cache_spec
+
+    def _e8_get_kv_cache_spec(self, vllm_config):
+        spec = _original_get_kv_cache_spec(self, vllm_config)
+        bpw = _active_config.get("bpw")
+        if bpw is None or bpw not in (2, 3, 4, 5, 6, 7):
+            return spec
+        if isinstance(spec, FullAttentionSpec):
+            return E8FullAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size,
+                head_size_v=spec.head_size_v,
+                dtype=spec.dtype,
+                sliding_window=spec.sliding_window,
+                attention_chunk_size=spec.attention_chunk_size,
+                bpw=bpw,
+            )
+        if isinstance(spec, SlidingWindowSpec):
+            return E8SlidingWindowSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size,
+                dtype=spec.dtype,
+                sliding_window=spec.sliding_window,
+                bpw=bpw,
+            )
+        return spec
+
+    Attention.get_kv_cache_spec = _e8_get_kv_cache_spec
+
+    # -- 1b) register E8 spec subclasses with the manager dispatch --
+    # vLLM's get_manager_for_kv_cache_spec uses type(spec) as a dict
+    # key, so subclassing isn't enough — we must add the entries.
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        spec_manager_map,
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    spec_manager_map[E8FullAttentionSpec] = FullAttentionManager
+    spec_manager_map[E8SlidingWindowSpec] = SlidingWindowManager
+
+    # -- 2) patch TritonAttentionBackend.get_kv_cache_shape --
+    try:
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionBackend,
+        )
+    except ImportError as e:
+        raise RuntimeError(
+            f"compressed allocation requires triton_attn backend: {e}") from e
+
+    if _original_triton_get_kv_cache_shape is None:
+        _original_triton_get_kv_cache_shape = (
+            TritonAttentionBackend.get_kv_cache_shape)
+
+    @staticmethod
+    def _e8_triton_get_kv_cache_shape(num_blocks, block_size,
+                                       num_kv_heads, head_size,
+                                       cache_dtype_str="auto"):
+        bpw = _active_config.get("bpw")
+        if bpw is None or bpw not in (2, 3, 4, 5, 6, 7):
+            return _original_triton_get_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size,
+                cache_dtype_str)
+        # dtype_size = 2 (bf16/fp16) for now — TODO: read from spec
+        return compressed_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size,
+            bpw=bpw, dtype_size=2)
+
+    TritonAttentionBackend.get_kv_cache_shape = _e8_triton_get_kv_cache_shape
+
+    _compressed_allocation_active = True
+    print("[glq_vllm.kv_compression] compressed allocation hooks "
+          "installed (Stage 5.3-2c-2b): Attention.get_kv_cache_spec + "
+          "TritonAttentionBackend.get_kv_cache_shape", flush=True)
+
+
+def disable_compressed_allocation() -> None:
+    global _compressed_allocation_active
+    _compressed_allocation_active = False
+    if _original_get_kv_cache_spec is not None:
+        try:
+            from vllm.model_executor.layers.attention.attention import (
+                Attention)
+            Attention.get_kv_cache_spec = _original_get_kv_cache_spec
+        except Exception:
+            pass
+    if _original_triton_get_kv_cache_shape is not None:
+        try:
+            from vllm.v1.attention.backends.triton_attn import (
+                TritonAttentionBackend)
+            TritonAttentionBackend.get_kv_cache_shape = (
+                _original_triton_get_kv_cache_shape)
+        except Exception:
+            pass
 
 
 def sidecar_stats() -> list[dict[str, Any]]:

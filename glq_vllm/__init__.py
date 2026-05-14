@@ -91,6 +91,15 @@ def register():
             kv_compression.enable_sidecar_read()
             print("[glq_vllm] GLQ_KV_E8_SIDECAR_READ=1 → attention reads "
                   "routed through E8 sidecar (Stage 5.3-2c-1)", flush=True)
+            # Stage 2c-2b: declare compressed page size to vLLM's
+            # allocator. Requires sidecar + read hooks to be active so
+            # vLLM's compressed buffer is never read or written
+            # directly (sidecar is the source of truth).
+            if os.environ.get("GLQ_KV_E8_COMPRESSED_ALLOC", "0") != "0":
+                kv_compression.enable_compressed_allocation()
+                print("[glq_vllm] GLQ_KV_E8_COMPRESSED_ALLOC=1 → vLLM "
+                      "allocates paged buffer at compressed page size "
+                      "(Stage 5.3-2c-2b)", flush=True)
 
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)
