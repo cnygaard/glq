@@ -33,6 +33,7 @@ fp16 values transparently — no decompression wrapper needed.
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 from typing import Any
 
@@ -656,21 +657,31 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
     try:
         from glq_vllm.e8_paged_cache import (
             gather_kv_to_paged_fp16,
+            gather_kv_to_paged_fp16_fused,
             remap_block_table,
         )
+        # Stage 3b: opt-in fused Triton kernel collapses the 5-take gather
+        # + dequant into one launch per side (eliminates ~10k Python-side
+        # aten::index calls per decode at ctx=4k). Falls through to the
+        # slow path automatically on CPU or if Triton is missing; the
+        # outer try/except below catches any fused-path bugs and falls
+        # back to slow.
+        _gather = (gather_kv_to_paged_fp16_fused
+                   if os.environ.get("GLQ_KV_E8_FUSED_GATHER", "0") == "1"
+                   else gather_kv_to_paged_fp16)
         if block_table is not None and block_table.numel() > 0:
             # Scoped: decompress only the blocks this batch references.
             # Bounds the transient fp16 workspace by # unique referenced
             # blocks instead of cache.num_blocks (typically ~100x smaller
             # at non-saturated load).
             unique_blocks = block_table.flatten().unique().long()
-            k_e8, v_e8 = gather_kv_to_paged_fp16(
+            k_e8, v_e8 = _gather(
                 quant, cache, block_indices=unique_blocks)
             new_block_table = remap_block_table(
                 block_table, unique_blocks, cache.num_blocks)
             kwargs = {**kwargs, "block_table": new_block_table}
         else:
-            k_e8, v_e8 = gather_kv_to_paged_fp16(quant, cache)
+            k_e8, v_e8 = _gather(quant, cache)
         if k_e8.dtype != k.dtype:
             k_e8 = k_e8.to(k.dtype)
             v_e8 = v_e8.to(v.dtype)

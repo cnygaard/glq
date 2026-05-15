@@ -434,6 +434,291 @@ def remap_block_table(block_table: torch.Tensor,
     return remap[block_table.long()].to(block_table.dtype)
 
 
+# --------------------------------------------------------------------------- #
+# Stage 3b — fused Triton dequant-gather kernel
+# --------------------------------------------------------------------------- #
+# The slow path below (``gather_kv_to_paged_fp16``) fires 5+ ``aten::index``
+# calls per side per layer, each of which triggers its own gather kernel
+# plus several ``aten::copy_`` follow-ups. The Stage 3a profile measured
+# ~10k Python-side dispatches per decode and ~57% of CUDA time spent in
+# this plumbing. The fused kernel below replaces the entire plumbing with
+# one launch: gather indices + scale, dequant via codebook lookup, residual
+# math, and per-group 8x8 inverse-Hadamard, all inline.
+#
+# ``gather_kv_to_paged_fp16_fused`` is signature-compatible with the slow
+# path. On CPU caches (used by unit tests) it transparently falls back to
+# the slow path; on CUDA it dispatches to the Triton kernel below.
+
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_OK = True
+except ImportError:  # pragma: no cover - triton is a required runtime dep on CUDA
+    _TRITON_OK = False
+
+
+def _hadamard_8_for_kernel(dtype: torch.dtype, device) -> torch.Tensor:
+    """Same matrix as ``glq.kv_e8._hadamard_8`` but cast to the kernel's
+    working dtype. Sized for the per-group 8x8 transform."""
+    import math as _math
+    H1 = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
+    H2 = torch.kron(H1, H1)
+    H3 = torch.kron(H2, H1)
+    return (H3 / _math.sqrt(8.0)).to(dtype=dtype, device=device).contiguous()
+
+
+if _TRITON_OK:
+    @triton.jit
+    def _fused_gather_dequant_kernel(
+        # cache buffers (one side, K or V):
+        idx1_ptr, idx2_ptr, idx3_ptr, idx_s1_ptr, scale_ptr,
+        # codebook tables:
+        cb_primary_ptr,    # [K_primary, 8]
+        cb_secondary_ptr,  # [K_secondary, 8] or null
+        # Hadamard matrix (symmetric -> equals its transpose):
+        h_ptr,             # [8, 8] same dtype as out
+        # gather indices:
+        block_indices_ptr,  # [NB_sel] int64
+        # output:
+        out_ptr,           # [NB_sel, BS, H, head_size] bf16/fp16
+        # sizes:
+        NB_sel,
+        BS: tl.constexpr,
+        H: tl.constexpr,
+        G: tl.constexpr,
+        # strides — idx1/idx2/idx3 share the [num_blocks, BS, H, G] layout:
+        idx_stride_nb,
+        idx_stride_bs: tl.constexpr,
+        idx_stride_h: tl.constexpr,
+        # uint8 idx_s1 may live in a separately strided buffer:
+        idxu_stride_nb,
+        idxu_stride_bs: tl.constexpr,
+        idxu_stride_h: tl.constexpr,
+        # scale buffer strides (same shape as idx tensors, dtype-strided):
+        sc_stride_nb,
+        sc_stride_bs: tl.constexpr,
+        sc_stride_h: tl.constexpr,
+        # output strides [NB_sel, BS, H, head_size]:
+        out_stride_nb: tl.constexpr,
+        out_stride_bs: tl.constexpr,
+        out_stride_h: tl.constexpr,
+        # math constants:
+        RS: tl.constexpr,
+        N_PRIMARY: tl.constexpr,
+        N_SECONDARY: tl.constexpr,
+    ):
+        """One program per (block_in_sel, slot, head). Each program
+        decodes all G groups for that (block, slot, head), so it emits
+        head_size = G * 8 output elements.
+
+        Grid: (NB_sel, BS, H). Total launches = NB_sel * BS * H, which
+        replaces ~10 ``aten::index`` + gather kernels per (block, slot,
+        head) in the slow path.
+        """
+        bi = tl.program_id(0)         # 0 .. NB_sel-1
+        s_idx = tl.program_id(1)      # 0 .. BS-1
+        h_idx = tl.program_id(2)      # 0 .. H-1
+
+        # Look up the absolute block id this program is responsible for.
+        nb_g = tl.load(block_indices_ptr + bi).to(tl.int64)
+
+        # Per-group offset within the cache buffers (idx1 stride is the same
+        # for idx2/idx3 since they share shape; idx_s1 may differ).
+        g_arange = tl.arange(0, G)
+        idx_base = (nb_g * idx_stride_nb
+                    + s_idx * idx_stride_bs
+                    + h_idx * idx_stride_h)
+        # int16 indices: load all G groups at once. The cache stores
+        # codebook indices in int16; values 32768..65535 are stored as
+        # negative two's-complement. PyTorch's ``cb[idx.long()]`` rescues
+        # them via negative-indexing wraparound, but Triton would
+        # sign-extend to int32 and load out-of-bounds memory. Mask to
+        # 16-bit unsigned before computing the codebook offset.
+        idx1_vec = tl.load(idx1_ptr + idx_base + g_arange).to(tl.int32) & 0xFFFF
+
+        # Primary stage 1: codebook[idx1] for each of the G groups.
+        # Output: dec[g, k] where g in [0, G), k in [0, 8).
+        cb_off = idx1_vec[:, None] * 8 + tl.arange(0, 8)[None, :]
+        dec = tl.load(cb_primary_ptr + cb_off).to(tl.float32)
+
+        # Primary stage 2.
+        if N_PRIMARY >= 2:
+            idx2_vec = tl.load(idx2_ptr + idx_base + g_arange).to(tl.int32) & 0xFFFF
+            cb_off2 = idx2_vec[:, None] * 8 + tl.arange(0, 8)[None, :]
+            dec = dec + tl.load(cb_primary_ptr + cb_off2).to(tl.float32) / RS
+
+        # Primary stage 3.
+        if N_PRIMARY >= 3:
+            idx3_vec = tl.load(idx3_ptr + idx_base + g_arange).to(tl.int32) & 0xFFFF
+            cb_off3 = idx3_vec[:, None] * 8 + tl.arange(0, 8)[None, :]
+            dec = dec + tl.load(cb_primary_ptr + cb_off3).to(tl.float32) / (RS * RS)
+
+        # Secondary stage 1 (8-bit small codebook).
+        if N_SECONDARY >= 1:
+            idxu_base = (nb_g * idxu_stride_nb
+                         + s_idx * idxu_stride_bs
+                         + h_idx * idxu_stride_h)
+            idxs_vec = tl.load(idx_s1_ptr + idxu_base + g_arange).to(tl.int32)
+            cb_offs = idxs_vec[:, None] * 8 + tl.arange(0, 8)[None, :]
+            # divisor = rs ** (n_primary - 1 + 1) = rs ** n_primary
+            if N_PRIMARY == 1:
+                div_s = RS
+            elif N_PRIMARY == 2:
+                div_s = RS * RS
+            else:
+                div_s = RS * RS * RS
+            dec = dec + tl.load(cb_secondary_ptr + cb_offs).to(tl.float32) / div_s
+
+        # Per-group scale.
+        sc_base = (nb_g * sc_stride_nb
+                   + s_idx * sc_stride_bs
+                   + h_idx * sc_stride_h)
+        scale_vec = tl.load(scale_ptr + sc_base + g_arange).to(tl.float32)
+        dec = dec * scale_vec[:, None]
+
+        # 8x8 inverse Hadamard, per group. Walsh-Hadamard is symmetric so
+        # H.T == H, hence dec @ H.T == dec @ H. Load once, fold over the
+        # group axis with tl.sum on the inner contraction.
+        h_rows = tl.arange(0, 8)[:, None]
+        h_cols = tl.arange(0, 8)[None, :]
+        H_mat = tl.load(h_ptr + h_rows * 8 + h_cols).to(tl.float32)
+        # dec is [G, 8]; we want out[g, j] = sum_k dec[g, k] * H[k, j].
+        # Triton: broadcast dec to [G, 8, 1], H to [1, 8, 8], multiply, sum.
+        out_block = tl.sum(
+            dec[:, :, None] * H_mat[None, :, :], axis=1
+        )  # [G, 8]
+
+        # Write to output [NB_sel, BS, H, head_size = G*8].
+        out_base = (bi * out_stride_nb
+                    + s_idx * out_stride_bs
+                    + h_idx * out_stride_h)
+        out_off = (tl.arange(0, G)[:, None] * 8
+                   + tl.arange(0, 8)[None, :])
+        tl.store(out_ptr + out_base + out_off,
+                 out_block.to(out_ptr.dtype.element_ty))
+
+
+# Module-level Hadamard cache keyed by (dtype, device) — built once.
+_HADAMARD_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _get_hadamard(dtype: torch.dtype, device) -> torch.Tensor:
+    """Return a cached 8x8 Hadamard matrix sized for ``dtype`` on
+    ``device``. The matrix is symmetric so we use it for the inverse
+    transform directly (H == H.T)."""
+    key = (dtype, torch.device(device).index if torch.device(device).index is not None
+           else str(device))
+    cached = _HADAMARD_CACHE.get(key)
+    if cached is not None and cached.device == torch.device(device):
+        return cached
+    H = _hadamard_8_for_kernel(dtype=dtype, device=device)
+    _HADAMARD_CACHE[key] = H
+    return H
+
+
+def gather_kv_to_paged_fp16_fused(quantizer, cache: E8PagedKVCache,
+                                   block_indices: torch.Tensor | None = None,
+                                   ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused replacement for ``gather_kv_to_paged_fp16``.
+
+    Signature-compatible with the slow path. On CPU caches (or if Triton
+    is missing) falls back to the slow path. On CUDA dispatches one
+    Triton kernel per side (K, V) — each launch handles every (block,
+    slot, head, group) tuple for that side.
+
+    Stage 3a profile target: the slow path issues ~10k Python-side
+    ``aten::index`` calls per decode (5 takes × 2 sides × ~32 layers ×
+    ~32 tokens). This kernel collapses each side's gather + dequant to
+    one launch, eliminating the gather plumbing entirely.
+    """
+    if cache.device.type != "cuda" or not _TRITON_OK:
+        return gather_kv_to_paged_fp16(quantizer, cache,
+                                       block_indices=block_indices)
+
+    if block_indices is None:
+        block_indices = torch.arange(
+            cache.num_blocks, device=cache.device, dtype=torch.long)
+    else:
+        block_indices = block_indices.to(device=cache.device, dtype=torch.long)
+    NB_sel = int(block_indices.shape[0])
+    BS = cache.block_size
+    H = cache.num_kv_heads
+    G = cache.n_groups
+    head_size = cache.head_size
+    dtype = cache.dtype
+
+    # Codebooks: use the half-precision tensor (.codebook_half) cast to
+    # the cache's dtype so loads match the slow path.
+    cb_pri = quantizer.codebook.codebook_half.to(dtype=dtype, device=cache.device)
+    if not cb_pri.is_contiguous():
+        cb_pri = cb_pri.contiguous()
+    if cache.n_secondary >= 1:
+        cb_sec = quantizer.secondary_codebook.codebook_half.to(
+            dtype=dtype, device=cache.device)
+        if not cb_sec.is_contiguous():
+            cb_sec = cb_sec.contiguous()
+    else:
+        # Triton wants a real pointer; use the primary codebook tensor
+        # (its data is unused when N_SECONDARY == 0).
+        cb_sec = cb_pri
+
+    rs = float(quantizer.codebook.resid_scale)
+    n_primary = cache.n_primary
+    n_secondary = cache.n_secondary
+
+    H_mat = _get_hadamard(dtype, cache.device)
+
+    def _run_side(side: str) -> torch.Tensor:
+        idx1 = getattr(cache, f"{side}_idx1")
+        idx2 = getattr(cache, f"{side}_idx2", None)
+        idx3 = getattr(cache, f"{side}_idx3", None)
+        idx_s1 = getattr(cache, f"{side}_idx_s1", None)
+        scale = getattr(cache, f"{side}_scale")
+
+        out = torch.empty(
+            (NB_sel, BS, H, head_size), dtype=dtype, device=cache.device)
+
+        # Strides for the [num_blocks, BS, H, G] index buffers.
+        idx_st_nb, idx_st_bs, idx_st_h, idx_st_g = idx1.stride()
+        assert idx_st_g == 1, "idx1 must be contiguous along G"
+        # idx2, idx3 share idx1's stride/layout if present.
+        # idx_s1 may have its own (uint8 storage):
+        if idx_s1 is not None:
+            idxu_st_nb, idxu_st_bs, idxu_st_h, idxu_st_g = idx_s1.stride()
+            assert idxu_st_g == 1
+        else:
+            idxu_st_nb = idxu_st_bs = idxu_st_h = 0
+        # scale tensor strides (same shape, different dtype):
+        sc_st_nb, sc_st_bs, sc_st_h, sc_st_g = scale.stride()
+        assert sc_st_g == 1
+        # out strides [NB_sel, BS, H, head_size]:
+        out_st_nb, out_st_bs, out_st_h, out_st_g = out.stride()
+        assert out_st_g == 1
+
+        grid = (NB_sel, BS, H)
+        idx2_ptr = idx2 if idx2 is not None else idx1
+        idx3_ptr = idx3 if idx3 is not None else idx1
+        idx_s1_ptr = idx_s1 if idx_s1 is not None else idx1
+        _fused_gather_dequant_kernel[grid](
+            idx1, idx2_ptr, idx3_ptr, idx_s1_ptr, scale,
+            cb_pri, cb_sec, H_mat,
+            block_indices,
+            out,
+            NB_sel,
+            BS, H, G,
+            idx_st_nb, idx_st_bs, idx_st_h,
+            idxu_st_nb, idxu_st_bs, idxu_st_h,
+            sc_st_nb, sc_st_bs, sc_st_h,
+            out_st_nb, out_st_bs, out_st_h,
+            RS=rs,
+            N_PRIMARY=n_primary,
+            N_SECONDARY=n_secondary,
+        )
+        return out
+
+    return _run_side("k"), _run_side("v")
+
+
 def gather_kv_to_paged_fp16(quantizer, cache: E8PagedKVCache,
                              block_indices: torch.Tensor | None = None,
                              ) -> tuple[torch.Tensor, torch.Tensor]:

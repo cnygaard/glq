@@ -100,6 +100,14 @@ def register():
                 print("[glq_vllm] GLQ_KV_E8_COMPRESSED_ALLOC=1 → vLLM "
                       "allocates paged buffer at compressed page size "
                       "(Stage 5.3-2c-2b)", flush=True)
+            # Stage 3b: opt-in fused Triton dequant-gather kernel. The
+            # plumbing reads GLQ_KV_E8_FUSED_GATHER at every attention
+            # call so it can be toggled without restart (mainly useful
+            # during A/B benchmarks).
+            if os.environ.get("GLQ_KV_E8_FUSED_GATHER", "0") != "0":
+                print("[glq_vllm] GLQ_KV_E8_FUSED_GATHER=1 → fused Triton "
+                      "dequant-gather kernel active (Stage 5.3-3b)",
+                      flush=True)
 
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)
