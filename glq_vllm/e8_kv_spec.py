@@ -31,7 +31,7 @@ Bytes-per-group lookup keeps the math:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 # Bytes per group of 8 elements at each bpw rung. Matches the on-card
@@ -124,6 +124,22 @@ def _make_spec_subclasses():
                 bpw=self.bpw,
             )
 
+        @classmethod
+        def merge(cls, specs):
+            # ``FullAttentionSpec.merge`` reconstructs via ``cls(...)`` but
+            # only forwards the base-class fields, so our ``bpw`` would
+            # default back to 2 and the merged group's page size would
+            # silently differ from the input specs at bpw != 2. Restore
+            # ``bpw`` after the parent merge (all specs in a group must
+            # share the same bpw).
+            merged = super().merge(specs)
+            bpws = {s.bpw for s in specs}
+            if len(bpws) != 1:
+                raise ValueError(
+                    f"All E8FullAttentionSpec in a KV cache group must share "
+                    f"the same bpw; got {sorted(bpws)}.")
+            return replace(merged, bpw=bpws.pop())
+
     @dataclass(frozen=True, kw_only=True)
     class E8SlidingWindowSpec(SlidingWindowSpec):
         """SlidingWindowSpec that declares the compressed page size."""
@@ -137,6 +153,10 @@ def _make_spec_subclasses():
                 head_size=self.head_size,
                 bpw=self.bpw,
             )
+
+        # ``SlidingWindowSpec`` inherits ``KVCacheSpec.merge`` which uses
+        # ``copy.deepcopy(specs[0])`` — that preserves our subclass and
+        # all its fields, including ``bpw``. No override needed here.
 
     return E8FullAttentionSpec, E8SlidingWindowSpec
 
