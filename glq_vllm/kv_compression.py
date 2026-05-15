@@ -212,6 +212,7 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
     from glq_vllm.e8_paged_cache import (
         E8PagedKVCache,
         write_kv,
+        write_kv_fused,
     )
 
     if key_cache.dim() != 4:
@@ -263,8 +264,14 @@ def _sidecar_write(key: torch.Tensor, value: torch.Tensor,
             pass
 
     # Key is already 3D here (guarded above when deriving head_size).
+    # Stage 4a: opt-in fused scatter kernel collapses the 2-5 index_put_
+    # calls per side into one Triton launch (~10 launches saved per
+    # token per layer).
+    _write = (write_kv_fused
+              if os.environ.get("GLQ_KV_E8_FUSED_WRITE", "0") == "1"
+              else write_kv)
     try:
-        write_kv(quant, key, value, cache, slot_mapping)
+        _write(quant, key, value, cache, slot_mapping)
         _sidecar_write_counter += 1
     except Exception as e:
         # Sidecar is best-effort during Stage 2b; the main monkey-patch

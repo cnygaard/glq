@@ -59,6 +59,13 @@ from typing import Optional
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_OK = True
+except ImportError:  # pragma: no cover - triton is a required runtime dep on CUDA
+    _TRITON_OK = False
+
 
 _BPW_RECIPE = {
     2: (1, 0),
@@ -338,6 +345,288 @@ def _scatter_into_cache(cache: E8PagedKVCache, slot_mapping: torch.Tensor,
     scale_buf[block, slot] = qt["scale"].to(scale_buf.dtype)
 
 
+# --------------------------------------------------------------------------- #
+# Stage 4a — fused Triton scatter kernel for the write path
+# --------------------------------------------------------------------------- #
+# After Stage 3b, ``_codebook_nn_kernel`` (the NN compute itself) is 42%
+# of CUDA time at 4 bpw — that's mostly unavoidable work. But the
+# *plumbing* around it (Hadamard, scale, residual, decode-and-subtract,
+# scatter) still fires 8-10 Python-side ops per (token, side) per layer.
+# The biggest chunk of that plumbing is ``_scatter_into_cache``'s
+# 2-5 ``buf[block, slot] = src`` (``index_put_``) calls per side, which
+# we collapse to one Triton launch here.
+#
+# Activation: ``GLQ_KV_E8_FUSED_WRITE=1`` (read via the env hook in
+# ``kv_compression._sidecar_write``).
+
+if _TRITON_OK:
+    @triton.jit
+    def _fused_scatter_qt_kernel(
+        # qt dict tensors (one side, K or V):
+        idx1_src_ptr, idx2_src_ptr, idx3_src_ptr, idx_s1_src_ptr,
+        scale_src_ptr,
+        # cache buffers (one side):
+        cache_idx1_ptr, cache_idx2_ptr, cache_idx3_ptr, cache_idx_s1_ptr,
+        cache_scale_ptr,
+        # slot_mapping [nT] int64:
+        slot_mapping_ptr,
+        # sizes:
+        nT,
+        H: tl.constexpr,
+        G: tl.constexpr,
+        block_size: tl.constexpr,
+        # source strides — qt tensors are [nT, H, G] after reshape:
+        src_stride_t,
+        src_stride_h: tl.constexpr,
+        # source strides for uint8 (idx_s1) and scale (cache dtype):
+        srcu_stride_t,
+        srcu_stride_h: tl.constexpr,
+        scsrc_stride_t,
+        scsrc_stride_h: tl.constexpr,
+        # cache strides — buffers are [num_blocks, block_size, H, G]:
+        cache_stride_nb,
+        cache_stride_bs: tl.constexpr,
+        cache_stride_h: tl.constexpr,
+        # cache strides for uint8 (idx_s1) and scale:
+        cacheu_stride_nb,
+        cacheu_stride_bs: tl.constexpr,
+        cacheu_stride_h: tl.constexpr,
+        scache_stride_nb,
+        scache_stride_bs: tl.constexpr,
+        scache_stride_h: tl.constexpr,
+        # math constants:
+        N_PRIMARY: tl.constexpr,
+        N_SECONDARY: tl.constexpr,
+    ):
+        """One program per (token, head). Each writes one full group's
+        worth of indices + scale at the right slot in the cache.
+
+        Grid: (nT, H). Replaces 2-5 ``index_put_`` launches with one.
+        """
+        # All offset math is int64. vLLM allocates the compressed
+        # paged buffer at multi-million blocks under realistic
+        # gpu_memory_utilization, so dst_off (block * cache_stride_nb
+        # + ...) easily exceeds int32 range (~2.1B elements) at
+        # head_size=512. Every stride is explicitly cast to int64
+        # before multiplying — Triton does not auto-promote the i32
+        # runtime int arguments when multiplied with an i64 program-id.
+        t_idx = tl.program_id(0).to(tl.int64)
+        h_idx = tl.program_id(1).to(tl.int64)
+        src_stride_t_i64 = tl.cast(src_stride_t, tl.int64)
+        srcu_stride_t_i64 = tl.cast(srcu_stride_t, tl.int64)
+        scsrc_stride_t_i64 = tl.cast(scsrc_stride_t, tl.int64)
+        cache_stride_nb_i64 = tl.cast(cache_stride_nb, tl.int64)
+        cacheu_stride_nb_i64 = tl.cast(cacheu_stride_nb, tl.int64)
+        scache_stride_nb_i64 = tl.cast(scache_stride_nb, tl.int64)
+
+        # Look up cache slot for this token. vLLM's dummy/warmup runs
+        # pad slot_mapping with -1 — the slow PyTorch path writes those
+        # to a wrap-around (negative-indexed) slot at the end of the
+        # cache; we just mask them out so the store is a no-op.
+        abs_slot = tl.load(slot_mapping_ptr + t_idx).to(tl.int64)
+        write_mask = abs_slot >= 0
+        abs_slot_safe = tl.where(write_mask, abs_slot, 0)
+        block = abs_slot_safe // block_size
+        slot = abs_slot_safe % block_size
+
+        g_arange = tl.arange(0, G).to(tl.int64)
+        # Force scalar -> vector mask broadcast via a tl.full op so the
+        # mask is unambiguously a [G]-shape boolean vector. An earlier
+        # attempt at ``write_mask & (g_arange < G)`` produced a CUDA
+        # illegal memory access when *every* program in the grid had
+        # ``write_mask = False`` (vLLM's flashinfer_autotune dummy run);
+        # the explicit ``tl.full(... True) & write_mask`` form avoids
+        # whatever optimization path was misbehaving.
+        store_mask = tl.full((G,), 1, dtype=tl.int1) & write_mask
+
+        # idx1 (always present): int16 src and int16 cache.
+        src_off1 = (t_idx * src_stride_t_i64
+                    + h_idx * src_stride_h
+                    + g_arange)
+        dst_off1 = (block * cache_stride_nb_i64
+                    + slot * cache_stride_bs
+                    + h_idx * cache_stride_h
+                    + g_arange)
+        v1 = tl.load(idx1_src_ptr + src_off1, mask=store_mask, other=0)
+        tl.store(cache_idx1_ptr + dst_off1, v1, mask=store_mask)
+
+        if N_PRIMARY >= 2:
+            v2 = tl.load(idx2_src_ptr + src_off1, mask=store_mask, other=0)
+            tl.store(cache_idx2_ptr + dst_off1, v2, mask=store_mask)
+        if N_PRIMARY >= 3:
+            v3 = tl.load(idx3_src_ptr + src_off1, mask=store_mask, other=0)
+            tl.store(cache_idx3_ptr + dst_off1, v3, mask=store_mask)
+
+        if N_SECONDARY >= 1:
+            srcu_off = (t_idx * srcu_stride_t_i64
+                        + h_idx * srcu_stride_h
+                        + g_arange)
+            dstu_off = (block * cacheu_stride_nb_i64
+                        + slot * cacheu_stride_bs
+                        + h_idx * cacheu_stride_h
+                        + g_arange)
+            vs = tl.load(idx_s1_src_ptr + srcu_off, mask=store_mask, other=0)
+            tl.store(cache_idx_s1_ptr + dstu_off, vs, mask=store_mask)
+
+        scsrc_off = (t_idx * scsrc_stride_t_i64
+                     + h_idx * scsrc_stride_h
+                     + g_arange)
+        scdst_off = (block * scache_stride_nb_i64
+                     + slot * scache_stride_bs
+                     + h_idx * scache_stride_h
+                     + g_arange)
+        sc = tl.load(scale_src_ptr + scsrc_off, mask=store_mask, other=0)
+        tl.store(cache_scale_ptr + scdst_off, sc, mask=store_mask)
+
+
+def _fused_scatter_qt_into_cache(cache: E8PagedKVCache,
+                                  slot_mapping: torch.Tensor,
+                                  *, side: str, qt: dict) -> None:
+    """Triton scatter — drop-in replacement for ``_scatter_into_cache``.
+
+    The qt dict ``[nT*H, G]`` index tensors are reshaped to ``[nT, H, G]``
+    before launch so per-program offsets are simple. Falls back to the
+    slow scatter on CPU or if Triton is missing.
+    """
+    if cache.device.type != "cuda" or not _TRITON_OK:
+        return _scatter_into_cache(cache, slot_mapping, side=side, qt=qt)
+
+    if slot_mapping.numel() == 0:
+        return  # nothing to write
+    # Note: vLLM's warmup / dummy run hands us all-``-1`` slot_mapping.
+    # The kernel's per-program store mask (``store_mask`` built from
+    # ``abs_slot >= 0``) handles that case in-kernel — no host-side
+    # ``.item()`` sync needed, which would cost ~100us per layer-side.
+
+    nT = slot_mapping.shape[0]
+    H = cache.num_kv_heads
+    G = cache.n_groups
+
+    def _src(name: str):
+        t = qt[name]
+        # qt produces tensors shaped [nT*H, G] or [nT, H, G]; normalize.
+        if t.dim() == 2:
+            t = t.reshape(nT, H, G)
+        return t.contiguous()
+
+    idx1 = _src("idx1")
+    idx2 = _src("idx2") if cache.n_primary >= 2 else None
+    idx3 = _src("idx3") if cache.n_primary >= 3 else None
+    idx_s1 = _src("idx_s1") if cache.n_secondary >= 1 else None
+    scale_src = qt["scale"]
+    if scale_src.dim() == 2:
+        scale_src = scale_src.reshape(nT, H, G)
+    scale_src = scale_src.to(cache.dtype).contiguous()
+
+    cache_idx1 = getattr(cache, f"{side}_idx1")
+    cache_idx2 = getattr(cache, f"{side}_idx2") if cache.n_primary >= 2 else cache_idx1
+    cache_idx3 = getattr(cache, f"{side}_idx3") if cache.n_primary >= 3 else cache_idx1
+    cache_idx_s1 = (getattr(cache, f"{side}_idx_s1")
+                    if cache.n_secondary >= 1 else cache_idx1)
+    cache_scale = getattr(cache, f"{side}_scale")
+
+    # Source dtypes must match the cache dtypes (int16, uint8, fp16/bf16).
+    if idx1.dtype != cache_idx1.dtype:
+        idx1 = idx1.to(cache_idx1.dtype)
+    if idx2 is not None and idx2.dtype != cache_idx2.dtype:
+        idx2 = idx2.to(cache_idx2.dtype)
+    if idx3 is not None and idx3.dtype != cache_idx3.dtype:
+        idx3 = idx3.to(cache_idx3.dtype)
+    if idx_s1 is not None and idx_s1.dtype != cache_idx_s1.dtype:
+        idx_s1 = idx_s1.to(cache_idx_s1.dtype)
+
+    # idx1/2/3 share the same stride pattern; scale is in cache dtype.
+    src_st_t, src_st_h, src_st_g = idx1.stride()
+    assert src_st_g == 1
+    if idx_s1 is not None:
+        srcu_st_t, srcu_st_h, srcu_st_g = idx_s1.stride()
+        assert srcu_st_g == 1
+    else:
+        srcu_st_t = srcu_st_h = 0
+    scsrc_st_t, scsrc_st_h, scsrc_st_g = scale_src.stride()
+    assert scsrc_st_g == 1
+
+    cache_st_nb, cache_st_bs, cache_st_h, cache_st_g = cache_idx1.stride()
+    assert cache_st_g == 1
+    if cache.n_secondary >= 1:
+        cacheu_st_nb, cacheu_st_bs, cacheu_st_h, cacheu_st_g = (
+            cache_idx_s1.stride())
+        assert cacheu_st_g == 1
+    else:
+        cacheu_st_nb = cacheu_st_bs = cacheu_st_h = 0
+    scache_st_nb, scache_st_bs, scache_st_h, scache_st_g = cache_scale.stride()
+    assert scache_st_g == 1
+
+    idx2_ptr = idx2 if idx2 is not None else idx1
+    idx3_ptr = idx3 if idx3 is not None else idx1
+    idx_s1_ptr = idx_s1 if idx_s1 is not None else idx1
+
+    grid = (nT, H)
+    # Debug instrumentation: opt-in via env. Prints once per layer the
+    # exact shapes/strides we hand the kernel, so we can verify the
+    # numbers match the expected vLLM layout without diving into a
+    # cuda-memcheck session.
+    import os as _os
+    if _os.environ.get("GLQ_KV_E8_FUSED_WRITE_DEBUG") == "1":
+        print(f"[fused_scatter] side={side} bpw={cache.bpw} "
+              f"nT={nT} H={H} G={G} block_size={cache.block_size}", flush=True)
+        print(f"  idx1: shape={tuple(idx1.shape)} stride={idx1.stride()} "
+              f"dtype={idx1.dtype}", flush=True)
+        print(f"  cache_idx1: shape={tuple(cache_idx1.shape)} "
+              f"stride={cache_idx1.stride()} dtype={cache_idx1.dtype} "
+              f"ptr={cache_idx1.data_ptr():#x} "
+              f"storage_size={cache_idx1.untyped_storage().nbytes()}",
+              flush=True)
+        print(f"  cache_scale: shape={tuple(cache_scale.shape)} "
+              f"stride={cache_scale.stride()} dtype={cache_scale.dtype}",
+              flush=True)
+        print(f"  slot_mapping: shape={tuple(slot_mapping.shape)} "
+              f"dtype={slot_mapping.dtype} "
+              f"min={slot_mapping.min().item()} "
+              f"max={slot_mapping.max().item()}", flush=True)
+        # Maximum dst offset (idx1) — must fit in storage.
+        max_block = slot_mapping.max().item() // cache.block_size
+        max_off = (max_block * cache_st_nb
+                   + (cache.block_size - 1) * cache_st_bs
+                   + (H - 1) * cache_st_h
+                   + (G - 1))
+        print(f"  max_dst_off_i16={max_off} (storage int16 elems="
+              f"{cache_idx1.untyped_storage().nbytes() // 2})", flush=True)
+    _fused_scatter_qt_kernel[grid](
+        idx1, idx2_ptr, idx3_ptr, idx_s1_ptr, scale_src,
+        cache_idx1, cache_idx2, cache_idx3, cache_idx_s1, cache_scale,
+        slot_mapping.to(dtype=torch.int64, device=cache.device),
+        nT, H, G, cache.block_size,
+        src_st_t, src_st_h,
+        srcu_st_t, srcu_st_h,
+        scsrc_st_t, scsrc_st_h,
+        cache_st_nb, cache_st_bs, cache_st_h,
+        cacheu_st_nb, cacheu_st_bs, cacheu_st_h,
+        scache_st_nb, scache_st_bs, scache_st_h,
+        N_PRIMARY=cache.n_primary,
+        N_SECONDARY=cache.n_secondary,
+    )
+
+
+def write_kv_fused(quantizer, key: torch.Tensor, value: torch.Tensor,
+                   cache: E8PagedKVCache,
+                   slot_mapping: torch.Tensor) -> None:
+    """Drop-in replacement for ``write_kv`` that uses the fused scatter
+    kernel for the cache writes. The quantize() math is unchanged for
+    Stage 4a — only the scatter is fused. Bit-exact equivalent to
+    ``write_kv``."""
+    assert key.shape == value.shape
+    assert key.shape[-1] == cache.head_size
+    assert key.shape[-2] == cache.num_kv_heads
+    if quantizer.bpw != cache.bpw:
+        raise ValueError(
+            f"quantizer bpw={quantizer.bpw} does not match cache bpw={cache.bpw}")
+    qt_k = quantizer.quantize(key)
+    qt_v = quantizer.quantize(value)
+    _fused_scatter_qt_into_cache(cache, slot_mapping, side="k", qt=qt_k)
+    _fused_scatter_qt_into_cache(cache, slot_mapping, side="v", qt=qt_v)
+
+
 def write_kv(quantizer, key: torch.Tensor, value: torch.Tensor,
              cache: E8PagedKVCache, slot_mapping: torch.Tensor) -> None:
     """Quantize K, V and write the encoded form into ``cache`` at slots.
@@ -448,14 +737,6 @@ def remap_block_table(block_table: torch.Tensor,
 # ``gather_kv_to_paged_fp16_fused`` is signature-compatible with the slow
 # path. On CPU caches (used by unit tests) it transparently falls back to
 # the slow path; on CUDA it dispatches to the Triton kernel below.
-
-try:
-    import triton
-    import triton.language as tl
-    _TRITON_OK = True
-except ImportError:  # pragma: no cover - triton is a required runtime dep on CUDA
-    _TRITON_OK = False
-
 
 def _hadamard_8_for_kernel(dtype: torch.dtype, device) -> torch.Tensor:
     """Same matrix as ``glq.kv_e8._hadamard_8`` but cast to the kernel's

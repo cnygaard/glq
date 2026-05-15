@@ -108,6 +108,12 @@ def register():
                 print("[glq_vllm] GLQ_KV_E8_FUSED_GATHER=1 → fused Triton "
                       "dequant-gather kernel active (Stage 5.3-3b)",
                       flush=True)
+            # Stage 4a: opt-in fused scatter on the write path. Same
+            # toggle pattern — env var is read at each attention call.
+            if os.environ.get("GLQ_KV_E8_FUSED_WRITE", "0") != "0":
+                print("[glq_vllm] GLQ_KV_E8_FUSED_WRITE=1 → fused Triton "
+                      "scatter kernel active on write path (Stage 5.3-4a)",
+                      flush=True)
 
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)
