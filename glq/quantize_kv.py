@@ -7,7 +7,7 @@ directly into ``GLQQuantizedCache(bpw_map=...)``.
 
 Example:
     python -m glq.quantize_kv \\
-        --model unsloth/gemma-4-E4B-it \\
+        --model google/gemma-4-E4B-it \\
         --bpw 3.0 \\
         --e8-method e8_relaxed \\
         --output kv_bpw_map.json

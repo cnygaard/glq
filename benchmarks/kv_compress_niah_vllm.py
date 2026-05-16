@@ -89,7 +89,7 @@ def _variant_label() -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="unsloth/gemma-4-E4B-it")
+    p.add_argument("--model", default="google/gemma-4-E4B-it")
     p.add_argument("--text-url",
                    default="https://www.gutenberg.org/cache/epub/6593/pg6593.txt")
     p.add_argument("--ctx-lens", type=int, nargs="+", default=[16384])

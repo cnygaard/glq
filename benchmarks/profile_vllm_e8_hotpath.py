@@ -85,7 +85,7 @@ def _decode_once(llm, msgs, *, n_decode: int):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="unsloth/gemma-4-E4B-it")
+    p.add_argument("--model", default="google/gemma-4-E4B-it")
     p.add_argument("--text-url",
                    default="https://www.gutenberg.org/cache/epub/6593/pg6593.txt")
     p.add_argument("--ctx-len", type=int, default=4096,

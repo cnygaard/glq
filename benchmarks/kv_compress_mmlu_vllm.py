@@ -51,7 +51,7 @@ def format_prompt(question: str, options: list[str]) -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="unsloth/gemma-4-E4B-it")
+    p.add_argument("--model", default="google/gemma-4-E4B-it")
     p.add_argument("--n", type=int, default=120,
                    help="number of mmlu_pro questions (~1%% of full eval)")
     p.add_argument("--seed", type=int, default=0)

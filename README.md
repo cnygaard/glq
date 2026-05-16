@@ -329,14 +329,14 @@ GLQ_KV_E8_SIDECAR_READ=1       # route attention reads through the sidecar
 GLQ_KV_E8_COMPRESSED_ALLOC=1   # tell vLLM to allocate the smaller buffer
 GLQ_KV_E8_FUSED_GATHER=1       # Triton dequant-gather kernel (read path)
 GLQ_KV_E8_FUSED_WRITE=1        # Triton scatter kernel (write path)
-vllm serve unsloth/gemma-4-E4B-it --enforce-eager
+vllm serve google/gemma-4-E4B-it --enforce-eager
 ```
 
 For mixed-bpw (per-layer or per-head allocation) calibrate first:
 
 ```bash
 python -m glq.cli.quantize_kv \
-    --model unsloth/gemma-4-E4B-it --bpw 4.0 \
+    --model google/gemma-4-E4B-it --bpw 4.0 \
     --min-bpw 3 --max-bpw 6 \
     --output kv_bpw_e4b_4.0.json
 # Then point vLLM at it:

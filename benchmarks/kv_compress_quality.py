@@ -17,7 +17,7 @@ read of compression-induced quality loss.
 
 Run:
     python benchmarks/kv_compress_quality.py \\
-        --model unsloth/gemma-4-E4B-it \\
+        --model google/gemma-4-E4B-it \\
         --text-url https://www.gutenberg.org/cache/epub/6593/pg6593.txt \\
         --tokens 4096 --residual 8 64 \\
         --bpw-map /tmp/kv_bpw_e4b_3.0.json \\
@@ -152,7 +152,7 @@ def build_variants(model_config, *, e8_method: str, bpw_map_path: str | None,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="unsloth/gemma-4-E4B-it")
+    p.add_argument("--model", default="google/gemma-4-E4B-it")
     p.add_argument("--text-url",
                    default="https://www.gutenberg.org/cache/epub/6593/pg6593.txt")
     p.add_argument("--tokens", type=int, default=4096,

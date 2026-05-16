@@ -16,7 +16,7 @@ matters for "how many tokens fit on a GB".
 
 Run:
     python benchmarks/kv_compress_memory.py \\
-        --model unsloth/gemma-4-E4B-it \\
+        --model google/gemma-4-E4B-it \\
         --ctx-lens 2048 4096 8192 16384 32768 \\
         --bpw-map /tmp/kv_bpw_e4b_4.0_full.json \\
         --out /tmp/logs/phase4_memory.json
@@ -163,7 +163,7 @@ def build_variants(model_config, *, e8_method: str, residual_length: int,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="unsloth/gemma-4-E4B-it")
+    p.add_argument("--model", default="google/gemma-4-E4B-it")
     p.add_argument("--text-url",
                    default="https://www.gutenberg.org/cache/epub/6593/pg6593.txt")
     p.add_argument("--ctx-lens", type=int, nargs="+",

@@ -40,7 +40,7 @@ def _variant_label() -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="unsloth/gemma-4-E4B-it")
+    p.add_argument("--model", default="google/gemma-4-E4B-it")
     p.add_argument("--max-model-len", type=int, default=16384)
     p.add_argument("--gpu-mem", type=float, default=0.5)
     p.add_argument("--out", default="/tmp/logs/kv_cap.json")

@@ -8,7 +8,7 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 N="${N:-120}"
-MODEL="${MODEL:-unsloth/gemma-4-E4B-it}"
+MODEL="${MODEL:-google/gemma-4-E4B-it}"
 OUT_DIR="${OUT_DIR:-/tmp/logs}"
 mkdir -p "$OUT_DIR"
 
