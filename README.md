@@ -349,7 +349,7 @@ glq_vllm/              # vLLM integration: weight + KV cache (v0.3.0+)
 
 ## Acknowledgments
 
-GLQ builds directly on [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng
+GLQ is inspired by [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng
 et al., 2024) — the RHT-incoherence + lattice-codebook recipe is
 theirs, and this project would not exist without that paper. The
 specific choices here (relaxed E8 codebook enumeration, N-stage residual
