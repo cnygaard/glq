@@ -51,7 +51,7 @@ source $VENV/bin/activate
 # when fast_hadamard_transform / mamba-ssm / causal-conv1d try to build
 # against it with CUDA_HOME=/usr/local/cuda-12.9.
 pip install -q pip --upgrade
-pip install -q vllm==0.20.0
+pip install -q vllm==0.20.2
 pip install -q 'glq[quantize]==${glq_version}' ninja wheel
 # mamba-ssm and causal-conv1d need CUDA_HOME for building
 export CUDA_HOME=/usr/local/cuda-12.9
@@ -69,13 +69,14 @@ pip install -q py-spy
 pip install -q pytest
 pip install -q ray
 git clone https://github.com/ggml-org/llama.cpp
-cmake llama.cpp -B llama.cpp/build \
-    -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
-cmake --build llama.cpp/build --config Release -j --clean-first --target llama-cli llama-mtmd-cli llama-server llama-gguf-split
-cp llama.cpp/build/bin/llama-* llama.cpp
+#cmake llama.cpp -B llama.cpp/build \
+#    -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
+#cmake --build llama.cpp/build --config Release -j --clean-first --target llama-cli llama-mtmd-cli llama-server llama-gguf-split
+#cp llama.cpp/build/bin/llama-* llama.cpp
 pip install -q gptqmodel --no-build-isolation
 pip install -q tenacity
 pip install -q optimum  # required by HF transformers to *load* GPTQ models
+pip install -q 'https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
 # HF cache on NVMe. Symlink ~/.cache/huggingface to the NVMe location so
 # tooling that ignores HF_HOME (non-interactive ssh, services, any subprocess
 # that doesn't inherit an interactive shell env) still lands on the fast disk.
@@ -98,4 +99,5 @@ sudo chmod 755 /etc/profile.d/ninja.sh
 sudo apt-get install -y -qq nsight-systems-2025.3
 sudo apt-get install -y -qq mosh
 
+touch /tmp/ready
 echo "=== GLQ setup done ==="

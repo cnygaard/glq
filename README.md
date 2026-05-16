@@ -306,6 +306,50 @@ output = model.generate(**inputs, max_new_tokens=200, past_key_values=cache)
 
 The INT8 cache uses per-channel absmax quantization with no external dependencies (pure PyTorch). Recent tokens are kept in full precision (configurable via `residual_length`) while older tokens are quantized to INT8, following the [KIVI](https://arxiv.org/abs/2402.02750) approach. Requires transformers >= 4.45.
 
+### E8 lattice KV cache (vLLM)
+
+Added in v0.3.0. Runs the same E8-lattice quantizer used for weights against vLLM's paged KV cache — the on-card layout is **4 bpw effective** (`int16` codebook index + `bf16` per-group scale per 8-element group) at the bpw-recipe `e8_relaxed:2`, so vLLM allocates 4.02× more cache slots in the same memory budget as fp16. The compression is opt-in via env vars; default vLLM behavior is unchanged.
+
+Measured on Gemma-4-E4B-it / RTX PRO 6000 Blackwell / vLLM 0.20:
+
+| | fp16 baseline | E8 4 bpw |
+|---|---|---|
+| KV cache capacity @ 27.9 GiB | 303 984 tokens | **1 221 232 tokens (4.02×)** |
+| Max concurrency @ 16k requests | 31.8× | **127.6×** |
+| mmlu_pro n=240 accuracy | 71.25% | **71.25% (bit-identical)** |
+| Single-stream decode @ ctx=4k | (n/a — no quant) | 15.32 tok/s |
+| `cudaLaunchKernel` per decode | 110 659 (slow path) | **71 619 (-35%)** |
+
+Activation (all env vars are opt-in):
+
+```bash
+GLQ_KV_QUANT=e8_relaxed:2      # 4 bpw RVQ (2-stage). Other rungs: 1=2bpw, 3=6bpw.
+GLQ_KV_E8_SIDECAR=1            # build the compressed sidecar cache
+GLQ_KV_E8_SIDECAR_READ=1       # route attention reads through the sidecar
+GLQ_KV_E8_COMPRESSED_ALLOC=1   # tell vLLM to allocate the smaller buffer
+GLQ_KV_E8_FUSED_GATHER=1       # Triton dequant-gather kernel (read path)
+GLQ_KV_E8_FUSED_WRITE=1        # Triton scatter kernel (write path)
+vllm serve unsloth/gemma-4-E4B-it --enforce-eager
+```
+
+For mixed-bpw (per-layer or per-head allocation) calibrate first:
+
+```bash
+python -m glq.cli.quantize_kv \
+    --model unsloth/gemma-4-E4B-it --bpw 4.0 \
+    --min-bpw 3 --max-bpw 6 \
+    --output kv_bpw_e4b_4.0.json
+# Then point vLLM at it:
+GLQ_KV_BPW_MAP=$PWD/kv_bpw_e4b_4.0.json   # overrides GLQ_KV_QUANT
+```
+
+Requirements / known limitations:
+
+- vLLM 0.20.x (`pyproject.toml` pins compatible; the spec-subclass monkey-patches were validated against 0.20.0 and 0.20.2)
+- `--enforce-eager` (CUDA graph mode untested with the hooks)
+- Tested end-to-end on Gemma-4-E4B-it. Other models supported by `glq_vllm` should work but aren't yet validated under the Stage 2c-2c stack.
+- `_codebook_nn_kernel` (the actual E8 NN compute) is still ~42% of CUDA time at 4 bpw — fusing that is the v0.4 target.
+
 ### Bit widths
 
 | BPW | Stages | Bits per 8 weights | Storage |
