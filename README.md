@@ -349,21 +349,11 @@ glq_vllm/              # vLLM integration: weight + KV cache (v0.3.0+)
 
 ## Acknowledgments
 
-GLQ is inspired by [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng
-et al., 2024) — the RHT-incoherence + lattice-codebook recipe is
-theirs, and this project would not exist without that paper. The
-specific choices here (relaxed E8 codebook enumeration, N-stage residual
-vector quantization, the fused CUDA C kernels) are derivative
-engineering on top of QuIP#'s framework.
+Inspired by [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng et al., 2024).
 
-Additional foundations:
-
-- LDLQ block-feedback follows [GPTQ](https://arxiv.org/abs/2210.17323)
-  (Frantar et al., 2022).
-- E8 lattice geometry from Conway & Sloane, *Sphere Packings, Lattices
-  and Groups*.
-- INT8 KV cache approach follows
-  [KIVI](https://arxiv.org/abs/2402.02750) (Liu et al., 2024).
+- E8 lattice: Gosset (1900); Conway & Sloane, *Sphere Packings, Lattices and Groups*; [Viazovska (2016)](https://arxiv.org/abs/1603.04246) — sphere-packing optimality in 8 dimensions.
+- LDLQ block-feedback: [GPTQ](https://arxiv.org/abs/2210.17323) (Frantar et al., 2022).
+- INT8 KV cache: [KIVI](https://arxiv.org/abs/2402.02750) (Liu et al., 2024).
 
 ## License
 
