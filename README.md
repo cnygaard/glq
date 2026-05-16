@@ -156,11 +156,6 @@ vLLM 0.18.1, L40S.
    dense weight matrix is never materialized. GPU memory savings scale
    with the compression ratio.
 
-The RHT incoherence approach follows
-[QuIP#](https://arxiv.org/abs/2402.04396); LDLQ feedback follows
-[GPTQ](https://arxiv.org/abs/2210.17323). The E8 lattice itself is
-from Conway & Sloane, *Sphere Packings, Lattices and Groups*.
-
 ## KV cache compression
 
 GLQ ships two KV cache compressors. Either is opt-in — default
@@ -351,6 +346,24 @@ glq/
   cuda_graph.py        # B=1 decode wrapper
 glq_vllm/              # vLLM integration: weight + KV cache (v0.3.0+)
 ```
+
+## Acknowledgments
+
+GLQ builds directly on [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng
+et al., 2024) — the RHT-incoherence + lattice-codebook recipe is
+theirs, and this project would not exist without that paper. The
+specific choices here (relaxed E8 codebook enumeration, N-stage residual
+vector quantization, the fused CUDA C kernels) are derivative
+engineering on top of QuIP#'s framework.
+
+Additional foundations:
+
+- LDLQ block-feedback follows [GPTQ](https://arxiv.org/abs/2210.17323)
+  (Frantar et al., 2022).
+- E8 lattice geometry from Conway & Sloane, *Sphere Packings, Lattices
+  and Groups*.
+- INT8 KV cache approach follows
+  [KIVI](https://arxiv.org/abs/2402.02750) (Liu et al., 2024).
 
 ## License
 
