@@ -315,7 +315,6 @@ Measured on Gemma-4-E4B-it / RTX PRO 6000 Blackwell / vLLM 0.20:
 | | fp16 baseline | E8 4 bpw |
 |---|---|---|
 | KV cache capacity @ 27.9 GiB | 303 984 tokens | **1 221 232 tokens (4.02×)** |
-| Max concurrency @ 16k requests | 31.8× | **127.6×** |
 | mmlu_pro n=240 accuracy | 71.25% | **71.25% (bit-identical)** |
 | Single-stream decode @ ctx=4k | (n/a — no quant) | 15.32 tok/s |
 | `cudaLaunchKernel` per decode | 110 659 (slow path) | **71 619 (-35%)** |
