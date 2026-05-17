@@ -115,6 +115,18 @@ def register():
                       "scatter kernel active on write path (Stage 5.3-4a)",
                       flush=True)
 
+        # v0.3.3 known limitation: the E8 KV gather path allocates its
+        # K/V workspace via ``torch.empty()`` on every attention call,
+        # which isn't graph-safe under vLLM's piecewise/FULL CUDA-graph
+        # capture (the per-call allocation gets invalidated on graph
+        # replay → ``cudaErrorIllegalAddress``). Until that path is
+        # refactored to write into a pre-allocated buffer, E8 KV
+        # requires ``enforce_eager=True`` (vLLM CLI: ``--enforce-eager``).
+        print("[glq_vllm] NOTE: E8 KV cache requires "
+              "``enforce_eager=True`` / ``--enforce-eager``. The default "
+              "v0.3.2 piecewise capture is incompatible with the current "
+              "gather path; this will be addressed in v0.3.4.", flush=True)
+
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)
 register()

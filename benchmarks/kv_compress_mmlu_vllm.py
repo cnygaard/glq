@@ -75,9 +75,11 @@ def main():
     print(f"=== mmlu_pro vLLM — {args.label} ===", flush=True)
 
     t0 = time.time()
+    # E8 KV path is not graph-safe in v0.3.x; force eager.
     llm = LLM(model=args.model, dtype="bfloat16",
               max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_mem)
+              gpu_memory_utilization=args.gpu_mem,
+              enforce_eager=True)
     print(f"  load: {time.time()-t0:.1f}s", flush=True)
 
     ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")

@@ -413,20 +413,19 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
             y = y.to(dtype)
         return y
 
-    # Input RHT
+    # Input RHT — C++ kernel for n_pad ≤ 16384, Triton wrapper for >16384.
+    # Both go through ``torch.ops.glq.*`` so dynamo sees one op call per
+    # branch (no untraced raw Triton-kernel calls).
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
     rsqrt_n = 1.0 / math.sqrt(n_pad)
-    if n_pad <= 16384 and hasattr(torch.ops.glq, "input_rht"):
-        x_half = x.half().contiguous()
+    x_half = x.half().contiguous()
+    if n_pad <= 16384:
         torch.ops.glq.input_rht(x_half, SV, x_rht,
                                 in_features, in_features, rsqrt_n, n_pad, log_n)
     else:
-        # Triton fallback for n_pad > 16384 (current GLQ checkpoints don't
-        # hit this; piecewise capture for it is a separate follow-up).
-        from glq.quantized_linear import _input_rht_kernel
-        _input_rht_kernel[(B,)](
-            x, SV, x_rht, in_features, x.stride(0),
-            rsqrt_n, N=n_pad, LOG_N=log_n, num_warps=8)
+        torch.ops.glq.input_rht_triton(x_half, SV, x_rht,
+                                        in_features, in_features, rsqrt_n,
+                                        n_pad, log_n)
 
     if _GLQ_DEBUG:
         torch.cuda.synchronize()
@@ -453,7 +452,9 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     rsqrt_m = 1.0 / math.sqrt(m_pad)
     if _GLQ_DEBUG:
         print(f"GLQ_DEBUG: output_rht params B={B} out={out_features} m_pad={m_pad} log_m={log_m} SU={SU.shape} SU_dev={SU.device} y_rht_dev={y_rht.device}", file=sys.stderr, flush=True)
-    if m_pad <= 16384 and hasattr(torch.ops.glq, "output_rht"):
+    # Output RHT — same C++/Triton split as input_rht. Both branches go
+    # through torch.ops.glq.* so dynamo traces a single op call.
+    if m_pad <= 16384:
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
         torch.ops.glq.output_rht(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
         if _GLQ_DEBUG:
@@ -462,14 +463,15 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         if dtype != torch.float16:
             y = y.to(dtype)
     else:
-        # Triton fallback for m_pad > 16384 (current GLQ checkpoints don't
-        # hit this; piecewise capture for it is a separate follow-up).
-        from glq.quantized_linear import _output_rht_kernel
-        output_fp16 = (dtype == torch.float16)
-        y = torch.empty(B, out_features, dtype=dtype, device=device)
-        _output_rht_kernel[(B,)](
-            y_rht, SU, y, out_features, y_rht.stride(0), y.stride(0),
-            rsqrt_m, OUTPUT_FP16=output_fp16, M=m_pad, LOG_M=log_m, num_warps=8)
+        # Allocate fp16 (matches the C++ branch), let the Triton kernel
+        # store fp16, then cast to the target dtype if needed. This keeps
+        # both branches numerically equivalent and avoids the Triton
+        # kernel's missing bf16 store path.
+        y = torch.empty(B, out_features, dtype=torch.float16, device=device)
+        torch.ops.glq.output_rht_triton(y_rht, SU, y, out_features,
+                                         m_pad, log_m, rsqrt_m)
+        if dtype != torch.float16:
+            y = y.to(dtype)
     return y
 
 

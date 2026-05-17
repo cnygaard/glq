@@ -561,7 +561,6 @@ def _fused_scatter_qt_into_cache(cache: E8PagedKVCache,
     idx3_ptr = idx3 if idx3 is not None else idx1
     idx_s1_ptr = idx_s1 if idx_s1 is not None else idx1
 
-    grid = (nT, H)
     # Debug instrumentation: opt-in via env. Prints once per layer the
     # exact shapes/strides we hand the kernel, so we can verify the
     # numbers match the expected vLLM layout without diving into a
@@ -592,7 +591,10 @@ def _fused_scatter_qt_into_cache(cache: E8PagedKVCache,
                    + (G - 1))
         print(f"  max_dst_off_i16={max_off} (storage int16 elems="
               f"{cache_idx1.untyped_storage().nbytes() // 2})", flush=True)
-    _fused_scatter_qt_kernel[grid](
+    # Dispatch via the registered op so dynamo can trace this scatter +
+    # quantize boundary cleanly (matches the gather op above and the
+    # symmetric C++ ops).
+    torch.ops.glq.scatter_kv_paged_quant(
         idx1, idx2_ptr, idx3_ptr, idx_s1_ptr, scale_src,
         cache_idx1, cache_idx2, cache_idx3, cache_idx_s1, cache_scale,
         slot_mapping.to(dtype=torch.int64, device=cache.device),
@@ -603,8 +605,7 @@ def _fused_scatter_qt_into_cache(cache: E8PagedKVCache,
         cache_st_nb, cache_st_bs, cache_st_h,
         cacheu_st_nb, cacheu_st_bs, cacheu_st_h,
         scache_st_nb, scache_st_bs, scache_st_h,
-        N_PRIMARY=cache.n_primary,
-        N_SECONDARY=cache.n_secondary,
+        cache.n_primary, cache.n_secondary,
     )
 
 
@@ -976,24 +977,22 @@ def gather_kv_to_paged_fp16_fused(quantizer, cache: E8PagedKVCache,
         out_st_nb, out_st_bs, out_st_h, out_st_g = out.stride()
         assert out_st_g == 1
 
-        grid = (NB_sel, BS, H)
         idx2_ptr = idx2 if idx2 is not None else idx1
         idx3_ptr = idx3 if idx3 is not None else idx1
         idx_s1_ptr = idx_s1 if idx_s1 is not None else idx1
-        _fused_gather_dequant_kernel[grid](
+        # Dispatch via the registered op so dynamo can trace through the
+        # gather + dequant boundary (matches the symmetric C++ ops).
+        torch.ops.glq.gather_kv_paged_dequant(
             idx1, idx2_ptr, idx3_ptr, idx_s1_ptr, scale,
             cb_pri, cb_sec, H_mat,
-            block_indices,
-            out,
+            block_indices, out,
             NB_sel,
             BS, H, G,
             idx_st_nb, idx_st_bs, idx_st_h,
             idxu_st_nb, idxu_st_bs, idxu_st_h,
             sc_st_nb, sc_st_bs, sc_st_h,
             out_st_nb, out_st_bs, out_st_h,
-            RS=rs,
-            N_PRIMARY=n_primary,
-            N_SECONDARY=n_secondary,
+            rs, n_primary, n_secondary,
         )
         return out
 

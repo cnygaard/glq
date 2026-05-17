@@ -676,7 +676,15 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
         _gather = (gather_kv_to_paged_fp16_fused
                    if os.environ.get("GLQ_KV_E8_FUSED_GATHER", "0") == "1"
                    else gather_kv_to_paged_fp16)
-        if block_table is not None and block_table.numel() > 0:
+        # ``.unique()`` is data-dependent and illegal during CUDA-graph
+        # capture (``cudaErrorStreamCaptureUnsupported``). When vLLM's
+        # full/piecewise capture is recording, fall back to the
+        # all-blocks decompress: slower, but the captured graph is
+        # replayable. Proper fix is to move unique-block computation to
+        # the scheduler; tracked as a v0.3.4 follow-up.
+        _capturing = torch.cuda.is_current_stream_capturing()
+        if (block_table is not None and block_table.numel() > 0
+                and not _capturing):
             # Scoped: decompress only the blocks this batch references.
             # Bounds the transient fp16 workspace by # unique referenced
             # blocks instead of cache.num_blocks (typically ~100x smaller
@@ -688,6 +696,8 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
                 block_table, unique_blocks, cache.num_blocks)
             kwargs = {**kwargs, "block_table": new_block_table}
         else:
+            # Either no block_table OR we're inside CUDA-graph capture →
+            # decompress all blocks (no .unique() needed).
             k_e8, v_e8 = _gather(quant, cache)
         if k_e8.dtype != k.dtype:
             k_e8 = k_e8.to(k.dtype)

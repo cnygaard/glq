@@ -61,6 +61,12 @@ def test_fused_kernel_custom_ops_registered():
         "dequant_matvec_packed", "dequant_matmul_packed",
         "input_rht", "output_rht",
         "fused_linear", "fused_linear_block_diag", "fused_moe_block_diag",
+        # v0.3.3: Triton-fallback RHT wrappers (n_pad > 16384).
+        "input_rht_triton", "output_rht_triton",
+        # v0.3.3: KV gather/scatter Triton wrappers (preparatory for
+        # full-graph mode; the attention region is already a piecewise
+        # graph-break boundary today).
+        "gather_kv_paged_dequant", "scatter_kv_paged_quant",
     ]
     missing = [op for op in expected if not hasattr(torch.ops.glq, op)]
     assert not missing, f"unregistered: {missing}"

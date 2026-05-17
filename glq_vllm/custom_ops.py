@@ -108,7 +108,75 @@ def _ensure_registered():
     _glq_lib._register_fake("fused_linear_block_diag",
                             _fused_linear_block_diag_fake)
 
-    # -- 9. fused_moe_block_diag: per-expert dispatch + dequant + matmul +
+    # -- 9a. input_rht_triton: same schema as input_rht (C++), but
+    #         dispatches to the Triton fallback in glq.quantized_linear.
+    #         Fires when n_pad > 16384 (e.g., 70B-class MLPs). Kept
+    #         symmetric so dynamo sees a clean torch.ops.glq.* call on
+    #         both branches of the n_pad <= 16384 shape gate. --
+    _glq_lib.define(
+        "input_rht_triton(Tensor x, Tensor sv, Tensor(a!) out, int in_features, "
+        "int stride_x, float rsqrt_n, int n_pad, int log_n) -> ()")
+    _glq_lib.impl("input_rht_triton", _input_rht_triton_impl, dispatch_key)
+    _glq_lib._register_fake("input_rht_triton", _input_rht_fake)
+
+    # -- 9b. output_rht_triton: same schema as output_rht (C++). --
+    _glq_lib.define(
+        "output_rht_triton(Tensor y_rht, Tensor su, Tensor(a!) out, "
+        "int out_features, int m_pad, int log_m, float rsqrt_m) -> ()")
+    _glq_lib.impl("output_rht_triton", _output_rht_triton_impl, dispatch_key)
+    _glq_lib._register_fake("output_rht_triton", _output_rht_fake)
+
+    # -- 9c. gather_kv_paged_dequant: fused Triton gather + E8 dequant for
+    #         the v0.3.0 KV cache hot path. Mutates the pre-allocated
+    #         ``out`` tensor in-place. Preparatory work for full-graph
+    #         capture; today the attention region is already a piecewise
+    #         graph-break boundary (because of ``.unique()`` in
+    #         ``kv_compression.py``), so this op doesn't unblock any
+    #         further capture by itself. --
+    _glq_lib.define(
+        "gather_kv_paged_dequant("
+        "Tensor idx1, Tensor idx2, Tensor idx3, Tensor idx_s1, Tensor scale, "
+        "Tensor cb_primary, Tensor cb_secondary, Tensor h_mat, "
+        "Tensor block_indices, Tensor(a!) out, "
+        "int NB_sel, int BS, int H, int G, "
+        "int idx_st_nb, int idx_st_bs, int idx_st_h, "
+        "int idxu_st_nb, int idxu_st_bs, int idxu_st_h, "
+        "int sc_st_nb, int sc_st_bs, int sc_st_h, "
+        "int out_st_nb, int out_st_bs, int out_st_h, "
+        "float rs, int n_primary, int n_secondary) -> ()")
+    _glq_lib.impl("gather_kv_paged_dequant",
+                  _gather_kv_paged_dequant_impl, dispatch_key)
+    _glq_lib._register_fake("gather_kv_paged_dequant",
+                            _gather_kv_paged_dequant_fake)
+
+    # -- 9d. scatter_kv_paged_quant: fused Triton write-side scatter.
+    #         Aliases all five destination cache buffers as outputs. When
+    #         ``n_primary < 3`` or ``n_secondary < 1`` the corresponding
+    #         dst args are passed as aliases of ``cache_idx1`` (matching
+    #         the existing Python launcher); the kernel's constexpr
+    #         ``N_PRIMARY`` / ``N_SECONDARY`` guards then skip those
+    #         writes. --
+    _glq_lib.define(
+        "scatter_kv_paged_quant("
+        "Tensor idx1_src, Tensor idx2_src, Tensor idx3_src, Tensor idx_s1_src, "
+        "Tensor scale_src, "
+        "Tensor(a!) cache_idx1, Tensor(b!) cache_idx2, Tensor(c!) cache_idx3, "
+        "Tensor(d!) cache_idx_s1, Tensor(e!) cache_scale, "
+        "Tensor slot_mapping, "
+        "int nT, int H, int G, int block_size, "
+        "int src_st_t, int src_st_h, "
+        "int srcu_st_t, int srcu_st_h, "
+        "int scsrc_st_t, int scsrc_st_h, "
+        "int cache_st_nb, int cache_st_bs, int cache_st_h, "
+        "int cacheu_st_nb, int cacheu_st_bs, int cacheu_st_h, "
+        "int scache_st_nb, int scache_st_bs, int scache_st_h, "
+        "int n_primary, int n_secondary) -> ()")
+    _glq_lib.impl("scatter_kv_paged_quant",
+                  _scatter_kv_paged_quant_impl, dispatch_key)
+    _glq_lib._register_fake("scatter_kv_paged_quant",
+                            _scatter_kv_paged_quant_fake)
+
+    # -- 10. fused_moe_block_diag: per-expert dispatch + dequant + matmul +
     #       activation + output project, in one kernel. (B, hidden) fp16 →
     #       (B, hidden) fp16. --
     _glq_lib.define(
@@ -158,6 +226,110 @@ def _dequant_matmul_packed_fake(x, qidxs, codebook_packed, wscale):
     B = x.shape[0]
     M = qidxs.shape[0]
     return torch.empty(B, M, dtype=torch.float32, device=x.device)
+
+
+def _gather_kv_paged_dequant_impl(idx1, idx2, idx3, idx_s1, scale,
+                                   cb_primary, cb_secondary, h_mat,
+                                   block_indices, out,
+                                   NB_sel, BS, H, G,
+                                   idx_st_nb, idx_st_bs, idx_st_h,
+                                   idxu_st_nb, idxu_st_bs, idxu_st_h,
+                                   sc_st_nb, sc_st_bs, sc_st_h,
+                                   out_st_nb, out_st_bs, out_st_h,
+                                   rs, n_primary, n_secondary):
+    """Real-device impl for ``glq::gather_kv_paged_dequant``. Launches the
+    fused Triton kernel; mutates ``out`` in place."""
+    from glq_vllm.e8_paged_cache import _fused_gather_dequant_kernel
+    grid = (NB_sel, BS, H)
+    _fused_gather_dequant_kernel[grid](
+        idx1, idx2, idx3, idx_s1, scale,
+        cb_primary, cb_secondary, h_mat,
+        block_indices, out,
+        NB_sel,
+        BS, H, G,
+        idx_st_nb, idx_st_bs, idx_st_h,
+        idxu_st_nb, idxu_st_bs, idxu_st_h,
+        sc_st_nb, sc_st_bs, sc_st_h,
+        out_st_nb, out_st_bs, out_st_h,
+        RS=rs,
+        N_PRIMARY=n_primary,
+        N_SECONDARY=n_secondary,
+    )
+
+
+def _gather_kv_paged_dequant_fake(idx1, idx2, idx3, idx_s1, scale,
+                                   cb_primary, cb_secondary, h_mat,
+                                   block_indices, out,
+                                   NB_sel, BS, H, G,
+                                   idx_st_nb, idx_st_bs, idx_st_h,
+                                   idxu_st_nb, idxu_st_bs, idxu_st_h,
+                                   sc_st_nb, sc_st_bs, sc_st_h,
+                                   out_st_nb, out_st_bs, out_st_h,
+                                   rs, n_primary, n_secondary):
+    pass  # mutates ``out`` in place
+
+
+def _scatter_kv_paged_quant_impl(idx1_src, idx2_src, idx3_src, idx_s1_src,
+                                  scale_src,
+                                  cache_idx1, cache_idx2, cache_idx3,
+                                  cache_idx_s1, cache_scale,
+                                  slot_mapping,
+                                  nT, H, G, block_size,
+                                  src_st_t, src_st_h,
+                                  srcu_st_t, srcu_st_h,
+                                  scsrc_st_t, scsrc_st_h,
+                                  cache_st_nb, cache_st_bs, cache_st_h,
+                                  cacheu_st_nb, cacheu_st_bs, cacheu_st_h,
+                                  scache_st_nb, scache_st_bs, scache_st_h,
+                                  n_primary, n_secondary):
+    """Real-device impl for ``glq::scatter_kv_paged_quant``. Launches the
+    fused Triton scatter kernel; mutates the destination cache buffers
+    in place."""
+    from glq_vllm.e8_paged_cache import _fused_scatter_qt_kernel
+    grid = (nT, H)
+    _fused_scatter_qt_kernel[grid](
+        idx1_src, idx2_src, idx3_src, idx_s1_src, scale_src,
+        cache_idx1, cache_idx2, cache_idx3, cache_idx_s1, cache_scale,
+        slot_mapping,
+        nT, H, G, block_size,
+        src_st_t, src_st_h,
+        srcu_st_t, srcu_st_h,
+        scsrc_st_t, scsrc_st_h,
+        cache_st_nb, cache_st_bs, cache_st_h,
+        cacheu_st_nb, cacheu_st_bs, cacheu_st_h,
+        scache_st_nb, scache_st_bs, scache_st_h,
+        N_PRIMARY=n_primary,
+        N_SECONDARY=n_secondary,
+    )
+
+
+def _scatter_kv_paged_quant_fake(*args, **kwargs):
+    pass  # mutates destination cache buffers in place
+
+
+def _input_rht_triton_impl(x, sv, out, in_features, stride_x, rsqrt_n,
+                            n_pad, log_n):
+    """Real-device impl for ``glq::input_rht_triton``. Same semantics as
+    the C++ kernel but uses the Triton fallback that handles the
+    n_pad > 16384 path. Mutates ``out`` in place."""
+    from glq.quantized_linear import _input_rht_kernel
+    B = x.shape[0]
+    _input_rht_kernel[(B,)](
+        x, sv, out, in_features, stride_x,
+        rsqrt_n, N=n_pad, LOG_N=log_n, num_warps=8)
+
+
+def _output_rht_triton_impl(y_rht, su, out, out_features, m_pad, log_m,
+                             rsqrt_m):
+    """Real-device impl for ``glq::output_rht_triton``. Mutates ``out``."""
+    from glq.quantized_linear import _output_rht_kernel
+    B = y_rht.shape[0]
+    output_fp16 = (out.dtype == torch.float16)
+    _output_rht_kernel[(B,)](
+        y_rht, su, out, out_features,
+        y_rht.stride(0), out.stride(0),
+        rsqrt_m, OUTPUT_FP16=output_fp16,
+        M=m_pad, LOG_M=log_m, num_warps=8)
 
 
 def _input_rht_fake(x, sv, out, in_features, stride_x, rsqrt_n, n_pad, log_n):
