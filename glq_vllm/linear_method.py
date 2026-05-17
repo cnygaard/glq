@@ -192,7 +192,22 @@ def _make_glq_param(tensor):
 
 
 def _register_glq_buffers(layer, prefix, out_size, in_size):
-    """Register one set of GLQ compressed buffers on the layer."""
+    """Register one set of GLQ compressed buffers on the layer.
+
+    Higher-stage buffers (Qidxs3 / Qidxs4 and their matching
+    inv_resid_scale*) are allocated as **zero-sized sentinels** for
+    layers whose checkpoint doesn't carry them. The
+    ``weight_loader`` (see ``_glq_weight_loader`` above) replaces
+    ``param.data`` wholesale with the loaded shape when the stage is
+    present. Qidxs2 is left at full size because every bpw >= 3 layer
+    has it and the wholesale-replacement path is rarely exercised for
+    it, so empty(0) there would just churn allocations on every load.
+
+    Memory: for a mix-3-8 5 bpw 31B checkpoint this drops the
+    post-load model footprint from ~94 GiB (OOM on a 96 GiB card) to
+    ~66 GiB by skipping the Qidxs3/Qidxs4 pre-alloc on the majority
+    of layers (only 6-8 bpw layers populate them).
+    """
     m_pad = _glq_pad(out_size)
     n_pad = _glq_pad(in_size)
     n_blocks = n_pad // 8
@@ -209,14 +224,16 @@ def _register_glq_buffers(layer, prefix, out_size, in_size):
         torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
     setattr(layer, f'inv_resid_scale{p}', _make_glq_param(
         torch.zeros((), dtype=torch.float32)))
-    # Phase D: N-stage RVQ for 5-8 bpw. Zero-init buffers are safe to ship —
-    # forward() only reads them when _glq_n_stages >= 3 / >= 4.
+    # Phase D: N-stage RVQ for 5-8 bpw — sentinels only. forward() reads
+    # these only when ``_glq_n_stages >= 3 / >= 4``, which is gated by
+    # ``inv_resid_scale2.item() != 0.0`` (set when the checkpoint loads
+    # an actual stage-3 tensor).
     setattr(layer, f'Qidxs3{p}', _make_glq_param(
-        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+        torch.empty(0, dtype=torch.int16)))
     setattr(layer, f'inv_resid_scale2{p}', _make_glq_param(
         torch.zeros((), dtype=torch.float32)))
     setattr(layer, f'Qidxs4{p}', _make_glq_param(
-        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+        torch.empty(0, dtype=torch.int16)))
     setattr(layer, f'inv_resid_scale3{p}', _make_glq_param(
         torch.zeros((), dtype=torch.float32)))
     return m_pad, n_pad
@@ -231,44 +248,43 @@ class GLQShardedParameter(BasevLLMParameter):
     because GLQ pads to power-of-2 and each shard has independent RHT).
     """
 
-    def __new__(cls, shard_sizes, inner_dim, dtype, **kwargs):
-        # Allocate data with the TOTAL concatenated shape so vLLM's
-        # weight_loader shape assertions pass (param.data.shape check)
-        total_m = sum(_glq_pad(s) if s > 1 else 1 for s in shard_sizes)
-        if inner_dim > 0:
-            data = torch.zeros(total_m, inner_dim, dtype=dtype)
-        elif inner_dim == -1:
-            # 1D vector: SU sign vector, m_pad per shard concatenated
-            data = torch.zeros(total_m, dtype=dtype)
-        else:
-            data = torch.zeros(len(shard_sizes), dtype=dtype)
+    def __new__(cls, shard_sizes, inner_dim, dtype, sentinel: bool = False,
+                **kwargs):
+        # Phase B: param.data is a zero-byte placeholder. Fused load goes
+        # through _glq_shard_loader → _shard_data[i], bypassing the standard
+        # vLLM shape-check + resize path that needs a real param.data.
+        data = torch.empty(0, dtype=dtype)
         return super().__new__(cls, data=data, **kwargs)
 
     def __init__(self, shard_sizes: list[int], inner_dim: int,
-                 dtype: torch.dtype, weight_loader: Callable, **kwargs):
-        total_m = sum(_glq_pad(s) if s > 1 else 1 for s in shard_sizes)
-        if inner_dim > 0:
-            data = torch.zeros(total_m, inner_dim, dtype=dtype)
-        elif inner_dim == -1:
-            data = torch.zeros(total_m, dtype=dtype)
-        else:
-            data = torch.zeros(len(shard_sizes), dtype=dtype)
+                 dtype: torch.dtype, weight_loader: Callable,
+                 sentinel: bool = False, **kwargs):
+        data = torch.empty(0, dtype=dtype)
         super().__init__(data=data, weight_loader=weight_loader)
         self._shard_sizes = shard_sizes
         self._inner_dim = inner_dim
         self._dtype = dtype
-        # Allocate per-shard buffers with power-of-2 padding
+        # Phase A: when sentinel=True, allocate zero-size per-shard buffers
+        # and rely on load_qkv_weight / load_merged_column_weight to resize
+        # on first store. Used for stage-3/4 indices that only exist for
+        # bpw ≥ 5 / ≥ 7 layers; saves ~20 GB on Gemma-4-31B mix-3-8.
         self._shard_data = []
-        for sz in shard_sizes:
-            m_pad = _glq_pad(sz) if sz > 1 else 1
-            if inner_dim > 0:
-                self._shard_data.append(torch.zeros(m_pad, inner_dim, dtype=dtype))
-            elif inner_dim == -1:
-                # 1D vector per shard (SU sign vector)
-                self._shard_data.append(torch.ones(m_pad, dtype=dtype))
-            else:
-                # Scalar per shard (Wscale, inv_resid_scale)
-                self._shard_data.append(torch.zeros((), dtype=dtype))
+        if sentinel:
+            for _ in shard_sizes:
+                self._shard_data.append(torch.empty(0, dtype=dtype))
+        else:
+            for sz in shard_sizes:
+                m_pad = _glq_pad(sz) if sz > 1 else 1
+                if inner_dim > 0:
+                    self._shard_data.append(
+                        torch.zeros(m_pad, inner_dim, dtype=dtype))
+                elif inner_dim == -1:
+                    # 1D vector per shard (SU sign vector)
+                    self._shard_data.append(
+                        torch.ones(m_pad, dtype=dtype))
+                else:
+                    # Scalar per shard (Wscale, inv_resid_scale)
+                    self._shard_data.append(torch.zeros((), dtype=dtype))
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
         shard_id = kwargs.get("shard_id")
@@ -315,15 +331,17 @@ class GLQShardedParameter(BasevLLMParameter):
         return len(self._shard_data)
 
     def to(self, *args, **kwargs):
-        """Move all internal shard buffers to device."""
-        result = super().to(*args, **kwargs)
-        result._shard_data = [s.to(*args, **kwargs) for s in result._shard_data]
-        return result
+        """Move per-shard buffers in place. Since Phase B made param.data
+        empty(0), we can't rely on ``super().to()`` round-tripping back to
+        a ``GLQShardedParameter`` (PyTorch may downcast to plain Tensor
+        when the wrapped storage is empty). Operate on ``self`` directly."""
+        self.data = self.data.to(*args, **kwargs)
+        self._shard_data = [s.to(*args, **kwargs) for s in self._shard_data]
+        return self
 
     def cuda(self, device=None):
-        result = super().cuda(device)
-        result._shard_data = [s.cuda(device) for s in result._shard_data]
-        return result
+        target = device if device is not None else torch.cuda.current_device()
+        return self.to(device=target)
 
 
 def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
@@ -563,13 +581,19 @@ class GLQLinearMethod(LinearMethodBase):
                 output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
             layer.inv_resid_scale = GLQShardedParameter(
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
-            # Phase D: stage 3/4 buffers per shard. Zero-init for 2-stage models.
+            # Stage 3/4 indices: sentinel-allocate (empty(0) per shard) — the
+            # loader auto-resizes on first store, so layers with bpw < 5/7
+            # never materialise these tensors. inv_resid_scale2/3 stay
+            # full-size (scalar): process_weights_after_loading reads them
+            # as the "stage exists?" gate.
             layer.Qidxs3 = GLQShardedParameter(
-                output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
+                output_partition_sizes, n_blocks, torch.int16,
+                weight_loader=weight_loader, sentinel=True)
             layer.inv_resid_scale2 = GLQShardedParameter(
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
             layer.Qidxs4 = GLQShardedParameter(
-                output_partition_sizes, n_blocks, torch.int16, weight_loader=weight_loader)
+                output_partition_sizes, n_blocks, torch.int16,
+                weight_loader=weight_loader, sentinel=True)
             layer.inv_resid_scale3 = GLQShardedParameter(
                 [1] * len(output_partition_sizes), 0, torch.float32, weight_loader=weight_loader)
 

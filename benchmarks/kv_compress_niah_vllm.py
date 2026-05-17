@@ -100,6 +100,10 @@ def main():
     p.add_argument("--max-model-len", type=int, default=None,
                    help="vLLM max_model_len; defaults to max(ctx_lens)+128")
     p.add_argument("--gpu-mem", type=float, default=0.85)
+    p.add_argument("--max-batched-tokens", type=int, default=None,
+                   help="vLLM max_num_batched_tokens; controls chunked prefill chunk + profile_run activation peak")
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                   help="vLLM max_num_seqs; cap concurrent sequences (1 for single-seq NIAH)")
     p.add_argument("--out", default="/tmp/logs/niah_vllm.json")
     p.add_argument("--label", default=None)
     args = p.parse_args()
@@ -118,10 +122,17 @@ def main():
     max_model_len = args.max_model_len or (max_ctx + 256)
 
     t0 = time.time()
-    llm = LLM(model=args.model, dtype="bfloat16",
-              max_model_len=max_model_len,
-              gpu_memory_utilization=args.gpu_mem,
-              enforce_eager=True)
+    llm_kwargs = dict(
+        model=args.model, dtype="bfloat16",
+        max_model_len=max_model_len,
+        gpu_memory_utilization=args.gpu_mem,
+        enforce_eager=True,
+    )
+    if args.max_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_batched_tokens
+    if args.max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
+    llm = LLM(**llm_kwargs)
     print(f"  load: {time.time()-t0:.1f}s  max_model_len={max_model_len}",
           flush=True)
 
