@@ -190,7 +190,7 @@ Measured on Gemma-4-E4B-it, RTX PRO 6000 Blackwell, vLLM 0.20:
 |---|---|---|
 | KV cache capacity @ 27.9 GiB | 303,984 tokens | **1,221,232 (4.02×)** at `e8_relaxed:1` |
 | mmlu_pro n=240 accuracy | 71.25 % | **71.25 % (bit-identical)** at `e8_relaxed:2` |
-| NIAH passkey @ ctx=16k + 32k | — | **20/20** at `e8_relaxed:2` |
+| NIAH passkey @ ctx=16k / 32k / 64k / 130k | — | **40/40** at `e8_relaxed:2` (full 128k window) |
 | `cudaLaunchKernel` per decode | 110,659 | **71,619 (−35 %)** at `e8_relaxed:2` |
 
 Activation:
