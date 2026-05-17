@@ -30,7 +30,9 @@ def serve(model_id, tokenizer_id=None, prompts=None, max_tokens=100):
         quantization="glq",
         gpu_memory_utilization=0.9,
         max_model_len=2048,
-        enforce_eager=True,  # disable torch.compile for GLQ custom kernels
+        # piecewise CUDA-graph capture works as of v0.3.2 — pass
+        # ``enforce_eager=True`` here if you hit a compile-time issue on
+        # an untested model architecture.
     )
 
     sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0)

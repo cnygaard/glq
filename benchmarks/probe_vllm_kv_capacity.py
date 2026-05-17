@@ -68,8 +68,7 @@ def main():
     t0 = time.time()
     llm = LLM(model=args.model, dtype="bfloat16",
               max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_mem,
-              enforce_eager=True)
+              gpu_memory_utilization=args.gpu_mem)
     load_dt = time.time() - t0
     free_after, _ = torch.cuda.mem_get_info()
     used_gib = (free_before - free_after) / 1024**3

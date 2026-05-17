@@ -200,12 +200,14 @@ GLQ_KV_QUANT=e8_relaxed:2 \
 GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 \
 GLQ_KV_E8_COMPRESSED_ALLOC=1 \
 GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
-vllm serve google/gemma-4-E4B-it --enforce-eager
+vllm serve google/gemma-4-E4B-it
 ```
 
-Limitations: vLLM 0.20.x only, `--enforce-eager` required, validated
-end-to-end on Gemma-4-E4B-it. The codebook-NN kernel is still ~42 %
-of CUDA time at 4 bpw — fusing that is the v0.4 target.
+Validated end-to-end on Gemma-4-E4B-it / Gemma-4-31B-it on vLLM
+0.20.x. As of v0.3.2 the default piecewise CUDA-graph capture path
+works with GLQ (no `--enforce-eager` required). The codebook-NN
+kernel is still ~42 % of CUDA time at 4 bpw — fusing that is the
+v0.4 target.
 
 ## Advanced
 
@@ -264,13 +266,14 @@ python -m sglang.launch_server \
     --model xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw \
     --tokenizer-path HuggingFaceTB/SmolLM2-360M-Instruct \
     --quantization glq \
-    --attention-backend triton --sampling-backend pytorch \
-    --disable-cuda-graph --disable-piecewise-cuda-graph
+    --attention-backend triton --sampling-backend pytorch
 ```
 
 Requires the triton attention backend (flashinfer returns wrong
-logprobs in echo/prefill mode) and `--disable-piecewise-cuda-graph`
-(torch.dynamo can't trace the pybind GLQ extension).
+logprobs in echo/prefill mode). Default CUDA-graph capture is
+supported (v0.3.2+). If you hit a graph-break in a model architecture
+we haven't tested, pass `--disable-piecewise-cuda-graph` as a
+fallback.
 
 ### Devstral-24B tokenizer
 

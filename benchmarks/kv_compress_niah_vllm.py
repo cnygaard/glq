@@ -104,6 +104,8 @@ def main():
                    help="vLLM max_num_batched_tokens; controls chunked prefill chunk + profile_run activation peak")
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help="vLLM max_num_seqs; cap concurrent sequences (1 for single-seq NIAH)")
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="disable vLLM's torch.compile + CUDA-graph capture (debugging only)")
     p.add_argument("--out", default="/tmp/logs/niah_vllm.json")
     p.add_argument("--label", default=None)
     args = p.parse_args()
@@ -126,8 +128,9 @@ def main():
         model=args.model, dtype="bfloat16",
         max_model_len=max_model_len,
         gpu_memory_utilization=args.gpu_mem,
-        enforce_eager=True,
     )
+    if args.enforce_eager:
+        llm_kwargs["enforce_eager"] = True
     if args.max_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_batched_tokens
     if args.max_num_seqs is not None:

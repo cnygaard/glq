@@ -361,8 +361,10 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     """
     dtype = x.dtype
     B = x.shape[0]
-    _use_custom_ops = hasattr(torch.ops, 'glq') and hasattr(torch.ops.glq, 'dequant_matvec')
-    _use_cuda_c = _ik._glq_cuda is not None and not _VLLM_USE_TRITON
+    # custom_ops are registered at ``import glq_vllm`` time (__init__.py
+    # calls _ensure_registered()). If they're missing here the install is
+    # broken — fail loud, don't silently fall back to a path dynamo can't
+    # trace.
     _GLQ_DEBUG = os.environ.get("GLQ_DEBUG") == "1"
 
     # Weight tensors are guaranteed on GPU after process_weights_after_loading
@@ -374,11 +376,11 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
 
     if _GLQ_DEBUG:
         print(f"GLQ_DEBUG _glq_apply_shard: m_pad={m_pad} n_pad={n_pad} "
-              f"bd_meta={'set' if block_diag_meta is not None else 'NONE'} "
-              f"_use_cuda_c={_use_cuda_c}", file=sys.stderr, flush=True)
+              f"bd_meta={'set' if block_diag_meta is not None else 'NONE'}",
+              file=sys.stderr, flush=True)
     # ── Block-diagonal fast path (Phase B + D) ──────────────────────
-    if (block_diag_meta is not None and _use_cuda_c
-            and hasattr(_ik._glq_cuda, "glq_fused_linear_block_diag_cuda")
+    if (block_diag_meta is not None
+            and hasattr(torch.ops.glq, "fused_linear_block_diag")
             and n_pad <= 32768 and m_pad <= 32768):
         _empty_i16, _empty_f16 = _get_empty_sentinels(device)
         bn_tensor = block_diag_meta["blocks_n_tensor"]  # CPU int64
@@ -391,33 +393,22 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
         cb3_arg = primary_cb if Qidxs3 is not None else _empty_f16
         q4 = Qidxs4 if Qidxs4 is not None else _empty_i16
         cb4_arg = primary_cb if Qidxs4 is not None else _empty_f16
-        # Prefer torch.ops.glq.fused_linear_block_diag when registered so
-        # vLLM's torch.compile (mode>=3) can trace through this dispatch as
-        # an opaque op. Falls back to direct pybind11 if the custom_op
-        # surface isn't available (e.g., older glq_vllm install or CPU).
+        # Dispatched as a registered torch.ops.glq op so vLLM's
+        # torch.compile / piecewise-CUDA-graph capture treats this call
+        # as an opaque kernel boundary.
         x_half = x.half().contiguous()
         wscale_f = float(wscale)
         irs_f = float(inv_rs) if has_stage2 else 0.0
         irs2_f = float(inv_rs2) if Qidxs3 is not None else 0.0
         irs3_f = float(inv_rs3) if Qidxs4 is not None else 0.0
-        if _use_custom_ops and hasattr(torch.ops.glq, "fused_linear_block_diag"):
-            y = torch.ops.glq.fused_linear_block_diag(
-                x_half, SV, SU, Qidxs, primary_cb, wscale_f,
-                in_features, out_features, n_pad, m_pad,
-                bn_tensor, bm_tensor, bn_meta, bm_meta,
-                q2, cb2_arg, irs_f,
-                q3, cb3_arg, irs2_f,
-                q4, cb4_arg, irs3_f,
-            )
-        else:
-            y = _ik._glq_cuda.glq_fused_linear_block_diag_cuda(
-                x_half, SV, SU, Qidxs, primary_cb, wscale_f,
-                in_features, out_features, n_pad, m_pad,
-                bn_tensor, bm_tensor, bn_meta, bm_meta,
-                q2, cb2_arg, irs_f,
-                q3, cb3_arg, irs2_f,
-                q4, cb4_arg, irs3_f,
-            )
+        y = torch.ops.glq.fused_linear_block_diag(
+            x_half, SV, SU, Qidxs, primary_cb, wscale_f,
+            in_features, out_features, n_pad, m_pad,
+            bn_tensor, bm_tensor, bn_meta, bm_meta,
+            q2, cb2_arg, irs_f,
+            q3, cb3_arg, irs2_f,
+            q4, cb4_arg, irs3_f,
+        )
         if dtype != torch.float16:
             y = y.to(dtype)
         return y
@@ -425,15 +416,13 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     # Input RHT
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
     rsqrt_n = 1.0 / math.sqrt(n_pad)
-    if n_pad <= 16384 and (_use_custom_ops or _use_cuda_c):
+    if n_pad <= 16384 and hasattr(torch.ops.glq, "input_rht"):
         x_half = x.half().contiguous()
-        if _use_custom_ops:
-            torch.ops.glq.input_rht(x_half, SV, x_rht,
-                                    in_features, in_features, rsqrt_n, n_pad, log_n)
-        else:
-            _ik._glq_cuda.glq_input_rht_cuda(x_half, SV, x_rht,
-                                              in_features, in_features, rsqrt_n, n_pad, log_n)
+        torch.ops.glq.input_rht(x_half, SV, x_rht,
+                                in_features, in_features, rsqrt_n, n_pad, log_n)
     else:
+        # Triton fallback for n_pad > 16384 (current GLQ checkpoints don't
+        # hit this; piecewise capture for it is a separate follow-up).
         from glq.quantized_linear import _input_rht_kernel
         _input_rht_kernel[(B,)](
             x, SV, x_rht, in_features, x.stride(0),
@@ -464,18 +453,17 @@ def _glq_apply_shard(x, device, cb, cb2, Qidxs, SU, SV, wscale,
     rsqrt_m = 1.0 / math.sqrt(m_pad)
     if _GLQ_DEBUG:
         print(f"GLQ_DEBUG: output_rht params B={B} out={out_features} m_pad={m_pad} log_m={log_m} SU={SU.shape} SU_dev={SU.device} y_rht_dev={y_rht.device}", file=sys.stderr, flush=True)
-    if m_pad <= 16384 and (_use_custom_ops or _use_cuda_c):
+    if m_pad <= 16384 and hasattr(torch.ops.glq, "output_rht"):
         y = torch.empty(B, out_features, dtype=torch.float16, device=device)
-        if _use_custom_ops:
-            torch.ops.glq.output_rht(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
-        else:
-            _ik._glq_cuda.glq_output_rht_cuda(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
+        torch.ops.glq.output_rht(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
         if _GLQ_DEBUG:
             torch.cuda.synchronize()
             print(f"GLQ_DEBUG: output_rht OK y={y.shape}", file=sys.stderr, flush=True)
         if dtype != torch.float16:
             y = y.to(dtype)
     else:
+        # Triton fallback for m_pad > 16384 (current GLQ checkpoints don't
+        # hit this; piecewise capture for it is a separate follow-up).
         from glq.quantized_linear import _output_rht_kernel
         output_fp16 = (dtype == torch.float16)
         y = torch.empty(B, out_features, dtype=dtype, device=device)

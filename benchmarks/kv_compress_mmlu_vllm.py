@@ -77,8 +77,7 @@ def main():
     t0 = time.time()
     llm = LLM(model=args.model, dtype="bfloat16",
               max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_mem,
-              enforce_eager=True)
+              gpu_memory_utilization=args.gpu_mem)
     print(f"  load: {time.time()-t0:.1f}s", flush=True)
 
     ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
