@@ -115,17 +115,75 @@ def register():
                       "scatter kernel active on write path (Stage 5.3-4a)",
                       flush=True)
 
-        # v0.3.3 known limitation: the E8 KV gather path allocates its
-        # K/V workspace via ``torch.empty()`` on every attention call,
-        # which isn't graph-safe under vLLM's piecewise/FULL CUDA-graph
-        # capture (the per-call allocation gets invalidated on graph
-        # replay → ``cudaErrorIllegalAddress``). Until that path is
-        # refactored to write into a pre-allocated buffer, E8 KV
-        # requires ``enforce_eager=True`` (vLLM CLI: ``--enforce-eager``).
-        print("[glq_vllm] NOTE: E8 KV cache requires "
-              "``enforce_eager=True`` / ``--enforce-eager``. The default "
-              "v0.3.2 piecewise capture is incompatible with the current "
-              "gather path; this will be addressed in v0.3.4.", flush=True)
+        # v0.3.5: auto-force ``cudagraph_mode=PIECEWISE`` when E8 KV is
+        # active. FULL captures wrap the whole model.forward including
+        # our patched attention, which calls ``.unique()`` on
+        # ``block_table.flatten()`` — illegal during CUDA-graph capture
+        # (``cudaErrorStreamCaptureUnsupported``). PIECEWISE captures
+        # split at ``vllm::unified_attention_with_output`` so our
+        # patched attention runs in the eager break between subgraphs,
+        # where ``.unique()`` is fine. End-user effect: drop
+        # ``--enforce-eager`` for E8 KV. v0.3.3's enforce_eager=True
+        # workaround is no longer required.
+        #
+        # Hook point: ``vllm.LLM.__init__`` rather than
+        # ``CompilationConfig.__post_init__`` — the latter runs in the
+        # parent process only; the v1 EngineCore subprocess rebuilds the
+        # config from cross-process state, bypassing post-init. Injecting
+        # the override into the ``compilation_config`` kwarg at LLM
+        # construction time lets the value reach the subprocess via
+        # vLLM's own arg passing.
+        # Hook point: ``EngineArgs.create_engine_config`` runs **inside**
+        # ``LLM.__init__`` after vLLM has loaded plugins (and thus
+        # imported us). Patching there means our override is always in
+        # place by the time the VllmConfig is materialised, regardless
+        # of whether the user imported glq_vllm explicitly or relied on
+        # the ``vllm.general_plugins`` entry_point.
+        try:
+            from vllm.engine.arg_utils import EngineArgs as _GlqEngineArgs
+            from vllm.config.compilation import (
+                CUDAGraphMode as _GlqCUDAGraphMode,
+            )
+        except ImportError:
+            _GlqEngineArgs = None
+            _GlqCUDAGraphMode = None
+        if _GlqEngineArgs is not None and not getattr(
+                _GlqEngineArgs, "_glq_kv_piecewise_patched", False):
+            _orig_create_engine_config = _GlqEngineArgs.create_engine_config
+
+            def _glq_kv_create_engine_config(self, *args, **kwargs):
+                vllm_config = _orig_create_engine_config(
+                    self, *args, **kwargs)
+                cc = getattr(vllm_config, "compilation_config", None)
+                if cc is not None:
+                    mode = getattr(cc, "cudagraph_mode", None)
+                    full_modes = {
+                        _GlqCUDAGraphMode.FULL,
+                        _GlqCUDAGraphMode.FULL_DECODE_ONLY,
+                        _GlqCUDAGraphMode.FULL_AND_PIECEWISE,
+                    }
+                    if mode in full_modes or mode is None:
+                        cc.cudagraph_mode = _GlqCUDAGraphMode.PIECEWISE
+                        from_label = (
+                            mode.name if hasattr(mode, "name") else repr(mode)
+                        )
+                        print(
+                            f"[glq_vllm] E8 KV active → cudagraph_mode "
+                            f"forced from {from_label} to PIECEWISE "
+                            "(FULL captures incompatible with .unique() "
+                            "in _patched_unified_attention; fused-dequant "
+                            "paged_attention in v0.4 will lift this)",
+                            flush=True,
+                        )
+                return vllm_config
+
+            _GlqEngineArgs.create_engine_config = _glq_kv_create_engine_config
+            _GlqEngineArgs._glq_kv_piecewise_patched = True
+            print(
+                "[glq_vllm] E8 KV EngineArgs.create_engine_config hook "
+                "installed (forces cudagraph_mode=PIECEWISE)",
+                flush=True,
+            )
 
 
 # Also register on import for backward compat (vLLM 0.16 / manual usage)

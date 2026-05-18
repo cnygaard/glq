@@ -200,20 +200,21 @@ GLQ_KV_QUANT=e8_relaxed:2 \
 GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 \
 GLQ_KV_E8_COMPRESSED_ALLOC=1 \
 GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
-vllm serve google/gemma-4-E4B-it --enforce-eager
+vllm serve google/gemma-4-E4B-it
 ```
 
-**Important**: the E8 KV path requires `--enforce-eager` in v0.3.x.
-The gather workspace is allocated per attention call, which isn't
-compatible with vLLM's piecewise / full CUDA-graph capture (the
-default since v0.3.2 for weight-only GLQ). Refactoring the gather to
-use a pre-allocated workspace is a v0.3.4 target.
+As of v0.3.5, glq auto-forces `cudagraph_mode=PIECEWISE` when the
+E8 KV envs above are set, so `--enforce-eager` is no longer
+required (you'll see `[glq_vllm] E8 KV active → cudagraph_mode
+forced ... to PIECEWISE` at startup). Weight-only GLQ still uses
+the default `FULL_AND_PIECEWISE` for the +18.5 % B=4 FULL-graph win
+from v0.3.4. Bringing FULL captures to the E8 KV path needs the
+deeper paged_attention fork that fuses dequant into the attention
+kernel (v0.4 target).
 
 Validated end-to-end on Gemma-4-E4B-it / Gemma-4-31B-it on vLLM
-0.20.x. For weight-only GLQ (no E8 KV) the default piecewise
-CUDA-graph capture path works with no extra flags. The codebook-NN
-kernel is still ~42 % of CUDA time at 4 bpw — fusing that is the
-v0.4 target.
+0.20.x. The codebook-NN kernel is still ~42 % of CUDA time at 4 bpw
+— fusing that is also part of the v0.4 work.
 
 ## Advanced
 

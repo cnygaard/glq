@@ -75,11 +75,11 @@ def main():
     print(f"=== mmlu_pro vLLM — {args.label} ===", flush=True)
 
     t0 = time.time()
-    # E8 KV path is not graph-safe in v0.3.x; force eager.
+    # glq_vllm v0.3.5+ auto-forces ``cudagraph_mode=PIECEWISE`` when E8
+    # KV envs are set, so we no longer need ``enforce_eager=True`` here.
     llm = LLM(model=args.model, dtype="bfloat16",
               max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_mem,
-              enforce_eager=True)
+              gpu_memory_utilization=args.gpu_mem)
     print(f"  load: {time.time()-t0:.1f}s", flush=True)
 
     ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")

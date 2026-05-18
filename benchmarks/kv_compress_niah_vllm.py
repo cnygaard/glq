@@ -105,11 +105,12 @@ def main():
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help="vLLM max_num_seqs; cap concurrent sequences (1 for single-seq NIAH)")
     p.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="force vLLM eager (default True — E8 KV path is "
-                        "not graph-safe in v0.3.x). Pass "
-                        "``--no-enforce-eager`` to test piecewise mode "
-                        "(currently broken for E8 KV).")
+                   default=False,
+                   help="force vLLM eager (default False; glq_vllm v0.3.5+ "
+                        "auto-forces ``cudagraph_mode=PIECEWISE`` when E8 "
+                        "KV envs are set, so piecewise capture works). "
+                        "Pass ``--enforce-eager`` to disable graphs "
+                        "for debugging.")
     p.add_argument("--out", default="/tmp/logs/niah_vllm.json")
     p.add_argument("--label", default=None)
     args = p.parse_args()
@@ -128,8 +129,9 @@ def main():
     max_model_len = args.max_model_len or (max_ctx + 256)
 
     t0 = time.time()
-    # E8 KV path's gather workspace allocation isn't graph-safe; force
-    # eager unless the caller explicitly opted out (``--no-enforce-eager``).
+    # glq_vllm v0.3.5+ auto-forces ``cudagraph_mode=PIECEWISE`` when E8
+    # KV envs are set, so piecewise capture works out of the box.
+    # ``--enforce-eager`` stays available as a debug knob.
     llm_kwargs = dict(
         model=args.model, dtype="bfloat16",
         max_model_len=max_model_len,
