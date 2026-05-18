@@ -239,6 +239,40 @@ extra kwargs). For 24B models the matmul is compute-bound at B=1, so
 graphs don't help (Devstral-24B GLQ 4 bpw: 6.6 tok/s eager vs 6.4
 graphed).
 
+### Tuning vLLM CUDA-graph capture sizes (v0.3.4+)
+
+vLLM 0.20 captures both **FULL** model-forward graphs (single replay
+per fixed shape) and **PIECEWISE** subgraphs split at attention. The
+default capture set is derived from `max_num_seqs * 2`, so a
+single-sequence harness only gets FULL captures for `[1, 2]`. For
+batched serving, raise the list explicitly:
+
+```python
+from vllm import LLM
+llm = LLM(model="xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw",
+          compilation_config={
+              "cudagraph_capture_sizes": [1, 2, 4, 8, 16],
+          })
+```
+
+Measured impact on Gemma-4-E4B-it-GLQ-4bpw, RTX PRO 6000 Blackwell,
+256-token decode:
+
+| Mode | B=1 tok/s | B=4 tok/s (total) |
+|---|---:|---:|
+| Eager | 14.4 | 35.0 |
+| Piecewise + default capture `[1, 2]` | 39.4 | 132.7 |
+| Piecewise + capture `[1, 2, 4, 8, 16]` | **40.0** | **157.3 (+18.5 %)** |
+
+At B=1 the FULL graph was already captured (no change). At B=4 the
+extended list keeps the FULL graph active where the default
+degenerated to PIECEWISE-only, recovering ~6 tok/s per sequence.
+
+Cost: ~10-20 MB VRAM per captured shape on 3B / E4B models (vLLM
+prints the total at "Graph capturing finished in N s, took X GiB").
+On 24-31B models budget ~100-200 MB per shape. Capture time is
+~1 s per shape, one-time at LLM init.
+
 ### Bit widths
 
 | bpw | Primary | Residual stages |

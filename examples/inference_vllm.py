@@ -33,6 +33,12 @@ def serve(model_id, tokenizer_id=None, prompts=None, max_tokens=100):
         # piecewise CUDA-graph capture works as of v0.3.2 — pass
         # ``enforce_eager=True`` here if you hit a compile-time issue on
         # an untested model architecture.
+        # v0.3.4: capture FULL graphs for common decode batch sizes. The
+        # vLLM default derives the set from ``max_num_seqs * 2`` which
+        # gives ``[1, 2]`` for B=1 harnesses; this list keeps the FULL
+        # graph active up to B=16 (+18.5 % at B=4 vs default on E4B).
+        # VRAM cost is ~10-20 MB per captured shape on a 3B/E4B model.
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16]},
     )
 
     sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0)
