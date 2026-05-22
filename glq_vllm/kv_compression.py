@@ -635,6 +635,70 @@ def disable_sidecar() -> None:
             pass
 
 
+def _try_inline_dequant_attention(q, k, kwargs):
+    """v0.5 Phase 3 — env-gated inline-dequant fast path.
+
+    Bypasses the v0.3.5 pre-decompress workspace and calls the forked
+    Triton attention kernel directly on the compressed E8 K/V tensors.
+    Eliminates ~500 µs/layer/token of workspace overhead.
+
+    Currently supports the **4 bpw (n_primary=2, n_secondary=0) recipe
+    only** — Phase 5 will extend to bpw 5/6/7. For other recipes this
+    returns ``None`` (caller falls through to v0.3.5 path).
+
+    Returns the output tensor on success, ``None`` if any prerequisite
+    is missing or the recipe is unsupported.
+    """
+    real_head_size = q.shape[-1]
+    bin_key = (k.data_ptr(), real_head_size)
+    cache = _e8_sidecar.get(bin_key)
+    if cache is None:
+        return None
+    if cache.n_primary != 2 or cache.n_secondary != 0:
+        # Phase 3 supports 4 bpw only; other recipes route via v0.3.5
+        # workspace path (Phase 5 will lift this).
+        return None
+    quant, _ = _quantizer_for_bpw(cache.bpw)
+    if quant is None:
+        return None
+
+    from glq_vllm.e8_paged_cache import _get_hadamard
+    from glq_vllm.triton_unified_attention_e8 import (
+        unified_attention_e8_v2_1,
+    )
+
+    out = kwargs["out"]
+    cu_seqlens_q = kwargs["cu_seqlens_q"]
+    seqused_k = kwargs["seqused_k"]
+    softmax_scale = kwargs["softmax_scale"]
+    block_table = kwargs["block_table"]
+    # vLLM's ``window_size = (sliding_window - 1, 0)``; the kernel
+    # constexpr expects ``1 + window_size[0]`` (cf. upstream
+    # ``vllm/v1/attention/ops/triton_unified_attention.py:1029``).
+    window_size = kwargs.get("window_size", (-1, -1))
+    sliding_window = (1 + window_size[0]) if window_size[0] >= 0 else 0
+
+    codebook = quant.codebook.codebook_half
+    if codebook.device != q.device:
+        codebook = codebook.to(q.device)
+    H_mat = _get_hadamard(torch.float32, q.device)
+
+    unified_attention_e8_v2_1(
+        q=q,
+        k_idx1=cache.k_idx1, k_idx2=cache.k_idx2, k_scale=cache.k_scale,
+        v_idx1=cache.v_idx1, v_idx2=cache.v_idx2, v_scale=cache.v_scale,
+        codebook=codebook, H_mat=H_mat,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        softmax_scale=softmax_scale,
+        resid_scale=float(quant.codebook.resid_scale),
+        block_table=block_table,
+        sliding_window=sliding_window,
+    )
+    return out
+
+
 def _patched_unified_attention(*, q, k, v, **kwargs):
     """Stage 2c-1 attention-read hook.
 
@@ -644,10 +708,31 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
     (sidecar not allocated for this layer, quantizer not found, etc.)
     so a Stage 2c-1 bug never breaks generation — the main monkey-patch
     keeps vLLM's fp16 cache valid as a safety net.
+
+    v0.5 Phase 3 adds an opt-in ``GLQ_KV_E8_INLINE_DEQUANT`` env var
+    that routes 4 bpw paths through the forked Triton kernel
+    (``unified_attention_e8_v2_1``), skipping the workspace
+    pre-decompress. Falls back to the v0.3.5 path on any failure so
+    the new code never breaks generation.
     """
     global _sidecar_read_counter
     if not _sidecar_read_enabled:
         return _original_unified(q=q, k=k, v=v, **kwargs)
+
+    # Phase 3 — try inline-dequant first when env var set.
+    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT", "0") == "1":
+        try:
+            inline_out = _try_inline_dequant_attention(q, k, kwargs)
+            if inline_out is not None:
+                _sidecar_read_counter += 1
+                return None  # upstream contract: writes to kwargs["out"]
+        except Exception as e:
+            try:
+                print(f"[glq_vllm.kv_compression] inline-dequant fallback "
+                      f"(ptr={k.data_ptr():#x} head_size={q.shape[-1]}): "
+                      f"{type(e).__name__}: {e}", flush=True)
+            except Exception:
+                pass
     # Real head_size comes from q (the model produces q at full
     # head_size regardless of how vLLM stores cache). k.shape[-1] is
     # unreliable under Stage 2c-2b because vLLM's cache uses the
