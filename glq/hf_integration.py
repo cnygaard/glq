@@ -432,14 +432,28 @@ class GLQQuantizer(HfQuantizer):
 
     def _process_model_after_weight_loading(self, model, **kwargs):
         # Build the shared codebook and attach to all E8RHTLinear modules.
-        # Try loading from: 1) glq package dir, 2) enumerate fresh
+        # Search order:
+        #   1) model directory (per-artifact codebook — required for non-
+        #      default sizes like the 4 K shared-memory variant)
+        #   2) bundled glq/e8_codebook.pt (default 65 536-entry)
+        #   3) enumerate fresh (last-resort fallback)
         codebook = None
-        for path in [
-            os.path.join(os.path.dirname(__file__), "e8_codebook.pt"),
-        ]:
-            if os.path.exists(path):
-                codebook = E8ShellCodebook.load(path, device='cpu')
-                break
+        cfg = getattr(model, "config", None)
+        pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
+        if pretrained_path:
+            try:
+                from transformers.utils.hub import cached_file
+                cb_path = cached_file(
+                    pretrained_path, "e8_codebook.pt",
+                    _raise_exceptions_for_missing_entries=False)
+                if cb_path is not None and os.path.exists(cb_path):
+                    codebook = E8ShellCodebook.load(cb_path, device='cpu')
+            except Exception:
+                pass
+        if codebook is None:
+            bundled = os.path.join(os.path.dirname(__file__), "e8_codebook.pt")
+            if os.path.exists(bundled):
+                codebook = E8ShellCodebook.load(bundled, device='cpu')
         if codebook is None:
             codebook = E8ShellCodebook(device='cpu', verbose=False)
 

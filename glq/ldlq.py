@@ -71,7 +71,7 @@ def quantize_ldlq_codebook(
 
     if Wscale is None:
         W_rms = W.pow(2).mean().sqrt().item()
-        Wscale = W_rms / codebook.opt_scale if W_rms > 1e-10 else 1.0
+        Wscale = W_rms * codebook.opt_scale if W_rms > 1e-10 else 1.0
 
     Wr = W / Wscale
     hatWr = torch.zeros_like(Wr)
@@ -185,7 +185,17 @@ def quantize_ldlq_codebook_2stage(
 
     if Wscale is None:
         W_rms = W.pow(2).mean().sqrt().item()
-        Wscale = W_rms / codebook1.opt_scale if W_rms > 1e-10 else 1.0
+        Wscale = W_rms * codebook1.opt_scale if W_rms > 1e-10 else 1.0
+
+    # Stage-2 codebook may have a different opt_scale than stage-1 (e.g.,
+    # 3-bpw recipe: primary 65K opt_scale=1.0, secondary make_small(256)
+    # opt_scale=1.5). resid_scale was tuned via primary._compute_resid_scale,
+    # which assumes stage 2 uses the same codebook as stage 1 (target rms =
+    # 1/opt_scale1). When stage 2 has a different opt_scale, rescale to
+    # target 1/opt_scale2 instead. The saved inv_resid_scale = 1/resid_scale
+    # is updated to match, so inference automatically uses the correct value.
+    if codebook1.opt_scale != codebook2.opt_scale:
+        resid_scale = resid_scale * (codebook1.opt_scale / codebook2.opt_scale)
 
     Wr = W / Wscale
     all_indices1 = torch.zeros(m, num_blocks, dtype=torch.long, device=device)
@@ -384,7 +394,21 @@ def quantize_ldlq_codebook_nstage(
 
     if Wscale is None:
         W_rms = W.pow(2).mean().sqrt().item()
-        Wscale = W_rms / codebooks[0].opt_scale if W_rms > 1e-10 else 1.0
+        Wscale = W_rms * codebooks[0].opt_scale if W_rms > 1e-10 else 1.0
+
+    # resid_scales[k] gates the input to stage k+1. It was tuned (via
+    # primary._compute_resid_scale) assuming every stage uses the same
+    # codebook. When codebooks[k+1].opt_scale differs from codebooks[k]'s,
+    # rescale so stage k+1's input lands at 1/codebooks[k+1].opt_scale rms.
+    # See the matching adjustment in quantize_ldlq_codebook_2stage. The
+    # saved inv_cumul values use the corrected resid_scales so the
+    # inference path needs no changes.
+    resid_scales = list(resid_scales)
+    for k in range(n_stages - 1):
+        os_k = codebooks[k].opt_scale
+        os_kp1 = codebooks[k + 1].opt_scale
+        if os_k != os_kp1:
+            resid_scales[k] = resid_scales[k] * (os_k / os_kp1)
 
     Wr = W / Wscale
 

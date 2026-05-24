@@ -466,6 +466,7 @@ def quantize(
     trust_remote_code: bool = False,
     streaming: bool = False,
     workers: int = 0,
+    codebook_size: int = None,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -630,7 +631,7 @@ def quantize(
     # ---- Calibration data ----
     print(f"\nLoading calibration data ...")
     from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
     text = "\n\n".join(ds["text"])
     enc = tokenizer(text, return_tensors="pt")
     input_ids = enc.input_ids[0]
@@ -640,7 +641,7 @@ def quantize(
 
     # ---- Build codebook ----
     print(f"\nBuilding E8 shell codebook ...")
-    codebook = E8ShellCodebook(device=device)
+    codebook = E8ShellCodebook(device=device, target_size=codebook_size)
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
@@ -1380,6 +1381,13 @@ def main():
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers for CPU quantization "
                              "(0=auto, 1=sequential, ignored on GPU)")
+    parser.add_argument("--codebook-size", type=int, default=None,
+                        help="E8 codebook entry count. Default 65 536 "
+                             "(shells 0-5 in full + 8 655 from shell 6). "
+                             "Use 4096 for v0.5 shared-memory-resident "
+                             "attention kernel (64 KB fp16 fits Blackwell "
+                             "per-CTA smem). Truncation is shell-sorted "
+                             "(smaller values drop high-norm vectors).")
     args = parser.parse_args()
 
     # Determine bpw: explicit map, fractional target, or uniform int
@@ -1404,6 +1412,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         streaming=args.streaming,
         workers=args.workers,
+        codebook_size=args.codebook_size,
     )
 
 
