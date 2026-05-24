@@ -297,42 +297,54 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
 
     def _run_ldlq(W_p, H_p):
         from .ldlq import quantize_ldlq_codebook_nstage
+        # ``resid_scale`` between two stages must be tuned for the actual
+        # (primary, secondary) pair. ``codebook.resid_scale`` was tuned for
+        # self-self (= 4/6/8 bpw uniform recipes). For 3/5/7 bpw recipes
+        # the last stage uses ``make_small(256)``, which has a different
+        # opt_scale and residual-error profile, so derive its rs directly
+        # against that pair. Both ``cb_small`` and ``rs_to_small`` are
+        # constants for the whole run, but ~10 ms × ~200 layers is
+        # trivial so we recompute here rather than thread state.
+        rs_self = codebook.resid_scale
         if bpw == 2:
             return quantize_ldlq_codebook(W_p, H_p, codebook, tune_iters=tune_iters)
         elif bpw == 3:
-            codebook_small = codebook.make_small(256)
+            cb_small = codebook.make_small(256)
+            rs_to_small = codebook.compute_paired_resid_scale(cb_small)
             return quantize_ldlq_codebook_2stage(
-                W_p, H_p, codebook, codebook_small,
-                resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+                W_p, H_p, codebook, cb_small,
+                resid_scale=rs_to_small, tune_iters=tune_iters)
         elif bpw == 4:
             return quantize_ldlq_codebook_2stage(
                 W_p, H_p, codebook, codebook,
-                resid_scale=codebook.resid_scale, tune_iters=tune_iters)
+                resid_scale=rs_self, tune_iters=tune_iters)
         elif bpw == 5:
             cb_small = codebook.make_small(256)
+            rs_to_small = codebook.compute_paired_resid_scale(cb_small)
             return quantize_ldlq_codebook_nstage(
                 W_p, H_p,
                 codebooks=[codebook, codebook, cb_small],
-                resid_scales=[codebook.resid_scale, codebook.resid_scale],
+                resid_scales=[rs_self, rs_to_small],
                 tune_iters=tune_iters)
         elif bpw == 6:
             return quantize_ldlq_codebook_nstage(
                 W_p, H_p,
                 codebooks=[codebook, codebook, codebook],
-                resid_scales=[codebook.resid_scale, codebook.resid_scale],
+                resid_scales=[rs_self, rs_self],
                 tune_iters=tune_iters)
         elif bpw == 7:
             cb_small = codebook.make_small(256)
+            rs_to_small = codebook.compute_paired_resid_scale(cb_small)
             return quantize_ldlq_codebook_nstage(
                 W_p, H_p,
                 codebooks=[codebook, codebook, codebook, cb_small],
-                resid_scales=[codebook.resid_scale] * 3,
+                resid_scales=[rs_self, rs_self, rs_to_small],
                 tune_iters=tune_iters)
         elif bpw == 8:
             return quantize_ldlq_codebook_nstage(
                 W_p, H_p,
                 codebooks=[codebook] * 4,
-                resid_scales=[codebook.resid_scale] * 3,
+                resid_scales=[rs_self] * 3,
                 tune_iters=tune_iters)
         else:
             raise ValueError(f"Unsupported bpw: {bpw}. Use 2, 3, 4, 5, 6, 7, or 8.")

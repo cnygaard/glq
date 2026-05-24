@@ -306,6 +306,30 @@ class E8ShellCodebook:
         return best_s
 
     def _compute_resid_scale(self, n_samples=8_000):
+        """resid_scale tuned for stage-2 == self (used at construction)."""
+        return self.compute_paired_resid_scale(self, n_samples=n_samples)
+
+    def compute_paired_resid_scale(self, secondary, n_samples=8_000):
+        """resid_scale that minimises 2-stage error when stage 1 uses
+        ``self`` and stage 2 uses ``secondary``.
+
+        Same search loop as the original self-self version, but stage 2
+        quantises through ``secondary.quantize`` so the optimum reflects
+        the secondary's actual density/structure (not just an opt_scale
+        ratio adjustment). For the canonical recipes:
+
+        - same codebook on both stages (4/6/8 bpw): equivalent to
+          ``_compute_resid_scale`` — backward-compatible default.
+        - primary 65 K + secondary ``make_small(256)`` (3/5/7 bpw at
+          default codebook): produces a different rs than the self-self
+          value because the 256-vector secondary has a very different
+          residual-error profile than the 65 K primary.
+
+        Note the NMSE metric still uses ``self.opt_scale`` (= the
+        primary's) because the error is measured in the primary's
+        un-scaled space — that's the space the LDLQ caller will
+        un-scale the reconstruction in.
+        """
         x = torch.randn(n_samples, self.DIM, device=self.device)
         x_s = x / self.opt_scale
         dec1, _ = self.quantize(x_s)
@@ -313,7 +337,7 @@ class E8ShellCodebook:
 
         best_nmse, best_rs = float('inf'), 1.0
         for rs in [0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0]:
-            dec2, _ = self.quantize(residual * rs)
+            dec2, _ = secondary.quantize(residual * rs)
             total = dec1 + dec2 / rs
             mse = ((x_s - total) ** 2).sum(-1).mean().item()
             nmse = mse * (self.opt_scale ** 2)
