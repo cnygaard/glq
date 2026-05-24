@@ -126,8 +126,25 @@ class E8ShellCodebook:
     CODEBOOK_SIZE = 65536
     DIM = 8
 
-    def __init__(self, device='cpu', verbose=True):
-        """Enumerate E8 shells and build codebook (~1.3s CPU)."""
+    def __init__(self, device='cpu', verbose=True, target_size: int = None):
+        """Enumerate E8 shells and build codebook (~1.3s CPU).
+
+        Args:
+            device: torch device for the codebook tensors.
+            verbose: print enumeration progress.
+            target_size: codebook size to truncate to. Defaults to
+                ``CODEBOOK_SIZE`` (= 65 536, fills through shell 6).
+                For shared-memory-resident kernels (v0.5 Phase 5),
+                use ``target_size=4096`` (= shells 0-3 prefix, 64 KB
+                at fp16). Truncation is shell-sorted: smaller values
+                drop high-norm vectors first. Valid range is
+                [1, 117361]; the value MUST also be ≤ 65 535 if
+                indices are stored as int16 unsigned (the default for
+                E8KVQuantizer / E8RHTLinear); 4 K, 8 K, 16 K, 32 K are
+                all safe at int16. ``opt_scale`` and ``resid_scale``
+                are recomputed for the truncated codebook so RVQ math
+                stays well-conditioned.
+        """
         G, _ = e8_basis()
 
         if verbose:
@@ -153,11 +170,16 @@ class E8ShellCodebook:
         for i, (exp, got) in enumerate(zip(expected_counts, shell_counts)):
             assert got == exp, f"Shell {i} count mismatch: expected {exp}, got {got}"
 
-        through_shell5 = sum(shell_counts[:6])  # 56881
-        n_from_shell6 = self.CODEBOOK_SIZE - through_shell5  # 8655
-        keep = shell_boundaries[6] + n_from_shell6
-        coords_sel = coords[:keep]
-        assert coords_sel.shape[0] == self.CODEBOOK_SIZE
+        # Truncate the shell-sorted enumeration to target_size. Default
+        # 65536 reproduces the original layout (shells 0-5 in full +
+        # 8655 vectors from shell 6).
+        if target_size is None:
+            target_size = self.CODEBOOK_SIZE
+        if not 1 <= target_size <= len(coords):
+            raise ValueError(
+                f"target_size {target_size} must be in [1, {len(coords)}]")
+        coords_sel = coords[:target_size]
+        assert coords_sel.shape[0] == target_size
 
         GT = G.T.double()
         vecs = coords_sel @ GT
@@ -170,11 +192,17 @@ class E8ShellCodebook:
         self.codebook_packed = _pack_codebook(self.codebook).to(device)
         self.codesz = self.DIM
         self.device = device
+        # Instance-level codebook_size — overrides the class constant
+        # when target_size differs from the default. Inference paths
+        # query the actual codebook tensor's row count (size-agnostic),
+        # so this is informational + for callers that need to know
+        # the active size (e.g., to budget shared memory).
+        self.codebook_size = target_size
 
         self.opt_scale = self._compute_opt_scale()
         self.resid_scale = self._compute_resid_scale()
         if verbose:
-            print(f"  {self.CODEBOOK_SIZE} entries in {t_enum:.2f}s, "
+            print(f"  {target_size} entries in {t_enum:.2f}s, "
                   f"opt_scale={self.opt_scale:.4f}, resid_scale={self.resid_scale:.2f}")
 
     @classmethod
@@ -191,6 +219,7 @@ class E8ShellCodebook:
         obj.codebook_packed = _pack_codebook(obj.codebook).to(device)
         obj.codesz = cls.DIM
         obj.device = device
+        obj.codebook_size = int(obj.codebook.shape[0])
         obj.opt_scale = opt_scale if opt_scale is not None else obj._compute_opt_scale()
         obj.resid_scale = resid_scale if resid_scale is not None else obj._compute_resid_scale()
         return obj
