@@ -114,15 +114,6 @@ def register():
                 print("[glq_vllm] GLQ_KV_E8_FUSED_WRITE=1 → fused Triton "
                       "scatter kernel active on write path (Stage 5.3-4a)",
                       flush=True)
-            # v0.5 Phase 3: opt-in inline-dequant attention (forked
-            # Triton kernel). Eliminates the v0.3.5 fp16 workspace
-            # — the kernel reads compressed K/V tensors directly.
-            # 4 bpw only for now; other recipes fall back to v0.3.5.
-            if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT", "0") != "0":
-                print("[glq_vllm] GLQ_KV_E8_INLINE_DEQUANT=1 → v0.5 inline "
-                      "dequant attention active (4 bpw paths only; "
-                      "non-4bpw layers fall back to v0.3.5 workspace)",
-                      flush=True)
 
         # v0.3.5: auto-force ``cudagraph_mode=PIECEWISE`` when E8 KV is
         # active. FULL captures wrap the whole model.forward including
