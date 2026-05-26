@@ -71,27 +71,40 @@ class E8RelaxedCodebook(E8ShellCodebook):
     CODEBOOK_SIZE = 65536
     DIM = 8
 
-    def __init__(self, device='cpu', verbose=True, max_norm_sq=12.5):
+    def __init__(self, device='cpu', verbose=True, max_norm_sq=12.5,
+                 target_size: int = None):
         """Enumerate D̃8 lattice points and build the codebook.
 
-        ``max_norm_sq`` defaults to 12.5 to match the strict E8 ceiling;
-        D̃8 has roughly double the points per shell so the search yields
-        more candidates than strict, but we truncate to the same 65,536
-        entries to keep 2-bpw indexing.
+        Args:
+            device: torch device for the codebook tensors.
+            verbose: print enumeration progress.
+            max_norm_sq: ceiling for the D̃8 enumeration search.
+                Defaults to 12.5 to match the strict E8 ceiling; D̃8 has
+                roughly double the points per shell so the search yields
+                more candidates than strict.
+            target_size: codebook size to truncate to. Defaults to
+                ``CODEBOOK_SIZE`` (= 65 536). For Phase 5.0a relaxed-
+                codebook smem probe use ``target_size=4096`` (= 64 KB
+                at fp16). Truncation is shell-sorted: smaller values
+                drop high-norm vectors first. ``opt_scale`` and
+                ``resid_scale`` are recomputed for the truncated
+                codebook.
         """
+        if target_size is None:
+            target_size = self.CODEBOOK_SIZE
         if verbose:
             print("E8RelaxedCodebook: enumerating D̃8 lattice ...")
         t0 = time.perf_counter()
         coords, norms_sq = enumerate_dtilde8(max_norm_sq=max_norm_sq)
         t_enum = time.perf_counter() - t0
 
-        assert coords.shape[0] >= self.CODEBOOK_SIZE, (
+        assert coords.shape[0] >= target_size, (
             f"D̃8 enumeration yielded only {coords.shape[0]} points within "
-            f"||v||²≤{max_norm_sq}; need at least {self.CODEBOOK_SIZE}. "
+            f"||v||²≤{max_norm_sq}; need at least {target_size}. "
             f"Increase max_norm_sq.")
 
         order = norms_sq.argsort()
-        coords = coords[order][:self.CODEBOOK_SIZE]
+        coords = coords[order][:target_size]
 
         self.codebook = coords.float().to(device)
         self.codebook_norms = (self.codebook ** 2).sum(-1)
@@ -101,10 +114,11 @@ class E8RelaxedCodebook(E8ShellCodebook):
         self.codebook_packed = _pack_codebook(self.codebook).to(device)
         self.codesz = self.DIM
         self.device = device
+        self.codebook_size = target_size
 
         self.opt_scale = self._compute_opt_scale()
         self.resid_scale = self._compute_resid_scale()
         if verbose:
-            print(f"  {self.CODEBOOK_SIZE} entries in {t_enum:.2f}s, "
+            print(f"  {target_size} entries in {t_enum:.2f}s, "
                   f"opt_scale={self.opt_scale:.4f}, "
                   f"resid_scale={self.resid_scale:.2f}")

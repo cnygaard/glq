@@ -171,6 +171,39 @@ class TestEnumerateEmpty:
         assert norms.shape[0] == 0
 
 
+class TestE8RelaxedCodebook:
+    """Sanity tests for the relaxed (D̃8) codebook + parametric target_size.
+
+    Phase 5.0a: target_size lets us probe whether the denser inner shells
+    of D̃8 (256 shell-1 points vs strict's 240, ~4320 shell-2 vs 2160)
+    transfer to weight quantization at small codebook sizes.
+    """
+
+    def test_default_size(self):
+        from glq.codebook_relaxed import E8RelaxedCodebook
+        cb = E8RelaxedCodebook(device="cpu", verbose=False)
+        assert cb.codebook.shape == (65536, 8)
+        assert cb.codebook_size == 65536
+
+    def test_target_size_4k(self):
+        from glq.codebook_relaxed import E8RelaxedCodebook
+        cb = E8RelaxedCodebook(device="cpu", verbose=False, target_size=4096)
+        assert cb.codebook.shape == (4096, 8)
+        assert cb.codebook_size == 4096
+        # opt_scale + resid_scale must be recomputed for the truncated codebook
+        assert cb.opt_scale > 0
+        assert cb.resid_scale > 0
+
+    def test_4k_quantize_reduces_error(self):
+        from glq.codebook_relaxed import E8RelaxedCodebook
+        cb = E8RelaxedCodebook(device="cpu", verbose=False, target_size=4096)
+        x = torch.randn(500, 8) * cb.opt_scale
+        decoded, _ = cb.quantize(x)
+        quant_mse = ((x - decoded) ** 2).mean().item()
+        random_mse = ((x - torch.randn_like(x)) ** 2).mean().item()
+        assert quant_mse < random_mse
+
+
 class TestVerboseOutput:
     def test_build_verbose(self, capsys):
         """build(verbose=True) prints loading message."""
