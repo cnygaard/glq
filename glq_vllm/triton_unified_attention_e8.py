@@ -1190,7 +1190,13 @@ def unified_attention_e8_v1_4(
     n_groups = k_idx1.shape[3]
     assert head_size == n_groups * 8
     assert k_scale.shape == k_idx1.shape
-    assert codebook.shape == (65536, 8)
+    # v0.5 Phase 5.2: accept either the production 65 K codebook OR a
+    # truncated smem-friendly variant (4 K = 64 KB fits Blackwell L1/smem
+    # pool comfortably). The kernel body doesn't reference codebook size
+    # — index masking ``& 0xFFFF`` is safe for any value ≤ 65 535.
+    assert codebook.shape[1] == 8, codebook.shape
+    assert codebook.shape[0] in (4096, 65536), \
+        f"unexpected codebook size {codebook.shape[0]}; supported: 4096, 65536"
     assert H_mat.shape == (8, 8)
     assert H_mat.is_contiguous()
 
@@ -1887,7 +1893,13 @@ def unified_attention_e8_v2_0(
     n_groups = k_idx1.shape[3]
     assert head_size == n_groups * 8
     assert k_scale.shape == k_idx1.shape
-    assert codebook.shape == (65536, 8)
+    # v0.5 Phase 5.2: accept either the production 65 K codebook OR a
+    # truncated smem-friendly variant (4 K = 64 KB fits Blackwell L1/smem
+    # pool comfortably). The kernel body doesn't reference codebook size
+    # — index masking ``& 0xFFFF`` is safe for any value ≤ 65 535.
+    assert codebook.shape[1] == 8, codebook.shape
+    assert codebook.shape[0] in (4096, 65536), \
+        f"unexpected codebook size {codebook.shape[0]}; supported: 4096, 65536"
     assert H_mat.shape == (8, 8)
     assert H_mat.is_contiguous()
 
@@ -2275,7 +2287,13 @@ def unified_attention_e8_v2_1(
     n_groups = k_idx1.shape[3]
     assert head_size == n_groups * 8
     assert k_scale.shape == k_idx1.shape
-    assert codebook.shape == (65536, 8)
+    # v0.5 Phase 5.2: accept either the production 65 K codebook OR a
+    # truncated smem-friendly variant (4 K = 64 KB fits Blackwell L1/smem
+    # pool comfortably). The kernel body doesn't reference codebook size
+    # — index masking ``& 0xFFFF`` is safe for any value ≤ 65 535.
+    assert codebook.shape[1] == 8, codebook.shape
+    assert codebook.shape[0] in (4096, 65536), \
+        f"unexpected codebook size {codebook.shape[0]}; supported: 4096, 65536"
     assert H_mat.shape == (8, 8)
     assert H_mat.is_contiguous()
 
@@ -2341,4 +2359,63 @@ def unified_attention_e8_v2_1(
         num_seqs=num_seqs,
         BLOCK_M=BLOCK_M,
         **launch_kwargs,
+    )
+
+
+def unified_attention_e8_v3_0(
+    q: torch.Tensor,
+    k_idx1: torch.Tensor,
+    k_idx2: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_idx1: torch.Tensor,
+    v_idx2: torch.Tensor,
+    v_scale: torch.Tensor,
+    codebook: torch.Tensor,
+    H_mat: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+    resid_scale: float,
+    block_table: torch.Tensor,
+    sliding_window: int = 0,
+):
+    """v0.5 Phase 5.2 launcher — 4 K-codebook variant for L1/L2 residency.
+
+    Identical to ``unified_attention_e8_v2_1`` but hard-asserts that
+    ``codebook.shape == (4096, 8)`` (64 KB fp16). On RTX PRO 6000
+    Blackwell (SM_120), per-SM L1/Shared pool is 128 KB total — the
+    4 K codebook is 50% of the pool and stays fully cache-resident
+    across the entire tile loop, vs the 1 MB 65 K codebook which
+    misses L2 on cold gathers.
+
+    Wires Phase 5.2 Branch B: 65 K strict codebook for weights
+    (unchanged production path); 4 K **relaxed** codebook for the
+    KV-side inline dequant in attention. The 4 K relaxed codebook is
+    constructed via
+    ``glq.kv_cache._get_codebook("e8_relaxed", target_size=4096)``.
+
+    Phase 5.2a (this commit): kernel body identical to v2.1; perf
+    win comes from L2-cache residency of the smaller working set.
+    Phase 5.2b (planned): explicit chunked-smem load at kernel entry
+    for the next perf step — validated viable via the chunked-gather
+    Triton probe (16 KB chunks compile cleanly, monolithic 64 KB
+    tile makes ptxas-blackwell hang).
+    """
+    assert codebook.shape == (4096, 8), (
+        f"v3.0 launcher requires a 4 K codebook; got {tuple(codebook.shape)}. "
+        "Use unified_attention_e8_v2_1 for 65 K codebooks."
+    )
+    unified_attention_e8_v2_1(
+        q=q,
+        k_idx1=k_idx1, k_idx2=k_idx2, k_scale=k_scale,
+        v_idx1=v_idx1, v_idx2=v_idx2, v_scale=v_scale,
+        codebook=codebook, H_mat=H_mat,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        softmax_scale=softmax_scale,
+        resid_scale=resid_scale,
+        block_table=block_table,
+        sliding_window=sliding_window,
     )

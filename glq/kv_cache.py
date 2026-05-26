@@ -49,8 +49,11 @@ except ImportError:
 # Lazy codebook + E8KVQuantizer imports — these pull in
 # ``glq.codebook_kernel`` which optionally imports triton; we don't want
 # to force that import just for the INT8 path.
-_E8_STRICT_CB = None
-_E8_RELAXED_CB = None
+# Cache keyed by (quant_method, device, target_size). v0.5 Phase 5.2
+# Branch B needs the parametric ``target_size`` for the smem-resident
+# attention kernel (typically 4096); the legacy paths leave it None for
+# the default 65 536-entry codebook.
+_CODEBOOK_CACHE: dict = {}
 
 
 def _check_available():
@@ -61,29 +64,40 @@ def _check_available():
         )
 
 
-def _get_codebook(quant_method: str, device: str | None = None):
-    """Lazily build (and cache) the strict / relaxed codebook.
+def _get_codebook(quant_method: str, device: str | None = None,
+                  target_size: int | None = None):
+    """Lazily build (and cache) a strict / relaxed codebook.
 
     Defaults to ``cuda`` when available so construction (especially
     ``_compute_opt_scale`` / ``_compute_resid_scale``, which do hundreds
     of millions of 8D NN distance computations) runs on the GPU. On
     CPU these take ~3 min for the 65,536-entry codebook; on GPU it's
     sub-second.
+
+    ``target_size``: codebook entry count. ``None`` means default
+    (65 536). v0.5 Phase 5.2 Branch B passes ``target_size=4096`` on
+    the KV side for the smem-resident attention kernel — see
+    ``glq/codebook.py:E8ShellCodebook.__init__`` for the shell-sorted
+    truncation contract.
     """
-    global _E8_STRICT_CB, _E8_RELAXED_CB
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    key = (quant_method, str(device), target_size)
+    cached = _CODEBOOK_CACHE.get(key)
+    if cached is not None:
+        return cached
     if quant_method == "e8_strict":
-        if _E8_STRICT_CB is None or str(_E8_STRICT_CB.device) != str(device):
-            from glq.codebook import E8ShellCodebook
-            _E8_STRICT_CB = E8ShellCodebook(device=device, verbose=False)
-        return _E8_STRICT_CB
-    if quant_method == "e8_relaxed":
-        if _E8_RELAXED_CB is None or str(_E8_RELAXED_CB.device) != str(device):
-            from glq.codebook_relaxed import E8RelaxedCodebook
-            _E8_RELAXED_CB = E8RelaxedCodebook(device=device, verbose=False)
-        return _E8_RELAXED_CB
-    raise ValueError(f"unknown quant_method: {quant_method!r}")
+        from glq.codebook import E8ShellCodebook
+        cb = E8ShellCodebook(device=device, verbose=False,
+                             target_size=target_size)
+    elif quant_method == "e8_relaxed":
+        from glq.codebook_relaxed import E8RelaxedCodebook
+        cb = E8RelaxedCodebook(device=device, verbose=False,
+                               target_size=target_size)
+    else:
+        raise ValueError(f"unknown quant_method: {quant_method!r}")
+    _CODEBOOK_CACHE[key] = cb
+    return cb
 
 
 class INT8QuantizedLayer(QuantizedLayer if _HAS_QUANTIZED_CACHE else object):
