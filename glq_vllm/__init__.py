@@ -114,6 +114,17 @@ def register():
                 print("[glq_vllm] GLQ_KV_E8_FUSED_WRITE=1 → fused Triton "
                       "scatter kernel active on write path (Stage 5.3-4a)",
                       flush=True)
+            # v0.5 Phase 5.3a research probe: opt-in v3.0 inline-dequant
+            # attention with a 4 K KV codebook. Kernel-level microbench
+            # already showed this at 1.00× of v2.1; the env-gated probe
+            # exists to confirm the kernel-level conclusion holds under
+            # vLLM cudagraph + piecewise dispatch. Production default
+            # remains the v0.3.5 workspace path.
+            if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") != "0":
+                print("[glq_vllm] GLQ_KV_E8_INLINE_DEQUANT_V3=1 → v3.0 "
+                      "inline-dequant attention with 4 K codebook "
+                      "(Phase 5.3a research probe, not production)",
+                      flush=True)
 
         # v0.3.5: auto-force ``cudagraph_mode=PIECEWISE`` when E8 KV is
         # active. FULL captures wrap the whole model.forward including

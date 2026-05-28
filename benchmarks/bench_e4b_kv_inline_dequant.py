@@ -48,7 +48,8 @@ def main() -> None:
 
     print(f"=== {args.label} — {args.model} ===", flush=True)
     for k in ("GLQ_KV_QUANT", "GLQ_KV_E8_SIDECAR", "GLQ_KV_E8_SIDECAR_READ",
-              "GLQ_KV_E8_COMPRESSED_ALLOC", "GLQ_KV_E8_INLINE_DEQUANT"):
+              "GLQ_KV_E8_COMPRESSED_ALLOC", "GLQ_KV_E8_INLINE_DEQUANT",
+              "GLQ_KV_E8_INLINE_DEQUANT_V3"):
         print(f"  {k}={os.environ.get(k, '<unset>')}", flush=True)
 
     from vllm import LLM, SamplingParams
@@ -103,6 +104,7 @@ def main() -> None:
         env={k: os.environ.get(k) for k in (
             "GLQ_KV_QUANT", "GLQ_KV_E8_SIDECAR", "GLQ_KV_E8_SIDECAR_READ",
             "GLQ_KV_E8_COMPRESSED_ALLOC", "GLQ_KV_E8_INLINE_DEQUANT",
+            "GLQ_KV_E8_INLINE_DEQUANT_V3",
         )},
         runs=runs,
     )

@@ -50,6 +50,66 @@ def cdiv_fn(x, y):
 
 
 @triton.jit
+def _hadamard_8_inline(x):
+    """Normalized 8-point Walsh–Hadamard (Sylvester order) on the last
+    axis of ``x`` (shape ``[..., 8]``), computed with a 3-stage radix-2
+    butterfly entirely in registers.
+
+    This replaces the ``tl.sum(dec[..., None] * H_mat[None, ...], axis=2)``
+    formulation in the v2.1/v3.0 kernels, which materialised a
+    ``[TILE, N_GROUPS, 8, 8]`` fp32 intermediate (131 KB for head=256,
+    262 KB for head=512 per K/V side) and spilled it to local memory —
+    the dominant ``long_scoreboard`` stall in the v3.0 ncu profile.
+
+    The butterfly produces results that are **bit-compatible** with
+    ``x @ H_mat`` where ``H_mat = _get_hadamard(fp32) = H3 / sqrt(8)`` and
+    ``H3 = kron(kron(H1, H1), H1)`` (Sylvester / natural order). Because
+    the XOR butterfly over a power-of-two length already yields Sylvester
+    order, no output permutation is required; we normalise by
+    ``1/sqrt(8)`` once after the 3 stages. Verified to max-abs < 1e-4 in
+    ``benchmarks/_fht_probe.py`` on both ``[BLK, 8]`` and the native
+    ``[TILE, N_GROUPS, 8]`` layouts.
+
+    The size-8 axis is peeled into 8 scalar lanes via repeated last-axis
+    ``tl.split`` and restacked via ``tl.join`` — no transposes, no 8×8
+    matrix.
+    """
+    INV = 0.3535533905932738  # 1 / sqrt(8)
+    # Peel last axis 8 -> 8 scalar lanes (natural order x_i = x[..., i]).
+    a, b = tl.split(tl.reshape(x, x.shape[:-1] + [4, 2]))     # [.., 4] each
+    a0, a1 = tl.split(tl.reshape(a, a.shape[:-1] + [2, 2]))   # [.., 2]
+    b0, b1 = tl.split(tl.reshape(b, b.shape[:-1] + [2, 2]))
+    x0, x1 = tl.split(a0)   # scalars [..]
+    x2, x3 = tl.split(a1)
+    x4, x5 = tl.split(b0)
+    x6, x7 = tl.split(b1)
+
+    # Stage b0 (partner i^1): pairs (0,1)(2,3)(4,5)(6,7)
+    y0 = x0 + x1; y1 = x0 - x1
+    y2 = x2 + x3; y3 = x2 - x3
+    y4 = x4 + x5; y5 = x4 - x5
+    y6 = x6 + x7; y7 = x6 - x7
+    # Stage b1 (partner i^2): pairs (0,2)(1,3)(4,6)(5,7)
+    z0 = y0 + y2; z2 = y0 - y2
+    z1 = y1 + y3; z3 = y1 - y3
+    z4 = y4 + y6; z6 = y4 - y6
+    z5 = y5 + y7; z7 = y5 - y7
+    # Stage b2 (partner i^4): pairs (0,4)(1,5)(2,6)(3,7)
+    w0 = z0 + z4; w4 = z0 - z4
+    w1 = z1 + z5; w5 = z1 - z5
+    w2 = z2 + z6; w6 = z2 - z6
+    w3 = z3 + z7; w7 = z3 - z7
+
+    # Restack natural order (inverse of the split tree) via tl.join.
+    o_a0 = tl.join(w0, w1); o_a1 = tl.join(w2, w3)
+    o_b0 = tl.join(w4, w5); o_b1 = tl.join(w6, w7)
+    o_a = tl.reshape(tl.join(o_a0, o_a1), w0.shape + [4])
+    o_b = tl.reshape(tl.join(o_b0, o_b1), w0.shape + [4])
+    out = tl.reshape(tl.join(o_a, o_b), w0.shape + [8])
+    return out * INV
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -2418,4 +2478,833 @@ def unified_attention_e8_v3_0(
         resid_scale=resid_scale,
         block_table=block_table,
         sliding_window=sliding_window,
+    )
+
+
+# =============================================================================
+# v0.5 Phase 5.2b — explicit chunked-smem codebook hoist
+# =============================================================================
+
+
+@triton.jit
+def _chunked_gather_4k(
+    idx_flat,             # (NUM_ELEMS,) int32, values in [0, 4096)
+    cb_0, cb_1, cb_2, cb_3,  # each (CHUNK=1024, 8) fp16 smem-resident
+    CHUNK: tl.constexpr,  # 1024
+):
+    """Gather 8-element vectors from 4×1024 chunks of the 4 K codebook.
+
+    Returns: (NUM_ELEMS, 8) fp32 dequant tile.
+
+    Each chunk is 1024 × 8 × 2 B = 16 KB and was pre-loaded into
+    Triton tensor variables in the calling kernel; Triton allocates
+    those in shared memory because 16 KB exceeds register-tile budget.
+
+    Per-element flow:
+      idx       in [0,    1024) → from cb_0, local_idx = idx
+      idx       in [1024, 2048) → from cb_1, local_idx = idx - 1024
+      idx       in [2048, 3072) → from cb_2, local_idx = idx - 2048
+      idx       in [3072, 4096) → from cb_3, local_idx = idx - 3072
+    """
+    # Chunk 0
+    in_0 = idx_flat < CHUNK
+    local_0 = tl.where(in_0, idx_flat, 0)
+    local_0_2d = local_0[:, None] + tl.zeros((1, 8), dtype=tl.int32)
+    g0 = tl.gather(cb_0, local_0_2d, axis=0).to(tl.float32)
+    dec = tl.where(in_0[:, None], g0, tl.zeros_like(g0))
+
+    # Chunk 1
+    in_1 = (idx_flat >= CHUNK) & (idx_flat < 2 * CHUNK)
+    local_1 = tl.where(in_1, idx_flat - CHUNK, 0)
+    local_1_2d = local_1[:, None] + tl.zeros((1, 8), dtype=tl.int32)
+    g1 = tl.gather(cb_1, local_1_2d, axis=0).to(tl.float32)
+    dec = tl.where(in_1[:, None], g1, dec)
+
+    # Chunk 2
+    in_2 = (idx_flat >= 2 * CHUNK) & (idx_flat < 3 * CHUNK)
+    local_2 = tl.where(in_2, idx_flat - 2 * CHUNK, 0)
+    local_2_2d = local_2[:, None] + tl.zeros((1, 8), dtype=tl.int32)
+    g2 = tl.gather(cb_2, local_2_2d, axis=0).to(tl.float32)
+    dec = tl.where(in_2[:, None], g2, dec)
+
+    # Chunk 3
+    in_3 = idx_flat >= 3 * CHUNK
+    local_3 = tl.where(in_3, idx_flat - 3 * CHUNK, 0)
+    local_3_2d = local_3[:, None] + tl.zeros((1, 8), dtype=tl.int32)
+    g3 = tl.gather(cb_3, local_3_2d, axis=0).to(tl.float32)
+    dec = tl.where(in_3[:, None], g3, dec)
+
+    return dec
+
+
+@triton.jit
+def kernel_unified_attention_2d_e8_v3_b(
+    output_ptr,
+    query_ptr,
+    K_idx1_ptr,
+    K_idx2_ptr,
+    K_scale_ptr,
+    V_idx1_ptr,
+    V_idx2_ptr,
+    V_scale_ptr,
+    codebook_ptr,
+    H_mat_ptr,
+    block_tables_ptr,
+    seq_lens_ptr,
+    scale,
+    rs,
+    num_query_heads: tl.constexpr,
+    num_queries_per_kv: tl.constexpr,
+    block_table_stride: tl.int64,
+    query_stride_0: tl.int64,
+    query_stride_1: tl.int64,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    CHUNK: tl.constexpr,    # 1024 — codebook chunk size for smem hoist
+    stride_k_idx_0: tl.int64,
+    stride_k_idx_1: tl.int64,
+    stride_k_idx_2: tl.int64,
+    stride_k_idx_3: tl.constexpr,
+    stride_v_idx_0: tl.int64,
+    stride_v_idx_1: tl.int64,
+    stride_v_idx_2: tl.int64,
+    stride_v_idx_3: tl.constexpr,
+    stride_k_scale_0: tl.int64,
+    stride_k_scale_1: tl.int64,
+    stride_k_scale_2: tl.int64,
+    stride_k_scale_3: tl.constexpr,
+    stride_v_scale_0: tl.int64,
+    stride_v_scale_1: tl.int64,
+    stride_v_scale_2: tl.int64,
+    stride_v_scale_3: tl.constexpr,
+    query_start_len_ptr,
+    BLOCK_Q: tl.constexpr,
+    num_seqs: tl.int32,
+    BLOCK_M: tl.constexpr,
+):
+    """v0.5 Phase 5.2b: kernel with explicit 4-chunk smem hoist of the
+    4 K codebook. Identical structure to v2.1 except the codebook is
+    pre-loaded into 4×1024-entry smem-resident tensors at kernel
+    entry, and per-tile gathers go through ``_chunked_gather_4k``
+    instead of global ``tl.load(codebook_ptr + ...)``.
+    """
+    q_block_global_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+    )
+
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_t = tl.arange(0, TILE_SIZE)
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+
+    dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
+    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+    )
+
+    block_table_offset = seq_idx * block_table_stride
+
+    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    context_len = seq_len - cur_batch_query_len
+    max_seq_prefix_len = (
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1
+    )
+    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+
+    # ─── Sliding-window tile-pruning ──────────────────────────────────
+    tile_start = 0
+    tile_end = num_tiles
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+
+    g_arange = tl.arange(0, N_GROUPS)
+    h_rows = tl.arange(0, 8)[:, None]
+    h_cols = tl.arange(0, 8)[None, :]
+    H_mat = tl.load(H_mat_ptr + h_rows * 8 + h_cols).to(tl.float32)
+
+    # ─── Phase 5.2b: pre-load 4×1024-entry codebook chunks into smem ──
+    # Total 4 × 16 KB = 64 KB smem-resident across the entire tile loop.
+    cb_offs_chunk = tl.arange(0, CHUNK * 8)
+    cb_chunk_0 = tl.reshape(
+        tl.load(codebook_ptr + cb_offs_chunk), (CHUNK, 8)
+    )
+    cb_chunk_1 = tl.reshape(
+        tl.load(codebook_ptr + CHUNK * 8 + cb_offs_chunk), (CHUNK, 8)
+    )
+    cb_chunk_2 = tl.reshape(
+        tl.load(codebook_ptr + 2 * CHUNK * 8 + cb_offs_chunk), (CHUNK, 8)
+    )
+    cb_chunk_3 = tl.reshape(
+        tl.load(codebook_ptr + 3 * CHUNK * 8 + cb_offs_chunk), (CHUNK, 8)
+    )
+
+    for j in range(tile_start, tile_end):
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+        slot = seq_offset % BLOCK_SIZE
+
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+        ).to(tl.int64)
+
+        # ───── K: chunked-smem gather ───────────────────────────────
+        k_idx_off = (
+            physical_block_idx[:, None] * stride_k_idx_0
+            + slot[:, None] * stride_k_idx_1
+            + kv_head_idx * stride_k_idx_2
+            + g_arange[None, :] * stride_k_idx_3
+        )
+        k_idx1 = tl.load(
+            K_idx1_ptr + k_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        k_idx2 = tl.load(
+            K_idx2_ptr + k_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+
+        k_idx1_flat = tl.reshape(k_idx1, (TILE_SIZE * N_GROUPS,))
+        k_idx2_flat = tl.reshape(k_idx2, (TILE_SIZE * N_GROUPS,))
+        k_dec1_flat = _chunked_gather_4k(
+            k_idx1_flat, cb_chunk_0, cb_chunk_1, cb_chunk_2, cb_chunk_3, CHUNK
+        )
+        k_dec2_flat = _chunked_gather_4k(
+            k_idx2_flat, cb_chunk_0, cb_chunk_1, cb_chunk_2, cb_chunk_3, CHUNK
+        )
+        k_dec = tl.reshape(k_dec1_flat, (TILE_SIZE, N_GROUPS, 8))
+        k_dec = k_dec + tl.reshape(k_dec2_flat, (TILE_SIZE, N_GROUPS, 8)) / rs
+
+        k_scale_off = (
+            physical_block_idx[:, None] * stride_k_scale_0
+            + slot[:, None] * stride_k_scale_1
+            + kv_head_idx * stride_k_scale_2
+            + g_arange[None, :] * stride_k_scale_3
+        )
+        k_scale = tl.load(
+            K_scale_ptr + k_scale_off, mask=tile_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        k_dec = k_dec * k_scale[:, :, None]
+
+        k_dec = tl.sum(
+            k_dec[:, :, :, None] * H_mat[None, None, :, :], axis=2
+        )
+
+        K = tl.trans(tl.reshape(k_dec, (TILE_SIZE, HEAD_SIZE)))
+        K = tl.where(tile_mask[None, :], K, 0.0).to(Q.dtype)
+
+        # ───── V: chunked-smem gather ───────────────────────────────
+        v_idx_off = (
+            physical_block_idx[:, None] * stride_v_idx_0
+            + slot[:, None] * stride_v_idx_1
+            + kv_head_idx * stride_v_idx_2
+            + g_arange[None, :] * stride_v_idx_3
+        )
+        v_idx1 = tl.load(
+            V_idx1_ptr + v_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        v_idx2 = tl.load(
+            V_idx2_ptr + v_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+
+        v_idx1_flat = tl.reshape(v_idx1, (TILE_SIZE * N_GROUPS,))
+        v_idx2_flat = tl.reshape(v_idx2, (TILE_SIZE * N_GROUPS,))
+        v_dec1_flat = _chunked_gather_4k(
+            v_idx1_flat, cb_chunk_0, cb_chunk_1, cb_chunk_2, cb_chunk_3, CHUNK
+        )
+        v_dec2_flat = _chunked_gather_4k(
+            v_idx2_flat, cb_chunk_0, cb_chunk_1, cb_chunk_2, cb_chunk_3, CHUNK
+        )
+        v_dec = tl.reshape(v_dec1_flat, (TILE_SIZE, N_GROUPS, 8))
+        v_dec = v_dec + tl.reshape(v_dec2_flat, (TILE_SIZE, N_GROUPS, 8)) / rs
+
+        v_scale_off = (
+            physical_block_idx[:, None] * stride_v_scale_0
+            + slot[:, None] * stride_v_scale_1
+            + kv_head_idx * stride_v_scale_2
+            + g_arange[None, :] * stride_v_scale_3
+        )
+        v_scale = tl.load(
+            V_scale_ptr + v_scale_off, mask=tile_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        v_dec = v_dec * v_scale[:, :, None]
+
+        v_dec = tl.sum(
+            v_dec[:, :, :, None] * H_mat[None, None, :, :], axis=2
+        )
+
+        V = tl.reshape(v_dec, (TILE_SIZE, HEAD_SIZE))
+        V = tl.where(tile_mask[:, None], V, 0.0).to(Q.dtype)
+
+        # ───── Online softmax + accumulate (identical to v2.1) ───────
+        query_abs_pos = context_len + query_pos[:, None]
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
+
+        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+        S += scale * tl.dot(Q, K)
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+
+        if SLIDING_WINDOW > 0:
+            qpos_lo_v = q_block_local_idx * BLOCK_Q
+            V = tl.where(
+                (context_len + qpos_lo_v - seq_offset[:, None]) < SLIDING_WINDOW,
+                V, 0.0,
+            )
+
+        acc += tl.dot(P.to(V.dtype), V)
+
+    acc = acc / L[:, None]
+
+    output_offset = (
+        query_offset_0[:, None] * output_stride_0
+        + query_offset_1[:, None] * output_stride_1
+        + offs_d[None, :]
+    )
+
+    tl.store(
+        output_ptr + output_offset,
+        acc,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
+
+
+def unified_attention_e8_v3_b(
+    q: torch.Tensor,
+    k_idx1: torch.Tensor,
+    k_idx2: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_idx1: torch.Tensor,
+    v_idx2: torch.Tensor,
+    v_scale: torch.Tensor,
+    codebook: torch.Tensor,
+    H_mat: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+    resid_scale: float,
+    block_table: torch.Tensor,
+    sliding_window: int = 0,
+):
+    """Phase 5.2b launcher — explicit chunked-smem codebook hoist.
+
+    Same K/V dequant math as v3.0 / v2.1 but with the 4 K codebook
+    pre-loaded into 4×1024-entry tensor variables at kernel entry.
+    Triton lays these out in shared memory (16 KB per chunk × 4 = 64 KB
+    smem residency); per-tile gather goes through ``tl.gather`` against
+    each chunk and merges with ``tl.where``.
+
+    Goal: prove the smem-residency path delivers a measurable per-call
+    speedup vs the v3.0 L2-cache-only path. If Phase 5.3 nsys/microbench
+    shows no improvement, the bottleneck is not the codebook gather but
+    the Hadamard-rotation intermediate (`tl.sum(dec×H, axis=2)`), and
+    Phase 5 should pivot to FHT-butterfly Hadamard.
+    """
+    assert codebook.shape == (4096, 8), (
+        f"v3_b launcher requires a 4 K codebook; got {tuple(codebook.shape)}."
+    )
+    block_size = k_idx1.shape[1]
+    num_seqs = len(seqused_k)
+    num_query_heads = q.shape[1]
+    num_kv_heads = k_idx1.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_size = q.shape[2]
+    n_groups = k_idx1.shape[3]
+    assert head_size == n_groups * 8
+    assert k_scale.shape == k_idx1.shape
+    assert H_mat.shape == (8, 8)
+    assert H_mat.is_contiguous()
+
+    BLOCK_M = (
+        16
+        if num_queries_per_kv <= 16
+        else triton.next_power_of_2(num_queries_per_kv)
+    )
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+
+    TILE_SIZE = 16
+    CHUNK = 1024  # 4 chunks × 1024 entries = 4096 entries total
+
+    if head_size > 256:
+        launch_kwargs = dict(num_stages=1, num_warps=8)
+    else:
+        launch_kwargs = {}
+
+    kernel_unified_attention_2d_e8_v3_b[
+        (total_num_q_blocks, num_kv_heads)
+    ](
+        output_ptr=out,
+        query_ptr=q,
+        K_idx1_ptr=k_idx1, K_idx2_ptr=k_idx2, K_scale_ptr=k_scale,
+        V_idx1_ptr=v_idx1, V_idx2_ptr=v_idx2, V_scale_ptr=v_scale,
+        codebook_ptr=codebook,
+        H_mat_ptr=H_mat,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seqused_k,
+        scale=softmax_scale,
+        rs=resid_scale,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+        N_GROUPS=n_groups,
+        SLIDING_WINDOW=sliding_window,
+        CHUNK=CHUNK,
+        stride_k_idx_0=k_idx1.stride(0),
+        stride_k_idx_1=k_idx1.stride(1),
+        stride_k_idx_2=k_idx1.stride(2),
+        stride_k_idx_3=k_idx1.stride(3),
+        stride_v_idx_0=v_idx1.stride(0),
+        stride_v_idx_1=v_idx1.stride(1),
+        stride_v_idx_2=v_idx1.stride(2),
+        stride_v_idx_3=v_idx1.stride(3),
+        stride_k_scale_0=k_scale.stride(0),
+        stride_k_scale_1=k_scale.stride(1),
+        stride_k_scale_2=k_scale.stride(2),
+        stride_k_scale_3=k_scale.stride(3),
+        stride_v_scale_0=v_scale.stride(0),
+        stride_v_scale_1=v_scale.stride(1),
+        stride_v_scale_2=v_scale.stride(2),
+        stride_v_scale_3=v_scale.stride(3),
+        query_start_len_ptr=cu_seqlens_q,
+        BLOCK_Q=BLOCK_Q,
+        num_seqs=num_seqs,
+        BLOCK_M=BLOCK_M,
+        **launch_kwargs,
+    )
+
+
+# =============================================================================
+# v0.5 Phase 5.3b — FHT-butterfly Hadamard (kills the [TILE,N_GROUPS,8,8] spill)
+# =============================================================================
+#
+# Byte-identical to ``kernel_unified_attention_2d_e8_v2_1`` EXCEPT:
+#   * the two ``tl.sum(dec[:, :, :, None] * H_mat[None, None, :, :], axis=2)``
+#     sites (K and V) are replaced by ``_hadamard_8_inline(dec)`` — a 3-stage
+#     radix-2 butterfly in registers, no ``[TILE, N_GROUPS, 8, 8]`` fp32
+#     intermediate. ncu on v3.0 showed that intermediate spilling to local
+#     memory (773 K spill insts at head=256, 5.8 M at head=512) is the
+#     dominant ``long_scoreboard`` stall (70–80 % of issue gaps).
+#   * the ``H_mat_ptr`` kernel arg and its per-launch load are removed.
+@triton.jit
+def kernel_unified_attention_2d_e8_v3_fht(
+    output_ptr,
+    query_ptr,
+    K_idx1_ptr,
+    K_idx2_ptr,
+    K_scale_ptr,
+    V_idx1_ptr,
+    V_idx2_ptr,
+    V_scale_ptr,
+    codebook_ptr,
+    block_tables_ptr,
+    seq_lens_ptr,
+    scale,
+    rs,
+    num_query_heads: tl.constexpr,
+    num_queries_per_kv: tl.constexpr,
+    block_table_stride: tl.int64,
+    query_stride_0: tl.int64,
+    query_stride_1: tl.int64,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    stride_k_idx_0: tl.int64,
+    stride_k_idx_1: tl.int64,
+    stride_k_idx_2: tl.int64,
+    stride_k_idx_3: tl.constexpr,
+    stride_v_idx_0: tl.int64,
+    stride_v_idx_1: tl.int64,
+    stride_v_idx_2: tl.int64,
+    stride_v_idx_3: tl.constexpr,
+    stride_k_scale_0: tl.int64,
+    stride_k_scale_1: tl.int64,
+    stride_k_scale_2: tl.int64,
+    stride_k_scale_3: tl.constexpr,
+    stride_v_scale_0: tl.int64,
+    stride_v_scale_1: tl.int64,
+    stride_v_scale_2: tl.int64,
+    stride_v_scale_3: tl.constexpr,
+    query_start_len_ptr,
+    BLOCK_Q: tl.constexpr,
+    num_seqs: tl.int32,
+    BLOCK_M: tl.constexpr,
+):
+    q_block_global_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+    )
+
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_t = tl.arange(0, TILE_SIZE)
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+
+    dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
+    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+    )
+
+    block_table_offset = seq_idx * block_table_stride
+
+    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    context_len = seq_len - cur_batch_query_len
+    max_seq_prefix_len = (
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1
+    )
+    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+
+    # ─── Sliding-window tile-pruning (upstream lines 209-230) ────────
+    tile_start = 0
+    tile_end = num_tiles
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+
+    g_arange = tl.arange(0, N_GROUPS)
+    cb_inner = tl.arange(0, 8)
+
+    for j in range(tile_start, tile_end):
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+        slot = seq_offset % BLOCK_SIZE
+
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+        ).to(tl.int64)
+
+        # ───── K: full dequant ─────────────────────────────────────
+        k_idx_off = (
+            physical_block_idx[:, None] * stride_k_idx_0
+            + slot[:, None] * stride_k_idx_1
+            + kv_head_idx * stride_k_idx_2
+            + g_arange[None, :] * stride_k_idx_3
+        )
+        k_idx1 = tl.load(
+            K_idx1_ptr + k_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        k_idx2 = tl.load(
+            K_idx2_ptr + k_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        k_cb_off1 = k_idx1[:, :, None] * 8 + cb_inner[None, None, :]
+        k_cb_off2 = k_idx2[:, :, None] * 8 + cb_inner[None, None, :]
+        k_dec = tl.load(codebook_ptr + k_cb_off1).to(tl.float32)
+        k_dec = k_dec + tl.load(codebook_ptr + k_cb_off2).to(tl.float32) / rs
+
+        k_scale_off = (
+            physical_block_idx[:, None] * stride_k_scale_0
+            + slot[:, None] * stride_k_scale_1
+            + kv_head_idx * stride_k_scale_2
+            + g_arange[None, :] * stride_k_scale_3
+        )
+        k_scale = tl.load(
+            K_scale_ptr + k_scale_off, mask=tile_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        k_dec = k_dec * k_scale[:, :, None]
+
+        # FHT butterfly replaces tl.sum(k_dec[...] * H_mat[...], axis=2).
+        k_dec = _hadamard_8_inline(k_dec)
+
+        K = tl.trans(tl.reshape(k_dec, (TILE_SIZE, HEAD_SIZE)))
+        K = tl.where(tile_mask[None, :], K, 0.0).to(Q.dtype)
+
+        # ───── V: full dequant ─────────────────────────────────────
+        v_idx_off = (
+            physical_block_idx[:, None] * stride_v_idx_0
+            + slot[:, None] * stride_v_idx_1
+            + kv_head_idx * stride_v_idx_2
+            + g_arange[None, :] * stride_v_idx_3
+        )
+        v_idx1 = tl.load(
+            V_idx1_ptr + v_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        v_idx2 = tl.load(
+            V_idx2_ptr + v_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        v_cb_off1 = v_idx1[:, :, None] * 8 + cb_inner[None, None, :]
+        v_cb_off2 = v_idx2[:, :, None] * 8 + cb_inner[None, None, :]
+        v_dec = tl.load(codebook_ptr + v_cb_off1).to(tl.float32)
+        v_dec = v_dec + tl.load(codebook_ptr + v_cb_off2).to(tl.float32) / rs
+
+        v_scale_off = (
+            physical_block_idx[:, None] * stride_v_scale_0
+            + slot[:, None] * stride_v_scale_1
+            + kv_head_idx * stride_v_scale_2
+            + g_arange[None, :] * stride_v_scale_3
+        )
+        v_scale = tl.load(
+            V_scale_ptr + v_scale_off, mask=tile_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        v_dec = v_dec * v_scale[:, :, None]
+
+        # FHT butterfly replaces tl.sum(v_dec[...] * H_mat[...], axis=2).
+        v_dec = _hadamard_8_inline(v_dec)
+
+        V = tl.reshape(v_dec, (TILE_SIZE, HEAD_SIZE))
+        V = tl.where(tile_mask[:, None], V, 0.0).to(Q.dtype)
+
+        # ───── Causal + sliding-window mask + Q @ K → S ───────────
+        query_abs_pos = context_len + query_pos[:, None]
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
+
+        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+        S += scale * tl.dot(Q, K)
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+
+        # ───── V mask under sliding-window (upstream lines 378-382) ──
+        if SLIDING_WINDOW > 0:
+            qpos_lo_v = q_block_local_idx * BLOCK_Q
+            V = tl.where(
+                (context_len + qpos_lo_v - seq_offset[:, None]) < SLIDING_WINDOW,
+                V, 0.0,
+            )
+
+        acc += tl.dot(P.to(V.dtype), V)
+
+    acc = acc / L[:, None]
+
+    output_offset = (
+        query_offset_0[:, None] * output_stride_0
+        + query_offset_1[:, None] * output_stride_1
+        + offs_d[None, :]
+    )
+
+    tl.store(
+        output_ptr + output_offset,
+        acc,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
+
+
+def unified_attention_e8_v3_fht(
+    q: torch.Tensor,
+    k_idx1: torch.Tensor,
+    k_idx2: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_idx1: torch.Tensor,
+    v_idx2: torch.Tensor,
+    v_scale: torch.Tensor,
+    codebook: torch.Tensor,
+    H_mat: torch.Tensor = None,  # kept for call-site compatibility; ignored.
+    out: torch.Tensor = None,
+    cu_seqlens_q: torch.Tensor = None,
+    seqused_k: torch.Tensor = None,
+    softmax_scale: float = None,
+    resid_scale: float = None,
+    block_table: torch.Tensor = None,
+    sliding_window: int = 0,
+):
+    """v0.5 Phase 5.3b launcher — FHT-butterfly Hadamard variant of v3.0.
+
+    Same 4 K-codebook contract and K/V dequant math as
+    ``unified_attention_e8_v3_0`` but the per-group inverse Hadamard is
+    applied with ``_hadamard_8_inline`` (3-stage register butterfly)
+    instead of the ``tl.sum(dec × H_mat, axis=2)`` matrix form. This
+    removes the ``[TILE, N_GROUPS, 8, 8]`` fp32 intermediate that spilled
+    to local memory and dominated the v3.0 ncu ``long_scoreboard`` stall.
+
+    ``H_mat`` is accepted in the signature (the bench / test harnesses
+    pass it as a kwarg) but is **ignored** — the butterfly hard-codes the
+    normalized Sylvester Hadamard, verified bit-compatible with
+    ``_get_hadamard`` in ``benchmarks/_fht_probe.py``.
+    """
+    assert codebook.shape == (4096, 8), (
+        f"v3_fht launcher requires a 4 K codebook; got {tuple(codebook.shape)}. "
+        "Use unified_attention_e8_v2_1 for 65 K codebooks."
+    )
+    block_size = k_idx1.shape[1]
+    num_seqs = len(seqused_k)
+    num_query_heads = q.shape[1]
+    num_kv_heads = k_idx1.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_size = q.shape[2]
+    n_groups = k_idx1.shape[3]
+    assert head_size == n_groups * 8
+    assert k_scale.shape == k_idx1.shape
+
+    BLOCK_M = (
+        16
+        if num_queries_per_kv <= 16
+        else triton.next_power_of_2(num_queries_per_kv)
+    )
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+
+    TILE_SIZE = 16
+
+    if head_size > 256:
+        launch_kwargs = dict(num_stages=1, num_warps=8)
+    else:
+        launch_kwargs = {}
+
+    kernel_unified_attention_2d_e8_v3_fht[
+        (total_num_q_blocks, num_kv_heads)
+    ](
+        output_ptr=out,
+        query_ptr=q,
+        K_idx1_ptr=k_idx1, K_idx2_ptr=k_idx2, K_scale_ptr=k_scale,
+        V_idx1_ptr=v_idx1, V_idx2_ptr=v_idx2, V_scale_ptr=v_scale,
+        codebook_ptr=codebook,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seqused_k,
+        scale=softmax_scale,
+        rs=resid_scale,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+        N_GROUPS=n_groups,
+        SLIDING_WINDOW=sliding_window,
+        stride_k_idx_0=k_idx1.stride(0),
+        stride_k_idx_1=k_idx1.stride(1),
+        stride_k_idx_2=k_idx1.stride(2),
+        stride_k_idx_3=k_idx1.stride(3),
+        stride_v_idx_0=v_idx1.stride(0),
+        stride_v_idx_1=v_idx1.stride(1),
+        stride_v_idx_2=v_idx1.stride(2),
+        stride_v_idx_3=v_idx1.stride(3),
+        stride_k_scale_0=k_scale.stride(0),
+        stride_k_scale_1=k_scale.stride(1),
+        stride_k_scale_2=k_scale.stride(2),
+        stride_k_scale_3=k_scale.stride(3),
+        stride_v_scale_0=v_scale.stride(0),
+        stride_v_scale_1=v_scale.stride(1),
+        stride_v_scale_2=v_scale.stride(2),
+        stride_v_scale_3=v_scale.stride(3),
+        query_start_len_ptr=cu_seqlens_q,
+        BLOCK_Q=BLOCK_Q,
+        num_seqs=num_seqs,
+        BLOCK_M=BLOCK_M,
+        **launch_kwargs,
     )

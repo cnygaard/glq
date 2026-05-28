@@ -90,10 +90,19 @@ _E8_BPW_RECIPES = {
 
 def _get_quantizer(quant_method: str, n_stages: int,
                    secondary_stages: int = 0):
-    """Lazily build an E8KVQuantizer with the given primary/secondary stages."""
+    """Lazily build an E8KVQuantizer with the given primary/secondary stages.
+
+    When ``GLQ_KV_E8_INLINE_DEQUANT_V3=1`` is set, the primary codebook
+    is built at ``target_size=4096`` (Phase 5.3a probe) so both the
+    write quantizer and the v3.0 attention kernel reference the same
+    4 K-entry tensor.
+    """
     from glq.kv_cache import _get_codebook
     from glq.kv_e8 import E8KVQuantizer
-    cb = _get_codebook(quant_method)  # cuda-default after 666ffcd
+    target_size = None
+    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1":
+        target_size = 4096
+    cb = _get_codebook(quant_method, target_size=target_size)
     small = cb.make_small() if secondary_stages > 0 else None
     return E8KVQuantizer(cb, n_stages=n_stages,
                         secondary_codebook=small,
@@ -635,6 +644,74 @@ def disable_sidecar() -> None:
             pass
 
 
+def _try_inline_dequant_attention_v3(q, k, kwargs):
+    """v0.5 Phase 5.3a — env-gated v3.0 inline-dequant fast path.
+
+    Bypasses the v0.3.5 pre-decompress workspace and calls the v3.0
+    Triton attention kernel directly on the compressed E8 K/V tensors
+    backed by a 4 K-entry codebook (set up at quantizer-construction
+    time via ``GLQ_KV_E8_INLINE_DEQUANT_V3``).
+
+    This is an **opt-in research probe**, not a production path. Phase
+    5.3 kernel-level microbench measured v3.0 at 1.00× of v2.1 (no
+    codebook-size effect) and 354–593× behind the v0.3.5 workspace
+    path. The end-to-end probe exists to confirm that vLLM-context
+    overhead (cudagraph capture, piecewise dispatch, autotuner cache)
+    does not flip the kernel-level conclusion.
+
+    4 bpw (n_primary=2, n_secondary=0) only; other recipes fall through.
+    Returns the output tensor on success, ``None`` on any failure.
+    """
+    real_head_size = q.shape[-1]
+    bin_key = (k.data_ptr(), real_head_size)
+    cache = _e8_sidecar.get(bin_key)
+    if cache is None:
+        return None
+    if cache.n_primary != 2 or cache.n_secondary != 0:
+        return None
+    quant, _ = _quantizer_for_bpw(cache.bpw)
+    if quant is None:
+        return None
+
+    from glq_vllm.e8_paged_cache import _get_hadamard
+    from glq_vllm.triton_unified_attention_e8 import (
+        unified_attention_e8_v3_fht,
+    )
+
+    out = kwargs["out"]
+    cu_seqlens_q = kwargs["cu_seqlens_q"]
+    seqused_k = kwargs["seqused_k"]
+    softmax_scale = kwargs["softmax_scale"]
+    block_table = kwargs["block_table"]
+    window_size = kwargs.get("window_size", (-1, -1))
+    sliding_window = (1 + window_size[0]) if window_size[0] >= 0 else 0
+
+    codebook = quant.codebook.codebook_half
+    if codebook.shape[0] != 4096:
+        # Quantizer wasn't built for V3 (env not set at init time).
+        return None
+    if codebook.device != q.device:
+        codebook = codebook.to(q.device)
+    # v3_fht keeps the H_mat kwarg for drop-in compat but applies the
+    # inverse Hadamard via the in-register butterfly (26-31x over v3.0).
+    H_mat = _get_hadamard(torch.float32, q.device)
+
+    unified_attention_e8_v3_fht(
+        q=q,
+        k_idx1=cache.k_idx1, k_idx2=cache.k_idx2, k_scale=cache.k_scale,
+        v_idx1=cache.v_idx1, v_idx2=cache.v_idx2, v_scale=cache.v_scale,
+        codebook=codebook, H_mat=H_mat,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        softmax_scale=softmax_scale,
+        resid_scale=float(quant.codebook.resid_scale),
+        block_table=block_table,
+        sliding_window=sliding_window,
+    )
+    return out
+
+
 def _patched_unified_attention(*, q, k, v, **kwargs):
     """Stage 2c-1 attention-read hook.
 
@@ -654,10 +731,29 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
     in ``triton_unified_attention_e8.py``) remains as a research
     artifact for the smem-resident codebook approach planned in
     Phase 5.
+
+    v0.5 Phase 5.3a re-introduces an opt-in v3.0 fast path under
+    ``GLQ_KV_E8_INLINE_DEQUANT_V3=1`` (with the 4 K codebook set up
+    at quantizer-init time). Pure research probe — production default
+    remains the v0.3.5 workspace path.
     """
     global _sidecar_read_counter
     if not _sidecar_read_enabled:
         return _original_unified(q=q, k=k, v=v, **kwargs)
+
+    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1":
+        try:
+            inline_out = _try_inline_dequant_attention_v3(q, k, kwargs)
+            if inline_out is not None:
+                _sidecar_read_counter += 1
+                return None
+        except Exception as e:
+            try:
+                print(f"[glq_vllm.kv_compression] v3 inline fallback "
+                      f"(ptr={k.data_ptr():#x} head_size={q.shape[-1]}): "
+                      f"{type(e).__name__}: {e}", flush=True)
+            except Exception:
+                pass
     # Real head_size comes from q (the model produces q at full
     # head_size regardless of how vLLM stores cache). k.shape[-1] is
     # unreliable under Stage 2c-2b because vLLM's cache uses the
