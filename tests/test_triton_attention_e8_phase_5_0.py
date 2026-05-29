@@ -97,12 +97,13 @@ def _build(Tq, Tk, head_size, num_q_heads, num_kv_heads, seed):
     )
 
 
-# v0.5 Phase 5.3b: the two launchers under test. ``v3_0`` is the
+# v0.5 Phase 5.3b/c: the launchers under test. ``v3_0`` is the
 # matrix-Hadamard baseline; ``v3_fht`` is the FHT-butterfly variant that
-# removes the [TILE,N_GROUPS,8,8] local-memory spill. Both must match the
-# bf16 reference within the same rtol/atol gate. Select the butterfly
-# subset with ``pytest -k fht``.
-LAUNCHERS = ["v3_0", "v3_fht"]
+# removes the [TILE,N_GROUPS,8,8] local-memory spill; ``v3_split`` adds
+# flash-decoding KV-split (3D grid + deterministic reduce) on top of the
+# v3_fht body. All must match the bf16 reference within the same
+# rtol/atol gate. Select a subset with ``pytest -k fht`` / ``-k split``.
+LAUNCHERS = ["v3_0", "v3_fht", "v3_split"]
 
 
 def _run_launcher(launcher, q, k_idx1, k_idx2, k_scale, v_idx1, v_idx2,
@@ -170,12 +171,14 @@ def test_v3_0_rejects_non_4k_codebook(quantizer_4k_relaxed, hadamard_8):
 @pytest.mark.parametrize("launcher", LAUNCHERS)
 @pytest.mark.parametrize("head_size", [128, 256, 512])
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(1, 1), (4, 1), (8, 4)])
-@pytest.mark.parametrize("Tk", [32, 64])
+@pytest.mark.parametrize("Tk", [32, 64, 256, 512])
 def test_v3_matches_reference_no_sliding(
         quantizer_4k_relaxed, hadamard_8,
         launcher, head_size, num_q_heads, num_kv_heads, Tk):
-    """4 K-codebook attention via v3.0 / v3_fht must match reference
-    within ``rtol=5e-3, atol=5e-3`` across the Phase 2.0 shape sweep."""
+    """4 K-codebook attention via v3.0 / v3_fht / v3_split must match
+    reference within ``rtol=5e-3, atol=5e-3`` across the Phase 2.0 shape
+    sweep. Tk=32/64 exercise the v3_split num_kv_splits=1 degenerate
+    path; Tk=256/512 exercise multi-split (the heuristic picks >1)."""
     block_size = 16
     Tq = 16
     seed = head_size * 100 + num_q_heads * 10 + Tk
@@ -253,3 +256,108 @@ def test_v3_matches_reference_sliding(
     max_abs = (out_v3 - out_ref).abs().max().item()
     print(f"  [{launcher}] SW={sliding_window} Tk={Tk}: max-abs={max_abs:.2e}")
     torch.testing.assert_close(out_v3, out_ref, rtol=5e-3, atol=5e-3)
+
+
+def _run_v3_split_forced(q, k_idx1, k_idx2, k_scale, v_idx1, v_idx2, v_scale,
+                         codebook, H_mat, resid_scale, *, Tk, softmax_scale,
+                         sliding_window, num_kv_splits):
+    """Direct v3_split call with an explicit ``num_kv_splits`` (the
+    generic ``_run_launcher`` always lets the heuristic choose)."""
+    import glq_vllm.triton_unified_attention_e8 as _mod
+    Tq = q.shape[0]
+    num_blocks = k_idx1.shape[0]
+    out = torch.zeros_like(q)
+    cu_seqlens_q = torch.tensor([0, Tq], device=q.device, dtype=torch.int32)
+    seqused_k = torch.tensor([Tk], device=q.device, dtype=torch.int32)
+    block_table = torch.arange(
+        num_blocks, device=q.device, dtype=torch.int32
+    ).reshape(1, num_blocks)
+    _mod.unified_attention_e8_v3_split(
+        q=q,
+        k_idx1=k_idx1, k_idx2=k_idx2, k_scale=k_scale,
+        v_idx1=v_idx1, v_idx2=v_idx2, v_scale=v_scale,
+        codebook=codebook, H_mat=H_mat,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        softmax_scale=softmax_scale,
+        resid_scale=resid_scale,
+        block_table=block_table,
+        sliding_window=sliding_window,
+        num_kv_splits=num_kv_splits,
+    )
+    return out
+
+
+@pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
+@pytest.mark.parametrize("Tk", [256, 512])
+def test_v3_split_forced_splits_match_reference(
+        quantizer_4k_relaxed, hadamard_8, Tk, num_kv_splits):
+    """v3_split with an EXPLICIT num_kv_splits (incl. the degenerate
+    splits=1 and several multi-split counts) must match the bf16
+    reference. Exercises the cross-split log-sum-exp reduction directly,
+    independent of the launcher heuristic."""
+    head_size = 256
+    block_size = 16
+    Tq = 16
+    seed = Tk * 17 + num_kv_splits
+    q, K, V = _build(Tq, Tk, head_size, num_q_heads=4, num_kv_heads=1, seed=seed)
+    num_blocks = (Tk + block_size - 1) // block_size
+
+    (k_idx1, k_idx2, k_scale, v_idx1, v_idx2, v_scale,
+     qk, qv) = _quantize_to_paged(
+        K, V, quantizer_4k_relaxed, num_blocks=num_blocks, block_size=block_size,
+    )
+    codebook = quantizer_4k_relaxed.codebook.codebook_half
+    rs = float(quantizer_4k_relaxed.codebook.resid_scale)
+    softmax_scale = 1.0 / math.sqrt(head_size)
+
+    out_split = _run_v3_split_forced(
+        q, k_idx1, k_idx2, k_scale, v_idx1, v_idx2, v_scale,
+        codebook, hadamard_8, rs, Tk=Tk, softmax_scale=softmax_scale,
+        sliding_window=0, num_kv_splits=num_kv_splits,
+    )
+
+    from tests.test_e8_attention_reference import reference_e8_attention
+    out_ref = reference_e8_attention(
+        q=q, k_qt=qk, v_qt=qv, quantizer=quantizer_4k_relaxed,
+        softmax_scale=softmax_scale, sliding_window=0,
+    )
+    max_abs = (out_split - out_ref).abs().max().item()
+    print(f"  [v3_split] Tk={Tk} splits={num_kv_splits}: max-abs={max_abs:.2e}")
+    torch.testing.assert_close(out_split, out_ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("Tk", [512])
+def test_v3_split_is_deterministic(quantizer_4k_relaxed, hadamard_8, Tk):
+    """Gate 2: the cross-split reduction is fixed-order (no atomics), so
+    two runs of v3_split on the same large-Tk fixture (multi-split) must
+    be BIT-IDENTICAL (max-abs diff == 0)."""
+    head_size = 256
+    block_size = 16
+    Tq = 16
+    q, K, V = _build(Tq, Tk, head_size, num_q_heads=4, num_kv_heads=1, seed=999)
+    num_blocks = (Tk + block_size - 1) // block_size
+
+    (k_idx1, k_idx2, k_scale, v_idx1, v_idx2, v_scale,
+     qk, qv) = _quantize_to_paged(
+        K, V, quantizer_4k_relaxed, num_blocks=num_blocks, block_size=block_size,
+    )
+    codebook = quantizer_4k_relaxed.codebook.codebook_half
+    rs = float(quantizer_4k_relaxed.codebook.resid_scale)
+    softmax_scale = 1.0 / math.sqrt(head_size)
+
+    # Force a real multi-split so the reduction actually merges segments.
+    out_a = _run_v3_split_forced(
+        q, k_idx1, k_idx2, k_scale, v_idx1, v_idx2, v_scale,
+        codebook, hadamard_8, rs, Tk=Tk, softmax_scale=softmax_scale,
+        sliding_window=0, num_kv_splits=8,
+    )
+    out_b = _run_v3_split_forced(
+        q, k_idx1, k_idx2, k_scale, v_idx1, v_idx2, v_scale,
+        codebook, hadamard_8, rs, Tk=Tk, softmax_scale=softmax_scale,
+        sliding_window=0, num_kv_splits=8,
+    )
+    max_abs = (out_a - out_b).abs().max().item()
+    print(f"  [v3_split] determinism Tk={Tk} splits=8: max-abs diff={max_abs:.2e}")
+    assert max_abs == 0.0, f"v3_split not bit-identical across runs: {max_abs}"

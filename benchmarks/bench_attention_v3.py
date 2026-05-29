@@ -167,6 +167,7 @@ def main():
         unified_attention_e8_v3_0,
         unified_attention_e8_v3_b,
         unified_attention_e8_v3_fht,
+        unified_attention_e8_v3_split,
     )
 
     print(f"=== Phase 5.3 microbench: v2.1 (65 K) vs v3.0 (4 K) vs v3_b (4 K smem) vs v3_fht (4 K butterfly) ===", flush=True)
@@ -209,14 +210,16 @@ def main():
             sliding_window=shape["sliding_window"],
         )
 
-        # Confirm all four produce output within reasonable range (sanity)
+        # Confirm all five produce output within reasonable range (sanity)
         unified_attention_e8_v2_1(**fx_65k)
         unified_attention_e8_v3_0(**fx_4k)
-        # v3_b / v3_fht share the 4K fixture (same compressed K/V as v3.0)
+        # v3_b / v3_fht / v3_split share the 4K fixture (same compressed K/V)
         unified_attention_e8_v3_b(**fx_4k)
         unified_attention_e8_v3_fht(**fx_4k)
+        # v3_split picks its own num_kv_splits from the seq_len heuristic.
+        unified_attention_e8_v3_split(**fx_4k)
 
-        # Time all four
+        # Time all five
         t_v21 = _time_kernel(
             unified_attention_e8_v2_1, fx_65k,
             n_iters=args.n_iters, warmup=args.warmup,
@@ -233,11 +236,16 @@ def main():
             unified_attention_e8_v3_fht, fx_4k,
             n_iters=args.n_iters, warmup=args.warmup,
         )
+        t_split = _time_kernel(
+            unified_attention_e8_v3_split, fx_4k,
+            n_iters=args.n_iters, warmup=args.warmup,
+        )
 
         s_v21 = _stats(f"v2.1 (65K)", t_v21)
         s_v30 = _stats(f"v3.0 (4K)", t_v30)
         s_v3b = _stats(f"v3_b (4K smem)", t_v3b)
         s_fht = _stats(f"v3_fht (4K butterfly)", t_fht)
+        s_split = _stats(f"v3_split (4K KV-split)", t_split)
         speedup_v30 = s_v21["median_us"] / s_v30["median_us"]
         speedup_v3b = s_v21["median_us"] / s_v3b["median_us"]
         speedup_smem = s_v30["median_us"] / s_v3b["median_us"]
@@ -260,16 +268,27 @@ def main():
               f"v3_b / v3.0 = {speedup_smem:.2f}×", flush=True)
         print(f"  speedup (FHT):     v3_fht / v2.1 = {speedup_fht:.2f}×   "
               f"v3_fht / v3.0 = {speedup_fht_v30:.2f}×", flush=True)
+        # v3_split: KV-split flash-decoding. At short Tk the heuristic
+        # picks num_kv_splits=1 (degenerates to v3_fht + a no-op reduce);
+        # at long Tk it parallelizes the key range across extra CTAs.
+        speedup_split_fht = s_fht["median_us"] / s_split["median_us"]
+        print(f"  v3_split (KVsplit):median {s_split['median_us']} µs   "
+              f"(p05 {s_split['p05_us']}  p95 {s_split['p95_us']}  "
+              f"σ {s_split['stdev_us']})", flush=True)
+        print(f"  speedup (split):   v3_split / v3_fht = "
+              f"{speedup_split_fht:.2f}×", flush=True)
         gate_pass = s_fht["median_us"] <= 50.0
         print(f"  gate (≤ 50 µs, FHT):  {'PASS' if gate_pass else 'FAIL'}",
               flush=True)
         results.append(dict(
             shape=shape, v21=s_v21, v30=s_v30, v3b=s_v3b, fht=s_fht,
+            split=s_split,
             speedup_v30=round(speedup_v30, 3),
             speedup_v3b=round(speedup_v3b, 3),
             speedup_smem=round(speedup_smem, 3),
             speedup_fht=round(speedup_fht, 3),
             speedup_fht_v30=round(speedup_fht_v30, 3),
+            speedup_split_fht=round(speedup_split_fht, 3),
             gate_pass=gate_pass,
         ))
 

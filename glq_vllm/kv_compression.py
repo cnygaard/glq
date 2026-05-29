@@ -101,7 +101,18 @@ def _get_quantizer(quant_method: str, n_stages: int,
     from glq.kv_e8 import E8KVQuantizer
     target_size = None
     if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1":
-        target_size = 4096
+        # Default to the 4 K KV codebook: it is QUALITY-NEUTRAL vs the
+        # full 65 K (MMLU-Pro n=400 same-400-Q: workspace-65K=0.630,
+        # v3_split+65K=0.652, v3_split+4K=0.640 — all within the ~±2pp
+        # vLLM greedy-noise band; the inline-65K run even beat the
+        # workspace control, so the kernel path is provably noise-equal),
+        # and once the FHT butterfly removed the [TILE,G,8,8] Hadamard
+        # spill the codebook gather became a measurable fraction of
+        # kernel time, so the 64 KB 4 K codebook is ~1.5x faster than the
+        # 1 MB 65 K one at long context (16k decode: 36 vs 24 tok/s).
+        # Set GLQ_KV_E8_TARGET_SIZE=65536 to opt into the 65 K codebook.
+        ts_env = os.environ.get("GLQ_KV_E8_TARGET_SIZE")
+        target_size = int(ts_env) if ts_env else 4096
     cb = _get_codebook(quant_method, target_size=target_size)
     small = cb.make_small() if secondary_stages > 0 else None
     return E8KVQuantizer(cb, n_stages=n_stages,
@@ -676,6 +687,16 @@ def _try_inline_dequant_attention_v3(q, k, kwargs):
     from glq_vllm.e8_paged_cache import _get_hadamard
     from glq_vllm.triton_unified_attention_e8 import (
         unified_attention_e8_v3_fht,
+        unified_attention_e8_v3_split,
+    )
+
+    # Dispatch selector (default = v3_split flash-decoding KV-split).
+    # ``GLQ_KV_E8_V3_DISPATCH=fht`` pins the single-pass v3_fht kernel for
+    # A/B comparison; ``split`` (default) uses the KV-split launcher.
+    _dispatch = os.environ.get("GLQ_KV_E8_V3_DISPATCH", "split").lower()
+    _attn_fn = (
+        unified_attention_e8_v3_fht if _dispatch == "fht"
+        else unified_attention_e8_v3_split
     )
 
     out = kwargs["out"]
@@ -687,16 +708,32 @@ def _try_inline_dequant_attention_v3(q, k, kwargs):
     sliding_window = (1 + window_size[0]) if window_size[0] >= 0 else 0
 
     codebook = quant.codebook.codebook_half
-    if codebook.shape[0] != 4096:
-        # Quantizer wasn't built for V3 (env not set at init time).
+    if codebook.shape[0] not in (4096, 65536):
+        # Unsupported codebook size for the v3 kernels (they accept the
+        # 4K relaxed or the full 65K codebook). Fall back to workspace.
         return None
     if codebook.device != q.device:
         codebook = codebook.to(q.device)
-    # v3_fht keeps the H_mat kwarg for drop-in compat but applies the
+    # v3_split keeps the H_mat kwarg for drop-in compat but applies the
     # inverse Hadamard via the in-register butterfly (26-31x over v3.0).
+    # It adds flash-decoding KV-split (3D grid + deterministic reduce) on
+    # top of the v3_fht body: at long context the heuristic raises the
+    # split count so SM occupancy rises (12 CTAs -> ~1 wave); at short
+    # context it auto-selects num_kv_splits=1 (degenerates to v3_fht + a
+    # masked no-op reduce), so short-context decode does NOT regress.
     H_mat = _get_hadamard(torch.float32, q.device)
 
-    unified_attention_e8_v3_fht(
+    # Pass vLLM's HOST-side max_seqlen_k to the split launcher so its
+    # KV-split heuristic avoids a per-call ``seqused_k.max().item()``
+    # GPU->CPU sync (34 layers × sync/token in decode). v3_fht has no such
+    # param, so only forward it on the split path.
+    extra = {}
+    if _attn_fn is unified_attention_e8_v3_split:
+        max_seqlen_k = kwargs.get("max_seqlen_k")
+        if max_seqlen_k is not None:
+            extra["max_seqlen_k"] = int(max_seqlen_k)
+
+    _attn_fn(
         q=q,
         k_idx1=cache.k_idx1, k_idx2=cache.k_idx2, k_scale=cache.k_scale,
         v_idx1=cache.v_idx1, v_idx2=cache.v_idx2, v_scale=cache.v_scale,
@@ -708,6 +745,7 @@ def _try_inline_dequant_attention_v3(q, k, kwargs):
         resid_scale=float(quant.codebook.resid_scale),
         block_table=block_table,
         sliding_window=sliding_window,
+        **extra,
     )
     return out
 

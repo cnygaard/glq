@@ -3232,9 +3232,9 @@ def unified_attention_e8_v3_fht(
     normalized Sylvester Hadamard, verified bit-compatible with
     ``_get_hadamard`` in ``benchmarks/_fht_probe.py``.
     """
-    assert codebook.shape == (4096, 8), (
-        f"v3_fht launcher requires a 4 K codebook; got {tuple(codebook.shape)}. "
-        "Use unified_attention_e8_v2_1 for 65 K codebooks."
+    assert codebook.shape[1] == 8 and codebook.shape[0] in (4096, 65536), (
+        f"v3_fht launcher requires a 4 K or 65 K codebook; got "
+        f"{tuple(codebook.shape)}."
     )
     block_size = k_idx1.shape[1]
     num_seqs = len(seqused_k)
@@ -3308,3 +3308,659 @@ def unified_attention_e8_v3_fht(
         BLOCK_M=BLOCK_M,
         **launch_kwargs,
     )
+
+
+
+# =============================================================================
+# v0.5 Phase 5.3c — Flash-decoding KV-split for the FHT-butterfly kernel.
+# =============================================================================
+#
+# Problem (ncu on v3_fht): the 2D grid is ``(total_num_q_blocks,
+# num_kv_heads)`` ~= 12 CTAs at B=1 decode on a 188-SM Blackwell — every
+# CTA loops over ALL key tiles serially, so SM occupancy sits at ~8-17 %
+# and decode latency grows O(ctx). At ctx>=8 K the inline path falls
+# behind the v0.3.5 workspace path (which uses vLLM flash-decoding so it
+# stays flat ~18 tok/s).
+#
+# Fix (modeled 1:1 on vLLM's own ``kernel_unified_attention_3d`` +
+# ``reduce_segments`` in
+# ``vllm/v1/attention/ops/triton_unified_attention.py``): add a third
+# grid dim ``NUM_SEGMENTS_PER_SEQ`` that splits the key range across
+# CTAs. Each ``(q_block, kv_head, segm_idx)`` CTA runs a PARTIAL online
+# softmax over its key slice and writes ``(acc, M, L)`` to a per-segment
+# scratch buffer. A second ``reduce_segments_e8`` kernel merges the
+# partials per ``(q_block, kv_head)`` via a fixed-order (index-order,
+# NO-atomics -> bit-exact deterministic) log-sum-exp rescale.
+#
+# Body diff vs ``kernel_unified_attention_2d_e8_v3_fht``: IDENTICAL
+# K/V load + dequant (idx1/idx2 gather + ``_hadamard_8_inline`` + scale),
+# Q@K, causal + sliding-window masking, online-softmax step and V mask.
+# The ONLY changes are:
+#   * a ``segm_idx = tl.program_id(2)`` + ``tiles_per_segment`` scoping
+#     of the tile loop bounds (intersected with the existing
+#     causal/sliding-window ``[tile_start, tile_end)`` pruning);
+#   * a 3D epilogue that stores ``(acc, M, L)`` per segment instead of
+#     the ``acc / L`` final divide.
+#
+# Segment-buffer layout (matches the vLLM reference exactly):
+#   segm_output : [num_tokens, num_query_heads, NUM_SEGMENTS, HEAD_SIZE_PADDED]
+#   segm_max    : [num_tokens, num_query_heads, NUM_SEGMENTS]
+#   segm_expsum : [num_tokens, num_query_heads, NUM_SEGMENTS]
+# All three are torch.empty'd per launch in the Python launcher and
+# passed in (no persistent state, graph-capture safe).
+@triton.jit
+def kernel_unified_attention_2d_e8_v3_split(
+    segm_output_ptr,   # [num_tokens, num_query_heads, NUM_SEGMENTS, HEAD_SIZE_PADDED] f32
+    segm_max_ptr,      # [num_tokens, num_query_heads, NUM_SEGMENTS] f32
+    segm_expsum_ptr,   # [num_tokens, num_query_heads, NUM_SEGMENTS] f32
+    query_ptr,
+    K_idx1_ptr,
+    K_idx2_ptr,
+    K_scale_ptr,
+    V_idx1_ptr,
+    V_idx2_ptr,
+    V_scale_ptr,
+    codebook_ptr,
+    block_tables_ptr,
+    seq_lens_ptr,
+    scale,
+    rs,
+    num_query_heads: tl.constexpr,
+    num_queries_per_kv: tl.constexpr,
+    block_table_stride: tl.int64,
+    query_stride_0: tl.int64,
+    query_stride_1: tl.int64,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    stride_k_idx_0: tl.int64,
+    stride_k_idx_1: tl.int64,
+    stride_k_idx_2: tl.int64,
+    stride_k_idx_3: tl.constexpr,
+    stride_v_idx_0: tl.int64,
+    stride_v_idx_1: tl.int64,
+    stride_v_idx_2: tl.int64,
+    stride_v_idx_3: tl.constexpr,
+    stride_k_scale_0: tl.int64,
+    stride_k_scale_1: tl.int64,
+    stride_k_scale_2: tl.int64,
+    stride_k_scale_3: tl.constexpr,
+    stride_v_scale_0: tl.int64,
+    stride_v_scale_1: tl.int64,
+    stride_v_scale_2: tl.int64,
+    stride_v_scale_3: tl.constexpr,
+    query_start_len_ptr,
+    BLOCK_Q: tl.constexpr,
+    num_seqs: tl.int32,
+    BLOCK_M: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+):
+    q_block_global_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    segm_idx = tl.program_id(2)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+    )
+
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    # --- 3D segment scoping (vLLM reference lines 162-166) -----------
+    # Split the *full* sequence into NUM_SEGMENTS_PER_SEQ contiguous
+    # tile runs; this segment owns [segm_idx, segm_idx+1) x tiles.
+    tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_t = tl.arange(0, TILE_SIZE)
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+
+    dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
+    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+    )
+
+    block_table_offset = seq_idx * block_table_stride
+
+    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+
+    context_len = seq_len - cur_batch_query_len
+    max_seq_prefix_len = (
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1
+    )
+    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+
+    # --- Sliding-window tile-pruning (same as v3_fht) ----------------
+    tile_start = 0
+    tile_end = num_tiles
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+
+    # --- Intersect causal/SW pruning with this segment's slice -------
+    # (vLLM reference compute_tile_loop_bounds, IS_3D branch)
+    loop_lo = tl.maximum(segm_idx * tiles_per_segment, tile_start)
+    loop_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, tile_end)
+
+    g_arange = tl.arange(0, N_GROUPS)
+    cb_inner = tl.arange(0, 8)
+
+    for j in range(loop_lo, loop_hi):
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+        slot = seq_offset % BLOCK_SIZE
+
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+        ).to(tl.int64)
+
+        # ----- K: full dequant --------------------------------------
+        k_idx_off = (
+            physical_block_idx[:, None] * stride_k_idx_0
+            + slot[:, None] * stride_k_idx_1
+            + kv_head_idx * stride_k_idx_2
+            + g_arange[None, :] * stride_k_idx_3
+        )
+        k_idx1 = tl.load(
+            K_idx1_ptr + k_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        k_idx2 = tl.load(
+            K_idx2_ptr + k_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        k_cb_off1 = k_idx1[:, :, None] * 8 + cb_inner[None, None, :]
+        k_cb_off2 = k_idx2[:, :, None] * 8 + cb_inner[None, None, :]
+        k_dec = tl.load(codebook_ptr + k_cb_off1).to(tl.float32)
+        k_dec = k_dec + tl.load(codebook_ptr + k_cb_off2).to(tl.float32) / rs
+
+        k_scale_off = (
+            physical_block_idx[:, None] * stride_k_scale_0
+            + slot[:, None] * stride_k_scale_1
+            + kv_head_idx * stride_k_scale_2
+            + g_arange[None, :] * stride_k_scale_3
+        )
+        k_scale = tl.load(
+            K_scale_ptr + k_scale_off, mask=tile_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        k_dec = k_dec * k_scale[:, :, None]
+
+        k_dec = _hadamard_8_inline(k_dec)
+
+        K = tl.trans(tl.reshape(k_dec, (TILE_SIZE, HEAD_SIZE)))
+        K = tl.where(tile_mask[None, :], K, 0.0).to(Q.dtype)
+
+        # ----- V: full dequant --------------------------------------
+        v_idx_off = (
+            physical_block_idx[:, None] * stride_v_idx_0
+            + slot[:, None] * stride_v_idx_1
+            + kv_head_idx * stride_v_idx_2
+            + g_arange[None, :] * stride_v_idx_3
+        )
+        v_idx1 = tl.load(
+            V_idx1_ptr + v_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        v_idx2 = tl.load(
+            V_idx2_ptr + v_idx_off, mask=tile_mask[:, None], other=0,
+        ).to(tl.int32) & 0xFFFF
+        v_cb_off1 = v_idx1[:, :, None] * 8 + cb_inner[None, None, :]
+        v_cb_off2 = v_idx2[:, :, None] * 8 + cb_inner[None, None, :]
+        v_dec = tl.load(codebook_ptr + v_cb_off1).to(tl.float32)
+        v_dec = v_dec + tl.load(codebook_ptr + v_cb_off2).to(tl.float32) / rs
+
+        v_scale_off = (
+            physical_block_idx[:, None] * stride_v_scale_0
+            + slot[:, None] * stride_v_scale_1
+            + kv_head_idx * stride_v_scale_2
+            + g_arange[None, :] * stride_v_scale_3
+        )
+        v_scale = tl.load(
+            V_scale_ptr + v_scale_off, mask=tile_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        v_dec = v_dec * v_scale[:, :, None]
+
+        v_dec = _hadamard_8_inline(v_dec)
+
+        V = tl.reshape(v_dec, (TILE_SIZE, HEAD_SIZE))
+        V = tl.where(tile_mask[:, None], V, 0.0).to(Q.dtype)
+
+        # ----- Causal + sliding-window mask + Q @ K -> S ------------
+        query_abs_pos = context_len + query_pos[:, None]
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
+
+        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+        S += scale * tl.dot(Q, K)
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+
+        if SLIDING_WINDOW > 0:
+            qpos_lo_v = q_block_local_idx * BLOCK_Q
+            V = tl.where(
+                (context_len + qpos_lo_v - seq_offset[:, None]) < SLIDING_WINDOW,
+                V, 0.0,
+            )
+
+        acc += tl.dot(P.to(V.dtype), V)
+
+    # --- 3D epilogue: store per-segment partials (no /L) -------------
+    segm_output_offset = (
+        query_offset_0[:, None].to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + segm_idx * HEAD_SIZE_PADDED
+        + offs_d[None, :]
+    )
+    tl.store(
+        segm_output_ptr + segm_output_offset,
+        acc,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
+
+    segm_offset = (
+        query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+        + segm_idx
+    )
+    tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
+    tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
+
+
+@triton.jit
+def reduce_segments_e8(
+    output_ptr,        # [num_tokens, num_query_heads, head_size]
+    segm_output_ptr,   # [num_tokens, num_query_heads, NUM_SEGMENTS, HEAD_SIZE_PADDED]
+    segm_max_ptr,      # [num_tokens, num_query_heads, NUM_SEGMENTS]
+    segm_expsum_ptr,   # [num_tokens, num_query_heads, NUM_SEGMENTS]
+    seq_lens_ptr,      # [num_seqs]
+    num_seqs,
+    num_query_heads: tl.constexpr,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    query_start_len_ptr,
+    BLOCK_Q: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+):
+    """Merge ``NUM_SEGMENTS_PER_SEQ`` per-segment online-softmax partials
+    into the final attention output for one ``(token, head)``.
+
+    DETERMINISTIC by construction: the merge is a fixed-order (segment
+    index order) log-sum-exp rescale with NO atomics, matching the
+    project's scratch+reduce determinism contract (see
+    ``glq/csrc/glq_cuda.cu``). Byte-identical to vLLM's
+    ``reduce_segments`` minus the FP8 / out_scale path (E8 KV output is
+    always fp16/bf16).
+    """
+    query_token_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+    )
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    # Number of segments that actually carried tiles for this seq_len.
+    num_segments = NUM_SEGMENTS_PER_SEQ
+    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+    )
+    dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
+
+    segm_offset = (
+        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+    )
+    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
+    overall_max = tl.max(segm_max)
+
+    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
+    overall_expsum = tl.sum(segm_expsum)
+
+    segm_output_offset = (
+        query_token_idx.to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
+        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+    )
+    segm_output = tl.load(
+        segm_output_ptr + segm_output_offset,
+        mask=segm_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+    segm_output *= tl.exp(segm_max - overall_max)[:, None]
+    acc_sum = tl.sum(segm_output, axis=0)
+    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+
+    output_offset = (
+        query_token_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + tl.arange(0, HEAD_SIZE_PADDED)
+    )
+    tl.store(output_ptr + output_offset, acc, mask=dim_mask)
+
+
+def _num_kv_splits_heuristic(
+    *, seq_len, total_num_q_blocks, num_kv_heads, tile_size, sm_count=188,
+    max_splits=64, min_tiles_per_split=8, min_tiles_to_split=384,
+):
+    """Pick ``NUM_SEGMENTS_PER_SEQ`` to fill ~1 wave of the GPU.
+
+    Targets ``total_num_q_blocks * num_kv_heads * num_kv_splits`` ~= a few
+    hundred CTAs (so the 188-SM Blackwell stays busy) while keeping each
+    split fat enough (>= ``min_tiles_per_split`` tiles) to amortize the
+    extra reduce pass.
+
+    Short/medium sequences get ``num_kv_splits = 1`` so the launcher
+    short-circuits to the single-pass v3_fht kernel with NO regression.
+    The threshold ``min_tiles_to_split`` is set to **384 tiles** (≈ 6 144
+    keys at TILE_SIZE 16), the measured crossover on the Gemma-4-E4B-it
+    end-to-end decode bench (Blackwell RTX PRO 6000, B=1):
+
+        ctx   v3_fht   v3_split   winner
+        1024   30.8      21.2      v3_fht  (split = 0.69×)
+        4096   24.2      20.7      v3_fht  (split = 0.86×)
+        8192   18.8      28.2      v3_split (1.50×)
+       16384   13.0      27.5      v3_split (2.12×)
+
+    Below ~6 K the single-pass v3_fht kernel is still fast enough that the
+    extra ``reduce_segments_e8`` pass (which re-reads all per-segment
+    scratch) + the 3-buffer scratch alloc is net overhead. Above it the
+    serial tile loop dominates and KV-split parallelism wins big. Gating
+    at 384 tiles keeps short-context decode on the faster path and only
+    engages the split where v3_fht is genuinely losing — including vs the
+    ~18 tok/s workspace floor (split beats it from 8 K up).
+
+    NOTE: the launcher rounds the returned value UP to a power of two
+    (``reduce_segments_e8`` indexes the segment dim with ``tl.arange``),
+    so e.g. a heuristic value of 31 becomes 32 there.
+    """
+    num_tiles = (seq_len + tile_size - 1) // tile_size
+    # Below the split threshold, single-pass v3_fht is already fast enough
+    # that the reduce pass would dominate — stay on the no-split path.
+    if num_tiles < min_tiles_to_split:
+        return 1
+    base_ctas = max(total_num_q_blocks * num_kv_heads, 1)
+    # Aim for ~1 wave: target ~= 2x SM count of total CTAs.
+    target = max(sm_count * 2 // base_ctas, 1)
+    # Don't make splits thinner than min_tiles_per_split tiles.
+    by_tiles = max(num_tiles // min_tiles_per_split, 1)
+    num_kv_splits = min(target, by_tiles, max_splits)
+    return max(int(num_kv_splits), 1)
+
+
+def unified_attention_e8_v3_split(
+    q: torch.Tensor,
+    k_idx1: torch.Tensor,
+    k_idx2: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_idx1: torch.Tensor,
+    v_idx2: torch.Tensor,
+    v_scale: torch.Tensor,
+    codebook: torch.Tensor,
+    H_mat: torch.Tensor = None,  # kept for call-site compatibility; ignored.
+    out: torch.Tensor = None,
+    cu_seqlens_q: torch.Tensor = None,
+    seqused_k: torch.Tensor = None,
+    softmax_scale: float = None,
+    resid_scale: float = None,
+    block_table: torch.Tensor = None,
+    sliding_window: int = 0,
+    num_kv_splits: int = None,
+    max_seqlen_k: int = None,
+):
+    """v0.5 Phase 5.3c launcher — flash-decoding KV-split variant of v3_fht.
+
+    Same 4 K-codebook contract and inline E8 dequant math as
+    ``unified_attention_e8_v3_fht`` but splits the key range across
+    ``num_kv_splits`` extra CTAs (3D grid) so SM occupancy rises from
+    the ~12-CTA / 8-17 %-busy v3_fht regime toward ~1 wave at long
+    context. A deterministic ``reduce_segments_e8`` pass merges the
+    per-segment partials.
+
+    When ``num_kv_splits == 1`` (auto-selected for short sequences) the
+    3D kernel runs a single segment covering the whole sequence and the
+    reduce pass is a no-op rescale — bit-identical to a single-pass
+    online softmax, so there is NO long-context-only regression on short
+    decode.
+
+    ``H_mat`` is accepted (bench/test harnesses pass it as a kwarg) but
+    ignored — the inverse Hadamard is the in-register
+    ``_hadamard_8_inline`` butterfly.
+    """
+    assert codebook.shape[1] == 8 and codebook.shape[0] in (4096, 65536), (
+        f"v3_split launcher requires a 4 K or 65 K codebook; got "
+        f"{tuple(codebook.shape)}."
+    )
+    block_size = k_idx1.shape[1]
+    num_seqs = len(seqused_k)
+    num_query_heads = q.shape[1]
+    num_kv_heads = k_idx1.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_size = q.shape[2]
+    n_groups = k_idx1.shape[3]
+    assert head_size == n_groups * 8
+    assert k_scale.shape == k_idx1.shape
+
+    BLOCK_M = (
+        16
+        if num_queries_per_kv <= 16
+        else triton.next_power_of_2(num_queries_per_kv)
+    )
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+
+    TILE_SIZE = 16
+    HEAD_SIZE_PADDED = triton.next_power_of_2(head_size)
+
+    # Choose the split count from the (decode-time) max sequence length.
+    auto_split = num_kv_splits is None
+    if num_kv_splits is None:
+        # Prefer the HOST-side ``max_seqlen_k`` (vLLM passes it as a plain
+        # int in attention metadata) — reading ``seqused_k.max().item()``
+        # forces a GPU->CPU sync on EVERY attention call (34 layers ×
+        # sync/token in decode), which measurably regressed short-context
+        # decode (e2e Gemma-4-E4B ctx=1024: 30.8 -> 25.7 tok/s) even when
+        # the call ultimately delegates to single-pass v3_fht.
+        if max_seqlen_k is not None:
+            max_seq_len = int(max_seqlen_k)
+        else:
+            try:
+                max_seq_len = int(seqused_k.max().item())
+            except Exception:
+                max_seq_len = block_size
+        sm_count = 188
+        try:
+            sm_count = torch.cuda.get_device_properties(
+                q.device
+            ).multi_processor_count
+        except Exception:
+            pass
+        num_kv_splits = _num_kv_splits_heuristic(
+            seq_len=max_seq_len,
+            total_num_q_blocks=total_num_q_blocks,
+            num_kv_heads=num_kv_heads,
+            tile_size=TILE_SIZE,
+            sm_count=sm_count,
+        )
+    num_kv_splits = max(int(num_kv_splits), 1)
+
+    # Short-context fast path: when the heuristic (or the caller) chose a
+    # single segment, there is nothing to split — delegate straight to
+    # v3_fht. This avoids the 3 scratch ``torch.empty`` allocations + the
+    # extra ``reduce_segments_e8`` launch, which otherwise cost ~50-60 µs
+    # and make splits=1 SLOWER than plain v3_fht (bench: Tk=256 sliding
+    # layer 0.57×). With this branch the no-split case is bit-identical to
+    # — and exactly as fast as — v3_fht, so short-context decode does NOT
+    # regress. A FORCED ``num_kv_splits=1`` (auto_split=False, e.g. the
+    # determinism / forced-split tests) still runs the 3D kernel +
+    # single-segment reduce below so that code path stays covered.
+    if num_kv_splits == 1 and auto_split:
+        return unified_attention_e8_v3_fht(
+            q=q,
+            k_idx1=k_idx1, k_idx2=k_idx2, k_scale=k_scale,
+            v_idx1=v_idx1, v_idx2=v_idx2, v_scale=v_scale,
+            codebook=codebook, H_mat=H_mat, out=out,
+            cu_seqlens_q=cu_seqlens_q, seqused_k=seqused_k,
+            softmax_scale=softmax_scale, resid_scale=resid_scale,
+            block_table=block_table, sliding_window=sliding_window,
+        )
+
+    # ``reduce_segments_e8`` indexes the segment dimension with
+    # ``tl.arange(0, NUM_SEGMENTS_PER_SEQ)``, which Triton requires to be a
+    # power of two. Round up; the split kernel early-returns for segments
+    # past ``act_num_segments`` and the reduce masks them out, so the extra
+    # (empty) segments are correctness-neutral — they only cost a little
+    # scratch. Without this, the auto heuristic (e.g. 31 splits at ctx≥4 K)
+    # would raise "arange's range must be a power of 2" at long context.
+    num_kv_splits = triton.next_power_of_2(num_kv_splits)
+
+    if head_size > 256:
+        launch_kwargs = dict(num_stages=1, num_warps=8)
+    else:
+        launch_kwargs = {}
+
+    common_kwargs = dict(
+        query_ptr=q,
+        K_idx1_ptr=k_idx1, K_idx2_ptr=k_idx2, K_scale_ptr=k_scale,
+        V_idx1_ptr=v_idx1, V_idx2_ptr=v_idx2, V_scale_ptr=v_scale,
+        codebook_ptr=codebook,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seqused_k,
+        scale=softmax_scale,
+        rs=resid_scale,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        N_GROUPS=n_groups,
+        SLIDING_WINDOW=sliding_window,
+        stride_k_idx_0=k_idx1.stride(0),
+        stride_k_idx_1=k_idx1.stride(1),
+        stride_k_idx_2=k_idx1.stride(2),
+        stride_k_idx_3=k_idx1.stride(3),
+        stride_v_idx_0=v_idx1.stride(0),
+        stride_v_idx_1=v_idx1.stride(1),
+        stride_v_idx_2=v_idx1.stride(2),
+        stride_v_idx_3=v_idx1.stride(3),
+        stride_k_scale_0=k_scale.stride(0),
+        stride_k_scale_1=k_scale.stride(1),
+        stride_k_scale_2=k_scale.stride(2),
+        stride_k_scale_3=k_scale.stride(3),
+        stride_v_scale_0=v_scale.stride(0),
+        stride_v_scale_1=v_scale.stride(1),
+        stride_v_scale_2=v_scale.stride(2),
+        stride_v_scale_3=v_scale.stride(3),
+        query_start_len_ptr=cu_seqlens_q,
+        BLOCK_Q=BLOCK_Q,
+        num_seqs=num_seqs,
+        BLOCK_M=BLOCK_M,
+        NUM_SEGMENTS_PER_SEQ=num_kv_splits,
+    )
+
+    num_tokens = q.shape[0]
+    # Per-launch scratch (graph-capture safe; torch.empty per call).
+    segm_output = torch.empty(
+        num_tokens, num_query_heads, num_kv_splits, HEAD_SIZE_PADDED,
+        dtype=torch.float32, device=q.device,
+    )
+    segm_max = torch.empty(
+        num_tokens, num_query_heads, num_kv_splits,
+        dtype=torch.float32, device=q.device,
+    )
+    segm_expsum = torch.empty(
+        num_tokens, num_query_heads, num_kv_splits,
+        dtype=torch.float32, device=q.device,
+    )
+
+    kernel_unified_attention_2d_e8_v3_split[
+        (total_num_q_blocks, num_kv_heads, num_kv_splits)
+    ](
+        segm_output_ptr=segm_output,
+        segm_max_ptr=segm_max,
+        segm_expsum_ptr=segm_expsum,
+        **common_kwargs,
+        **launch_kwargs,
+    )
+
+    reduce_segments_e8[(num_tokens, num_query_heads)](
+        output_ptr=out,
+        segm_output_ptr=segm_output,
+        segm_max_ptr=segm_max,
+        segm_expsum_ptr=segm_expsum,
+        seq_lens_ptr=seqused_k,
+        num_seqs=num_seqs,
+        num_query_heads=num_query_heads,
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        query_start_len_ptr=cu_seqlens_q,
+        BLOCK_Q=BLOCK_Q,
+        NUM_SEGMENTS_PER_SEQ=num_kv_splits,
+    )
+    return out

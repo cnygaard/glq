@@ -46,6 +46,9 @@ def main() -> None:
                    default=[1024, 4096, 8192, 16384])
     p.add_argument("--decode-len", type=int, default=128,
                    help="N for the t_N timing point")
+    p.add_argument("--reps", type=int, default=5,
+                   help="repeat each (t_1,t_N) pair this many times; "
+                        "report median decode tok/s to reject spikes")
     p.add_argument("--gpu-mem", type=float, default=0.85)
     p.add_argument("--text-url",
                    default="https://www.gutenberg.org/files/1342/1342-0.txt")
@@ -86,10 +89,12 @@ def main() -> None:
         ids = (filler_ids * reps)[:ctx_len]
         return ids
 
+    import statistics
+    from vllm import TokensPrompt
+
     def _time_gen(prompt_ids, n_tokens):
         sp = SamplingParams(temperature=0.0, max_tokens=n_tokens)
         sp.ignore_eos = True
-        from vllm import TokensPrompt
         t0 = time.time()
         llm.generate(TokensPrompt(prompt_token_ids=prompt_ids),
                      sampling_params=sp, use_tqdm=False)
@@ -98,19 +103,36 @@ def main() -> None:
     rows = []
     for ctx_len in args.ctx_lens:
         pids = _prompt_ids(ctx_len)
-        # warm-up at this ctx (CUDA-graph capture for the bucket)
+        # warm-up at this ctx (CUDA-graph capture for the bucket) — twice so
+        # the first-replay/autotune spike never lands in a timed run.
         _time_gen(pids, 4)
-        t1 = _time_gen(pids, 1)
-        tN = _time_gen(pids, args.decode_len)
-        decode_s = max(tN - t1, 1e-6)
-        decode_tok_s = (args.decode_len - 1) / decode_s
-        ms_per_tok = decode_s * 1000.0 / (args.decode_len - 1)
-        print(f"  ctx={ctx_len:>6}: t_1={t1:.3f}s t_N={tN:.3f}s "
-              f"decode={decode_tok_s:6.1f} tok/s ({ms_per_tok:.2f} ms/tok)",
+        _time_gen(pids, args.decode_len)
+        # Two-point decode isolation, repeated --reps times; report MEDIAN
+        # of the per-rep decode tok/s to reject t_1/t_N spikes (cudagraph
+        # capture, autotune, scheduler hiccups) that corrupt a single pair.
+        per_rep = []
+        t1s, tNs = [], []
+        for _ in range(args.reps):
+            t1 = _time_gen(pids, 1)
+            tN = _time_gen(pids, args.decode_len)
+            decode_s = max(tN - t1, 1e-6)
+            per_rep.append((args.decode_len - 1) / decode_s)
+            t1s.append(t1)
+            tNs.append(tN)
+        decode_tok_s = statistics.median(per_rep)
+        ms_per_tok = 1000.0 / decode_tok_s
+        print(f"  ctx={ctx_len:>6}: t_1~{statistics.median(t1s):.3f}s "
+              f"t_N~{statistics.median(tNs):.3f}s  decode(median of "
+              f"{args.reps})={decode_tok_s:6.1f} tok/s ({ms_per_tok:.2f} "
+              f"ms/tok)  [min {min(per_rep):.1f} max {max(per_rep):.1f}]",
               flush=True)
-        rows.append(dict(ctx_len=ctx_len, t_1=t1, t_N=tN,
-                         decode_len=args.decode_len,
-                         decode_tok_s=decode_tok_s, ms_per_tok=ms_per_tok))
+        rows.append(dict(ctx_len=ctx_len,
+                         t_1_median=statistics.median(t1s),
+                         t_N_median=statistics.median(tNs),
+                         decode_len=args.decode_len, reps=args.reps,
+                         decode_tok_s=round(decode_tok_s, 2),
+                         decode_tok_s_all=[round(x, 2) for x in per_rep],
+                         ms_per_tok=round(ms_per_tok, 2)))
 
     result = dict(label=args.label, model=args.model,
                   env={k: os.environ.get(k) for k in (
