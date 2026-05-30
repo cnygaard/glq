@@ -165,6 +165,29 @@ def register():
             def _glq_kv_create_engine_config(self, *args, **kwargs):
                 vllm_config = _orig_create_engine_config(
                     self, *args, **kwargs)
+                # Force the Triton attention backend when E8 KV is active.
+                # The entire E8-KV read/alloc path (sidecar read hook +
+                # compressed get_kv_cache_shape + v3 inline kernels) is built
+                # on vLLM's TritonAttentionBackend. Gemma-4 selects Triton
+                # natively (heterogeneous head dims make FlashAttention
+                # invalid), but uniform-head models (SmolLM3 head=128, Llama,
+                # …) default to FlashAttention → our hooks never fire and the
+                # compressed buffer is read/reshaped as fp16 → crash/garbage.
+                # Only set it when the user hasn't pinned a backend.
+                ac = getattr(vllm_config, "attention_config", None)
+                if ac is not None and getattr(ac, "backend", None) is None:
+                    try:
+                        from vllm.v1.attention.backends.registry import (
+                            AttentionBackendEnum,
+                        )
+                        ac.backend = AttentionBackendEnum.TRITON_ATTN
+                        print("[glq_vllm] E8 KV active → attention backend "
+                              "forced to TRITON_ATTN (E8-KV path requires "
+                              "the Triton backend; uniform-head models would "
+                              "otherwise pick FlashAttention)", flush=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[glq_vllm] could not force TRITON_ATTN "
+                              f"backend: {e}", flush=True)
                 cc = getattr(vllm_config, "compilation_config", None)
                 if cc is not None:
                     mode = getattr(cc, "cudagraph_mode", None)

@@ -673,16 +673,31 @@ def _try_inline_dequant_attention_v3(q, k, kwargs):
     4 bpw (n_primary=2, n_secondary=0) only; other recipes fall through.
     Returns the output tensor on success, ``None`` on any failure.
     """
+    _dbg = os.environ.get("GLQ_KV_E8_DEBUG_SHAPE")
     real_head_size = q.shape[-1]
     bin_key = (k.data_ptr(), real_head_size)
     cache = _e8_sidecar.get(bin_key)
     if cache is None:
+        if _dbg:
+            print(f"[glq DEBUG v3] sidecar MISS key=({hex(bin_key[0])},"
+                  f"{bin_key[1]}); have {len(_e8_sidecar)} entries: "
+                  f"{[(hex(kk[0]), kk[1]) for kk in list(_e8_sidecar)[:6]]}",
+                  flush=True)
         return None
     if cache.n_primary != 2 or cache.n_secondary != 0:
+        if _dbg:
+            print(f"[glq DEBUG v3] recipe mismatch n_primary="
+                  f"{cache.n_primary} n_secondary={cache.n_secondary}",
+                  flush=True)
         return None
     quant, _ = _quantizer_for_bpw(cache.bpw)
     if quant is None:
+        if _dbg:
+            print(f"[glq DEBUG v3] quant None for bpw={cache.bpw}", flush=True)
         return None
+    if _dbg:
+        print(f"[glq DEBUG v3] reached kernel dispatch (bpw={cache.bpw} "
+              f"hs={real_head_size})", flush=True)
 
     from glq_vllm.e8_paged_cache import _get_hadamard
     from glq_vllm.triton_unified_attention_e8 import (
@@ -972,6 +987,14 @@ def enable_compressed_allocation() -> None:
                                        num_kv_heads, head_size,
                                        cache_dtype_str="auto"):
         bpw = _active_config.get("bpw")
+        if os.environ.get("GLQ_KV_E8_DEBUG_SHAPE"):
+            shp = compressed_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size,
+                bpw=bpw or 4, dtype_size=2)
+            print(f"[glq DEBUG] _e8_triton_get_kv_cache_shape FIRED "
+                  f"bpw={bpw} nb={num_blocks} bs={block_size} "
+                  f"kvh={num_kv_heads} hs={head_size} -> compressed {shp}",
+                  flush=True)
         if bpw is None or bpw not in (2, 3, 4, 5, 6, 7):
             return _original_triton_get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -982,6 +1005,65 @@ def enable_compressed_allocation() -> None:
             bpw=bpw, dtype_size=2)
 
     TritonAttentionBackend.get_kv_cache_shape = _e8_triton_get_kv_cache_shape
+
+    # -- 2b) robust hook: patch get_kv_cache_shape on WHATEVER backend
+    #        class the attention selector actually resolves.
+    #
+    # Patching the one imported ``TritonAttentionBackend`` above is not
+    # enough: vLLM resolves the per-layer backend by qualname inside the
+    # cached ``selector._cached_get_attn_backend`` and, depending on the
+    # model/arch (e.g. SmolLM3 head_size=128 vs Gemma-4 256/512) + platform
+    # (SM_120), the resolved class can be a *different* object than the one
+    # we imported — so our class-level patch never fires (``FIRED count:
+    # 0`` in the debug log) and ``_reshape_kv_cache_tensors`` views the
+    # 3/8-size compressed buffer at the full fp16 shape → crash. We wrap
+    # the selector's cached resolver (referenced as a module global, so
+    # not defeated by ``from ... import`` bindings) and install the
+    # compressed-shape override on the returned class, idempotently.
+    def _install_compressed_shape_hook(backend_cls):
+        if backend_cls is None or getattr(
+                backend_cls, "_glq_shape_hooked", False):
+            return backend_cls
+        _orig_shape = backend_cls.get_kv_cache_shape
+
+        @staticmethod
+        def _hooked_shape(num_blocks, block_size, num_kv_heads, head_size,
+                          cache_dtype_str="auto"):
+            bpw = _active_config.get("bpw")
+            if os.environ.get("GLQ_KV_E8_DEBUG_SHAPE"):
+                print(f"[glq DEBUG] hooked get_kv_cache_shape FIRED on "
+                      f"{backend_cls.__qualname__} bpw={bpw} nb={num_blocks} "
+                      f"bs={block_size} kvh={num_kv_heads} hs={head_size}",
+                      flush=True)
+            if bpw is None or bpw not in (2, 3, 4, 5, 6, 7):
+                return _orig_shape(num_blocks, block_size, num_kv_heads,
+                                   head_size, cache_dtype_str)
+            return compressed_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size,
+                bpw=bpw, dtype_size=2)
+
+        backend_cls.get_kv_cache_shape = _hooked_shape
+        backend_cls._glq_shape_hooked = True
+        if os.environ.get("GLQ_KV_E8_DEBUG_SHAPE"):
+            print(f"[glq DEBUG] installed compressed-shape hook on resolved "
+                  f"backend {backend_cls.__module__}.{backend_cls.__qualname__}"
+                  f" id={id(backend_cls)}", flush=True)
+        return backend_cls
+
+    try:
+        import vllm.v1.attention.selector as _glq_sel
+        if not getattr(_glq_sel, "_glq_selector_wrapped", False):
+            _glq_orig_cached = _glq_sel._cached_get_attn_backend
+
+            def _glq_cached_get_attn_backend(*a, **k):
+                return _install_compressed_shape_hook(
+                    _glq_orig_cached(*a, **k))
+
+            _glq_sel._cached_get_attn_backend = _glq_cached_get_attn_backend
+            _glq_sel._glq_selector_wrapped = True
+    except Exception as e:  # noqa: BLE001
+        print(f"[glq_vllm.kv_compression] could not wrap attn selector "
+              f"(falling back to class-level shape patch): {e}", flush=True)
 
     _compressed_allocation_active = True
     print("[glq_vllm.kv_compression] compressed allocation hooks "
