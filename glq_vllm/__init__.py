@@ -189,23 +189,41 @@ def register():
                         print(f"[glq_vllm] could not force TRITON_ATTN "
                               f"backend: {e}", flush=True)
                 cc = getattr(vllm_config, "compilation_config", None)
-                # v0.5 Phase 5.7 probe: the forced PIECEWISE downgrade below
-                # exists because the v0.3.5 WORKSPACE read path calls
-                # ``block_table.unique()`` (data-dependent → illegal in
-                # CUDA-graph capture). The v3 inline path
-                # (GLQ_KV_E8_INLINE_DEQUANT_V3=1) is host-sync-clean (no
-                # .unique()/.item()), and the write hook is too — so FULL
-                # capture should be viable and would eliminate the ~41 ms/tok
-                # eager-dispatch tax measured in the SmolLM3 decode profile.
-                # Opt-in: GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH=1 skips the downgrade.
-                _allow_full = (
-                    os.environ.get("GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH", "0") == "1"
-                    and os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1"
+                # The forced PIECEWISE downgrade below exists because the
+                # v0.3.5 WORKSPACE read path calls ``block_table.unique()``
+                # (data-dependent → illegal in CUDA-graph capture). The v3
+                # inline path (GLQ_KV_E8_INLINE_DEQUANT_V3=1) is host-sync-
+                # clean (no .unique()/.item() in the read hook, and the write
+                # hook is too), so vLLM CAN capture it in the FULL decode
+                # graph — which removes the ~41 ms/tok eager-dispatch tax.
+                #
+                # v0.5 Phase 5.7v (validated 2026-05-31, SmolLM3 + Gemma-4
+                # focused A/B gate): FULL is now the DEFAULT for the v3 path.
+                #   - SmolLM3 (deterministic): FULL is BIT-IDENTICAL to
+                #     PIECEWISE on MMLU n=120 / NIAH-16k / varlen, and runs
+                #     2.5-3.5x faster (B=1 15→38, B=4 37→130 tok/s; longctx
+                #     16k 15→36).
+                #   - Gemma-4 (sliding-window + head 256/512): FULL lands
+                #     within Gemma's OWN PIECEWISE run-to-run greedy non-
+                #     determinism (MMLU acc 79 inside the [78,85] PIE-vs-PIE
+                #     spread; a pre-existing vLLM+Gemma property, not GLQ);
+                #     NIAH 10/10; tok/s FULL >= PIECEWISE.
+                # Escape hatch: GLQ_KV_E8_FORCE_PIECEWISE=1 (or the legacy
+                # GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH=0) restores PIECEWISE. The
+                # WORKSPACE path (V3 unset) always stays forced-PIECEWISE.
+                _v3 = os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") != "0"
+                _force_pie = (
+                    os.environ.get("GLQ_KV_E8_FORCE_PIECEWISE", "0") == "1"
                 )
+                _legacy_off = (
+                    os.environ.get("GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH") == "0"
+                )
+                _allow_full = _v3 and not _force_pie and not _legacy_off
                 if cc is not None and _allow_full:
-                    print("[glq_vllm] GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH=1 + V3 "
-                          "→ leaving cudagraph_mode as-is (Phase 5.7 probe: "
-                          "v3 path is capture-clean)", flush=True)
+                    print("[glq_vllm] E8 KV v3 inline path → leaving "
+                          "cudagraph_mode as-is (FULL decode-graph capture, "
+                          "Phase 5.7v default; GLQ_KV_E8_FORCE_PIECEWISE=1 "
+                          "to opt out)", flush=True)
                 if cc is not None and not _allow_full:
                     mode = getattr(cc, "cudagraph_mode", None)
                     full_modes = {
@@ -218,12 +236,14 @@ def register():
                         from_label = (
                             mode.name if hasattr(mode, "name") else repr(mode)
                         )
+                        _why = (
+                            "GLQ_KV_E8_FORCE_PIECEWISE/ALLOW_FULL=0 escape hatch"
+                            if _v3 else
+                            "workspace read path uses .unique() (capture-unsafe)"
+                        )
                         print(
                             f"[glq_vllm] E8 KV active → cudagraph_mode "
-                            f"forced from {from_label} to PIECEWISE "
-                            "(FULL captures incompatible with .unique() "
-                            "in _patched_unified_attention; fused-dequant "
-                            "paged_attention in v0.4 will lift this)",
+                            f"forced from {from_label} to PIECEWISE ({_why})",
                             flush=True,
                         )
                 return vllm_config
@@ -232,7 +252,9 @@ def register():
             _GlqEngineArgs._glq_kv_piecewise_patched = True
             print(
                 "[glq_vllm] E8 KV EngineArgs.create_engine_config hook "
-                "installed (forces cudagraph_mode=PIECEWISE)",
+                "installed (v3 inline path → FULL decode graph by default; "
+                "workspace path → PIECEWISE; GLQ_KV_E8_FORCE_PIECEWISE=1 "
+                "to force PIECEWISE)",
                 flush=True,
             )
 

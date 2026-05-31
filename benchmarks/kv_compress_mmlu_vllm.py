@@ -64,6 +64,9 @@ def main():
     p.add_argument("--out", default="/tmp/logs/mmlu_vllm.json")
     p.add_argument("--label",
                    default=os.environ.get("GLQ_KV_QUANT", "baseline-fp16"))
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="Disable CUDA graphs; eliminates batch-size-mismatch "
+                        "stalls when running uncaptured shapes")
     args = p.parse_args()
 
     os.environ.setdefault("HF_HOME", "/opt/dlami/nvme/hf_cache")
@@ -79,7 +82,8 @@ def main():
     # KV envs are set, so we no longer need ``enforce_eager=True`` here.
     llm = LLM(model=args.model, dtype="bfloat16",
               max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_mem)
+              gpu_memory_utilization=args.gpu_mem,
+              enforce_eager=args.enforce_eager)
     print(f"  load: {time.time()-t0:.1f}s", flush=True)
 
     ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
