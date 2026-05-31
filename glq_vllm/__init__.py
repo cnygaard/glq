@@ -189,7 +189,24 @@ def register():
                         print(f"[glq_vllm] could not force TRITON_ATTN "
                               f"backend: {e}", flush=True)
                 cc = getattr(vllm_config, "compilation_config", None)
-                if cc is not None:
+                # v0.5 Phase 5.7 probe: the forced PIECEWISE downgrade below
+                # exists because the v0.3.5 WORKSPACE read path calls
+                # ``block_table.unique()`` (data-dependent → illegal in
+                # CUDA-graph capture). The v3 inline path
+                # (GLQ_KV_E8_INLINE_DEQUANT_V3=1) is host-sync-clean (no
+                # .unique()/.item()), and the write hook is too — so FULL
+                # capture should be viable and would eliminate the ~41 ms/tok
+                # eager-dispatch tax measured in the SmolLM3 decode profile.
+                # Opt-in: GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH=1 skips the downgrade.
+                _allow_full = (
+                    os.environ.get("GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH", "0") == "1"
+                    and os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1"
+                )
+                if cc is not None and _allow_full:
+                    print("[glq_vllm] GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH=1 + V3 "
+                          "→ leaving cudagraph_mode as-is (Phase 5.7 probe: "
+                          "v3 path is capture-clean)", flush=True)
+                if cc is not None and not _allow_full:
                     mode = getattr(cc, "cudagraph_mode", None)
                     full_modes = {
                         _GlqCUDAGraphMode.FULL,
