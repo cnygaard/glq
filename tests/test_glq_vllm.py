@@ -153,6 +153,9 @@ def test_glq_embedding_method_registered():
     assert isinstance(method, UnquantizedEmbeddingMethod), type(method).__name__
 
 
+@pytest.mark.skipif(
+    not _HAS_TRANSFORMERS, reason="transformers not installed"
+)
 def test_glq_embedding_dequant_matches_hf():
     """``_dequant_embedding_rows`` must reproduce ``E8RHTEmbedding.forward``
     (with embed_scale=1.0, the convention vLLM uses) byte-for-byte.
