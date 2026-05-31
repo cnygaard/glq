@@ -75,6 +75,83 @@ For **mixed-precision** allocation, run a two-pass flow: a profile
 pass writes a per-layer `bpw_allocation.json`, then a quantize pass
 applies it. See [`examples/quantize_mixed_precision.md`](examples/quantize_mixed_precision.md).
 
+## Docker image (NVIDIA GPU)
+
+A prebuilt CUDA image ships everything needed to run GLQ models —
+`glq`, PyTorch, vLLM, transformers, and lm-eval on CUDA 12.8:
+
+```
+ghcr.io/cnygaard/glq-env:0.5.0     # also :latest, :0.5
+```
+
+**Prerequisite — GPU access in Docker.** You need an NVIDIA GPU plus
+the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+installed on the host; that's what makes the `--gpus all` flag pass
+the GPU into the container. Verify it works:
+
+```bash
+docker run --rm --gpus all ghcr.io/cnygaard/glq-env:0.5.0 nvidia-smi
+```
+
+If that prints your GPU table, you're set. (No toolkit → `--gpus`
+errors with "could not select device driver".)
+
+**Produce output.** Mount a host directory for the model cache (the
+image's `HF_HOME` is `/cache/hf`, so models persist across runs
+instead of re-downloading), then generate:
+
+```bash
+docker run --rm --gpus all \
+    -v "$HOME/.cache/huggingface:/cache/hf" \
+    ghcr.io/cnygaard/glq-env:0.5.0 \
+    python -c '
+import glq.hf_integration, torch                      # registers GLQ with HF
+from transformers import AutoModelForCausalLM, AutoTokenizer
+mid = "xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw"
+tok = AutoTokenizer.from_pretrained(mid)
+model = AutoModelForCausalLM.from_pretrained(
+    mid, device_map="cuda", torch_dtype=torch.float16)
+ids = tok("The capital of France is", return_tensors="pt").to("cuda")
+print(tok.decode(model.generate(**ids, max_new_tokens=20)[0],
+                 skip_special_tokens=True))
+'
+```
+
+Expected output:
+
+```
+The capital of France is Paris. It is located in the north of the country.
+```
+
+The first run downloads the model into the mounted cache; later runs
+reuse it. Swap `mid` for any GLQ checkpoint (see
+[Available pre-quantized checkpoints](#available-pre-quantized-checkpoints)).
+
+**Flag reference:**
+
+| Flag | Why |
+|---|---|
+| `--gpus all` | binds **all** host GPUs into the container (needs the NVIDIA Container Toolkit). Use `--gpus '"device=0"'` to pick one. |
+| `-v "$HOME/.cache/huggingface:/cache/hf"` | persists downloaded weights on the host (`HF_HOME=/cache/hf` inside) so they survive `--rm`. |
+| `--rm` | remove the container when it exits (drop it to keep the container around). |
+
+**Serving (vLLM) & an interactive shell.** The image bundles vLLM, so
+you can serve an OpenAI-compatible endpoint — publish the port and
+mount the cache:
+
+```bash
+docker run --rm --gpus all -p 8000:8000 \
+    -v "$HOME/.cache/huggingface:/cache/hf" \
+    ghcr.io/cnygaard/glq-env:0.5.0 \
+    vllm serve xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
+```
+
+For the long-context E8 KV-cache flags (`GLQ_KV_*`), pass them with
+`-e` and see [E8 lattice cache](#e8-lattice-cache-vllm-v030) /
+[Inline-dequant E8 KV](#inline-dequant-e8-kv-v05--recommended-for-long-context).
+The image's default command is a shell (`docker run --rm -it --gpus all
+ghcr.io/cnygaard/glq-env:0.5.0`) if you'd rather poke around interactively.
+
 ## Results
 
 ### SmolLM3-3B at matched 4.5 bpw vs GPTQ
