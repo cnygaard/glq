@@ -294,30 +294,32 @@ long-context / KV-bound serving.
 Validated end-to-end on Gemma-4-E4B-it / Gemma-4-31B-it on vLLM
 0.20.x.
 
-### Inline-dequant E8 KV (v0.5) — recommended for long-context
+### Inline-dequant E8 KV (default in v0.5.1)
 
 The workspace path above pre-decompresses K/V into a scratch buffer
 that vLLM's attention then re-reads — pure overhead, since each K/V
-vector is read exactly once. **v0.5 adds an inline-dequant path**: a
-forked Triton attention kernel dequantizes the compressed E8 K/V
-*inside* the tile loop (an 8-point FHT butterfly for the inverse
-Hadamard, plus flash-decoding KV-split for long-context occupancy).
-There is no workspace, and — because the read/write hooks are
-host-sync-clean — the **FULL CUDA graph captures the whole decode**,
-eliminating the per-token eager-dispatch overhead that dominated
-E8-KV decode. This is the **recommended path for long-context /
-KV-bound serving**.
+vector is read exactly once. The **inline-dequant path** instead
+dequantizes the compressed E8 K/V *inside* a forked Triton attention
+kernel (an 8-point FHT butterfly for the inverse Hadamard, plus
+flash-decoding KV-split for long-context occupancy). There is no
+workspace, and — because the read/write hooks are host-sync-clean —
+the **FULL CUDA graph captures the whole decode**, eliminating the
+per-token eager-dispatch overhead that dominated E8-KV decode.
 
-Enable it by adding one env to the bundle above:
+**As of v0.5.1 this is the default** for the E8-KV path — the standard
+bundle is all you need (no extra flag):
 
 ```bash
 GLQ_KV_QUANT=e8_relaxed:2 \
 GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 \
 GLQ_KV_E8_COMPRESSED_ALLOC=1 \
 GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
-GLQ_KV_E8_INLINE_DEQUANT_V3=1 \
 vllm serve xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
 ```
+
+Opt out with `GLQ_KV_E8_INLINE_DEQUANT_V3=0` (reverts to the 65 K
+workspace path) or `GLQ_KV_E8_FORCE_PIECEWISE=1` (keeps inline but
+disables the FULL decode graph).
 
 Decode throughput, SmolLM3-3B-GLQ-3.5bpw, RTX PRO 6000 Blackwell,
 vLLM 0.20.2 — inline vs the pre-v0.5 E8-KV path (workspace,
@@ -341,15 +343,14 @@ non-determinism — MMLU-Pro n=120, thinking, 16384-token budget:
 PIECEWISE 0.742 vs inline-FULL 0.750 (a smaller gap than two
 PIECEWISE runs differ from each other), NIAH-16k 10/10 both.
 
-**Scope (why it stays opt-in in v0.5).** It covers the **4 bpw** KV
-recipe (`e8_relaxed:2`); other recipes automatically fall back to
-the workspace path. It requires the Triton attention backend
-(auto-forced when E8 KV is active). It is validated on Gemma-4-E4B-it
-+ SmolLM3-3B / vLLM 0.20.2 / RTX PRO 6000 Blackwell — **not yet on
-24–32 GB consumer GPUs or other architectures**, which is why it
-remains opt-in for this release. FULL CUDA-graph capture is the
-default for this path; set `GLQ_KV_E8_FORCE_PIECEWISE=1` to fall
-back to PIECEWISE.
+**Scope.** It covers the **4 bpw** KV recipe (`e8_relaxed:2`); other
+recipes automatically fall back to the workspace path. It requires the
+Triton attention backend (auto-forced when E8 KV is active). Validated
+across the consumer GPU lineup — A10G (`sm_86`, 3090-class, 24 GB),
+L40S (`sm_89`, 4090-class), and RTX PRO 6000 Blackwell (`sm_120`,
+5090-class): the kernels compile and NIAH-16k + MMLU are correct on all
+three, and FULL-vs-PIECEWISE is quality-neutral on Blackwell (the
+consumer-card runs are shorter FULL-only smokes). Opt out per above.
 
 ## Advanced
 

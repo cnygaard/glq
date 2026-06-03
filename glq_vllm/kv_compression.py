@@ -92,15 +92,17 @@ def _get_quantizer(quant_method: str, n_stages: int,
                    secondary_stages: int = 0):
     """Lazily build an E8KVQuantizer with the given primary/secondary stages.
 
-    When ``GLQ_KV_E8_INLINE_DEQUANT_V3=1`` is set, the primary codebook
-    is built at ``target_size=4096`` (Phase 5.3a probe) so both the
-    write quantizer and the v3.0 attention kernel reference the same
-    4 K-entry tensor.
+    The v3 inline-dequant path is the DEFAULT for the E8-KV path as of
+    v0.5.1 (validated on sm_86/sm_89/sm_120). When active, the primary
+    codebook is built at ``target_size=4096`` so both the write quantizer
+    and the v3 attention kernel reference the same 4 K-entry tensor. Opt
+    out with ``GLQ_KV_E8_INLINE_DEQUANT_V3=0`` (reverts to the 65 K
+    workspace path).
     """
     from glq.kv_cache import _get_codebook
     from glq.kv_e8 import E8KVQuantizer
     target_size = None
-    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1":
+    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "1") != "0":
         # Default to the 4 K KV codebook: it is QUALITY-NEUTRAL vs the
         # full 65 K (MMLU-Pro n=400 same-400-Q: workspace-65K=0.630,
         # v3_split+65K=0.652, v3_split+4K=0.640 — all within the ~±2pp
@@ -785,16 +787,18 @@ def _patched_unified_attention(*, q, k, v, **kwargs):
     artifact for the smem-resident codebook approach planned in
     Phase 5.
 
-    v0.5 Phase 5.3a re-introduces an opt-in v3.0 fast path under
-    ``GLQ_KV_E8_INLINE_DEQUANT_V3=1`` (with the 4 K codebook set up
-    at quantizer-init time). Pure research probe — production default
-    remains the v0.3.5 workspace path.
+    As of v0.5.1 the v3 inline-dequant fast path (4 K codebook, FHT
+    butterfly, flash-decoding KV-split, FULL cudagraph) is the DEFAULT
+    for the E8-KV read path — validated quality-neutral on sm_86 / sm_89
+    / sm_120. 4 bpw recipes use it; other recipes fall through to the
+    workspace path automatically. Opt out with
+    ``GLQ_KV_E8_INLINE_DEQUANT_V3=0``.
     """
     global _sidecar_read_counter
     if not _sidecar_read_enabled:
         return _original_unified(q=q, k=k, v=v, **kwargs)
 
-    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") == "1":
+    if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "1") != "0":
         try:
             inline_out = _try_inline_dequant_attention_v3(q, k, kwargs)
             if inline_out is not None:

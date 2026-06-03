@@ -120,10 +120,11 @@ def register():
             # exists to confirm the kernel-level conclusion holds under
             # vLLM cudagraph + piecewise dispatch. Production default
             # remains the v0.3.5 workspace path.
-            if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") != "0":
-                print("[glq_vllm] GLQ_KV_E8_INLINE_DEQUANT_V3=1 → v3.0 "
-                      "inline-dequant attention with 4 K codebook "
-                      "(Phase 5.3a research probe, not production)",
+            if os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "1") != "0":
+                print("[glq_vllm] v3 inline-dequant attention (4 K codebook, "
+                      "FHT butterfly, KV-split, FULL cudagraph) — DEFAULT "
+                      "E8-KV read path as of v0.5.1; "
+                      "GLQ_KV_E8_INLINE_DEQUANT_V3=0 to opt out",
                       flush=True)
 
         # v0.3.5: auto-force ``cudagraph_mode=PIECEWISE`` when E8 KV is
@@ -211,7 +212,7 @@ def register():
                 # Escape hatch: GLQ_KV_E8_FORCE_PIECEWISE=1 (or the legacy
                 # GLQ_KV_E8_ALLOW_FULL_CUDAGRAPH=0) restores PIECEWISE. The
                 # WORKSPACE path (V3 unset) always stays forced-PIECEWISE.
-                _v3 = os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "0") != "0"
+                _v3 = os.environ.get("GLQ_KV_E8_INLINE_DEQUANT_V3", "1") != "0"
                 _force_pie = (
                     os.environ.get("GLQ_KV_E8_FORCE_PIECEWISE", "0") == "1"
                 )
