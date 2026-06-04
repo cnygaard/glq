@@ -23,9 +23,8 @@ ARG UBUNTU_VERSION=24.04
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
 
 # Build args (re-declared after FROM so they're in scope).
-ARG GLQ_VERSION=0.2.18
-ARG VLLM_VERSION=0.20.0
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG GLQ_VERSION=0.5.2
+ARG VLLM_VERSION=0.20.2
 
 # Locale + non-interactive apt.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -73,17 +72,15 @@ ENV PATH=/opt/venv/bin:$PATH \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel ninja
 
-# Heavy CUDA stack: torch first so subsequent extensions build against it.
-# Pinning torch 2.11+cu128 to match the rest of the production stack
-# (vLLM 0.20.0 ABI, our compiled fast-hadamard-transform wheel).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
-        --extra-index-url ${TORCH_INDEX_URL} \
-        "torch==2.11.0" "torchaudio==2.11.0" "torchvision==0.26.0"
-
-# vLLM — pulls a long chain of deps including transformers, huggingface_hub,
-# flashinfer, etc. Keep this layer separate so changes in glq version don't
-# bust the vLLM cache.
+# vLLM FIRST, so it resolves its OWN matching-CUDA torch + nvidia libs as one
+# consistent set (it also pulls transformers, huggingface_hub, flashinfer…).
+#
+# This ordering is the v0.5.2 fix for the broken `:0.5.0`/`:0.5.1` images:
+# pinning torch==cu128 *before* vLLM left vLLM's wheel mismatched, so
+# `import vllm._C` failed at runtime under --gpus all with
+# `libcudart.so.13: cannot open shared object file`. A fresh vLLM resolve
+# pulls torch 2.11+cu128 with a matching vllm._C (verified on L40S/A10G).
+# No torch pin / TORCH_INDEX_URL needed; torchaudio/torchvision aren't used.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "vllm==${VLLM_VERSION}"
 

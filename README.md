@@ -44,14 +44,27 @@ naive dequantize-then-matmul.
 
 ### Available pre-quantized checkpoints
 
-| Repo | Base model | bpw | License |
-|---|---|---|---|
-| [`xv0y5ncu/SmolLM2-135M-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-135M-Instruct-GLQ-4bpw) | SmolLM2-135M-Instruct | 4.0 | Apache 2.0 |
-| [`xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw) | SmolLM2-360M-Instruct | 4.0 | Apache 2.0 |
-| [`xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw) | SmolLM3-3B | 3.5 (mixed) | Apache 2.0 |
-| [`xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw) | Gemma-4-E4B-it | 4.0 | Apache 2.0 |
-| [`xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0 | Apache 2.0 |
-| [`xv0y5ncu/Nemotron-3-Nano-30B-A3B-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Nemotron-3-Nano-30B-A3B-GLQ-4bpw) | Nemotron-3-Nano-30B (Mamba-MoE) | 4.0 | Nemotron |
+| Repo | Base model | bpw | License | VRAM¹ | Tok/s² (b1 / b32) |
+|---|---|---|---|--:|--:|
+| [`xv0y5ncu/SmolLM2-135M-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-135M-Instruct-GLQ-4bpw) | SmolLM2-135M-Instruct | 4.0 | Apache 2.0 | 0.18 | 152 / 4205 |
+| [`xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw) | SmolLM2-360M-Instruct | 4.0 | Apache 2.0 | 0.33 | 135 / 2990 |
+| [`xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw) | SmolLM3-3B | 3.5 (mixed) | Apache 2.0 | 2.4 | 35 / 654 |
+| [`xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw) | Gemma-4-E4B-it | 4.0 | Apache 2.0 | 5.8 | 33 / 600 |
+| [`xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0 | Apache 2.0 | ~20.5 | 6.6 / — |
+| [`xv0y5ncu/Nemotron-3-Nano-30B-A3B-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Nemotron-3-Nano-30B-A3B-GLQ-4bpw) | Nemotron-3-Nano-30B (Mamba-MoE) | 4.0 | Nemotron | — | — |
+
+<sub>¹ **VRAM** = resident weight footprint at load (vLLM's `Model loading took … GiB`)
+on a **g6e.xlarge** (NVIDIA L40S) — the figure that decides whether a model fits a
+24/32 GB card; it tracks the bpw budget. Devstral ≈ 20.5 GiB is its HF-transformers
+load; Nemotron-30B not measured here.<br>
+² **Tok/s** = total decode throughput, weight-only GLQ, vLLM 0.20.2, short context
+(256 generated tokens), same hardware. **b1** = single-stream, **b32** = 32 concurrent
+sequences — a high-batch sample near the throughput knee, not a hard maximum.
+Devstral-24B is HF-transformers single-stream (vLLM v1 deadlocks; no batched figure;
+see [CUDA-graph decode wrapper](#cuda-graph-decode-wrapper)). Nemotron-3-Nano-30B is a
+Mamba-MoE (vLLM-unsupported here, compute-bound) — not benchmarked. E8-KV compression
+leaves these short-context numbers unchanged; its payoff is a ~4× smaller KV cache →
+more context / concurrency in the same VRAM (see [KV cache compression](#kv-cache-compression)).</sub>
 
 ### Quantize your own model
 
@@ -142,15 +155,22 @@ mount the cache:
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
     -v "$HOME/.cache/huggingface:/cache/hf" \
-    ghcr.io/cnygaard/glq-env:0.5.0 \
+    ghcr.io/cnygaard/glq-env:latest \
     vllm serve xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
 ```
 
+> **Image vLLM note:** in-image vLLM serving needs an image built from the
+> **v0.5.2 Dockerfile fix or later** (vLLM now resolves its own matching-CUDA
+> torch). The published `:0.5.0` / `:0.5.1` snapshots predate that fix and hit
+> `ImportError: libcudart.so.13` under `--gpus all`; on those, use the HF
+> generate path above (works), or `pip install glq` + your own vLLM. The pip
+> package is unaffected on all versions.
+
 For the long-context E8 KV-cache flags (`GLQ_KV_*`), pass them with
 `-e` and see [E8 lattice cache](#e8-lattice-cache-vllm-v030) /
-[Inline-dequant E8 KV](#inline-dequant-e8-kv-v05--recommended-for-long-context).
+[Inline-dequant E8 KV](#inline-dequant-e8-kv-default-in-v051).
 The image's default command is a shell (`docker run --rm -it --gpus all
-ghcr.io/cnygaard/glq-env:0.5.0`) if you'd rather poke around interactively.
+ghcr.io/cnygaard/glq-env:latest`) if you'd rather poke around interactively.
 
 ## Results
 
