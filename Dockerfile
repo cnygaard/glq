@@ -6,8 +6,11 @@
 # container so contributors can replicate eval results without AWS, and so
 # our AMIs can be baked from the same source of truth.
 #
-# Base: NVIDIA CUDA 12.8 cuDNN devel on Ubuntu 24.04
-# - CUDA 12.8 matches torch 2.11+cu128 binary wheels
+# Base: NVIDIA CUDA 12.9 cuDNN devel on Ubuntu 24.04
+# - CUDA 12.9 is the minimum for Blackwell (sm_120 — RTX PRO 6000 / RTX 5090):
+#   on 12.8 torch warns "SM 12.x requires CUDA >= 12.9" and falls back, with
+#   very slow / incomplete startup. 12.9 still covers sm_75/86/89
+#   (T4 / A10G / L4 / L40S). Matches torch 2.11+cu129 binary wheels.
 # - Ubuntu 24.04 ships Python 3.12 — same minor we use in the venv
 # - cudnn-devel includes nvcc, headers, and libs needed for JIT-compiling
 #   our CUDA C extension and for building mamba-ssm / causal-conv1d
@@ -17,7 +20,7 @@
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
 #              ghcr.io/cnygaard/glq-env:0.2.18
-ARG CUDA_VERSION=12.8.0
+ARG CUDA_VERSION=12.9.1
 ARG UBUNTU_VERSION=24.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
@@ -72,15 +75,21 @@ ENV PATH=/opt/venv/bin:$PATH \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel ninja
 
-# vLLM FIRST, so it resolves its OWN matching-CUDA torch + nvidia libs as one
-# consistent set (it also pulls transformers, huggingface_hub, flashinfer…).
-#
-# This ordering is the v0.5.2 fix for the broken `:0.5.0`/`:0.5.1` images:
-# pinning torch==cu128 *before* vLLM left vLLM's wheel mismatched, so
-# `import vllm._C` failed at runtime under --gpus all with
-# `libcudart.so.13: cannot open shared object file`. A fresh vLLM resolve
-# pulls torch 2.11+cu128 with a matching vllm._C (verified on L40S/A10G).
-# No torch pin / TORCH_INDEX_URL needed; torchaudio/torchvision aren't used.
+# torch + torchvision from the cu129 wheel index FIRST. Blackwell (sm_120)
+# needs CUDA >= 12.9, and the default-PyPI torchvision is a cu130 build that
+# mismatches torch's 12.9 ("PyTorch and torchvision compiled with different
+# CUDA major versions"), so pin BOTH from cu129 here. vLLM 0.20.2 then accepts
+# the already-present torch==2.11.0 / torchvision==0.26.0 and does NOT
+# re-pull them. (vLLM's vllm._C is a cu12 build → libcudart.so.12 → loads
+# against cu128 or cu129 alike; the old `:0.5.0/:0.5.1` libcudart.so.13 break
+# was the cu13 BASE image, since reverted.) Verified on an RTX PRO 6000
+# (sm_120): no "SM 12.x" warning, clean startup, coherent output.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.11.0 torchvision==0.26.0 \
+        --index-url https://download.pytorch.org/whl/cu129
+
+# vLLM — uses the cu129 torch/torchvision installed above (it also pulls
+# transformers, huggingface_hub, flashinfer…).
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "vllm==${VLLM_VERSION}"
 
