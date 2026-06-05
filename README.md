@@ -153,25 +153,42 @@ you can serve an OpenAI-compatible endpoint — publish the port and
 mount the cache:
 
 ```bash
-# `tool.jinja` is your tool-calling chat template — keep it in the current
-# directory; it is mounted into the container at /work/tool.jinja below.
+# Plain chat — the model ships its own chat template, so nothing extra needed:
 docker run --rm --gpus all -p 8000:8000 \
     -v "$HOME/.cache/huggingface:/cache/hf" \
-    -v "$PWD/tool.jinja:/work/tool.jinja:ro" \
+    ghcr.io/cnygaard/glq-env:latest \
+    vllm serve xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw --max-model-len 64000
+```
+
+**Tool-calling + thinking.** Gemma-4's tool template is *not* in the model (its
+bundled `chat_template.jinja` is plain chat) and *not* in the vLLM pip wheel, so
+fetch it from vLLM's `examples/` first, then mount it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm/v0.20.2/examples/tool_chat_template_gemma4.jinja \
+    -o tool_chat_template_gemma4.jinja
+
+docker run --rm --gpus all -p 8000:8000 \
+    -v "$HOME/.cache/huggingface:/cache/hf" \
+    -v "$PWD/tool_chat_template_gemma4.jinja:/work/tool.jinja:ro" \
     ghcr.io/cnygaard/glq-env:latest \
     vllm serve xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw \
         --max-model-len 64000 \
         --enable-auto-tool-choice \
         --tool-call-parser gemma4 \
         --reasoning-parser gemma4 \
-        --chat-template /work/tool.jinja
+        --chat-template /work/tool.jinja \
+        --default-chat-template-kwargs '{"enable_thinking": true}'
 ```
 
-A minimal serve is just `vllm serve <glq-model>`; the flags above add 64k
-context plus Gemma-4 tool-calling and reasoning parsing. Two gotchas: pass
-`--chat-template` the **in-container** mount path (`/work/tool.jinja`), not the
-host path; and the `gemma4` tool-call/reasoning parsers require a vLLM build
-that registers them.
+Pass `--chat-template` the **in-container** mount path (`/work/tool.jinja`), not
+the host path. `--default-chat-template-kwargs '{"enable_thinking": true}'`
+defaults Gemma-4 reasoning on. The `gemma4` parsers and all of these flags are
+accepted by the image's bundled vLLM 0.20.2 and the model loads; note that
+startup runs a multi-minute `torch.compile` + CUDA-graph capture before the
+endpoint is ready. See the
+[vLLM Gemma-4 recipe](https://docs.vllm.ai/projects/recipes/en/latest/Google/Gemma4.html)
+for the full tool-calling / reasoning reference.
 
 > **Image vLLM note:** in-image vLLM serving needs an image built from the
 > **v0.5.2 Dockerfile fix or later** (vLLM now resolves its own matching-CUDA
