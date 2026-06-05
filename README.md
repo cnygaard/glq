@@ -153,11 +153,25 @@ you can serve an OpenAI-compatible endpoint — publish the port and
 mount the cache:
 
 ```bash
+# `tool.jinja` is your tool-calling chat template — keep it in the current
+# directory; it is mounted into the container at /work/tool.jinja below.
 docker run --rm --gpus all -p 8000:8000 \
     -v "$HOME/.cache/huggingface:/cache/hf" \
+    -v "$PWD/tool.jinja:/work/tool.jinja:ro" \
     ghcr.io/cnygaard/glq-env:latest \
-    vllm serve xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
+    vllm serve xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw \
+        --max-model-len 64000 \
+        --enable-auto-tool-choice \
+        --tool-call-parser gemma4 \
+        --reasoning-parser gemma4 \
+        --chat-template /work/tool.jinja
 ```
+
+A minimal serve is just `vllm serve <glq-model>`; the flags above add 64k
+context plus Gemma-4 tool-calling and reasoning parsing. Two gotchas: pass
+`--chat-template` the **in-container** mount path (`/work/tool.jinja`), not the
+host path; and the `gemma4` tool-call/reasoning parsers require a vLLM build
+that registers them.
 
 > **Image vLLM note:** in-image vLLM serving needs an image built from the
 > **v0.5.2 Dockerfile fix or later** (vLLM now resolves its own matching-CUDA
