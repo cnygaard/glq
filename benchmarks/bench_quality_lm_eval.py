@@ -320,14 +320,17 @@ def main() -> int:
     p.add_argument("--timeout", type=int, default=21600, help="per-bucket seconds")
     p.add_argument("--tps-log", default=None,
                    help="(table mode) bench_tps_vllm RESULT log for B1/B32 tok/s")
+    p.add_argument("--no-baselines", action="store_true",
+                   help="with --only, do NOT auto-add bf16 counterparts (GLQ-only)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
     specs = default_specs()
     if args.only:
         keep = {s.strip() for s in args.only.split(",")}
-        # keep bf16 counterparts so the table can compute % bf16
-        keep |= {by.bf16_of for by in specs if by.name in keep and by.bf16_of}
+        # keep bf16 counterparts so the table can compute % bf16 (unless GLQ-only)
+        if not args.no_baselines:
+            keep |= {by.bf16_of for by in specs if by.name in keep and by.bf16_of}
         specs = [s for s in specs if s.name in keep]
         if not specs:
             print(f"No specs match --only={args.only}. "
