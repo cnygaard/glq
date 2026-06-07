@@ -1230,6 +1230,27 @@ def quantize(
             if not tied:
                 state_dict["lm_head.weight"] = lm_w.data.cpu()
 
+    # Streaming multimodal Mistral3: promote to a text-only Ministral3ForCausalLM
+    # layout — strip the ``language_model.`` wrapper and drop the vision tower /
+    # projector so the checkpoint reloads as a pure text model (``model.layers.*``),
+    # matching the non-streaming path. Without this the checkpoint saves as
+    # Mistral3ForConditionalGeneration and glq's HF quantizer doesn't substitute
+    # the nested ``language_model.layers`` on reload (Qidxs come back UNEXPECTED
+    # -> GLQ weights silently not loaded -> garbage output).
+    promote_text_only = streaming and is_mistral3
+    if promote_text_only:
+        _DROP = ("vision_tower.", "multi_modal_projector.",
+                 "model.vision_tower.", "model.multi_modal_projector.")
+        remapped = {}
+        for _k, _v in state_dict.items():
+            if _k.startswith(_DROP):
+                continue
+            _nk = _k[len("language_model."):] if _k.startswith("language_model.") else _k
+            remapped[_nk] = _v
+        print(f"  promoted to text-only (stripped language_model. wrapper, "
+              f"dropped {len(state_dict) - len(remapped)} vision/projector tensors)")
+        state_dict = remapped
+
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
     # 2. Save codebook
@@ -1239,6 +1260,11 @@ def quantize(
     if not streaming:
         is_wrapped = text_model is not model
         save_cfg = text_model.config if is_wrapped else cfg
+    elif promote_text_only:
+        # Promoted text-only checkpoint: save the text decoder config and let
+        # the ``architectures`` get rewritten to the matching *ForCausalLM below.
+        save_cfg = cfg.text_config
+        is_wrapped = True
     else:
         save_cfg = cfg
         is_wrapped = False
