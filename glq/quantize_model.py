@@ -127,6 +127,21 @@ _MODEL_PROFILES = {
         'trust_remote_code': False,
         'forward_kwargs': 'gemma4',
     },
+    'Gemma4UnifiedForConditionalGeneration': {
+        # gemma-4-12B-it (model_type `gemma4_unified`): a vision+audio
+        # multimodal wrapper around a DENSE Gemma-4 text decoder. Same module
+        # layout as Gemma4ForConditionalGeneration (decoder at
+        # model.language_model.*), but dense — hidden_size_per_layer_input == 0
+        # (no PLE) and num_kv_shared_layers == 0 (no KV sharing), so those
+        # gemma4 code paths auto-skip. Streaming branch overrides sd_prefix and
+        # picks the Gemma4Unified* classes by arch/model_type.
+        'layers_attr': 'model.language_model.layers',
+        'embed_attr': 'model.language_model.embed_tokens',
+        'rotary_attr': 'model.language_model.rotary_emb',
+        'sd_prefix': 'model.language_model.layers',
+        'trust_remote_code': False,
+        'forward_kwargs': 'gemma4',
+    },
 }
 
 _DEFAULT_PROFILE = {
@@ -566,10 +581,14 @@ def quantize(
     # Ministral3RotaryEmbedding as the multimodal variant. Careful: "Mistral3"
     # is NOT a substring of "Ministral3" (the latter has an extra 'n').
     is_ministral3_text = arch == "Ministral3ForCausalLM"
-    # Gemma 4 is multimodal (Gemma4ForConditionalGeneration). The language
-    # decoder lives at `model.language_model` and saved keys are prefixed
-    # `model.language_model.layers.…`. We quantize the text decoder only.
-    is_gemma4 = "Gemma4ForConditional" in arch
+    # Gemma 4 is multimodal (Gemma4ForConditionalGeneration, and the newer
+    # Gemma4UnifiedForConditionalGeneration used by gemma-4-12B-it). The
+    # language decoder lives at `model.language_model` and saved keys are
+    # prefixed `model.language_model.layers.…`. We quantize the text decoder
+    # only. Both share the same module layout; the only differences the
+    # streaming path cares about are the model + rotary class names.
+    is_gemma4 = "Gemma4" in arch and "ForConditionalGeneration" in arch
+    is_gemma4_unified = "Gemma4Unified" in arch
 
     if streaming:
         # Streaming mode: don't load model into RAM. Instead, instantiate
@@ -583,9 +602,13 @@ def quantize(
             _layers = get_decoder_layers(_text, profile)
             sd_prefix = "language_model.model.layers"
         elif is_gemma4:
-            from transformers import Gemma4ForConditionalGeneration
+            import transformers as _tf
+            # arch is 'Gemma4ForConditionalGeneration' or
+            # 'Gemma4UnifiedForConditionalGeneration' — both are exported at the
+            # transformers top level and both expose model.language_model.
+            gemma_cls = getattr(_tf, arch)
             with torch.device("meta"):
-                _model = Gemma4ForConditionalGeneration(cfg)
+                _model = gemma_cls(cfg)
             _text = _model.model.language_model
             _layers = list(_text.layers)
             sd_prefix = "model.language_model.layers"
@@ -688,9 +711,16 @@ def quantize(
             if use_gpu:
                 rotary_emb.to(device)
         elif is_gemma4:
-            # Gemma4 text decoder needs a Gemma4-specific rotary embedding.
-            from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding
-            rotary_emb = Gemma4TextRotaryEmbedding(config=cfg.text_config)
+            # Gemma4 text decoder needs a Gemma4-specific rotary embedding
+            # (per-layer sliding/full type). The unified variant ships its own
+            # copy under modeling_gemma4_unified.
+            if is_gemma4_unified:
+                from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+                    Gemma4UnifiedTextRotaryEmbedding as _GemmaRotary)
+            else:
+                from transformers.models.gemma4.modeling_gemma4 import (
+                    Gemma4TextRotaryEmbedding as _GemmaRotary)
+            rotary_emb = _GemmaRotary(config=cfg.text_config)
             if use_gpu:
                 rotary_emb.to(device)
     else:
