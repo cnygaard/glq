@@ -191,7 +191,7 @@ endpoint is ready. See the
 for the full tool-calling / reasoning reference.
 
 > **Image vLLM note:** in-image vLLM serving needs an image built from the
-> **v0.5.2 Dockerfile fix or later** (vLLM now resolves its own matching-CUDA
+> **v0.5.3 Dockerfile fix or later** (vLLM now resolves its own matching-CUDA
 > torch). The published `:0.5.0` / `:0.5.1` snapshots predate that fix and hit
 > `ImportError: libcudart.so.13` under `--gpus all`; on those, use the HF
 > generate path above (works), or `pip install glq` + your own vLLM. The pip

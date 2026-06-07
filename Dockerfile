@@ -26,7 +26,7 @@ ARG UBUNTU_VERSION=24.04
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
 
 # Build args (re-declared after FROM so they're in scope).
-ARG GLQ_VERSION=0.5.2
+ARG GLQ_VERSION=0.5.3
 ARG VLLM_VERSION=0.20.2
 
 # Locale + non-interactive apt.
