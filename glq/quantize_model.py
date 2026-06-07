@@ -474,7 +474,15 @@ def _load_tensor_from_shards(weight_map, shard_paths, key):
 
 
 def _download_snapshot(model_id):
-    """Download model and return snapshot directory path."""
+    """Download model and return snapshot directory path.
+
+    If ``model_id`` is already a local directory (e.g. a checkpoint fetched
+    via ``hf download --local-dir``), return it as-is instead of passing it to
+    ``snapshot_download`` (which rejects non-repo-id paths).
+    """
+    import os
+    if os.path.isdir(model_id):
+        return model_id
     from huggingface_hub import snapshot_download
     return snapshot_download(model_id)
 
@@ -686,11 +694,23 @@ def quantize(
     rotary_emb = None
 
     if streaming:
-        # Load embedding from safetensors
-        if is_mistral3:
-            embed_key = "language_model.model.embed_tokens.weight"
-        elif is_gemma4:
-            embed_key = "model.language_model.embed_tokens.weight"
+        # Load embedding from safetensors. Auto-detect the checkpoint key layout
+        # from the weight_map instead of pinning a transformers version:
+        # transformers <5.10 saved the Mistral3 text decoder under
+        # ``language_model.model.*``; >=5.10 (and gemma4) use
+        # ``model.language_model.*``. Deriving embed_key + sd_prefix from the
+        # actual keys keeps streaming robust across both layouts.
+        if is_mistral3 or is_gemma4:
+            _ek = next((k for k in weight_map
+                        if k.endswith("embed_tokens.weight")
+                        and "vision" not in k and "per_layer" not in k), None)
+            embed_key = _ek or (
+                "model.language_model.embed_tokens.weight" if is_gemma4
+                else "language_model.model.embed_tokens.weight")
+            _lk = next((k for k in weight_map
+                        if ".layers.0." in k and "vision" not in k), None)
+            if _lk:
+                sd_prefix = _lk.split(".layers.")[0] + ".layers"
         else:
             embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
             embed_key = f"{embed_attr}.weight"
