@@ -82,6 +82,24 @@ class GLQvLLMConfig(QuantizationConfig):
                 best = max(best or 0, int(self.layer_bpw[f]))
         return best
 
+    def _is_prefused(self, prefix: str) -> bool:
+        """True iff ``prefix`` is a DIRECT layer_bpw entry — i.e. the checkpoint
+        stores this fused linear as one jointly-quantized matrix (e.g.
+        ``query_key_value``), rather than as separate per-shard weights merged
+        at load (``qkv_proj``/``gate_up_proj``, whose q/k/v or gate/up
+        sub-layers are the layer_bpw entries, reached via ``_lookup_bpw``'s
+        merge_map). Such a matrix has a single row-direction Hadamard over all
+        output rows and must be loaded/dequantized whole, not split into shards.
+        """
+        if not self.layer_bpw:
+            return False
+        forms = {prefix}
+        if prefix.startswith("model.") and ".language_model." not in prefix:
+            forms.add("model.language_model." + prefix[len("model."):])
+        if prefix.startswith("language_model.model."):
+            forms.add("model.language_model." + prefix[len("language_model.model."):])
+        return any(f in self.layer_bpw for f in forms)
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):
             bpw = self._lookup_bpw(prefix)
@@ -89,7 +107,9 @@ class GLQvLLMConfig(QuantizationConfig):
                 # Layer is bf16 in the checkpoint — return default so
                 # vLLM loads `.weight` instead of expecting GLQ buffers.
                 return UnquantizedLinearMethod()
-            return GLQLinearMethod(self, bpw=bpw if bpw is not None else self.bpw)
+            return GLQLinearMethod(
+                self, bpw=bpw if bpw is not None else self.bpw,
+                pre_fused=self._is_prefused(prefix))
 
         # VocabParallelEmbedding (and subclasses, e.g. ParallelLMHead).
         # Quantized embeddings — currently only Gemma-4's PLE — appear in

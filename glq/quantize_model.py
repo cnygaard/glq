@@ -158,6 +158,16 @@ _MODEL_PROFILES = {
         'sd_prefix': 'model.layers',
         'trust_remote_code': True,
         'forward_kwargs': 'default',
+        # Routed MoE experts feed vLLM's FusedMoE, whose fused dequant kernel
+        # takes a SINGLE input rotation (w13_SV) for the stacked gate+up (w13).
+        # gate_proj/up_proj quantized separately each carry their OWN random
+        # Hadamard SV, so they cannot be stacked under one SV (the fused-QKV
+        # shared-SV trap). Fusing gate+up into one ``gate_up_proj`` matrix
+        # BEFORE quantization yields one shared SV/SU/Wscale/inv_resid_scale —
+        # matching FusedMoE's w13 layout exactly (same pattern as a fused QKV).
+        # Applies to routed experts only; the dense (first_k_dense) MLP and the
+        # shared expert stay split and use vLLM's per-shard merged-linear path.
+        'fuse_expert_gate_up': True,
     },
 }
 
@@ -794,7 +804,11 @@ def quantize(
     with torch.no_grad():
         for i in range(calib_ids.shape[0]):
             hidden_states.append(embed(calib_ids[i:i+1].to(device)))
-    hidden_states = torch.cat(hidden_states, dim=0)
+    # Match the calibration activations to the compute dtype: streaming loads
+    # the raw embedding (fp32 for fp32-stored checkpoints like sarvam_moe) while
+    # the decoder layers are cast to `dtype` — without this the first layer's
+    # matmul hits a float-vs-bf16 dtype mismatch. No-op for bf16/fp16 models.
+    hidden_states = torch.cat(hidden_states, dim=0).to(dtype)
 
     # ---- Gemma-4 Per-Layer Embedding (PLE) precomputation ----
     # E2B / E4B have hidden_size_per_layer_input > 0 and feed each decoder
@@ -967,6 +981,101 @@ def quantize(
         if use_gpu:
             torch.cuda.empty_cache()
 
+        # ---- Jointly quantize routed-expert gate+up, store split ----
+        # vLLM's FusedMoE stacks gate+up into w13 with ONE per-expert Wscale.
+        # gate_proj/up_proj quantized SEPARATELY get different Wscale (the
+        # magnitude lives entirely in the scalar Wscale; SU is ±1 signs), so
+        # they can't share a single w13 scale. Quantizing the concatenated
+        # [gate; up] matrix JOINTLY yields one Wscale (and one SU/SV) for the
+        # whole w13. We then store the result split back under the original
+        # gate_proj/up_proj keys (Qidxs/Qidxs2/SU row-split; SV/Wscale/
+        # inv_resid_scale shared -> duplicated) so vLLM's native expert mapping
+        # (gate->w1, up->w3) reassembles an exact w13 with no model patch.
+        # Routed experts only; the dense (first_k_dense) MLP and the shared
+        # expert keep the per-shard merged-linear path.
+        gate_up_fusion = {}  # fused_name -> (gate_mod, up_mod, gate_out, g_name, u_name)
+        if profile.get('fuse_expert_gate_up'):
+            pairs = []
+            for name in list(linears):
+                if not name.endswith('.gate_proj'):
+                    continue
+                if '.experts.' not in name or 'shared' in name:
+                    continue  # routed experts only
+                up_name = name[:-len('.gate_proj')] + '.up_proj'
+                if up_name in linears:
+                    pairs.append((name, up_name))
+            for gate_name, up_name in pairs:
+                fused_name = gate_name[:-len('.gate_proj')] + '.gate_up_proj'
+                real_gate, real_up = linears[gate_name], linears[up_name]
+                gate_out = real_gate.weight.data.shape[0]
+                fused = nn.Linear(
+                    real_gate.in_features,
+                    gate_out + real_up.weight.data.shape[0],
+                    bias=False, device=real_gate.weight.device,
+                    dtype=real_gate.weight.dtype)
+                with torch.no_grad():
+                    fused.weight.copy_(torch.cat(
+                        [real_gate.weight.data, real_up.weight.data], dim=0))
+                linears[fused_name] = fused
+                # gate & up share the expert input -> identical Hessian; reuse
+                # whichever was captured (un-routed experts -> identity fallback).
+                H = hessians.pop(gate_name, None)
+                H_up = hessians.pop(up_name, None)
+                if H is None:
+                    H = H_up
+                if H is not None:
+                    hessians[fused_name] = H
+                del linears[gate_name], linears[up_name]
+                gate_up_fusion[fused_name] = (
+                    real_gate, real_up, gate_out, gate_name, up_name)
+            if pairs:
+                print(f"  joint-quant {len(pairs)} expert gate+up (one Wscale), "
+                      f"stored split as gate_proj/up_proj")
+
+        def _writeback(name, W_hat):
+            """Store the dequantized weight back into the live module(s) so the
+            post-quant calibration forward reflects quantization. A fused
+            gate_up_proj splits back into its real gate/up modules."""
+            if name in gate_up_fusion:
+                real_gate, real_up, gate_out, _, _ = gate_up_fusion[name]
+                real_gate.weight.data = W_hat[:gate_out].to(
+                    dtype=real_gate.weight.dtype, device=real_gate.weight.device)
+                real_up.weight.data = W_hat[gate_out:gate_out + real_up.weight.data.shape[0]].to(
+                    dtype=real_up.weight.dtype, device=real_up.weight.device)
+            else:
+                mod = linears[name]
+                mod.weight.data = W_hat.to(dtype=mod.weight.dtype,
+                                           device=mod.weight.device)
+
+        # Output-row-indexed artifacts get row-split between gate/up; the rest
+        # (input-side SV, scalar Wscale/inv_resid_scale) are shared -> duplicated.
+        _ROW_ARTS = {'Qidxs', 'Qidxs2', 'Qidxs3', 'SU'}
+        _SHARED_ARTS = {'SV', 'Wscale', 'inv_resid_scale', 'inv_resid_scale2'}
+
+        def _store_artifacts(name, arts):
+            """Record quantized artifacts under their checkpoint prefix(es).
+            A jointly-quantized gate_up result is split row-wise back into the
+            gate_proj/up_proj prefixes vLLM's expert mapping expects."""
+            if name not in gate_up_fusion:
+                all_artifacts[f"{sd_prefix}.{layer_idx}.{name}"] = arts
+                return
+            real_gate, real_up, gate_out, gate_name, up_name = gate_up_fusion[name]
+            up_out = real_up.weight.data.shape[0]
+            gate_arts, up_arts = {}, {}
+            for k, v in arts.items():
+                if k in _ROW_ARTS:
+                    gate_arts[k] = v[:gate_out].clone()
+                    up_arts[k] = v[gate_out:gate_out + up_out].clone()
+                elif k in _SHARED_ARTS:
+                    gate_arts[k] = v.clone()
+                    up_arts[k] = v.clone()
+                else:
+                    raise ValueError(
+                        f"gate_up split: unhandled artifact key {k!r}; add it to "
+                        f"_ROW_ARTS or _SHARED_ARTS in _store_artifacts")
+            all_artifacts[f"{sd_prefix}.{layer_idx}.{gate_name}"] = gate_arts
+            all_artifacts[f"{sd_prefix}.{layer_idx}.{up_name}"] = up_arts
+
         # Quantize each linear sublayer
         # Filter to quantizable sublayers
         quant_names = []
@@ -994,11 +1103,8 @@ def quantize(
             dt_batch = time.perf_counter() - t0
 
             for name, W_hat, artifacts, metrics in results:
-                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
-                all_artifacts[layer_prefix] = artifacts
-                linears[name].weight.data = W_hat.to(
-                    dtype=linears[name].weight.dtype,
-                    device=linears[name].weight.device)
+                _store_artifacts(name, artifacts)
+                _writeback(name, W_hat)
                 all_sqnr.append(metrics['sqnr'])
 
             # Print summary
@@ -1033,10 +1139,8 @@ def quantize(
             def _collect_result(name, W_hat, artifacts_cpu, metrics):
                 """Store result from a quantized sublayer."""
                 layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
-                all_artifacts[layer_prefix] = artifacts_cpu
-                mod = linears[name]
-                mod.weight.data = W_hat.to(dtype=mod.weight.dtype,
-                                           device=mod.weight.device)
+                _store_artifacts(name, artifacts_cpu)
+                _writeback(name, W_hat)
                 all_sqnr.append(metrics['sqnr'])
                 all_proxy_losses[layer_prefix] = metrics['proxy_loss']
 

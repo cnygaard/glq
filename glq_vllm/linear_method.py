@@ -153,17 +153,30 @@ def _detect_block_diag(m_pad: int, n_pad: int):
 def _glq_weight_loader(param, loaded_weight, *args, **kwargs):
     """GLQ weight loader — handles per-expert, shared, and standard params."""
     expert_id = kwargs.get('expert_id')
+    shard_id = kwargs.get('shard_id')
     if expert_id is not None:
         if param.data.dim() >= 2:
-            # Per-expert tensor (Qidxs 3D, SU 2D): index by expert_id
+            # Per-expert tensor: Qidxs (E, m_pad, nblk) or SU (E, m_pad).
             slot = param.data[expert_id]
-            if slot.shape != loaded_weight.shape:
-                new_shape = list(param.data.shape)
-                for d in range(loaded_weight.dim()):
-                    new_shape[d + 1] = loaded_weight.shape[d]
-                param.data = torch.zeros(new_shape, dtype=param.data.dtype,
-                                         device=param.data.device)
-            param.data[expert_id].copy_(loaded_weight)
+            # Gated w13 = [gate; up] stacked: gate (shard "w1") fills the first
+            # half of the output rows, up (shard "w3") the second half. The GLQ
+            # checkpoint stores gate_proj/up_proj jointly-quantized then row-
+            # split, so each loaded half has exactly m_pad/2 rows and shares one
+            # Wscale/SV — placing them into the two halves reassembles an exact
+            # w13. (Down-proj / shard "w2" is a single full-width projection.)
+            if shard_id in ('w1', 'w3') and loaded_weight.shape[0] * 2 == slot.shape[0]:
+                off = 0 if shard_id == 'w1' else slot.shape[0] // 2
+                slot[off:off + loaded_weight.shape[0]].copy_(loaded_weight)
+            else:
+                # Full per-expert copy (w2/down, or non-split). Resize the slot
+                # if its allocated shape doesn't match the loaded weight.
+                if slot.shape != loaded_weight.shape:
+                    new_shape = list(param.data.shape)
+                    for d in range(loaded_weight.dim()):
+                        new_shape[d + 1] = loaded_weight.shape[d]
+                    param.data = torch.zeros(new_shape, dtype=param.data.dtype,
+                                             device=param.data.device)
+                param.data[expert_id].copy_(loaded_weight)
         elif param.data.dim() == 1 and loaded_weight.dim() == 0:
             # Per-expert scalar (Wscale, inv_resid_scale): param is (num_experts,)
             param.data[expert_id] = loaded_weight.item()
@@ -522,9 +535,17 @@ class GLQLinearMethod(LinearMethodBase):
     Supports standard linear layers AND fused QKV (per-shard buffers).
     """
 
-    def __init__(self, quant_config, bpw: int = 2):
+    def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False):
         self.quant_config = quant_config
         self.bpw = bpw
+        # ``pre_fused``: the checkpoint stores this fused linear as ONE
+        # jointly-quantized matrix (e.g. sarvam/Bailing's ``query_key_value``),
+        # not as separate per-shard weights merged at load. A jointly-quantized
+        # matrix has a single row-direction Hadamard spanning all output rows,
+        # so it MUST be dequantized as a whole — it cannot be split into q/k/v
+        # shards. Load it as a single (non-sharded) GLQ matrix; its dequant
+        # output [q;k;v] is exactly what QKVParallelLinear consumes.
+        self.pre_fused = pre_fused
 
     def create_weights(
         self,
@@ -536,7 +557,10 @@ class GLQLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        is_fused = len(output_partition_sizes) > 1
+        # A pre-fused checkpoint matrix (e.g. ``query_key_value``) is loaded as a
+        # single non-sharded GLQ matrix even though vLLM's layer reports
+        # multiple output partitions — see GLQLinearMethod.pre_fused.
+        is_fused = len(output_partition_sizes) > 1 and not self.pre_fused
         layer.glq_is_fused = is_fused
         layer.glq_in_features = input_size_per_partition
         layer.glq_bpw = self.bpw

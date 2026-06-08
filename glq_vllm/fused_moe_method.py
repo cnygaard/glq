@@ -203,9 +203,18 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: nn.Module | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
-        """Fused dequant+matmul for active experts via CUDA kernels."""
+        """Fused dequant+matmul for active experts via CUDA kernels.
+
+        ``shared_experts`` (vLLM >= 0.22 FusedMoE) is accepted but ignored: GLQ
+        does not fuse the shared expert into the routed-expert kernel, so the
+        runner computes it separately (its Linears are served by
+        GLQLinearMethod via the layer_bpw whitelist). ``**kwargs`` absorbs any
+        further runner-only kwargs added by newer vLLM versions.
+        """
         from . import linear_method as _lm
         from glq import inference_kernel as _ik
 
@@ -220,8 +229,12 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         w13_out = layer.glq_w13_out
         activation = getattr(layer, 'activation', None)
 
-        # Try fused C++ MoE path
-        if (_ik._try_load_cuda_ext()
+        # Try fused C++ MoE path (GLQ_MOE_FORCE_FALLBACK=1 forces the per-expert
+        # Python loop instead — used to A/B-isolate the fused kernel vs the
+        # weight load during bring-up of a new MoE architecture).
+        import os as _os
+        if (_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_moe_cuda')
                 and layer.glq_n_pad_w13 <= 16384
                 and layer.glq_m_pad_w13 <= 16384
@@ -229,12 +242,13 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 and layer.glq_m_pad_w2 <= 16384):
             _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
             _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+            _empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
             cb_half = cb.codebook_half if cb is not None else _empty_f16
             cb2_half = cb2.codebook_half if cb2 is not None else _empty_f16
 
             output = _ik._glq_cuda.glq_fused_moe_cuda(
                 x.half().contiguous(),
-                topk_ids,
+                topk_ids.to(torch.int64),   # vLLM >=0.22 gives int32; kernel wants int64
                 topk_weights,
                 # w13
                 layer.w13_Qidxs, layer.w13_SU, layer.w13_SV,
@@ -251,6 +265,9 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 layer.glq_log_n_w13, layer.glq_log_m_w13,
                 layer.glq_log_n_w2, layer.glq_log_m_w2,
                 self._activation_type(activation),
+                # stage-3 RVQ: pass empty tensors (2-stage). pybind requires real
+                # tensors here — the C++ `= None` default can't bind to torch::Tensor.
+                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
             )
             if dtype != torch.float16:
                 output = output.to(dtype)
