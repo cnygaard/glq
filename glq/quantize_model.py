@@ -142,6 +142,23 @@ _MODEL_PROFILES = {
         'trust_remote_code': False,
         'forward_kwargs': 'gemma4',
     },
+    'SarvamMoEForCausalLM': {
+        # sarvam-30b (model_type `sarvam_moe`, trust_remote_code): a dense-text
+        # MoE. Standard `model.layers.*` layout; embeddings at
+        # `model.word_embeddings`; global rotary at `model.rotary_emb`. Each
+        # SarvamMoEDecoderLayer self-selects dense-vs-MoE MLP by layer_idx
+        # (first_k_dense_replace). Experts are per-expert nn.Linear in a
+        # ModuleList (+ a shared expert) so the nn.Linear quant loop picks them
+        # up; the router (SarvamMoEGate) is an nn.Parameter so it is skipped and
+        # stays dense. The attention requires precomputed position_embeddings,
+        # so the streaming path builds the rotary from `rotary_attr`.
+        'layers_attr': 'model.layers',
+        'embed_attr': 'model.word_embeddings',
+        'rotary_attr': 'model.rotary_emb',
+        'sd_prefix': 'model.layers',
+        'trust_remote_code': True,
+        'forward_kwargs': 'default',
+    },
 }
 
 _DEFAULT_PROFILE = {
@@ -584,6 +601,7 @@ def quantize(
     weight_map = None
     shard_paths = None
     BlockClass = None
+    _rotary_cls = None  # generic-streaming rotary class (built off-meta in the rotary section)
     is_mistral3 = "Mistral3" in arch  # Mistral3ForConditionalGeneration (multimodal 24B)
     # Pure-text Ministral3 (123B Devstral-2) uses its own LM class but the same
     # Ministral3RotaryEmbedding as the multimodal variant. Careful: "Mistral3"
@@ -628,6 +646,15 @@ def quantize(
                 _layers = _resolve_attr(_model, profile['layers_attr'])
             else:
                 _layers = get_decoder_layers(_model, profile)
+            # Capture the rotary class so the calibration forward can build a
+            # real (off-meta) rotary later. Attentions that hard-unpack
+            # position_embeddings (e.g. sarvam_moe) require it; the meta model's
+            # rotary has meta-tensor inv_freq, so we re-instantiate by class.
+            if profile.get('rotary_attr'):
+                try:
+                    _rotary_cls = type(_resolve_attr(_model, profile['rotary_attr']))
+                except (AttributeError, KeyError):
+                    _rotary_cls = None
         BlockClass = type(_layers[0])
         n_layers = len(_layers)
         del _model, _layers
@@ -741,6 +768,14 @@ def quantize(
                 from transformers.models.gemma4.modeling_gemma4 import (
                     Gemma4TextRotaryEmbedding as _GemmaRotary)
             rotary_emb = _GemmaRotary(config=cfg.text_config)
+            if use_gpu:
+                rotary_emb.to(device)
+        elif _rotary_cls is not None:
+            # Generic custom arch (e.g. sarvam_moe): build the rotary off-meta
+            # from the class captured during meta discovery, so the calibration
+            # forward can pass position_embeddings to attentions that require them
+            # (sarvam attention hard-unpacks `cos, sin = position_embeddings`).
+            rotary_emb = _rotary_cls(config=cfg)
             if use_gpu:
                 rotary_emb.to(device)
     else:
