@@ -280,7 +280,11 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
         if shared_kv_cache is not None and sample_idx is not None:
             for producer_idx, samples in shared_kv_cache.items():
                 if sample_idx < len(samples):
-                    shared_kv[producer_idx] = samples[sample_idx]
+                    # transformers >=5.10 keys shared_kv_states by layer_type
+                    # ('full_attention'/'sliding_attention'), not producer index
+                    # (the reader does ``shared_kv_states[self.layer_type]``).
+                    # Producer's layer_type == its reader's, so this resolves.
+                    shared_kv[cfg.text_config.layer_types[producer_idx]] = samples[sample_idx]
         return dict(
             position_ids=position_ids,
             position_embeddings=rotary_emb(h, position_ids=position_ids,
@@ -744,8 +748,15 @@ def quantize(
             embed_key = _ek or (
                 "model.language_model.embed_tokens.weight" if is_gemma4
                 else "language_model.model.embed_tokens.weight")
+            # Target the LANGUAGE-MODEL decoder layers specifically. Multimodal
+            # Gemma-4 / Mistral3 also expose ``*_tower.layers.0.*`` (vision AND
+            # audio encoders), so matching a bare ``.layers.0.`` would pick a
+            # tower prefix (e.g. ``model.audio_tower.layers``) and quantize the
+            # wrong stack. The text decoder key always contains "language_model"
+            # (``model.language_model.layers.*`` on tf>=5.10, ``language_model.
+            # model.layers.*`` on tf<5.10), so key on that.
             _lk = next((k for k in weight_map
-                        if ".layers.0." in k and "vision" not in k), None)
+                        if ".layers.0." in k and "language_model" in k), None)
             if _lk:
                 sd_prefix = _lk.split(".layers.")[0] + ".layers"
         else:
@@ -1203,13 +1214,15 @@ def quantize(
                 out = layer(h, **kwargs)
                 new_hidden.append(out[0] if isinstance(out, tuple) else out)
                 # Capture K/V from a producer layer's post-quantization
-                # forward. Gemma4TextAttention writes
-                # ``shared_kv_states[self.layer_idx] = (K, V)`` for non-reader
-                # layers, so the same dict object we passed in now has the
-                # entry. Move to CPU to bound GPU memory across samples.
-                if is_producer and layer_idx in kwargs['shared_kv_states']:
-                    K, V = kwargs['shared_kv_states'][layer_idx]
-                    shared_kv_cache[layer_idx].append((K.cpu(), V.cpu()))
+                # forward. transformers >=5.10 Gemma4TextAttention writes
+                # ``shared_kv_states[self.layer_type] = (K, V)`` for non-reader
+                # layers (store_full_length_kv), so the dict object we passed in
+                # now holds that entry. Move to CPU to bound GPU memory.
+                if is_producer:
+                    producer_type = cfg.text_config.layer_types[layer_idx]
+                    if producer_type in kwargs['shared_kv_states']:
+                        K, V = kwargs['shared_kv_states'][producer_type]
+                        shared_kv_cache[layer_idx].append((K.cpu(), V.cpu()))
         hidden_states = torch.cat(new_hidden, dim=0)
 
         if streaming:
