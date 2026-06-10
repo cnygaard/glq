@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "glq": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GLQ (local vLLM)",
+      "options": {
+        "baseURL": "http://localhost:8000/v1",
+        "apiKey": "glq"
+      },
+      "models": {
+        "xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw": { "name": "Gemma-4-E4B-it GLQ 4bpw" },
+        "xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw": { "name": "SmolLM3-3B GLQ 3.5bpw" }
+      }
+    }
+  }
+}

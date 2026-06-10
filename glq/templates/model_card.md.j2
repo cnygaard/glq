@@ -1,0 +1,128 @@
+# {{ title }} — GLQ {{ bpw_label }}
+
+**GLQ ({{ "%.1f"|format(avg_bpw) }} bits/weight)** quantization of [`{{ base_model }}`](https://huggingface.co/{{ base_model }}) using an **E8-lattice codebook + randomized Hadamard transform (RHT) + LDLQ**. Weights stay compressed in memory and are dequantized on the fly by fused CUDA kernels.
+
+> **Where GLQ shines:** the size-vs-accuracy win is strongest at **2–4 bits/weight**. {% if avg_bpw > 4.05 %}At {{ "%.1f"|format(avg_bpw) }} bpw the weight savings are modest — the bigger win at this precision is pairing it with the **E8 KV cache** (≈4× smaller KV cache → much longer context / more concurrency in the same VRAM).{% else %}For even more headroom, combine it with the **E8 KV cache** (≈4× smaller KV cache → longer context in the same VRAM).{% endif +%}
+
+- **Base model:** [`{{ base_model }}`](https://huggingface.co/{{ base_model }})
+- **Method:** E8 shell codebook + RHT + LDLQ{% if is_mixed %} — mixed precision (per-layer {{ min_bpw }}–{{ max_bpw }} bpw, avg {{ "%.1f"|format(avg_bpw) }}){% else %} — {{ "%.1f"|format(avg_bpw) }} bpw uniform{% endif +%}
+{% if avg_sqnr_db %}
+- **Avg weight SQNR:** {{ "%.2f"|format(avg_sqnr_db) }} dB{% if n_quantized_layers %} over {{ n_quantized_layers }} quantized layers{% endif +%}
+{% endif %}
+- **Calibration:** {{ nsamples }} samples × {{ seqlen }} tokens (WikiText-2)
+
+## Install
+
+```bash
+pip install glq
+```
+
+## Use with vLLM (recommended)
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="{{ repo_id }}",
+    quantization="glq",
+{% if trust_remote_code %}
+    trust_remote_code=True,
+{% endif %}
+    dtype="bfloat16",
+    max_model_len=4096,
+{% if multimodal %}
+    limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},  # text-only serving
+{% endif %}
+)
+out = llm.generate(["The capital city of New Zealand is"],
+                   SamplingParams(max_tokens=64, temperature=0))
+print(out[0].outputs[0].text)
+```
+
+`glq` registers with vLLM automatically via its plugin entry point — no extra import needed.
+
+## Use with Transformers
+
+```python
+import glq.hf_integration  # registers the GLQ quantization method
+from transformers import {{ auto_cls }}, AutoTokenizer
+import torch
+
+model = {{ auto_cls }}.from_pretrained(
+    "{{ repo_id }}", device_map="cuda", dtype=torch.bfloat16{% if trust_remote_code %}, trust_remote_code=True{% endif %})
+tok = AutoTokenizer.from_pretrained("{{ repo_id }}"{% if trust_remote_code %}, trust_remote_code=True{% endif %})
+
+msgs = [{"role": "user", "content": "What is the capital city of New Zealand?"}]
+ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to("cuda")
+print(tok.decode(model.generate(ids, max_new_tokens=64)[0][ids.shape[1]:], skip_special_tokens=True))
+```
+{% if multimodal %}
+
+> This is a multimodal base model. GLQ quantizes the **text decoder** (the vision/audio towers are kept in their native format). vLLM is the recommended runtime.
+{% endif %}
+
+## Use with coding agents (pi-code, opencode)
+
+Serve an OpenAI-compatible endpoint, then point your agent at it:
+
+```bash
+vllm serve {{ repo_id }} --port 8000{% if trust_remote_code %} --trust-remote-code{% endif +%}
+```
+
+**pi-code** — `~/.pi/agent/models.json`:
+```json
+{{ pi_config }}
+```
+
+**opencode** — `~/.config/opencode/opencode.json`:
+```json
+{{ opencode_config }}
+```
+
+## Smaller KV cache (E8) — long context in the same VRAM
+
+GLQ also ships an **E8-quantized KV cache** (~4× smaller than fp16, ~bit-identical at 4-bit). Enable it at serve time:
+
+```bash
+GLQ_KV_QUANT=e8_relaxed:2 \
+GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 GLQ_KV_E8_COMPRESSED_ALLOC=1 \
+GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
+vllm serve {{ repo_id }}
+```
+
+`e8_relaxed:2` ≈ 4-bit KV, `:1` ≈ 2-bit, `:3` ≈ 6-bit. This is the part of GLQ that keeps paying off **above** 4-bit weights.
+{% if benchmarks %}
+
+## Benchmarks
+
+| Benchmark | Metric | GLQ {{ bpw_label }} |
+|---|---|---|
+{% for b in benchmarks %}
+| {{ b.task }} | {{ b.metric }}{% if b.n %} (n={{ b.n }}){% endif %} | {{ b.value }} |
+{% endfor %}
+
+*Measured with lm-evaluation-harness on vLLM. Small-n results are noisy estimates.*
+{% endif %}
+
+## How GLQ works
+
+Each group of 8 weights is rounded to the nearest **E8 lattice** point (a Golay/Leech-family shell codebook). A **randomized Hadamard transform** whitens the weights so the Hessian is near-diagonal, and **LDLQ** error feedback propagates rounding error across columns. {{ stages_blurb }}
+
+Code, kernels and quantizer: **[GLQ on GitHub]({{ glq_repo }})**.
+
+---
+{% if orig_body %}
+
+<details>
+<summary>Original model card ({{ base_model }})</summary>
+
+{{ orig_body }}
+
+</details>
+
+---
+{% endif %}
+
+*Derivative work of [`{{ base_model }}`](https://huggingface.co/{{ base_model }}), quantized with [GLQ]({{ glq_repo }}). It inherits the base model's license{% if license %} (`{{ license }}`){% endif %} — please respect the base model's terms.*
+
+⭐ [GLQ on GitHub]({{ glq_repo }})
