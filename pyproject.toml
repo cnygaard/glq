@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "glq"
-version = "0.5.4"
+version = "0.5.5"
 description = "E8 lattice codebook quantization for LLM weights"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,6 +21,8 @@ classifiers = [
 cuda = ["triton"]
 dev = ["pytest"]
 quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepiece"]
+# card generation + HF upload for the batch quantizer (scripts/batch_quantization.py)
+hub = ["jinja2", "huggingface_hub", "pyyaml"]
 
 [project.scripts]
 glq-quantize = "glq.quantize_model:main"
@@ -38,4 +40,4 @@ markers = [
 include = ["glq*", "glq_vllm*"]
 
 [tool.setuptools.package-data]
-glq = ["*.pt", "csrc/*.cu", "csrc/*.cpp", "csrc/*.h", "csrc/*.cuh"]
+glq = ["*.pt", "csrc/*.cu", "csrc/*.cpp", "csrc/*.h", "csrc/*.cuh", "templates/*.j2"]

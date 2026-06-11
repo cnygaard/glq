@@ -85,11 +85,91 @@ def test_shared_sv_and_scalars():
     assert torch.allclose(w13_Wscale.data, torch.full((E,), 0.0088)), "per-expert Wscale not loaded"
 
 
+# --------------------------------------------------------------------------- #
+# Gemma-4 MoE: the routed experts are stored STACKED + pre-fused as
+# experts.gate_up_proj [E, 2*inter, hidden]. The quantizer slices each expert,
+# quantizes the (already fused) gate_up jointly, then ROW-SPLITS the artifacts
+# into per-expert gate_proj/up_proj exactly like sarvam — so the same loader
+# reassembly applies. These pin both halves of that contract.
+# --------------------------------------------------------------------------- #
+
+# Must match _ROW_ARTS / _SHARED_ARTS in glq/quantize_model.py:_store_artifacts.
+_ROW_ARTS = {"Qidxs", "Qidxs2", "Qidxs3", "SU"}
+_SHARED_ARTS = {"SV", "Wscale", "inv_resid_scale", "inv_resid_scale2"}
+
+
+def _split_gate_up(arts: dict, inter: int):
+    """Mirror of _store_artifacts' moe_gate_up branch: row-split row-indexed
+    artifacts into gate (rows [0:inter]) + up (rows [inter:2*inter]); duplicate
+    the shared input-side artifacts."""
+    gate, up = {}, {}
+    for k, v in arts.items():
+        if k in _ROW_ARTS:
+            gate[k] = v[:inter].clone()
+            up[k] = v[inter:2 * inter].clone()
+        elif k in _SHARED_ARTS:
+            gate[k] = v.clone()
+            up[k] = v.clone()
+        else:
+            raise AssertionError(f"unhandled artifact {k!r}")
+    return gate, up
+
+
+def test_gemma4_expert_gate_up_split_roundtrip():
+    """Pure-logic (no GPU/glq_vllm): row-splitting a jointly-quantized gate_up
+    and re-concatenating reproduces the original — and shared artifacts dup."""
+    inter, hidden_blk = 704, 512  # gemma-4-26B-A4B: expert inter 704, hidden 2816->/8 pad
+    m_pad = 2 * inter             # 1408 fused gate||up rows
+    torch.manual_seed(3)
+    arts = {
+        "Qidxs": torch.randint(-32768, 32767, (m_pad, hidden_blk), dtype=torch.int16),
+        "Qidxs2": torch.randint(-128, 127, (m_pad, hidden_blk), dtype=torch.int16),
+        "SU": torch.randn(m_pad, dtype=torch.float16),
+        "SV": torch.sign(torch.randn(4096)).to(torch.float16),
+        "Wscale": torch.tensor(0.0091, dtype=torch.float32),
+        "inv_resid_scale": torch.tensor(7.5, dtype=torch.float32),
+    }
+    gate, up = _split_gate_up(arts, inter)
+    for k in _ROW_ARTS & set(arts):
+        recon = torch.cat([gate[k], up[k]], dim=0)
+        assert torch.equal(recon, arts[k]), f"{k} row-split not lossless"
+        assert gate[k].shape[0] == inter and up[k].shape[0] == inter
+    for k in _SHARED_ARTS & set(arts):
+        assert torch.equal(gate[k], arts[k]) and torch.equal(up[k], arts[k])
+
+
+@requires_glq_vllm
+def test_gemma4_expert_split_then_loader_reassemble():
+    """End-to-end on real gemma-4-26B-A4B expert dims: store-split then the vLLM
+    loader reassembles an exact w13; down is a full-width per-expert copy."""
+    E, inter, hidden_blk, inter_blk = 4, 704, 512, 128
+    m_pad_w13, m_pad_w2 = 2 * inter, 2816  # gate||up rows; down hidden rows
+    torch.manual_seed(4)
+    fused_Q = torch.randint(-32768, 32767, (E, m_pad_w13, hidden_blk), dtype=torch.int16)
+    fused_SU = torch.randn(E, m_pad_w13, dtype=torch.float16)
+    down_Q = torch.randint(-32768, 32767, (E, m_pad_w2, inter_blk), dtype=torch.int16)
+    w13_Q = _param(torch.zeros(E, m_pad_w13, hidden_blk, dtype=torch.int16))
+    w13_SU = _param(torch.zeros(E, m_pad_w13, dtype=torch.float16))
+    w2_Q = _param(torch.zeros(E, m_pad_w2, inter_blk, dtype=torch.int16))
+    for e in range(E):
+        g, u = _split_gate_up({"Qidxs": fused_Q[e], "SU": fused_SU[e]}, inter)
+        _glq_weight_loader(w13_Q, g["Qidxs"], "n", shard_id="w1", expert_id=e)
+        _glq_weight_loader(w13_Q, u["Qidxs"], "n", shard_id="w3", expert_id=e)
+        _glq_weight_loader(w13_SU, g["SU"], "n", shard_id="w1", expert_id=e)
+        _glq_weight_loader(w13_SU, u["SU"], "n", shard_id="w3", expert_id=e)
+        _glq_weight_loader(w2_Q, down_Q[e].clone(), "n", shard_id="w2", expert_id=e)
+    assert torch.equal(w13_Q.data, fused_Q)
+    assert torch.equal(w13_SU.data, fused_SU)
+    assert torch.equal(w2_Q.data, down_Q)
+
+
 if __name__ == "__main__":
+    test_gemma4_expert_gate_up_split_roundtrip()
     if not _HAS:
-        print("glq_vllm not importable; run on the box")
+        print("glq_vllm not importable; loader tests run on the box")
     else:
         test_w13_gate_up_halves_reassemble()
         test_w2_down_is_full_width_copy()
         test_shared_sv_and_scalars()
-        print("OK: gate+up loader reassembly lossless; w2 full copy; shared SV/scalars")
+        test_gemma4_expert_split_then_loader_reassemble()
+        print("OK: gate+up loader reassembly lossless; w2 full copy; shared SV/scalars; gemma-4 experts")

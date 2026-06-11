@@ -17,8 +17,14 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 
 from .linear_method import (
-    _ensure_codebook, _glq_pad, _make_glq_param, _glq_apply_shard,
+    _ensure_codebook, _glq_pad, _is_pow2, _make_glq_param, _glq_apply_shard,
+    _detect_block_diag, _pack_block_meta,
 )
+
+
+def _round8(n: int) -> int:
+    """Round up to a multiple of 8 (GLQ packs 8 weights per E8 block)."""
+    return ((n + 7) // 8) * 8
 
 
 def _apply_activation(h, activation):
@@ -32,9 +38,13 @@ def _apply_activation(h, activation):
     if act == "silu":
         gate, up = h.chunk(2, dim=-1)
         return F.silu(gate) * up
-    elif act == "gelu":
+    elif act in ("gelu", "gelu_tanh", "gelu_pytorch_tanh"):
+        # gemma-4 experts use gelu_pytorch_tanh (vLLM names it "gelu_tanh").
+        # Matching only the bare "gelu" string sent these to the non-gated
+        # silu fallback below -> structurally wrong output (garbage).
         gate, up = h.chunk(2, dim=-1)
-        return F.gelu(gate) * up
+        approx = "tanh" if "tanh" in act else "none"
+        return F.gelu(gate, approximate=approx) * up
     elif act == "relu2":
         gate, up = h.chunk(2, dim=-1)
         return F.relu(gate).square() * up
@@ -88,13 +98,20 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         if is_gated is None:
             is_gated = getattr(layer, 'is_act_and_mul', False)
         w13_out = 2 * intermediate_size_per_partition if is_gated else intermediate_size_per_partition
-        m_pad_w13 = _glq_pad(w13_out)
-        n_pad_w13 = _glq_pad(hidden_size)
+        # GLQ (post-v0.2.9) stores BLOCK-DIAGONAL artifacts: m_pad/n_pad equal the
+        # TRUE out/in dims (n rounded to a multiple of 8), NOT padded to a power of
+        # 2. Allocate the buffers at those true dims so (a) the gate/up loader's
+        # `loaded*2 == slot` row-split lands correctly when 2*intermediate isn't a
+        # power of 2 (e.g. gemma-4: 2*704=1408), and (b) the per-expert artifact
+        # shapes match. (For power-of-2 MoE dims, e.g. sarvam, this is identical to
+        # the old _glq_pad and the fast fused kernel still applies.)
+        m_pad_w13 = w13_out
+        n_pad_w13 = _round8(hidden_size)
         n_blocks_w13 = n_pad_w13 // 8
 
         # w2 = down_proj
-        m_pad_w2 = _glq_pad(hidden_size)
-        n_pad_w2 = _glq_pad(intermediate_size_per_partition)
+        m_pad_w2 = hidden_size
+        n_pad_w2 = _round8(intermediate_size_per_partition)
         n_blocks_w2 = n_pad_w2 // 8
 
         # Store metadata for apply()
@@ -172,11 +189,36 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             if t is not None and t.device != device:
                 setattr(layer, attr, torch.nn.Parameter(t.data.to(device), requires_grad=False))
 
-        # Cache log2 values and per-expert scalars for fast apply()
-        layer.glq_log_n_w13 = int(math.log2(layer.glq_n_pad_w13))
-        layer.glq_log_m_w13 = int(math.log2(layer.glq_m_pad_w13))
-        layer.glq_log_n_w2 = int(math.log2(layer.glq_n_pad_w2))
-        layer.glq_log_m_w2 = int(math.log2(layer.glq_m_pad_w2))
+        # Cache log2 values and per-expert scalars for fast apply().
+        # CRITICAL: for non-power-of-2 (block-diagonal) dims the log is 0 — the
+        # C++ RHT ops treat log==0 as the "decompose m_pad/n_pad into pow2 blocks"
+        # sentinel. Passing int(log2(non_pow2)) (a truncated log) makes the op
+        # index the buffer as if it were the smaller 2^log size -> out-of-bounds
+        # illegal memory access. Mirror the linear path (linear_method.py:784).
+        def _glog(p):
+            return int(math.log2(p)) if _is_pow2(p) else 0
+        layer.glq_log_n_w13 = _glog(layer.glq_n_pad_w13)
+        layer.glq_log_m_w13 = _glog(layer.glq_m_pad_w13)
+        layer.glq_log_n_w2 = _glog(layer.glq_n_pad_w2)
+        layer.glq_log_m_w2 = _glog(layer.glq_m_pad_w2)
+
+        # Block-diagonal metadata for non-pow2 dims. The per-expert fallback
+        # `_glq_apply_shard` ONLY applies the (block-diagonal) Hadamard via the
+        # fused_linear_block_diag op when this meta is supplied — without it the
+        # legacy path runs with log==0 (= no transform) and the weights decode to
+        # ~zero. Build it exactly like the non-MoE linear path (linear_method.py:775).
+        def _bd_meta(m_pad, n_pad):
+            is_bd, blocks_m, blocks_n = _detect_block_diag(m_pad, n_pad)
+            if not is_bd:
+                return None
+            return {
+                "blocks_n_tensor": torch.tensor(blocks_n, dtype=torch.int64, device='cpu'),
+                "blocks_m_tensor": torch.tensor(blocks_m, dtype=torch.int64, device='cpu'),
+                "blocks_n_meta_gpu": _pack_block_meta(blocks_n).to(device, non_blocking=True),
+                "blocks_m_meta_gpu": _pack_block_meta(blocks_m).to(device, non_blocking=True),
+            }
+        layer.glq_bd_meta_w13 = _bd_meta(layer.glq_m_pad_w13, layer.glq_n_pad_w13)
+        layer.glq_bd_meta_w2 = _bd_meta(layer.glq_m_pad_w2, layer.glq_n_pad_w2)
 
         n = layer.glq_num_experts
         layer.glq_w13_wscale = [layer.w13_Wscale[i].item() for i in range(n)]
@@ -193,8 +235,9 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     def _activation_type(activation) -> int:
         """Map activation string/enum to integer for C++ dispatch."""
         act = activation.value if hasattr(activation, 'value') else str(activation) if activation else "silu"
-        return {"silu": 0, "gelu": 1, "relu2": 2,
-                "silu_no_mul": 3, "gelu_no_mul": 4, "relu2_no_mul": 5}.get(act, 5)
+        return {"silu": 0, "gelu": 1, "gelu_tanh": 1, "gelu_pytorch_tanh": 1,
+                "relu2": 2, "silu_no_mul": 3, "gelu_no_mul": 4,
+                "relu2_no_mul": 5}.get(act, 5)
 
     @torch.compiler.disable
     def apply(
@@ -232,8 +275,16 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         # Try fused C++ MoE path (GLQ_MOE_FORCE_FALLBACK=1 forces the per-expert
         # Python loop instead — used to A/B-isolate the fused kernel vs the
         # weight load during bring-up of a new MoE architecture).
+        # The fused MoE kernel assumes power-of-2 padded dims (it shifts by
+        # log2(pad)). Block-diagonal experts (non-pow2 true dims, e.g. gemma-4:
+        # hidden 2816, 2*inter 1408, inter 704) must take the block-diag-capable
+        # per-expert fallback (`_glq_apply_shard`, the same path the non-MoE GLQ
+        # linears use for o_proj/down_proj). Fused-kernel block-diag is a perf TODO.
         import os as _os
+        _pow2_dims = (_is_pow2(layer.glq_n_pad_w13) and _is_pow2(layer.glq_m_pad_w13)
+                      and _is_pow2(layer.glq_n_pad_w2) and _is_pow2(layer.glq_m_pad_w2))
         if (_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                and _pow2_dims
                 and _ik._try_load_cuda_ext()
                 and hasattr(_ik._glq_cuda, 'glq_fused_moe_cuda')
                 and layer.glq_n_pad_w13 <= 16384
@@ -273,7 +324,13 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 output = output.to(dtype)
             return output
 
-        # Fallback: Python expert loop
+        # Fallback: Python expert loop (block-diag-capable via _glq_apply_shard).
+        # Defensive: the shared SV vectors must be on the compute device (the
+        # per-expert dequant kernel asserts sv.is_cuda).
+        if layer.w13_SV.device != device:
+            layer.w13_SV = nn.Parameter(layer.w13_SV.data.to(device), requires_grad=False)
+        if layer.w2_SV.device != device:
+            layer.w2_SV = nn.Parameter(layer.w2_SV.data.to(device), requires_grad=False)
         output = torch.zeros(num_tokens, out_dim, dtype=dtype, device=device)
         active_experts = topk_ids.unique()
 
@@ -300,6 +357,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 out_features=w13_out, in_features=hidden,
                 m_pad=layer.glq_m_pad_w13, n_pad=layer.glq_n_pad_w13,
                 log_n=layer.glq_log_n_w13, log_m=layer.glq_log_m_w13,
+                block_diag_meta=layer.glq_bd_meta_w13,
             )
 
             h = _apply_activation(h, activation)
@@ -318,6 +376,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 out_features=out_dim, in_features=inter_dim,
                 m_pad=layer.glq_m_pad_w2, n_pad=layer.glq_n_pad_w2,
                 log_n=layer.glq_log_n_w2, log_m=layer.glq_log_m_w2,
+                block_diag_meta=layer.glq_bd_meta_w2,
             )
 
             output[token_mask] += h.to(dtype) * selected_weights.unsqueeze(-1)

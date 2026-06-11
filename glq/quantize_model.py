@@ -923,6 +923,11 @@ def quantize(
     all_artifacts = {}  # layer_name -> {Qidxs, SU, SV, Wscale}
     all_sqnr = []
     all_proxy_losses = {}  # layer_prefix -> proxy_loss (for sensitivity profiling)
+    # Gemma-4 MoE: original stacked expert tensors (experts.gate_up_proj /
+    # experts.down_proj) are replaced by per-expert GLQ artifacts, so they must
+    # NOT be re-streamed verbatim into the saved checkpoint (would double size +
+    # confuse the loader). Full source keys collected here are skipped at save.
+    dropped_stacked_keys: set[str] = set()
     t_start = time.perf_counter()
 
     # ---- Set up parallel worker pool for CPU quantization ----
@@ -965,6 +970,59 @@ def quantize(
             if isinstance(mod, nn.Linear):
                 linears[name] = mod
 
+        # Gemma-4 MoE: the routed experts live in a Gemma4TextExperts module as
+        # stacked 3D nn.Parameters (gate_up_proj [E,2I,H], down_proj [E,H,I]), so
+        # the nn.Linear walk above misses them. Detect those modules and install a
+        # forward hook to capture per-expert input Hessians during calibration
+        # (gate+up share the routed input; down sees act(gate)*up). Also drop the
+        # tiny router projection from quantization — it's routing-critical and
+        # negligible in size, so we keep it bf16.
+        gemma4_experts = []        # list of (module_name, experts_module)
+        moe_expert_hessians = {}   # virtual_name -> accumulated input Gram (GPU)
+        moe_hooks = []
+        if is_gemma4:
+            linears = {n: m for n, m in linears.items()
+                       if not n.endswith('router.proj')}
+            for mn, mod in layer.named_modules():
+                gup = getattr(mod, 'gate_up_proj', None)
+                if isinstance(gup, nn.Parameter) and gup.dim() == 3:
+                    gemma4_experts.append((mn, mod))
+
+            def _make_expert_hook(mn, emod):
+                n_exp = emod.gate_up_proj.shape[0]
+
+                def _hook(module, args, kwargs, output):
+                    hs = kwargs.get('hidden_states', args[0] if args else None)
+                    ti = kwargs.get('top_k_index',
+                                    args[1] if len(args) > 1 else None)
+                    if hs is None or ti is None:
+                        return
+                    hs = hs.reshape(-1, hs.shape[-1])
+                    ti = ti.reshape(-1, ti.shape[-1])
+                    for e in range(n_exp):
+                        sel = (ti == e).any(dim=-1)
+                        if not bool(sel.any()):
+                            continue
+                        xs = hs[sel]
+                        xf = xs.float()
+                        gk = f"{mn}.{e}.gate_up_proj"
+                        moe_expert_hessians[gk] = (
+                            moe_expert_hessians.get(gk, 0) + xf.t() @ xf)
+                        with torch.no_grad():
+                            go = nn.functional.linear(
+                                xs.to(emod.gate_up_proj.dtype),
+                                emod.gate_up_proj[e])
+                            g, u = go.chunk(2, dim=-1)
+                            di = (emod.act_fn(g) * u).float()
+                        dk = f"{mn}.{e}.down_proj"
+                        moe_expert_hessians[dk] = (
+                            moe_expert_hessians.get(dk, 0) + di.t() @ di)
+                return _hook
+
+            for mn, emod in gemma4_experts:
+                moe_hooks.append(emod.register_forward_hook(
+                    _make_expert_hook(mn, emod), with_kwargs=True))
+
         # Install Hessian hooks
         captures = {}
         for name, mod in linears.items():
@@ -988,6 +1046,42 @@ def quantize(
                 hessians[name] = H.cpu()
                 del H
         del captures
+
+        # Gemma-4 MoE: tear down the expert hooks, fold their per-expert Grams
+        # into `hessians`, and expand each stacked experts module into per-expert
+        # virtual nn.Linears so the standard quant loop handles them. The fused
+        # gate_up matrix (already [gate; up]) is row-split at store time into
+        # gate_proj/up_proj (one shared SV/Wscale) — vLLM's expert mapping reads
+        # those back as w13. Writeback puts the dequant into the 3D slice so the
+        # post-quant forward reflects quantization; original stacked tensors are
+        # dropped from the save.
+        for h in moe_hooks:
+            h.remove()
+        for k, H in moe_expert_hessians.items():
+            hessians[k] = H.cpu()
+        del moe_expert_hessians
+        moe_writeback = {}   # virtual_name -> (param3d, expert_idx)
+        moe_gate_up = {}     # gate_up virtual_name -> (gate_name, up_name, inter)
+        for mn, emod in gemma4_experts:
+            gup, dwn = emod.gate_up_proj, emod.down_proj
+            n_exp, two_inter, hdim = gup.shape
+            inter = two_inter // 2
+            for e in range(n_exp):
+                gu, dn = f"{mn}.{e}.gate_up_proj", f"{mn}.{e}.down_proj"
+                vgu = nn.Linear(hdim, two_inter, bias=False,
+                                device=gup.device, dtype=gup.dtype)
+                vgu.weight.data = gup.data[e].clone()
+                vdn = nn.Linear(dwn.shape[2], dwn.shape[1], bias=False,
+                                device=dwn.device, dtype=dwn.dtype)
+                vdn.weight.data = dwn.data[e].clone()
+                linears[gu] = vgu
+                linears[dn] = vdn
+                moe_writeback[gu] = (gup, e)
+                moe_writeback[dn] = (dwn, e)
+                moe_gate_up[gu] = (f"{mn}.{e}.gate_proj", f"{mn}.{e}.up_proj", inter)
+            dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.gate_up_proj")
+            dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.down_proj")
+
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
@@ -1047,6 +1141,11 @@ def quantize(
             """Store the dequantized weight back into the live module(s) so the
             post-quant calibration forward reflects quantization. A fused
             gate_up_proj splits back into its real gate/up modules."""
+            if name in moe_writeback:
+                param3d, e = moe_writeback[name]
+                param3d.data[e] = W_hat.to(dtype=param3d.dtype,
+                                           device=param3d.device)
+                return
             if name in gate_up_fusion:
                 real_gate, real_up, gate_out, _, _ = gate_up_fusion[name]
                 real_gate.weight.data = W_hat[:gate_out].to(
@@ -1067,6 +1166,26 @@ def quantize(
             """Record quantized artifacts under their checkpoint prefix(es).
             A jointly-quantized gate_up result is split row-wise back into the
             gate_proj/up_proj prefixes vLLM's expert mapping expects."""
+            if name in moe_gate_up:
+                # Gemma-4 routed expert: the stacked gate_up matrix is already
+                # [gate; up]; row-split into per-expert gate_proj/up_proj (dup the
+                # shared SV/Wscale) so vLLM's FusedMoE w13 mapping reassembles it.
+                gate_name, up_name, inter = moe_gate_up[name]
+                gate_arts, up_arts = {}, {}
+                for k, v in arts.items():
+                    if k in _ROW_ARTS:
+                        gate_arts[k] = v[:inter].clone()
+                        up_arts[k] = v[inter:2 * inter].clone()
+                    elif k in _SHARED_ARTS:
+                        gate_arts[k] = v.clone()
+                        up_arts[k] = v.clone()
+                    else:
+                        raise ValueError(
+                            f"gemma4 expert gate_up split: unhandled artifact "
+                            f"key {k!r}; add it to _ROW_ARTS or _SHARED_ARTS")
+                all_artifacts[f"{sd_prefix}.{layer_idx}.{gate_name}"] = gate_arts
+                all_artifacts[f"{sd_prefix}.{layer_idx}.{up_name}"] = up_arts
+                return
             if name not in gate_up_fusion:
                 all_artifacts[f"{sd_prefix}.{layer_idx}.{name}"] = arts
                 return
@@ -1124,9 +1243,12 @@ def quantize(
             print(f"  {n_done} sublayers in {dt_batch:.1f}s (parallel) "
                   f"avg SQNR={avg:.1f}dB")
         else:
-            # Split into experts (parallelizable) and non-experts (sequential)
+            # Split into experts (parallelizable) and non-experts (sequential).
+            # Match both nested (`mlp.experts.0.`) and top-level (`experts.0.`,
+            # Gemma-4) routed-expert names.
             expert_names = [n for n in quant_names
-                           if '.experts.' in n and 'shared' not in n]
+                            if ('.experts.' in n or n.startswith('experts.'))
+                            and 'shared' not in n]
             non_expert_names = [n for n in quant_names if n not in expert_names]
 
             def _quantize_one(name):
@@ -1377,6 +1499,11 @@ def quantize(
     if streaming:
         # Stream non-quantized parameters from source safetensors
         for key in weight_map:
+            # Gemma-4 MoE: the original stacked expert tensors were replaced by
+            # per-expert GLQ artifacts (different key prefix), so the generic
+            # quantized_prefixes check below won't catch them — drop explicitly.
+            if key in dropped_stacked_keys:
+                continue
             param_prefix = key.rsplit(".", 1)[0] if "." in key else ""
             if param_prefix in quantized_prefixes:
                 continue
