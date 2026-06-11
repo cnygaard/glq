@@ -106,9 +106,9 @@ vllm serve {{ repo_id }}
 
 ## How GLQ works
 
-Each group of 8 weights is rounded to the nearest **E8 lattice** point (a Golay/Leech-family shell codebook). A **randomized Hadamard transform** whitens the weights so the Hessian is near-diagonal, and **LDLQ** error feedback propagates rounding error across columns. {{ stages_blurb }}
+GLQ compresses weights in groups of 8. A **randomized Hadamard transform** (a fixed random sign-flip + Hadamard rotation on each side) makes the weights and the calibration Hessian *incoherent* — spreading outliers so an 8-dimensional lattice quantizes them well. **LDLQ** then rounds each group to the nearest entry of an **E8 shell codebook** (a 65,536-point subset of the E8 lattice), feeding each group's rounding error forward across the remaining input dimensions via the Hessian's LDL factorization. {{ stages_blurb }}
 
-Code, kernels and quantizer: **[GLQ on GitHub]({{ glq_repo }})**.
+E8 is the 8-dimensional root lattice; the "Golay/Leech" in the project name refers to its higher-dimensional lattice cousins. Code, kernels and quantizer: **[GLQ on GitHub]({{ glq_repo }})**.
 
 ---
 {% if orig_body %}

@@ -105,12 +105,12 @@ def _bpw_label(avg_bpw: float, is_mixed: bool, lo, hi) -> str:
 
 def _stages_blurb(avg_bpw: float) -> str:
     if avg_bpw <= 2.5:
-        return "At ~2 bpw a single E8 codebook is used."
+        return "At ~2 bpw a single E8 codebook is used (one stage)."
     if avg_bpw <= 4.5:
-        return ("At 3–4 bpw a two-stage residual vector quantization "
-                "(primary + residual codebook) is used.")
-    return ("At 5–8 bpw an N-stage residual vector quantization is used "
-            "(multiple stacked E8 residual codebooks).")
+        return ("At 3–4 bpw a second residual codebook quantizes the leftover "
+                "error (two-stage residual VQ).")
+    return ("At 5–8 bpw several stacked residual codebooks are used "
+            "(N-stage residual VQ).")
 
 
 def _pi_config(repo_id: str) -> str:
