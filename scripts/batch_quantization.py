@@ -349,12 +349,31 @@ def _run_smoke_worker(out_dir: Path, max_tokens: int) -> int:
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"error": f"vllm/glq_vllm unavailable: {e}"}), flush=True)
         return 2
+    # Multimodal checkpoints (e.g. gemma-4 *ConditionalGeneration) need the towers
+    # capped to serve text-only; harmless to omit for text models so only set it
+    # when detected.
+    kw = dict(model=str(out_dir), quantization="glq", dtype="bfloat16",
+              trust_remote_code=True, max_model_len=2048,
+              gpu_memory_utilization=0.7, enforce_eager=True)
     try:
-        llm = LLM(model=str(out_dir), quantization="glq", dtype="bfloat16",
-                  trust_remote_code=True, max_model_len=2048,
-                  gpu_memory_utilization=0.7, enforce_eager=True)
+        cfg = json.loads((Path(out_dir) / "config.json").read_text())
+        arch = (cfg.get("architectures") or [""])[0]
+        if ("ConditionalGeneration" in arch or "vision_config" in cfg
+                or "audio_config" in cfg):
+            kw["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        llm = LLM(**kw)
         sp = SamplingParams(max_tokens=max_tokens, temperature=0.0)
-        outs = llm.generate([p for p, _ in SMOKE_PROMPTS], sp)
+        prompts = [p for p, _ in SMOKE_PROMPTS]
+        # Prefer the chat template: instruct models (gemma-4-it etc.) degenerate
+        # into repetition on raw completion even when the weights are fine. Fall
+        # back to plain completion for base models that have no chat template.
+        try:
+            outs = llm.chat([[{"role": "user", "content": p}] for p in prompts], sp)
+        except Exception:  # noqa: BLE001
+            outs = llm.generate(prompts, sp)
         samples = [(SMOKE_PROMPTS[i][0], SMOKE_PROMPTS[i][1], outs[i].outputs[0].text)
                    for i in range(len(SMOKE_PROMPTS))]
     except Exception as e:  # noqa: BLE001
