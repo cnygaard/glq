@@ -201,6 +201,22 @@ def _ensure_registered():
     _glq_lib._register_fake("fused_moe_block_diag",
                             _fused_moe_block_diag_fake)
 
+    # -- 11. embedding_dequant: GLQ per-row embedding lookup (gather + dequant +
+    #         inverse RHT) for the Gemma-4 GLQ-quantized PLE embedding. The shared
+    #         helper's raw ``fast_hadamard_transform`` is a kernel dynamo can't
+    #         trace, which was the last path breaking vLLM's torch.compile; wrap
+    #         it as one opaque op so the embedding lookup compiles + cudagraph-
+    #         captures. Real impl is the same ``_dequant_embedding_rows`` the HF
+    #         path uses (out_dtype carried as ScalarType). --
+    from glq.quantized_linear import _dequant_embedding_rows
+    _glq_lib.define(
+        "embedding_dequant(Tensor input_ids, Tensor qidxs, Tensor sv, "
+        "Tensor wscale, Tensor codebook, Tensor? qidxs2, "
+        "Tensor? inv_resid_scale, Tensor? codebook2, int n_pad, "
+        "int embedding_dim, float embed_scale, ScalarType? out_dtype) -> Tensor")
+    _glq_lib.impl("embedding_dequant", _dequant_embedding_rows, dispatch_key)
+    _glq_lib._register_fake("embedding_dequant", _embedding_dequant_fake)
+
 
 # --- Fake implementations for torch.compile tracing ---
 
@@ -226,6 +242,15 @@ def _dequant_matmul_packed_fake(x, qidxs, codebook_packed, wscale):
     B = x.shape[0]
     M = qidxs.shape[0]
     return torch.empty(B, M, dtype=torch.float32, device=x.device)
+
+
+def _embedding_dequant_fake(input_ids, qidxs, sv, wscale, codebook, qidxs2,
+                            inv_resid_scale, codebook2, n_pad, embedding_dim,
+                            embed_scale, out_dtype):
+    # Output: [*input_ids.shape, embedding_dim] in out_dtype (default sv.dtype),
+    # on input_ids' device — matches _dequant_embedding_rows' real return.
+    dt = out_dtype if out_dtype is not None else sv.dtype
+    return input_ids.new_empty((*input_ids.shape, embedding_dim), dtype=dt)
 
 
 def _gather_kv_paged_dequant_impl(idx1, idx2, idx3, idx_s1, scale,
