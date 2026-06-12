@@ -134,34 +134,55 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             "supported. If you're trying to quantize the LM head, that's "
             "not currently implemented; use the unquantized path.")
 
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Cache the codebook + stage count on the layer at LOAD time.
+
+        vLLM calls this once after the checkpoint is loaded. Doing the codebook
+        acquisition (which touches the filesystem via ``os.path.exists`` +
+        ``E8ShellCodebook.load``) and the stage-count ``.item()`` host sync here
+        — rather than in ``embedding()`` — keeps the per-forward path free of
+        ``os.stat``/disk-IO/host-syncs, so vLLM's ``torch.compile`` pass can
+        trace it and CUDA graphs can capture it (mirrors
+        ``GLQLinearMethod.process_weights_after_loading`` + ``_ensure_codebook``;
+        the GLQ-quantized Gemma-4 PLE embedding was the one path still breaking
+        compile with ``dynamo.exc.Unsupported: posix.stat``).
+        """
+        dev = layer.Qidxs.device
+        cb1, cb2 = _get_codebook_pair(self.bpw, dev)
+        layer.glq_cb1 = cb1
+        layer.glq_cb2 = cb2
+        # stage-2 active iff any inv_resid_scale is non-zero (per-row scales).
+        layer._glq_n_stages_cached = (
+            2 if layer.inv_resid_scale.abs().any().item() else 1)
+
     def embedding(self, layer: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
         """Per-forward dequant + lookup.
 
         Returns ``[*input_ids.shape, embedding_dim]`` in ``params_dtype``.
-        Does NOT apply Gemma-4's ``embed_scale_per_layer`` — that's
-        applied externally by ``Gemma4Model.get_per_layer_inputs`` after
-        the lookup. Same convention as the dequant-PLE pipeline.
-        """
-        cb1, cb2 = _get_codebook_pair(self.bpw, input_ids.device)
-        # Stage detection: stage-2 active iff any inv_resid_scale is non-zero.
-        # Per-row scales mean we check the whole tensor; cache this once.
-        if not hasattr(layer, "_glq_n_stages_cached"):
-            layer._glq_n_stages_cached = (
-                2 if layer.inv_resid_scale.abs().any().item() else 1
-            )
-        n_stages = layer._glq_n_stages_cached
+        Does NOT apply Gemma-4's ``embed_scale_per_layer`` — that's applied
+        externally by ``Gemma4Model.get_per_layer_inputs`` after the lookup.
 
-        return _dequant_embedding_rows(
-            input_ids,
-            layer.Qidxs, layer.SV, layer.Wscale, cb1,
+        Routes the dequant through the **registered** ``torch.ops.glq.embedding_dequant``
+        op (not the raw helper) so vLLM's torch.compile sees one opaque node: the
+        helper's ``fast_hadamard_transform`` is a kernel dynamo can't trace, which
+        otherwise breaks compile (the GLQ-quantized Gemma-4 PLE embedding was the
+        last path doing so). The codebook + n_stages are cached at load time
+        (``process_weights_after_loading``), so this path has no os.stat/disk/host
+        sync — it compiles + CUDA-graph-captures cleanly.
+        """
+        # Cached at load time; defensive lazy-fill for a direct (non-vLLM) call.
+        cb1 = getattr(layer, "glq_cb1", None)
+        if cb1 is None:
+            self.process_weights_after_loading(layer)
+            cb1 = layer.glq_cb1
+        cb2 = layer.glq_cb2
+        n_stages = layer._glq_n_stages_cached
+        return torch.ops.glq.embedding_dequant(
+            input_ids, layer.Qidxs, layer.SV, layer.Wscale, cb1,
             layer.Qidxs2 if n_stages >= 2 else None,
             layer.inv_resid_scale if n_stages >= 2 else None,
             cb2 if n_stages >= 2 else None,
-            n_pad=layer.glq_n_pad,
-            embedding_dim=layer.glq_embedding_dim,
-            embed_scale=1.0,  # vLLM applies its own scale externally
-            out_dtype=layer.glq_out_dtype,
-        )
+            layer.glq_n_pad, layer.glq_embedding_dim, 1.0, layer.glq_out_dtype)
 
 
 # ----------------------------------------------------------------------
