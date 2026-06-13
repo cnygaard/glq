@@ -324,6 +324,81 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 output = output.to(dtype)
             return output
 
+        # Block-diagonal fused path (non-pow2 expert dims, e.g. gemma-4: hidden
+        # 2816, 2*inter 1408, inter 704). Single host call into the SAME
+        # glq_fused_moe_block_diag_cuda kernel the HF E8RHTFusedExperts path uses,
+        # routed through the registered torch.ops.glq.fused_moe_block_diag so it is
+        # one opaque, host-sync-free op (no topk_ids.unique()/.item()/boolean-mask
+        # loop). That sync-freedom is what lets vLLM's FULL cudagraph capture the
+        # MoE decode step — the Python fallback below cannot be captured.
+        #
+        # The kernel iterates (token, expert) pairs at B=1, so it wins decode but
+        # loses multi-token prefill (where the Python loop's per-expert batched
+        # matmul is faster — see glq.fused_experts._FUSED_KERNEL_MAX_TOKENS). Gate
+        # on a token cap (env-tunable) so larger batches take the per-expert
+        # batched fallback while small-batch decode takes the fused op.
+        # GLQ_MOE_FORCE_FALLBACK=1 disables this path entirely (A/B isolation).
+        #
+        # EAGER default cap = 4 (matches glq.fused_experts._FUSED_KERNEL_MAX_TOKENS):
+        # the fused kernel iterates (token, expert) at B=1, so it wins small-batch
+        # decode (measured 26B-A4B b1: 11.4 vs 4.8 tok/s Python loop, 2.4x) but
+        # loses multi-token batches (b32: 39.3 vs 45.4), where grouping tokens
+        # per-expert (the Python loop) is faster. Raising the cap only pays off
+        # once the path is cudagraph-captured (decode replays at ~0 launch cost) —
+        # that lands with the Stage-2 device-dispatched kernel; until then keep it
+        # to decode-sized batches so large-batch/prefill throughput never regresses.
+        _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "4"))
+        if (_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                and not _pow2_dims
+                and layer.glq_bd_meta_w13 is not None
+                and layer.glq_bd_meta_w2 is not None
+                and num_tokens <= _bd_cap
+                and _ik._try_load_cuda_ext()
+                and hasattr(_ik._glq_cuda, 'glq_fused_moe_block_diag_cuda')
+                and hasattr(torch.ops, 'glq')
+                and hasattr(torch.ops.glq, 'fused_moe_block_diag')
+                and layer.glq_n_pad_w13 <= 16384
+                and layer.glq_m_pad_w13 <= 16384
+                and layer.glq_n_pad_w2 <= 16384
+                and layer.glq_m_pad_w2 <= 16384):
+            bd13 = layer.glq_bd_meta_w13
+            bd2 = layer.glq_bd_meta_w2
+            _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
+            _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+            _empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
+            cb_half = cb.codebook_half if cb is not None else _empty_f16
+            cb2_half = cb2.codebook_half if cb2 is not None else _empty_f16
+
+            output = torch.ops.glq.fused_moe_block_diag(
+                x.half().contiguous(),
+                topk_ids.to(torch.int64),
+                topk_weights.float().contiguous(),
+                # w13
+                layer.w13_Qidxs, layer.w13_SU, layer.w13_SV,
+                layer.w13_Wscale, layer.w13_Qidxs2, layer.w13_inv_resid_scale,
+                # w2
+                layer.w2_Qidxs, layer.w2_SU, layer.w2_SV,
+                layer.w2_Wscale, layer.w2_Qidxs2, layer.w2_inv_resid_scale,
+                # Codebooks
+                cb_half, cb2_half,
+                # Dims
+                hidden, inter_dim, w13_out,
+                layer.glq_n_pad_w13, layer.glq_m_pad_w13,
+                layer.glq_n_pad_w2, layer.glq_m_pad_w2,
+                # Block-diagonal meta (CPU block-size tensors + GPU packed meta),
+                # same dict the linear fallback already consumes successfully.
+                bd13["blocks_n_tensor"], bd13["blocks_m_tensor"],
+                bd13["blocks_n_meta_gpu"], bd13["blocks_m_meta_gpu"],
+                bd2["blocks_n_tensor"], bd2["blocks_m_tensor"],
+                bd2["blocks_n_meta_gpu"], bd2["blocks_m_meta_gpu"],
+                self._activation_type(activation),
+                # stage-3 RVQ: empty tensors (2-stage path).
+                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
+            )
+            if dtype != torch.float16:
+                output = output.to(dtype)
+            return output
+
         # Fallback: Python expert loop (block-diag-capable via _glq_apply_shard).
         # Defensive: the shared SV vectors must be on the compute device (the
         # per-expert dequant kernel asserts sv.is_cuda).
