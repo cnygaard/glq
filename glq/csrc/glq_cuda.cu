@@ -2970,6 +2970,87 @@ __global__ void silu_gated_activation_kernel(
     }
 }
 
+// GELU-tanh gated: out[i] = gelu_tanh(in[i]) * in[i + half]
+// (matches PyTorch F.gelu(approximate="tanh") == gemma gelu_pytorch_tanh)
+__global__ void gelu_tanh_gated_activation_kernel(
+    const half* __restrict__ in,
+    half* __restrict__ out,
+    int half_n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < half_n) {
+        float g = __half2float(in[i]);
+        float up = __half2float(in[i + half_n]);
+        float gelu = 0.5f * g * (1.0f + tanhf(
+            0.7978845608028654f * (g + 0.044715f * g * g * g)));
+        out[i] = __float2half(gelu * up);
+    }
+}
+
+// Squared-ReLU gated: out[i] = max(gate,0)^2 * up
+__global__ void relu2_gated_activation_kernel(
+    const half* __restrict__ in,
+    half* __restrict__ out,
+    int half_n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < half_n) {
+        float g = fmaxf(__half2float(in[i]), 0.0f);
+        float up = __half2float(in[i + half_n]);
+        out[i] = __float2half(g * g * up);
+    }
+}
+
+// SiLU (non-gated): out[i] = silu(in[i])
+__global__ void silu_act_kernel(
+    const half* __restrict__ in,
+    half* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(in[i]);
+        out[i] = __float2half(v / (1.0f + expf(-v)));
+    }
+}
+
+// GELU-tanh (non-gated): out[i] = gelu_tanh(in[i])
+__global__ void gelu_tanh_act_kernel(
+    const half* __restrict__ in,
+    half* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(in[i]);
+        out[i] = __float2half(0.5f * v * (1.0f + tanhf(
+            0.7978845608028654f * (v + 0.044715f * v * v * v))));
+    }
+}
+
+// Single source of truth for MoE activation dispatch, shared by both
+// glq_fused_moe_cuda and glq_fused_moe_block_diag_cuda. Gated types (0 silu,
+// 1 gelu-tanh, 2 relu2) read gate||up from a contiguous [w13_out] buffer and
+// write [w13_out/2]; non-gated types (3 silu, 4 gelu-tanh, 5 relu2) are
+// element-wise over [w13_out]. Replaces the old per-call if/else that wrongly
+// sent gated gelu/relu2 (types 1/2) to the non-gated relu2 kernel.
+static inline void launch_moe_activation(
+    int activation_type, const half* act_in, half* act_out,
+    int w13_out_features, cudaStream_t stream
+) {
+    int n_act = (activation_type < 3) ? w13_out_features / 2 : w13_out_features;
+    int blocks = (n_act + 255) / 256;
+    switch (activation_type) {
+        case 0: silu_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act); break;
+        case 1: gelu_tanh_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act); break;
+        case 2: relu2_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act); break;
+        case 3: silu_act_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act); break;
+        case 4: gelu_tanh_act_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act); break;
+        case 5:
+        default: relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act); break;
+    }
+}
+
 // Weighted accumulate: out[i] += weight * in[i]
 __global__ void weighted_add_kernel(
     half* __restrict__ out,
@@ -3446,22 +3527,12 @@ torch::Tensor glq_fused_moe_cuda(
                 (half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
                 w13_out_features, m_pad_w13, log_m_w13, rsqrt_m_w13, 1, stream);
 
-            // ---- Activation ----
-            {
-                int n_act = (activation_type < 3) ? w13_out_features / 2 : w13_out_features;
-                int blocks = (n_act + 255) / 256;
-                const half* act_in = (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features;
-                half* act_out = (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size;
-
-                if (activation_type == 5) {  // relu2_no_mul
-                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
-                } else if (activation_type == 0) {  // silu (gated)
-                    silu_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
-                } else {
-                    // Fallback: relu2_no_mul as default
-                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
-                }
-            }
+            // ---- Activation (gated 0/1/2 or non-gated 3/4/5) ----
+            launch_moe_activation(
+                activation_type,
+                (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
+                (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
+                w13_out_features, stream);
 
             // ---- w2: input RHT (different per expert — input is h_act) ----
             launch_input_rht(
@@ -3715,7 +3786,14 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
             // Gated activations (silu_gated, type=0) read out[i + half_n] which
             // may not be ready in another threadblock yet — fall back to the
             // 2-launch path for those.
-            bool act_fusable = (activation_type != 0)
+            // Only the non-gated relu2_no_mul (type 5) is safe to fuse into the
+            // output-RHT store. Gated activations (0 silu, 1 gelu-tanh, 2 relu2)
+            // need the full [w13_out] materialized first so the activation can
+            // read the gate||up partner element; fusing them did a cross-block
+            // out[i+half_n] read across block-diagonal boundaries -> illegal
+            // memory access (the gemma-4 gelu_tanh=1 crash). Route all non-type-5
+            // through the safe 2-launch path below (launch_moe_activation).
+            bool act_fusable = (activation_type == 5)
                 && (m_pad_w13 <= 8192) && bm_w13_meta_gpu;
             if (act_fusable) {
                 launch_output_rht_act_block_diag(
@@ -3738,19 +3816,12 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
                     bm_w13, n_m_w13,
                     bm_w13_meta, bm_w13_meta_gpu,
                     stream);
-                // ---- Activation (separate launch) ----
-                int n_act = (activation_type < 3) ? w13_out_features / 2 : w13_out_features;
-                int blocks = (n_act + 255) / 256;
-                const half* act_in = (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features;
-                half* act_out = (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size;
-
-                if (activation_type == 5) {  // relu2_no_mul
-                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
-                } else if (activation_type == 0) {  // silu (gated)
-                    silu_gated_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
-                } else {
-                    relu2_activation_kernel<<<blocks, 256, 0, stream>>>(act_in, act_out, n_act);
-                }
+                // ---- Activation (separate launch; full gated/non-gated dispatch) ----
+                launch_moe_activation(
+                    activation_type,
+                    (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
+                    (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
+                    w13_out_features, stream);
             }
 
             // ---- w2: input RHT (block-diag, per-expert input is h_act) ----
