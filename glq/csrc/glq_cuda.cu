@@ -380,9 +380,29 @@ glq_matvec_splitk_scratch_kernel(
     int M,
     int N_BLOCKS,
     int bps,
-    int cb2_size
+    int cb2_size,
+    // MoE device-routing (eidx_ptr != nullptr enables it): offset qidxs/qidxs2/
+    // qidxs3 by eidx*qidxs_estride and read wscale/inv_resid_scale[2] from
+    // per-expert device arrays, so the fused-MoE host loop never .cpu()s the
+    // routing (the launch sequence stays cudagraph-capturable). nullptr = the
+    // standalone/linear callers pass resolved pointers + host scalars.
+    const int64_t* __restrict__ eidx_ptr,
+    long qidxs_estride,
+    const float* __restrict__ wscale_dev,
+    const float* __restrict__ inv_rs_dev,
+    const float* __restrict__ inv_rs2_dev
 ) {
     extern __shared__ half smem_cb2[];
+
+    if (eidx_ptr != nullptr) {
+        long e = (long)(*eidx_ptr);
+        qidxs += e * qidxs_estride;
+        if (qidxs2 != nullptr) qidxs2 += e * qidxs_estride;
+        if (qidxs3 != nullptr) qidxs3 += e * qidxs_estride;
+        wscale = wscale_dev[e];
+        if (inv_rs_dev != nullptr) inv_resid_scale = inv_rs_dev[e];
+        if (inv_rs2_dev != nullptr) inv_resid_scale2 = inv_rs2_dev[e];
+    }
 
     if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
         int tid_flat = threadIdx.y * 32 + threadIdx.x;
@@ -1432,7 +1452,8 @@ torch::Tensor glq_dequant_matvec_cuda(
                 inv_resid_scale,
                 nullptr, nullptr, 0.0f,
                 nullptr, nullptr, 0.0f,
-                wscale, M, N_BLOCKS, bps, cb2_size
+                wscale, M, N_BLOCKS, bps, cb2_size,
+                nullptr, 0, nullptr, nullptr, nullptr  // non-MoE
             );
         } else {
             glq_matvec_splitk_scratch_kernel<1><<<grid, block, 0, stream>>>(
@@ -1443,7 +1464,8 @@ torch::Tensor glq_dequant_matvec_cuda(
                 nullptr, nullptr, 0.0f,
                 nullptr, nullptr, 0.0f,
                 nullptr, nullptr, 0.0f,
-                wscale, M, N_BLOCKS, bps, 0
+                wscale, M, N_BLOCKS, bps, 0,
+                nullptr, 0, nullptr, nullptr, nullptr  // non-MoE
             );
         }
 
@@ -2468,6 +2490,8 @@ void glq_output_rht_cuda(
 
 
 // Forward declaration (defined later after glq_fused_moe_cuda helpers).
+// The trailing MoE-routing + ext_scratch params (default nullptr/0) enable the
+// cudagraph-capturable fused-MoE path; standalone/linear callers omit them.
 static void launch_matvec_splitk(
     float* output, const half* x, const int16_t* qidxs,
     const half* codebook, float wscale,
@@ -2479,7 +2503,13 @@ static void launch_matvec_splitk(
     float inv_resid_scale3,
     int num_stages,
     int M, int N_BLOCKS, int cb2_size,
-    int num_sms, cudaStream_t stream
+    int num_sms, cudaStream_t stream,
+    const int64_t* eidx_ptr = nullptr,
+    long qidxs_estride = 0,
+    const float* wscale_dev = nullptr,
+    const float* inv_rs_dev = nullptr,
+    const float* inv_rs2_dev = nullptr,
+    float* ext_scratch = nullptr
 );
 
 
@@ -3056,12 +3086,35 @@ __global__ void weighted_add_kernel(
     half* __restrict__ out,
     const half* __restrict__ in,
     float weight,
+    int n,
+    // MoE device-routing: when weight_ptr != nullptr the routing weight is read
+    // from device (weight_ptr[0]) instead of the host `weight` arg, so the
+    // fused-MoE loop avoids a .cpu() of topk_weights (capturable launch seq).
+    const float* __restrict__ weight_ptr = nullptr
+) {
+    float w = (weight_ptr != nullptr) ? weight_ptr[0] : weight;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(out[i]) + w * __half2float(in[i]);
+        out[i] = __float2half(v);
+    }
+}
+
+// Gather one expert's per-row vector (e.g. SU, length n=m_pad) into a contiguous
+// buffer using a DEVICE-resident expert id — lets the fused-MoE loop supply the
+// per-expert SU to the existing (block-diag) output-RHT launchers without a host
+// .cpu() of topk_ids, keeping the launch sequence cudagraph-capturable.
+__global__ void glq_gather_expert_row_kernel(
+    half* __restrict__ dst,
+    const half* __restrict__ src_base,
+    const int64_t* __restrict__ eidx_ptr,
+    long estride,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float v = __half2float(out[i]) + weight * __half2float(in[i]);
-        out[i] = __float2half(v);
+        long e = (long)(*eidx_ptr);
+        dst[i] = src_base[e * estride + i];
     }
 }
 
@@ -3078,7 +3131,13 @@ static void launch_matvec_splitk(
     float inv_resid_scale3,
     int num_stages,
     int M, int N_BLOCKS, int cb2_size,
-    int num_sms, cudaStream_t stream
+    int num_sms, cudaStream_t stream,
+    const int64_t* eidx_ptr,
+    long qidxs_estride,
+    const float* wscale_dev,
+    const float* inv_rs_dev,
+    const float* inv_rs2_dev,
+    float* ext_scratch
 ) {
     const int WARPS = 8;
     const int rows_per_block = ROWS_PER_WARP * WARPS;
@@ -3095,8 +3154,14 @@ static void launch_matvec_splitk(
     }
     dim3 grid(m_blocks, k_splits);
 
+    // ext_scratch (caller-managed, sized >= k_splits*M) avoids a per-call
+    // raw_alloc/raw_delete — required for cudagraph capture of the fused-MoE
+    // loop (alloc/free during capture is illegal). Falls back to raw_alloc for
+    // standalone/linear callers.
     size_t scratch_bytes = (size_t)k_splits * M * sizeof(float);
-    float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+    float* scratch = ext_scratch != nullptr
+        ? ext_scratch
+        : (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
 
     int smem = (num_stages >= 2 && cb2_size > 0 && cb2_size <= 256)
                    ? cb2_size * 8 * (int)sizeof(half)
@@ -3108,7 +3173,8 @@ static void launch_matvec_splitk(
         qidxs2, codebook2, inv_resid_scale,                                      \
         qidxs3, codebook3, inv_resid_scale2,                                     \
         qidxs4, codebook4, inv_resid_scale3,                                     \
-        wscale, M, N_BLOCKS, bps, cb2_size)
+        wscale, M, N_BLOCKS, bps, cb2_size,                                      \
+        eidx_ptr, qidxs_estride, wscale_dev, inv_rs_dev, inv_rs2_dev)
     DISPATCH_NUM_STAGES(num_stages, LAUNCH_SPLITK_MATVEC);
 #undef LAUNCH_SPLITK_MATVEC
 
@@ -3119,7 +3185,8 @@ static void launch_matvec_splitk(
         output, scratch, M, k_splits
     );
 
-    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
+    if (ext_scratch == nullptr)
+        c10::cuda::CUDACachingAllocator::raw_delete(scratch);
 }
 
 // Helper: launch input/output RHT
@@ -3717,88 +3784,85 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
     auto y_rht_w2 = torch::empty({num_tokens, M_w2}, opts_f32);
     auto expert_out = torch::empty({num_tokens, hidden_size}, opts_f16);
 
-    // Read expert IDs to CPU (tiny sync — 2 int64s for top-2)
-    auto topk_ids_cpu = topk_ids.cpu();
-    auto topk_w_cpu = topk_weights.cpu();
-    const int64_t* topk_ids_p = topk_ids_cpu.data_ptr<int64_t>();
-    const float* topk_w_p = topk_w_cpu.data_ptr<float>();
+    // DEVICE-DISPATCHED routing (no .cpu()): the host loop below is a static
+    // launch sequence (num_tokens, top_k fixed), and every per-(token,expert)
+    // value — eidx, routing weight, wscale, inv_rs, SU — is read on-device from
+    // these base pointers + the loop index `tk`. This is what makes the fused
+    // MoE decode cudagraph-capturable (the old topk_ids.cpu()/Wscale.cpu() reads
+    // were the capture blockers). Per-expert stage count is UNIFORM across
+    // experts for a given model (all quantized at one bpw), so it's taken from
+    // tensor numel (host-known, no sync), not a per-expert inv_rs read.
+    const int64_t* topk_ids_dev = topk_ids.data_ptr<int64_t>();
+    const float* topk_w_dev = topk_weights.data_ptr<float>();
+    const float* w13_ws_dev = w13_Wscale.data_ptr<float>();
+    const float* w2_ws_dev = w2_Wscale.data_ptr<float>();
+    const float* w13_irs_dev = w13_has_s2 ? w13_inv_rs.data_ptr<float>() : nullptr;
+    const float* w2_irs_dev = w2_has_s2 ? w2_inv_rs.data_ptr<float>() : nullptr;
+    const float* w13_irs2_dev = w13_has_s3 ? w13_inv_rs2.data_ptr<float>() : nullptr;
+    const float* w2_irs2_dev = w2_has_s3 ? w2_inv_rs2.data_ptr<float>() : nullptr;
 
-    // v3a: hoist per-expert scalars to CPU once. Same rationale as
-    // glq_fused_moe_cuda above — eliminates ~6 syncs per (token, expert).
-    auto w13_Wscale_cpu = w13_Wscale.cpu();
-    auto w2_Wscale_cpu = w2_Wscale.cpu();
-    const float* w13_ws_p = w13_Wscale_cpu.data_ptr<float>();
-    const float* w2_ws_p = w2_Wscale_cpu.data_ptr<float>();
-    auto w13_inv_rs_cpu = w13_has_s2 ? w13_inv_rs.cpu() : torch::Tensor();
-    auto w2_inv_rs_cpu = w2_has_s2 ? w2_inv_rs.cpu() : torch::Tensor();
-    const float* w13_irs_p = w13_has_s2 ? w13_inv_rs_cpu.data_ptr<float>() : nullptr;
-    const float* w2_irs_p = w2_has_s2 ? w2_inv_rs_cpu.data_ptr<float>() : nullptr;
-    auto w13_inv_rs2_cpu = w13_has_s3 ? w13_inv_rs2.cpu() : torch::Tensor();
-    auto w2_inv_rs2_cpu = w2_has_s3 ? w2_inv_rs2.cpu() : torch::Tensor();
-    const float* w13_irs2_p = w13_has_s3 ? w13_inv_rs2_cpu.data_ptr<float>() : nullptr;
-    const float* w2_irs2_p = w2_has_s3 ? w2_inv_rs2_cpu.data_ptr<float>() : nullptr;
+    const int16_t* w13_q_base = w13_Qidxs.data_ptr<int16_t>();
+    const int16_t* w13_q2_base = w13_has_s2 ? w13_Qidxs2.data_ptr<int16_t>() : nullptr;
+    const int16_t* w13_q3_base = w13_has_s3 ? w13_Qidxs3.data_ptr<int16_t>() : nullptr;
+    const int16_t* w2_q_base = w2_Qidxs.data_ptr<int16_t>();
+    const int16_t* w2_q2_base = w2_has_s2 ? w2_Qidxs2.data_ptr<int16_t>() : nullptr;
+    const int16_t* w2_q3_base = w2_has_s3 ? w2_Qidxs3.data_ptr<int16_t>() : nullptr;
+    const half* w13_su_base = (const half*)w13_SU.data_ptr<c10::Half>();
+    const half* w2_su_base = (const half*)w2_SU.data_ptr<c10::Half>();
+
+    const long w13_q_estride = (long)M_w13 * NB_w13;
+    const long w2_q_estride = (long)M_w2 * NB_w2;
+    const int w13_num_stages = 1 + (w13_has_s2 ? 1 : 0) + (w13_has_s3 ? 1 : 0);
+    const int w2_num_stages = 1 + (w2_has_s2 ? 1 : 0) + (w2_has_s3 ? 1 : 0);
 
     const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
     const half* cb2_ptr = codebook2.numel() > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
     const half* cb3_ptr = codebook3.numel() > 0 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
 
+    // Pre-allocated, reused-across-(t,k) buffers (no alloc inside the loop, which
+    // would be illegal under cudagraph capture). Split-K scratch is oversized to
+    // the max k_splits (bps floors at 16 in launch_matvec_splitk). Per-expert SU
+    // is gathered into su_*_buf on-device. h_rht_half replaces a per-iter .to().
+    const int ks_w13 = (NB_w13 + 15) / 16;
+    const int ks_w2 = (NB_w2 + 15) / 16;
+    auto scratch_w13 = torch::empty({(long)ks_w13 * M_w13}, opts_f32);
+    auto scratch_w2 = torch::empty({(long)ks_w2 * M_w2}, opts_f32);
+    auto su_w13_buf = torch::empty({M_w13}, opts_f16);
+    auto su_w2_buf = torch::empty({M_w2}, opts_f16);
+    auto h_rht_half = torch::empty({num_tokens, n_pad_w2}, opts_f16);
+
     for (int t = 0; t < num_tokens; t++) {
         for (int k = 0; k < top_k; k++) {
-            int eidx = (int)topk_ids_p[t * top_k + k];
-            float ew = topk_w_p[t * top_k + k];
-            if (ew == 0.0f) continue;
+            const int tk = t * top_k + k;
+            const int64_t* eidx_ptr = topk_ids_dev + tk;  // device-resident expert id
 
-            float w13_ws = w13_ws_p[eidx];
-            float w13_irs = w13_irs_p ? w13_irs_p[eidx] : 0.0f;
-            bool w13_s2 = (w13_irs != 0.0f);
-            float w13_irs2 = (w13_s2 && w13_irs2_p) ? w13_irs2_p[eidx] : 0.0f;
-            bool w13_s3 = (w13_irs2 != 0.0f);
-
-            float w2_ws = w2_ws_p[eidx];
-            float w2_irs = w2_irs_p ? w2_irs_p[eidx] : 0.0f;
-            bool w2_s2 = (w2_irs != 0.0f);
-            float w2_irs2 = (w2_s2 && w2_irs2_p) ? w2_irs2_p[eidx] : 0.0f;
-            bool w2_s3 = (w2_irs2 != 0.0f);
-
-            int w13_num_stages = 1 + (w13_s2 ? 1 : 0) + (w13_s3 ? 1 : 0);
-            int w2_num_stages = 1 + (w2_s2 ? 1 : 0) + (w2_s3 ? 1 : 0);
-
-            // ---- w13: dequant+matmul (input RHT already done) ----
-            // v3b cut 1: no zero_() — scratch+reduce writes y_rht_w13.
+            // ---- w13: dequant+matmul (input RHT already done; expert routed on-device) ----
             launch_matvec_splitk(
                 y_rht_w13.data_ptr<float>() + t * M_w13,
                 (const half*)x_rht_half.data_ptr<c10::Half>() + t * n_pad_w13,
-                w13_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w13_ws,
-                w13_s2 ? w13_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
-                w13_s2 ? cb2_ptr : nullptr,
-                w13_irs,
-                w13_s3 ? w13_Qidxs3[eidx].data_ptr<int16_t>() : nullptr,
-                w13_s3 ? cb3_ptr : nullptr,
-                w13_irs2,
+                w13_q_base, cb_ptr, /*wscale host (unused in MoE)*/ 0.0f,
+                w13_q2_base, w13_has_s2 ? cb2_ptr : nullptr, /*inv_rs host*/ 0.0f,
+                w13_q3_base, w13_has_s3 ? cb3_ptr : nullptr, /*inv_rs2 host*/ 0.0f,
                 nullptr, nullptr, 0.0f,
                 w13_num_stages,
-                M_w13, NB_w13, cb2_size, num_sms, stream);
+                M_w13, NB_w13, cb2_size, num_sms, stream,
+                eidx_ptr, w13_q_estride, w13_ws_dev, w13_irs_dev, w13_irs2_dev,
+                scratch_w13.data_ptr<float>());
 
-            // ---- w13: output RHT (block-diag along m-axis) + activation FUSED ----
-            // v3b cut 2: when activation is element-wise (relu2_no_mul or any
-            // non-gated default), fuse into the output-RHT final-store, writing
-            // directly into h_act and skipping h_w13 + a separate kernel launch.
-            // Gated activations (silu_gated, type=0) read out[i + half_n] which
-            // may not be ready in another threadblock yet — fall back to the
-            // 2-launch path for those.
-            // Only the non-gated relu2_no_mul (type 5) is safe to fuse into the
-            // output-RHT store. Gated activations (0 silu, 1 gelu-tanh, 2 relu2)
-            // need the full [w13_out] materialized first so the activation can
-            // read the gate||up partner element; fusing them did a cross-block
-            // out[i+half_n] read across block-diagonal boundaries -> illegal
-            // memory access (the gemma-4 gelu_tanh=1 crash). Route all non-type-5
-            // through the safe 2-launch path below (launch_moe_activation).
+            // gather this expert's w13 SU into a contiguous buffer (device eidx)
+            glq_gather_expert_row_kernel<<<(M_w13 + 255) / 256, 256, 0, stream>>>(
+                (half*)su_w13_buf.data_ptr<c10::Half>(),
+                w13_su_base, eidx_ptr, (long)M_w13, M_w13);
+
+            // ---- w13: output RHT (block-diag) + activation ----
+            // Only non-gated relu2_no_mul (type 5) is safe to fuse; gated 0/1/2
+            // take the 2-launch path (see launch_moe_activation / the Stage-1 fix).
             bool act_fusable = (activation_type == 5)
                 && (m_pad_w13 <= 8192) && bm_w13_meta_gpu;
             if (act_fusable) {
                 launch_output_rht_act_block_diag(
                     y_rht_w13.data_ptr<float>() + t * M_w13,
-                    (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
+                    (const half*)su_w13_buf.data_ptr<c10::Half>(),
                     (half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
                     w13_out_features, m_pad_w13,
                     1,
@@ -3809,14 +3873,13 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
             } else {
                 launch_output_rht_block_diag(
                     y_rht_w13.data_ptr<float>() + t * M_w13,
-                    (const half*)w13_SU[eidx].data_ptr<c10::Half>(),
+                    (const half*)su_w13_buf.data_ptr<c10::Half>(),
                     (half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
                     w13_out_features, m_pad_w13,
                     1,
                     bm_w13, n_m_w13,
                     bm_w13_meta, bm_w13_meta_gpu,
                     stream);
-                // ---- Activation (separate launch; full gated/non-gated dispatch) ----
                 launch_moe_activation(
                     activation_type,
                     (const half*)h_w13.data_ptr<c10::Half>() + t * w13_out_features,
@@ -3824,7 +3887,7 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
                     w13_out_features, stream);
             }
 
-            // ---- w2: input RHT (block-diag, per-expert input is h_act) ----
+            // ---- w2: input RHT (block-diag; shared SV, no expert routing) ----
             launch_input_rht_block_diag(
                 (const half*)h_act.data_ptr<c10::Half>() + t * intermediate_size,
                 (const half*)w2_SV.data_ptr<c10::Half>(),
@@ -3834,28 +3897,31 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
                 bn_w2, n_n_w2,
                 bn_w2_meta, bn_w2_meta_gpu,
                 stream);
-            auto h_rht_half = h_rht.to(torch::kFloat16);
+            // fp32 -> fp16 cast of this token's row, in-place (no per-iter alloc).
+            h_rht_half.narrow(0, t, 1).copy_(h_rht.narrow(0, t, 1));
 
-            // ---- w2: dequant+matmul ----
-            // v3b cut 1: scratch+reduce writes y_rht_w2; no zero_() needed.
+            // gather this expert's w2 SU
+            glq_gather_expert_row_kernel<<<(M_w2 + 255) / 256, 256, 0, stream>>>(
+                (half*)su_w2_buf.data_ptr<c10::Half>(),
+                w2_su_base, eidx_ptr, (long)M_w2, M_w2);
+
+            // ---- w2: dequant+matmul (expert routed on-device) ----
             launch_matvec_splitk(
                 y_rht_w2.data_ptr<float>() + t * M_w2,
                 (const half*)h_rht_half.data_ptr<c10::Half>() + t * n_pad_w2,
-                w2_Qidxs[eidx].data_ptr<int16_t>(), cb_ptr, w2_ws,
-                w2_s2 ? w2_Qidxs2[eidx].data_ptr<int16_t>() : nullptr,
-                w2_s2 ? cb2_ptr : nullptr,
-                w2_irs,
-                w2_s3 ? w2_Qidxs3[eidx].data_ptr<int16_t>() : nullptr,
-                w2_s3 ? cb3_ptr : nullptr,
-                w2_irs2,
+                w2_q_base, cb_ptr, /*wscale host*/ 0.0f,
+                w2_q2_base, w2_has_s2 ? cb2_ptr : nullptr, /*inv_rs host*/ 0.0f,
+                w2_q3_base, w2_has_s3 ? cb3_ptr : nullptr, /*inv_rs2 host*/ 0.0f,
                 nullptr, nullptr, 0.0f,
                 w2_num_stages,
-                M_w2, NB_w2, cb2_size, num_sms, stream);
+                M_w2, NB_w2, cb2_size, num_sms, stream,
+                eidx_ptr, w2_q_estride, w2_ws_dev, w2_irs_dev, w2_irs2_dev,
+                scratch_w2.data_ptr<float>());
 
-            // ---- w2: output RHT (block-diag along m-axis) ----
+            // ---- w2: output RHT (block-diag) ----
             launch_output_rht_block_diag(
                 y_rht_w2.data_ptr<float>() + t * M_w2,
-                (const half*)w2_SU[eidx].data_ptr<c10::Half>(),
+                (const half*)su_w2_buf.data_ptr<c10::Half>(),
                 (half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
                 hidden_size, m_pad_w2,
                 1,
@@ -3863,14 +3929,15 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
                 bm_w2_meta, bm_w2_meta_gpu,
                 stream);
 
-            // ---- Weighted accumulate ----
+            // ---- Weighted accumulate (routing weight read on-device) ----
             {
                 int n = hidden_size;
                 int blocks = (n + 255) / 256;
                 weighted_add_kernel<<<blocks, 256, 0, stream>>>(
                     (half*)output.data_ptr<c10::Half>() + t * hidden_size,
                     (const half*)expert_out.data_ptr<c10::Half>() + t * hidden_size,
-                    ew, n);
+                    /*weight host (unused)*/ 0.0f, n,
+                    topk_w_dev + tk);
             }
         }
     }

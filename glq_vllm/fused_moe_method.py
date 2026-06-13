@@ -339,15 +339,15 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         # batched fallback while small-batch decode takes the fused op.
         # GLQ_MOE_FORCE_FALLBACK=1 disables this path entirely (A/B isolation).
         #
-        # EAGER default cap = 4 (matches glq.fused_experts._FUSED_KERNEL_MAX_TOKENS):
-        # the fused kernel iterates (token, expert) at B=1, so it wins small-batch
-        # decode (measured 26B-A4B b1: 11.4 vs 4.8 tok/s Python loop, 2.4x) but
-        # loses multi-token batches (b32: 39.3 vs 45.4), where grouping tokens
-        # per-expert (the Python loop) is faster. Raising the cap only pays off
-        # once the path is cudagraph-captured (decode replays at ~0 launch cost) —
-        # that lands with the Stage-2 device-dispatched kernel; until then keep it
-        # to decode-sized batches so large-batch/prefill throughput never regresses.
-        _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "4"))
+        # Default cap = 256 (>= vLLM's decode cudagraph capture sizes, which top
+        # out at max_num_seqs). The Stage-2 kernel is device-dispatched (reads
+        # routing on-device, no .cpu()), so under FULL cudagraph the whole decode
+        # step — every captured batch size up to the cap — is captured and replays
+        # at ~0 launch cost (this is the cudagraph win). Prefill (num_tokens > cap)
+        # still takes the per-expert batched Python loop, which is faster for many
+        # tokens and runs eager. For pure-eager serving (no cudagraph) at large
+        # batch, set GLQ_MOE_BD_MAX_TOKENS=4 to restore the small-batch-only gate.
+        _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
         if (_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                 and not _pow2_dims
                 and layer.glq_bd_meta_w13 is not None
