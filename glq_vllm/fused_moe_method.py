@@ -348,6 +348,56 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         # tokens and runs eager. For pure-eager serving (no cudagraph) at large
         # batch, set GLQ_MOE_BD_MAX_TOKENS=4 to restore the small-batch-only gate.
         _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
+
+        # Stage 3 grouped-GEMM path (opt-in: GLQ_MOE_GROUPED=1). Same inputs as the
+        # block-diag op but sorts tokens by expert -> one batched tensor-core GEMM
+        # per expert (the b32 throughput win). Gated activations only; non-gated
+        # falls through to the block-diag path below.
+        if (_os.environ.get("GLQ_MOE_GROUPED", "0") == "1"
+                and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                and not _pow2_dims
+                and layer.glq_bd_meta_w13 is not None
+                and layer.glq_bd_meta_w2 is not None
+                and self._activation_type(activation) < 3
+                and num_tokens <= _bd_cap
+                and _ik._try_load_cuda_ext()
+                and hasattr(_ik._glq_cuda, 'glq_fused_moe_grouped_gemm_cuda')
+                and hasattr(torch.ops, 'glq')
+                and hasattr(torch.ops.glq, 'fused_moe_grouped_gemm')
+                and layer.glq_n_pad_w13 <= 16384
+                and layer.glq_m_pad_w13 <= 16384
+                and layer.glq_n_pad_w2 <= 16384
+                and layer.glq_m_pad_w2 <= 16384):
+            bd13 = layer.glq_bd_meta_w13
+            bd2 = layer.glq_bd_meta_w2
+            _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
+            _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+            _empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
+            cb_half = cb.codebook_half if cb is not None else _empty_f16
+            cb2_half = cb2.codebook_half if cb2 is not None else _empty_f16
+            output = torch.ops.glq.fused_moe_grouped_gemm(
+                x.half().contiguous(),
+                topk_ids.to(torch.int64),
+                topk_weights.float().contiguous(),
+                layer.w13_Qidxs, layer.w13_SU, layer.w13_SV,
+                layer.w13_Wscale, layer.w13_Qidxs2, layer.w13_inv_resid_scale,
+                layer.w2_Qidxs, layer.w2_SU, layer.w2_SV,
+                layer.w2_Wscale, layer.w2_Qidxs2, layer.w2_inv_resid_scale,
+                cb_half, cb2_half,
+                hidden, inter_dim, w13_out,
+                layer.glq_n_pad_w13, layer.glq_m_pad_w13,
+                layer.glq_n_pad_w2, layer.glq_m_pad_w2,
+                bd13["blocks_n_tensor"], bd13["blocks_m_tensor"],
+                bd13["blocks_n_meta_gpu"], bd13["blocks_m_meta_gpu"],
+                bd2["blocks_n_tensor"], bd2["blocks_m_tensor"],
+                bd2["blocks_n_meta_gpu"], bd2["blocks_m_meta_gpu"],
+                self._activation_type(activation),
+                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
+            )
+            if dtype != torch.float16:
+                output = output.to(dtype)
+            return output
+
         if (_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                 and not _pow2_dims
                 and layer.glq_bd_meta_w13 is not None

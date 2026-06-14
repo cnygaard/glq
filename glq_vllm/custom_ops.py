@@ -201,6 +201,33 @@ def _ensure_registered():
     _glq_lib._register_fake("fused_moe_block_diag",
                             _fused_moe_block_diag_fake)
 
+    # -- 10b. fused_moe_grouped_gemm: grouped-GEMM MoE (sort tokens by expert +
+    #         batched tensor-core GEMM per expert). IDENTICAL signature + output
+    #         shape to fused_moe_block_diag, so it reuses the same fake impl.
+    #         Gated activations only (the dispatch routes non-gated to block-diag). --
+    if hasattr(cuda, "glq_fused_moe_grouped_gemm_cuda"):
+        _glq_lib.define(
+            "fused_moe_grouped_gemm(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+            "Tensor w13_Qidxs, Tensor w13_SU, Tensor w13_SV, "
+            "Tensor w13_Wscale, Tensor w13_Qidxs2, Tensor w13_inv_rs, "
+            "Tensor w2_Qidxs, Tensor w2_SU, Tensor w2_SV, "
+            "Tensor w2_Wscale, Tensor w2_Qidxs2, Tensor w2_inv_rs, "
+            "Tensor codebook, Tensor codebook2, "
+            "int hidden_size, int intermediate_size, int w13_out_features, "
+            "int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2, "
+            "Tensor blocks_n_w13, Tensor blocks_m_w13, "
+            "Tensor blocks_n_w13_meta, Tensor blocks_m_w13_meta, "
+            "Tensor blocks_n_w2, Tensor blocks_m_w2, "
+            "Tensor blocks_n_w2_meta, Tensor blocks_m_w2_meta, "
+            "int activation_type, "
+            "Tensor w13_Qidxs3, Tensor w13_inv_rs2, "
+            "Tensor w2_Qidxs3, Tensor w2_inv_rs2, "
+            "Tensor codebook3) -> Tensor")
+        _glq_lib.impl("fused_moe_grouped_gemm",
+                      cuda.glq_fused_moe_grouped_gemm_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_moe_grouped_gemm",
+                                _fused_moe_block_diag_fake)
+
     # -- 11. embedding_dequant: GLQ per-row embedding lookup (gather + dequant +
     #         inverse RHT) for the Gemma-4 GLQ-quantized PLE embedding. The shared
     #         helper's raw ``fast_hadamard_transform`` is a kernel dynamo can't
