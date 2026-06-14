@@ -4054,6 +4054,190 @@ torch::Tensor glq_moe_grouped_matmul(
 }
 
 
+// ─────────────────────────────────────────────────────────────────────
+// Grouped RHT + scatter-reduce (Stage 3 increment 3). Per-row variants of the
+// block-diag multiblock RHT that run on REAL grouped rows only: each row reads
+// m_indices[b]; a padding row (-1) zeroes its sub-block and returns BEFORE the
+// (expensive) FHT butterfly — so the FHT cost tracks R (real routings), not the
+// padded M_sum (~6.9× larger at b32). Output RHT also routes the per-row SU by
+// the row's expert (su_base + e*su_estride). The mask read is block-uniform
+// (b = blockIdx.x), so the FHT __syncthreads stay hazard-free. Padding rows are
+// zeroed (not left garbage) so the downstream w2 matmul stays NaN-free.
+// ─────────────────────────────────────────────────────────────────────
+
+__global__ void glq_input_rht_grouped_multiblock_kernel(
+    const half* __restrict__ x, const half* __restrict__ sv, float* __restrict__ out,
+    int in_features, int stride_x, int stride_out,
+    const int4* __restrict__ block_meta,
+    const int* __restrict__ m_indices   // (B,) expert per row, -1 = padding
+) {
+    int b = blockIdx.x;
+    int blk = blockIdx.y;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+    int4 meta = block_meta[blk];
+    int col_offset = meta.x;
+    int bs = meta.y;
+    int log_bs = meta.z;
+    if (m_indices[b] < 0) {                          // padding: zero sub-block, no FHT
+        for (int i = tid; i < bs; i += n_threads) out[b * stride_out + col_offset + i] = 0.0f;
+        return;
+    }
+    extern __shared__ float smem[];
+    float rsqrt_bs = rsqrtf((float)bs);
+    float* buf = smem;
+    for (int i = tid; i < bs; i += n_threads) {
+        float x_val = (col_offset + i < in_features)
+            ? __half2float(x[b * stride_x + col_offset + i]) : 0.0f;
+        buf[i] = x_val * __half2float(sv[col_offset + i]);
+    }
+    __syncthreads();
+    float* buf_b = smem + bs;
+    float* src = buf;
+    float* dst = buf_b;
+    for (int k = 0; k < log_bs; k++) {
+        for (int i = tid; i < bs; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float mv = src[i], pv = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (mv + pv) : (pv - mv);
+        }
+        __syncthreads();
+        float* tmp = src; src = dst; dst = tmp;
+    }
+    if (log_bs % 2 == 1) {
+        for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
+        __syncthreads();
+    }
+    for (int i = tid; i < bs; i += n_threads)
+        out[b * stride_out + col_offset + i] = buf[i] * rsqrt_bs;
+}
+
+__global__ void glq_output_rht_grouped_multiblock_kernel(
+    const float* __restrict__ y_rht, const half* __restrict__ su_base, half* __restrict__ out,
+    int out_features, int stride_in, int stride_out,
+    const int4* __restrict__ block_meta,
+    const int* __restrict__ m_indices, long su_estride
+) {
+    int b = blockIdx.x;
+    int blk = blockIdx.y;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+    int4 meta = block_meta[blk];
+    int col_offset = meta.x;
+    int bs = meta.y;
+    int log_bs = meta.z;
+    int e = m_indices[b];
+    if (e < 0) {                                     // padding: zero sub-block, no FHT
+        for (int i = tid; i < bs; i += n_threads) {
+            if (col_offset + i < out_features)
+                out[b * stride_out + col_offset + i] = __float2half(0.0f);
+        }
+        return;
+    }
+    const half* su = su_base + (long)e * su_estride;
+    extern __shared__ float smem[];
+    float rsqrt_bs = rsqrtf((float)bs);
+    float* buf = smem;
+    for (int i = tid; i < bs; i += n_threads)
+        buf[i] = y_rht[b * stride_in + col_offset + i];
+    __syncthreads();
+    float* buf_b = smem + bs;
+    float* src = buf;
+    float* dst = buf_b;
+    for (int k = 0; k < log_bs; k++) {
+        for (int i = tid; i < bs; i += n_threads) {
+            int partner = i ^ (1 << k);
+            float mv = src[i], pv = src[partner];
+            bool lo = (i & (1 << k)) == 0;
+            dst[i] = lo ? (mv + pv) : (pv - mv);
+        }
+        __syncthreads();
+        float* tmp = src; src = dst; dst = tmp;
+    }
+    if (log_bs % 2 == 1) {
+        for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
+        __syncthreads();
+    }
+    for (int i = tid; i < bs; i += n_threads) {
+        if (col_offset + i < out_features) {
+            float val = buf[i] * rsqrt_bs;
+            out[b * stride_out + col_offset + i] =
+                __float2half(val * __half2float(su[col_offset + i]));
+        }
+    }
+}
+
+// Grouped RHT launchers (multiblock path; the target MoE models always have
+// max_bs <= 8192 with GPU-resident block meta). Mirror launch_*_rht_block_diag.
+static void launch_input_rht_grouped(
+    const half* x, const half* sv, float* out, int in_features, int n_pad, int B,
+    const int64_t* blocks_n_host, int num_n_blocks, const int4* meta_dev,
+    const int* m_indices, cudaStream_t stream
+) {
+    int max_bs = 0;
+    for (int bi = 0; bi < num_n_blocks; bi++) { int bs = (int)blocks_n_host[bi]; if (bs > max_bs) max_bs = bs; }
+    int threads = min(max_bs, 1024);
+    int smem = 2 * max_bs * (int)sizeof(float);
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(glq_input_rht_grouped_multiblock_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    dim3 grid(B, num_n_blocks);
+    glq_input_rht_grouped_multiblock_kernel<<<grid, threads, smem, stream>>>(
+        x, sv, out, in_features, in_features, n_pad, meta_dev, m_indices);
+}
+
+static void launch_output_rht_grouped(
+    const float* y_rht, const half* su_base, half* out, int out_features, int m_pad, int B,
+    const int64_t* blocks_m_host, int num_m_blocks, const int4* meta_dev,
+    const int* m_indices, long su_estride, cudaStream_t stream
+) {
+    int max_bs = 0;
+    for (int bi = 0; bi < num_m_blocks; bi++) { int bs = (int)blocks_m_host[bi]; if (bs > max_bs) max_bs = bs; }
+    int threads = min(max_bs, 1024);
+    int smem = 2 * max_bs * (int)sizeof(float);
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(glq_output_rht_grouped_multiblock_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    dim3 grid(B, num_m_blocks);
+    glq_output_rht_grouped_multiblock_kernel<<<grid, threads, smem, stream>>>(
+        y_rht, su_base, out, out_features, m_pad, out_features, meta_dev, m_indices, su_estride);
+}
+
+// inv_perm[r] = slot for each real routing r (built from sorted_tk); -1 if a
+// routing never placed (shouldn't happen for valid topk). Lets the scatter-reduce
+// walk a token's top_k routings in fixed order (deterministic, no atomics).
+__global__ void glq_moe_build_inv_perm_kernel(
+    const int* __restrict__ sorted_tk, int* __restrict__ inv_perm, int M_sum_max
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= M_sum_max) return;
+    int r = sorted_tk[s];
+    if (r >= 0) inv_perm[r] = s;
+}
+
+// Weighted scatter-reduce: output[t,d] = sum_k topk_w[t*top_k+k] * expert_out[inv_perm[t*top_k+k], d].
+// Fixed-order k loop per output element -> deterministic (no atomicAdd).
+__global__ void glq_moe_weighted_scatter_reduce_kernel(
+    half* __restrict__ output,              // (num_tokens, hidden)
+    const half* __restrict__ expert_out,    // (M_sum_max, hidden)
+    const int* __restrict__ inv_perm,       // (num_tokens*top_k,)
+    const float* __restrict__ topk_weights, // (num_tokens*top_k,) fp32
+    int num_tokens, int top_k, int hidden
+) {
+    int t = blockIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= num_tokens || d >= hidden) return;
+    float acc = 0.0f;
+    for (int k = 0; k < top_k; k++) {
+        int r = t * top_k + k;
+        int s = inv_perm[r];
+        if (s >= 0) acc += topk_weights[r] * __half2float(expert_out[(size_t)s * hidden + d]);
+    }
+    output[(size_t)t * hidden + d] = __float2half(acc);
+}
+
+
 torch::Tensor glq_fused_moe_block_diag_cuda(
     torch::Tensor x,                    // (num_tokens, hidden) fp16
     torch::Tensor topk_ids,             // (num_tokens, top_k) int64
