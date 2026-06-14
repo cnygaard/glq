@@ -20,6 +20,7 @@ from .linear_method import (
     _ensure_codebook, _glq_pad, _is_pow2, _make_glq_param, _glq_apply_shard,
     _detect_block_diag, _pack_block_meta,
 )
+from ._dispatch import _grouped_enabled
 
 
 def _round8(n: int) -> int:
@@ -348,6 +349,69 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         # tokens and runs eager. For pure-eager serving (no cudagraph) at large
         # batch, set GLQ_MOE_BD_MAX_TOKENS=4 to restore the small-batch-only gate.
         _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
+
+        # Stage 3 grouped-GEMM path: sorts tokens by expert -> one batched
+        # tensor-core GEMM per expert. This is the batched-decode/throughput win
+        # (validated 26B-A4B: b32 6.9-8.4x over the per-(token,expert) block-diag
+        # matvec; b1 ~1.15x). DEFAULT-ON for batched MoE; b1 stays on the block-diag
+        # path below, which is bit-exact to the matvec oracle (grouped uses the TC
+        # matmul -> numerically equivalent but not bit-identical to it, only
+        # run-to-run deterministic). Gated activations only; non-gated falls through.
+        #
+        # GLQ_MOE_GROUPED tri-state:
+        #   unset / "auto" (default): grouped when num_tokens >= GLQ_MOE_GROUPED_MIN
+        #                             (default 2); block-diag keeps b1.
+        #   "1"/"on"/"true"         : force grouped whenever the gate holds (incl. b1).
+        #   "0"/"off"/"false"       : never grouped (force block-diag; A/B isolation).
+        _want_grouped = _grouped_enabled(
+            _os.environ.get("GLQ_MOE_GROUPED"),
+            int(_os.environ.get("GLQ_MOE_GROUPED_MIN", "2")),
+            num_tokens)
+        if (_want_grouped
+                and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                and not _pow2_dims
+                and layer.glq_bd_meta_w13 is not None
+                and layer.glq_bd_meta_w2 is not None
+                and self._activation_type(activation) < 3
+                and num_tokens <= _bd_cap
+                and _ik._try_load_cuda_ext()
+                and hasattr(_ik._glq_cuda, 'glq_fused_moe_grouped_gemm_cuda')
+                and hasattr(torch.ops, 'glq')
+                and hasattr(torch.ops.glq, 'fused_moe_grouped_gemm')
+                and layer.glq_n_pad_w13 <= 16384
+                and layer.glq_m_pad_w13 <= 16384
+                and layer.glq_n_pad_w2 <= 16384
+                and layer.glq_m_pad_w2 <= 16384):
+            bd13 = layer.glq_bd_meta_w13
+            bd2 = layer.glq_bd_meta_w2
+            _empty_i16 = torch.empty(0, dtype=torch.int16, device=device)
+            _empty_f16 = torch.empty(0, dtype=torch.float16, device=device)
+            _empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
+            cb_half = cb.codebook_half if cb is not None else _empty_f16
+            cb2_half = cb2.codebook_half if cb2 is not None else _empty_f16
+            output = torch.ops.glq.fused_moe_grouped_gemm(
+                x.half().contiguous(),
+                topk_ids.to(torch.int64),
+                topk_weights.float().contiguous(),
+                layer.w13_Qidxs, layer.w13_SU, layer.w13_SV,
+                layer.w13_Wscale, layer.w13_Qidxs2, layer.w13_inv_resid_scale,
+                layer.w2_Qidxs, layer.w2_SU, layer.w2_SV,
+                layer.w2_Wscale, layer.w2_Qidxs2, layer.w2_inv_resid_scale,
+                cb_half, cb2_half,
+                hidden, inter_dim, w13_out,
+                layer.glq_n_pad_w13, layer.glq_m_pad_w13,
+                layer.glq_n_pad_w2, layer.glq_m_pad_w2,
+                bd13["blocks_n_tensor"], bd13["blocks_m_tensor"],
+                bd13["blocks_n_meta_gpu"], bd13["blocks_m_meta_gpu"],
+                bd2["blocks_n_tensor"], bd2["blocks_m_tensor"],
+                bd2["blocks_n_meta_gpu"], bd2["blocks_m_meta_gpu"],
+                self._activation_type(activation),
+                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
+            )
+            if dtype != torch.float16:
+                output = output.to(dtype)
+            return output
+
         if (_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                 and not _pow2_dims
                 and layer.glq_bd_meta_w13 is not None
