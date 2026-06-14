@@ -21,8 +21,11 @@ def main():
     if mode == "fallback":
         os.environ["GLQ_MOE_FORCE_FALLBACK"] = "1"   # Python oracle
     elif mode == "grouped":
-        os.environ["GLQ_MOE_GROUPED"] = "1"          # Stage 3 grouped-GEMM path
-    # else "fused": both unset -> C++ block-diag fused path
+        os.environ["GLQ_MOE_GROUPED"] = "1"          # force grouped (incl. b1)
+    elif mode == "blockdiag":
+        os.environ["GLQ_MOE_GROUPED"] = "0"          # force block-diag (no grouped)
+    # else "fused"/"default": both unset -> SHIPPED DEFAULT gate
+    #   (b1 -> block-diag matvec; num_tokens >= 2 -> grouped-GEMM)
     import glq_vllm  # noqa
     from vllm import LLM, SamplingParams
 
@@ -36,8 +39,12 @@ def main():
     if eager:
         kw["enforce_eager"] = True
     else:
+        # GLQ_PARITY_CAPTURE tunes FULL-cudagraph capture sizes (24GB GPUs can't
+        # fit the full [1..64] set with the ~15GB 26B model -> use "1,2,4,8").
+        _caps = [int(s) for s in os.environ.get(
+            "GLQ_PARITY_CAPTURE", "1,2,4,8,16,32,64").split(",") if s.strip()]
         kw["compilation_config"] = {"cudagraph_mode": "FULL",
-                                    "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64]}
+                                    "cudagraph_capture_sizes": _caps}
     llm = LLM(**kw)
 
     # Fixed parity prompts (chat-templated) -- greedy, deterministic.
@@ -63,7 +70,9 @@ def main():
                  "Benin", "Gabon", "Haiti", "Macau"]
     base = [f"Tell me about the history of {c}." for c in countries]
     bsp = SamplingParams(max_tokens=128, temperature=0.0, ignore_eos=True)
-    for B in (1, 32):
+    _batches = tuple(int(s) for s in os.environ.get(
+        "GLQ_PARITY_BATCHES", "1,32").split(",") if s.strip())
+    for B in _batches:
         p = base[:B]
         llm.generate(p, bsp)  # warmup
         t0 = time.perf_counter()
