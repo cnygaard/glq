@@ -25,7 +25,7 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy
-          pip install -e .
+          pip install -e ".[hub]"   # jinja2 + huggingface_hub + pyyaml: the model-card feature's deps
           pip install pytest
 
       - name: Run tests
