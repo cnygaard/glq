@@ -3659,6 +3659,120 @@ torch::Tensor glq_fused_moe_cuda(
  * is dimension-agnostic and is called identically.
  * ───────────────────────────────────────────────────────────────────── */
 
+// ─────────────────────────────────────────────────────────────────────
+// Token grouping for the grouped-GEMM MoE path (Stage 3). Device-side and
+// cudagraph-capturable: every grid is sized from host-known
+// num_tokens/top_k/E (data-independent), and there is no .cpu()/.item()/sync
+// in the launch sequence. Mirrors vLLM's deepgemm_moe_permute: count
+// routings per expert -> padded exclusive cumsum of per-expert start offsets
+// -> atomic-scatter each (token,k) routing into its expert's contiguous slot
+// range, emitting m_indices (expert id per padded slot, -1 = padding) and
+// sorted_tk (routing index r = t*top_k+k per slot, -1 = padding). Atomics
+// assign SLOTS only (placement); the downstream numeric reduce stays
+// fixed-order (no atomic accumulate) so the math is bit-exact/deterministic.
+// ─────────────────────────────────────────────────────────────────────
+#define GLQ_MOE_GROUP_TILE 16
+
+// 1 thread per routing r in [0, R); R = num_tokens*top_k.
+__global__ void glq_moe_count_kernel(
+    const int64_t* __restrict__ topk_ids,   // (R,) flattened
+    int* __restrict__ expert_count,         // (E,)
+    int R, int E
+) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < R) {
+        int e = (int)topk_ids[r];
+        if (e >= 0 && e < E) atomicAdd(&expert_count[e], 1);
+    }
+}
+
+// Single block, E threads. Round each count up to `tile`, then a fixed-order
+// serial exclusive scan (thread 0) -> expert_offset[e]; expert_offset[E]=M_sum.
+__global__ void glq_moe_cumsum_kernel(
+    const int* __restrict__ expert_count,   // (E,)
+    int* __restrict__ expert_offset,        // (E+1,)
+    int E, int tile
+) {
+    extern __shared__ int s_pad[];          // (E,) rounded-up counts
+    int e = threadIdx.x;
+    if (e < E) {
+        int c = expert_count[e];
+        s_pad[e] = ((c + tile - 1) / tile) * tile;
+    }
+    __syncthreads();
+    if (e == 0) {
+        int acc = 0;
+        for (int j = 0; j < E; j++) {
+            expert_offset[j] = acc;
+            acc += s_pad[j];
+        }
+        expert_offset[E] = acc;             // M_sum (lives on-device)
+    }
+}
+
+// 1 thread per routing. slot = offset[e] + atomicAdd(cursor[e], 1).
+__global__ void glq_moe_scatter_kernel(
+    const int64_t* __restrict__ topk_ids,   // (R,)
+    const int* __restrict__ expert_offset,  // (E+1,)
+    int* __restrict__ expert_cursor,        // (E,) zeroed
+    int* __restrict__ m_indices,            // (M_sum_max,) prefilled -1
+    int* __restrict__ sorted_tk,            // (M_sum_max,) prefilled -1
+    int R, int E
+) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < R) {
+        int e = (int)topk_ids[r];
+        if (e >= 0 && e < E) {
+            int slot = expert_offset[e] + atomicAdd(&expert_cursor[e], 1);
+            sorted_tk[slot] = r;
+            m_indices[slot] = e;
+        }
+    }
+}
+
+// Host launcher: build the grouping on the current stream (capturable — all
+// grids host-sized, no sync). M_sum is returned on-device at expert_offset[E];
+// callers under capture read it on-device, the standalone test reads it in
+// Python (outside capture). Returns {expert_offset(E+1), m_indices(M_sum_max),
+// sorted_tk(M_sum_max)}, all int32 on the input device.
+std::vector<torch::Tensor> glq_moe_build_grouping(
+    torch::Tensor topk_ids,             // (num_tokens, top_k) int64
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t tile
+) {
+    CHECK_INPUT(topk_ids);
+    int num_tokens = (int)topk_ids.size(0);
+    int E = (int)num_experts;
+    int T = (int)tile;
+    int R = num_tokens * (int)top_k;
+    long M_sum_max = (long)R + (long)E * T;     // static capacity bound
+
+    at::DeviceGuard guard(topk_ids.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto opts_i32 = torch::dtype(torch::kInt32).device(topk_ids.device());
+
+    auto expert_count = torch::zeros({E}, opts_i32);
+    auto expert_cursor = torch::zeros({E}, opts_i32);
+    auto expert_offset = torch::zeros({E + 1}, opts_i32);
+    auto m_indices = torch::full({M_sum_max}, -1, opts_i32);
+    auto sorted_tk = torch::full({M_sum_max}, -1, opts_i32);
+
+    const int64_t* tk_ptr = topk_ids.data_ptr<int64_t>();
+    int threads = 256;
+    int blocks = (R + threads - 1) / threads;
+    glq_moe_count_kernel<<<blocks, threads, 0, stream>>>(
+        tk_ptr, expert_count.data_ptr<int>(), R, E);
+    glq_moe_cumsum_kernel<<<1, E, E * sizeof(int), stream>>>(
+        expert_count.data_ptr<int>(), expert_offset.data_ptr<int>(), E, T);
+    glq_moe_scatter_kernel<<<blocks, threads, 0, stream>>>(
+        tk_ptr, expert_offset.data_ptr<int>(), expert_cursor.data_ptr<int>(),
+        m_indices.data_ptr<int>(), sorted_tk.data_ptr<int>(), R, E);
+
+    return {expert_offset, m_indices, sorted_tk};
+}
+
+
 torch::Tensor glq_fused_moe_block_diag_cuda(
     torch::Tensor x,                    // (num_tokens, hidden) fp16
     torch::Tensor topk_ids,             // (num_tokens, top_k) int64

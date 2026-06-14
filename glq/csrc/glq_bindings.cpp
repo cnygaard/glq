@@ -113,6 +113,9 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
     torch::Tensor codebook3
 );
 
+std::vector<torch::Tensor> glq_moe_build_grouping(
+    torch::Tensor topk_ids, int64_t num_experts, int64_t top_k, int64_t tile);
+
 torch::Tensor glq_fused_linear_cuda(
     torch::Tensor x,
     torch::Tensor sv,
@@ -210,6 +213,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("w2_Qidxs3") = torch::Tensor(),
           py::arg("w2_inv_rs2") = torch::Tensor(),
           py::arg("codebook3") = torch::Tensor());
+    m.def("glq_moe_build_grouping", &glq_moe_build_grouping,
+          "GLQ MoE token grouping: count+padded-cumsum+scatter -> "
+          "(expert_offset, m_indices, sorted_tk), capturable",
+          py::arg("topk_ids"), py::arg("num_experts"), py::arg("top_k"),
+          py::arg("tile") = 16);
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
           "GLQ dequant+matvec B=1 (CUDA)");
     m.def("glq_dequant_matmul_cuda", &glq_dequant_matmul_cuda,
