@@ -20,6 +20,7 @@ from .linear_method import (
     _ensure_codebook, _glq_pad, _is_pow2, _make_glq_param, _glq_apply_shard,
     _detect_block_diag, _pack_block_meta,
 )
+from ._dispatch import _grouped_enabled
 
 
 def _round8(n: int) -> int:
@@ -349,11 +350,24 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         # batch, set GLQ_MOE_BD_MAX_TOKENS=4 to restore the small-batch-only gate.
         _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
 
-        # Stage 3 grouped-GEMM path (opt-in: GLQ_MOE_GROUPED=1). Same inputs as the
-        # block-diag op but sorts tokens by expert -> one batched tensor-core GEMM
-        # per expert (the b32 throughput win). Gated activations only; non-gated
-        # falls through to the block-diag path below.
-        if (_os.environ.get("GLQ_MOE_GROUPED", "0") == "1"
+        # Stage 3 grouped-GEMM path: sorts tokens by expert -> one batched
+        # tensor-core GEMM per expert. This is the batched-decode/throughput win
+        # (validated 26B-A4B: b32 6.9-8.4x over the per-(token,expert) block-diag
+        # matvec; b1 ~1.15x). DEFAULT-ON for batched MoE; b1 stays on the block-diag
+        # path below, which is bit-exact to the matvec oracle (grouped uses the TC
+        # matmul -> numerically equivalent but not bit-identical to it, only
+        # run-to-run deterministic). Gated activations only; non-gated falls through.
+        #
+        # GLQ_MOE_GROUPED tri-state:
+        #   unset / "auto" (default): grouped when num_tokens >= GLQ_MOE_GROUPED_MIN
+        #                             (default 2); block-diag keeps b1.
+        #   "1"/"on"/"true"         : force grouped whenever the gate holds (incl. b1).
+        #   "0"/"off"/"false"       : never grouped (force block-diag; A/B isolation).
+        _want_grouped = _grouped_enabled(
+            _os.environ.get("GLQ_MOE_GROUPED"),
+            int(_os.environ.get("GLQ_MOE_GROUPED_MIN", "2")),
+            num_tokens)
+        if (_want_grouped
                 and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                 and not _pow2_dims
                 and layer.glq_bd_meta_w13 is not None
