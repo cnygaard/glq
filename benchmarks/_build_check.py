@@ -14,3 +14,4 @@ m = load(
 print("BUILD_OK")
 print("glq_moe_grouped_matmul:", hasattr(m, "glq_moe_grouped_matmul"))
 print("glq_moe_build_grouping:", hasattr(m, "glq_moe_build_grouping"))
+print("glq_fused_moe_grouped_gemm_cuda:", hasattr(m, "glq_fused_moe_grouped_gemm_cuda"))

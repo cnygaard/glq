@@ -4238,6 +4238,243 @@ __global__ void glq_moe_weighted_scatter_reduce_kernel(
 }
 
 
+// Batched gated activation over grouped rows (types 0 silu, 1 gelu-tanh, 2 relu2):
+// out[b,i] = act(gate=in[b,i]) * up=in[b, intermediate+i]. Row strides: in=w13_out,
+// out=intermediate. One launch over all B=M_sum rows (vs per-token launch_moe_activation).
+__global__ void glq_moe_gated_activation_batched_kernel(
+    const half* __restrict__ in, half* __restrict__ out,
+    int B, int intermediate, int w13_out, int act_type
+) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)B * intermediate;
+    if (idx >= total) return;
+    int b = (int)(idx / intermediate);
+    int i = (int)(idx % intermediate);
+    float g = __half2float(in[(long)b * w13_out + i]);
+    float up = __half2float(in[(long)b * w13_out + intermediate + i]);
+    float a;
+    if (act_type == 0) a = g / (1.0f + expf(-g));
+    else if (act_type == 1) a = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+    else { float r = fmaxf(g, 0.0f); a = r * r; }
+    out[(long)b * intermediate + i] = __float2half(a * up);
+}
+
+// Grouped TC matmul + deterministic reduce over a PRE-GROUPED input (no gather).
+// Caller passes pre-allocated scratch (capture-safe — sized ks_max*M_sum_max*M).
+static void launch_grouped_matmul(
+    float* scratch, float* y_out, const half* x_grouped,
+    const int16_t* qb, const half* cb, const int16_t* q2b, const half* cb2,
+    const int16_t* q3b, const half* cb3,
+    int M_sum_max, int M, int N, int NB, long q_estride, int num_stages, int cb2_size,
+    const int* m_indices, const float* ws, const float* irs, const float* irs2,
+    int num_sms, cudaStream_t stream
+) {
+    const int WARPS = 8;
+    int b_tiles = (M_sum_max + 15) / 16;
+    int m_tiles = (M + 7) / 8;
+    int m_grid = (m_tiles + WARPS - 1) / WARPS;
+    int bps = TC_BPS_DEFAULT;
+    int k_splits = (NB + bps - 1) / bps;
+    int total_ctas = b_tiles * m_grid * k_splits;
+    if (total_ctas < num_sms * 2 && bps > 16) { bps = max(16, bps / 2); k_splits = (NB + bps - 1) / bps; }
+    dim3 tc_grid(b_tiles, m_grid, k_splits);
+    dim3 tc_block(32, WARPS);
+    int smem = (cb2_size > 0 && cb2_size <= 256) ? cb2_size * 8 * (int)sizeof(half) : 0;
+#define LGM(NS) glq_matmul_tc_grouped_scratch_kernel<NS><<<tc_grid, tc_block, smem, stream>>>( \
+        scratch, x_grouped, qb, cb, q2b, cb2, q3b, cb3,                                        \
+        M_sum_max, M, N, NB, N, bps, cb2_size, m_indices, q_estride, ws, irs, irs2)
+    switch (num_stages) {
+        case 1: LGM(1); break; case 2: LGM(2); break; case 3: LGM(3); break;
+        default: TORCH_CHECK(false, "grouped MoE num_stages must be 1-3");
+    }
+#undef LGM
+    int BM = M_sum_max * M;
+    glq_reduce_splits_2d_kernel<<<(BM + 255) / 256, 256, 0, stream>>>(y_out, scratch, BM, k_splits);
+}
+
+// Full grouped-GEMM MoE entry — same signature/semantics as
+// glq_fused_moe_block_diag_cuda, but the grouped (sort-by-expert + batched
+// tensor-core GEMM) compute path replaces the per-(token,expert) B=1 loop. Gated
+// activations only (0/1/2); the vLLM seam routes non-gated to the block-diag path.
+// Capturable: device grouping, pre-allocated scratch, fixed grids sized by M_sum_max.
+torch::Tensor glq_fused_moe_grouped_gemm_cuda(
+    torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w13_Qidxs, torch::Tensor w13_SU, torch::Tensor w13_SV,
+    torch::Tensor w13_Wscale, torch::Tensor w13_Qidxs2, torch::Tensor w13_inv_rs,
+    torch::Tensor w2_Qidxs, torch::Tensor w2_SU, torch::Tensor w2_SV,
+    torch::Tensor w2_Wscale, torch::Tensor w2_Qidxs2, torch::Tensor w2_inv_rs,
+    torch::Tensor codebook, torch::Tensor codebook2,
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2,
+    torch::Tensor blocks_n_w13, torch::Tensor blocks_m_w13,
+    torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
+    torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
+    torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
+    int activation_type,
+    torch::Tensor w13_Qidxs3, torch::Tensor w13_inv_rs2,
+    torch::Tensor w2_Qidxs3, torch::Tensor w2_inv_rs2, torch::Tensor codebook3
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(w13_Qidxs);
+    CHECK_INPUT(codebook);
+    TORCH_CHECK(activation_type < 3,
+                "grouped MoE path supports gated activations (0/1/2) only");
+
+    int num_tokens = x.size(0);
+    int top_k = topk_ids.size(1);
+    int E = w13_Qidxs.size(0);
+    int M_w13 = w13_Qidxs.size(1);
+    int NB_w13 = w13_Qidxs.size(2);
+    int M_w2 = w2_Qidxs.size(1);
+    int NB_w2 = w2_Qidxs.size(2);
+    bool w13_has_s2 = (w13_Qidxs2.numel() > 0);
+    bool w2_has_s2 = (w2_Qidxs2.numel() > 0);
+    bool w13_has_s3 = (w13_Qidxs3.numel() > 0 && w13_inv_rs2.numel() > 0);
+    bool w2_has_s3 = (w2_Qidxs3.numel() > 0 && w2_inv_rs2.numel() > 0);
+    int cb2_size = codebook2.numel() > 0 ? (int)codebook2.size(0) : 0;
+
+    at::DeviceGuard guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static int num_sms_gg = 0;
+    if (num_sms_gg == 0) {
+        cudaDeviceProp prop; cudaGetDeviceProperties(&prop, x.get_device());
+        num_sms_gg = prop.multiProcessorCount;
+    }
+    auto opts_f32 = torch::dtype(torch::kFloat32).device(x.device());
+    auto opts_f16 = torch::dtype(torch::kFloat16).device(x.device());
+    auto opts_i32 = torch::dtype(torch::kInt32).device(x.device());
+
+    // Block-diag metadata pointers (same resolution as the block-diag entry).
+    const int64_t* bn_w13 = blocks_n_w13.data_ptr<int64_t>(); int n_n_w13 = (int)blocks_n_w13.size(0);
+    const int4* bn_w13_meta = (const int4*)blocks_n_w13_meta.data_ptr<int32_t>();
+    const int64_t* bm_w13 = blocks_m_w13.data_ptr<int64_t>(); int n_m_w13 = (int)blocks_m_w13.size(0);
+    const int4* bm_w13_meta = (const int4*)blocks_m_w13_meta.data_ptr<int32_t>();
+    const int64_t* bn_w2 = blocks_n_w2.data_ptr<int64_t>(); int n_n_w2 = (int)blocks_n_w2.size(0);
+    const int4* bn_w2_meta = (const int4*)blocks_n_w2_meta.data_ptr<int32_t>();
+    const int64_t* bm_w2 = blocks_m_w2.data_ptr<int64_t>(); int n_m_w2 = (int)blocks_m_w2.size(0);
+    const int4* bm_w2_meta = (const int4*)blocks_m_w2_meta.data_ptr<int32_t>();
+
+    const float* topk_w_dev = topk_weights.data_ptr<float>();
+    const float* w13_ws_dev = w13_Wscale.data_ptr<float>();
+    const float* w2_ws_dev = w2_Wscale.data_ptr<float>();
+    const float* w13_irs_dev = w13_has_s2 ? w13_inv_rs.data_ptr<float>() : nullptr;
+    const float* w2_irs_dev = w2_has_s2 ? w2_inv_rs.data_ptr<float>() : nullptr;
+    const float* w13_irs2_dev = w13_has_s3 ? w13_inv_rs2.data_ptr<float>() : nullptr;
+    const float* w2_irs2_dev = w2_has_s3 ? w2_inv_rs2.data_ptr<float>() : nullptr;
+    const int16_t* w13_q_base = w13_Qidxs.data_ptr<int16_t>();
+    const int16_t* w13_q2_base = w13_has_s2 ? w13_Qidxs2.data_ptr<int16_t>() : nullptr;
+    const int16_t* w13_q3_base = w13_has_s3 ? w13_Qidxs3.data_ptr<int16_t>() : nullptr;
+    const int16_t* w2_q_base = w2_Qidxs.data_ptr<int16_t>();
+    const int16_t* w2_q2_base = w2_has_s2 ? w2_Qidxs2.data_ptr<int16_t>() : nullptr;
+    const int16_t* w2_q3_base = w2_has_s3 ? w2_Qidxs3.data_ptr<int16_t>() : nullptr;
+    const half* w13_su_base = (const half*)w13_SU.data_ptr<c10::Half>();
+    const half* w2_su_base = (const half*)w2_SU.data_ptr<c10::Half>();
+    const long w13_q_estride = (long)M_w13 * NB_w13;
+    const long w2_q_estride = (long)M_w2 * NB_w2;
+    const int w13_num_stages = 1 + (w13_has_s2 ? 1 : 0) + (w13_has_s3 ? 1 : 0);
+    const int w2_num_stages = 1 + (w2_has_s2 ? 1 : 0) + (w2_has_s3 ? 1 : 0);
+    const half* cb_ptr = (const half*)codebook.data_ptr<c10::Half>();
+    const half* cb2_ptr = cb2_size > 0 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const half* cb3_ptr = codebook3.numel() > 0 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
+
+    const int TILE = GLQ_MOE_GROUP_TILE;
+    int R = num_tokens * top_k;
+    long M_sum_max = (long)R + (long)E * TILE;
+
+    // 1. shared input RHT for w13 (per-token).
+    auto x_rht = torch::empty({num_tokens, n_pad_w13}, opts_f32);
+    launch_input_rht_block_diag(
+        (const half*)x.data_ptr<c10::Half>(), (const half*)w13_SV.data_ptr<c10::Half>(),
+        x_rht.data_ptr<float>(), hidden_size, n_pad_w13, num_tokens,
+        bn_w13, n_n_w13, bn_w13_meta, true, stream);
+    auto x_rht_half = torch::empty({num_tokens, n_pad_w13}, opts_f16);
+    x_rht_half.copy_(x_rht);
+
+    // 2. token grouping (device, capturable).
+    auto expert_count = torch::zeros({E}, opts_i32);
+    auto expert_cursor = torch::zeros({E}, opts_i32);
+    auto expert_offset = torch::zeros({E + 1}, opts_i32);
+    auto m_indices = torch::full({M_sum_max}, -1, opts_i32);
+    auto sorted_tk = torch::full({M_sum_max}, -1, opts_i32);
+    auto inv_perm = torch::full({R}, -1, opts_i32);
+    const int64_t* tk_ptr = topk_ids.data_ptr<int64_t>();
+    int gthreads = 256, gblocks = (R + 255) / 256;
+    glq_moe_count_kernel<<<gblocks, gthreads, 0, stream>>>(tk_ptr, expert_count.data_ptr<int>(), R, E);
+    glq_moe_cumsum_kernel<<<1, E, E * sizeof(int), stream>>>(expert_count.data_ptr<int>(), expert_offset.data_ptr<int>(), E, TILE);
+    glq_moe_scatter_kernel<<<gblocks, gthreads, 0, stream>>>(tk_ptr, expert_offset.data_ptr<int>(), expert_cursor.data_ptr<int>(), m_indices.data_ptr<int>(), sorted_tk.data_ptr<int>(), R, E);
+    glq_moe_build_inv_perm_kernel<<<((int)M_sum_max + 255) / 256, 256, 0, stream>>>(sorted_tk.data_ptr<int>(), inv_perm.data_ptr<int>(), (int)M_sum_max);
+    const int* mi = m_indices.data_ptr<int>();
+
+    // 3. gather x_rht -> grouped (M_sum_max, n_pad_w13).
+    auto x_grouped = torch::empty({M_sum_max, n_pad_w13}, opts_f16);
+    glq_moe_gather_rows_kernel<<<(int)M_sum_max, 256, 0, stream>>>(
+        (half*)x_grouped.data_ptr<c10::Half>(), (const half*)x_rht_half.data_ptr<c10::Half>(),
+        sorted_tk.data_ptr<int>(), top_k, n_pad_w13, (int)M_sum_max);
+
+    // pre-allocated capture-safe scratch (max k_splits = ceil(NB/16)).
+    int ks_w13 = (NB_w13 + 15) / 16;
+    int ks_w2 = (NB_w2 + 15) / 16;
+    auto scratch_w13 = torch::empty({(long)ks_w13 * M_sum_max * M_w13}, opts_f32);
+    auto scratch_w2 = torch::empty({(long)ks_w2 * M_sum_max * M_w2}, opts_f32);
+
+    // 4. w13 grouped matmul.
+    auto y_rht_w13 = torch::empty({M_sum_max, M_w13}, opts_f32);
+    launch_grouped_matmul(scratch_w13.data_ptr<float>(), y_rht_w13.data_ptr<float>(),
+        (const half*)x_grouped.data_ptr<c10::Half>(),
+        w13_q_base, cb_ptr, w13_q2_base, cb2_ptr, w13_q3_base, cb3_ptr,
+        (int)M_sum_max, M_w13, n_pad_w13, NB_w13, w13_q_estride, w13_num_stages, cb2_size,
+        mi, w13_ws_dev, w13_irs_dev, w13_irs2_dev, num_sms_gg, stream);
+
+    // 5. w13 output RHT (grouped, per-expert SU).
+    auto h_w13 = torch::empty({M_sum_max, w13_out_features}, opts_f16);
+    launch_output_rht_grouped(y_rht_w13.data_ptr<float>(), w13_su_base,
+        (half*)h_w13.data_ptr<c10::Half>(), w13_out_features, m_pad_w13, (int)M_sum_max,
+        bm_w13, n_m_w13, bm_w13_meta, mi, (long)m_pad_w13, stream);
+
+    // 6. gated activation (batched).
+    auto h_act = torch::empty({M_sum_max, intermediate_size}, opts_f16);
+    {
+        long tot = M_sum_max * intermediate_size;
+        glq_moe_gated_activation_batched_kernel<<<(int)((tot + 255) / 256), 256, 0, stream>>>(
+            (const half*)h_w13.data_ptr<c10::Half>(), (half*)h_act.data_ptr<c10::Half>(),
+            (int)M_sum_max, intermediate_size, w13_out_features, activation_type);
+    }
+
+    // 7. w2 input RHT (grouped, shared SV).
+    auto h_rht = torch::empty({M_sum_max, n_pad_w2}, opts_f32);
+    launch_input_rht_grouped((const half*)h_act.data_ptr<c10::Half>(),
+        (const half*)w2_SV.data_ptr<c10::Half>(), h_rht.data_ptr<float>(),
+        intermediate_size, n_pad_w2, (int)M_sum_max, bn_w2, n_n_w2, bn_w2_meta, mi, stream);
+    auto h_rht_half = torch::empty({M_sum_max, n_pad_w2}, opts_f16);
+    h_rht_half.copy_(h_rht);
+
+    // 8. w2 grouped matmul (input already grouped — no gather).
+    auto y_rht_w2 = torch::empty({M_sum_max, M_w2}, opts_f32);
+    launch_grouped_matmul(scratch_w2.data_ptr<float>(), y_rht_w2.data_ptr<float>(),
+        (const half*)h_rht_half.data_ptr<c10::Half>(),
+        w2_q_base, cb_ptr, w2_q2_base, cb2_ptr, w2_q3_base, cb3_ptr,
+        (int)M_sum_max, M_w2, n_pad_w2, NB_w2, w2_q_estride, w2_num_stages, cb2_size,
+        mi, w2_ws_dev, w2_irs_dev, w2_irs2_dev, num_sms_gg, stream);
+
+    // 9. w2 output RHT (grouped, per-expert SU) -> per-slot expert output.
+    auto expert_out = torch::empty({M_sum_max, hidden_size}, opts_f16);
+    launch_output_rht_grouped(y_rht_w2.data_ptr<float>(), w2_su_base,
+        (half*)expert_out.data_ptr<c10::Half>(), hidden_size, m_pad_w2, (int)M_sum_max,
+        bm_w2, n_m_w2, bm_w2_meta, mi, (long)m_pad_w2, stream);
+
+    // 10. weighted scatter-reduce -> output (num_tokens, hidden), deterministic.
+    auto output = torch::empty({num_tokens, hidden_size}, opts_f16);
+    {
+        dim3 sr_block(256);
+        dim3 sr_grid(num_tokens, (hidden_size + 255) / 256);
+        glq_moe_weighted_scatter_reduce_kernel<<<sr_grid, sr_block, 0, stream>>>(
+            (half*)output.data_ptr<c10::Half>(), (const half*)expert_out.data_ptr<c10::Half>(),
+            inv_perm.data_ptr<int>(), topk_w_dev, num_tokens, top_k, hidden_size);
+    }
+    return output;
+}
+
+
 torch::Tensor glq_fused_moe_block_diag_cuda(
     torch::Tensor x,                    // (num_tokens, hidden) fp16
     torch::Tensor topk_ids,             // (num_tokens, top_k) int64
