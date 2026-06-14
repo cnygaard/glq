@@ -116,6 +116,12 @@ torch::Tensor glq_fused_moe_block_diag_cuda(
 std::vector<torch::Tensor> glq_moe_build_grouping(
     torch::Tensor topk_ids, int64_t num_experts, int64_t top_k, int64_t tile);
 
+torch::Tensor glq_moe_grouped_matmul(
+    torch::Tensor x, torch::Tensor sorted_tk, torch::Tensor m_indices, int64_t top_k,
+    torch::Tensor qidxs, torch::Tensor codebook, torch::Tensor qidxs2, torch::Tensor codebook2,
+    torch::Tensor wscale, torch::Tensor inv_rs, torch::Tensor qidxs3, torch::Tensor codebook3,
+    torch::Tensor inv_rs2, int64_t num_stages);
+
 torch::Tensor glq_fused_linear_cuda(
     torch::Tensor x,
     torch::Tensor sv,
@@ -218,6 +224,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "(expert_offset, m_indices, sorted_tk), capturable",
           py::arg("topk_ids"), py::arg("num_experts"), py::arg("top_k"),
           py::arg("tile") = 16);
+    m.def("glq_moe_grouped_matmul", &glq_moe_grouped_matmul,
+          "GLQ grouped-GEMM MoE matmul: gather per-token rows + per-expert "
+          "tensor-core batched GEMM (m_indices-routed), deterministic scratch+reduce",
+          py::arg("x"), py::arg("sorted_tk"), py::arg("m_indices"), py::arg("top_k"),
+          py::arg("qidxs"), py::arg("codebook"), py::arg("qidxs2"), py::arg("codebook2"),
+          py::arg("wscale"), py::arg("inv_rs"), py::arg("qidxs3"), py::arg("codebook3"),
+          py::arg("inv_rs2"), py::arg("num_stages"));
     m.def("glq_dequant_matvec_cuda", &glq_dequant_matvec_cuda,
           "GLQ dequant+matvec B=1 (CUDA)");
     m.def("glq_dequant_matmul_cuda", &glq_dequant_matmul_cuda,

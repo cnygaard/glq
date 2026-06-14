@@ -3773,6 +3773,287 @@ std::vector<torch::Tensor> glq_moe_build_grouping(
 }
 
 
+// ─────────────────────────────────────────────────────────────────────
+// Grouped-GEMM MoE compute (Stage 3 increment 2). Gather per-token rows into
+// the expert-grouped buffer, then one batched tensor-core GEMM per expert via
+// glq_matmul_tc_grouped_scratch_kernel. Because token grouping pads each expert
+// to TILE=16, every 16-row b-tile is entirely one expert -> the block reads its
+// expert id from m_indices[b_start] (-1 => beyond M_sum / all-pad => early
+// return; uniform across the block, so the cb2-staging __syncthreads is safe)
+// and offsets qidxs/wscale/inv_rs by it (mirrors the matvec MoE routing).
+// Codebooks are shared across experts. Deterministic scratch+reduce preserved.
+// ─────────────────────────────────────────────────────────────────────
+
+// Gather grouped input rows: x_grouped[slot] = x[sorted_tk[slot] / top_k] for
+// real slots (the w13 input x_rht is per-token, shared across a token's experts),
+// zeros for padding (sorted_tk<0). One block per slot.
+__global__ void glq_moe_gather_rows_kernel(
+    half* __restrict__ x_grouped,        // (M_sum_max, N)
+    const half* __restrict__ x,          // (num_tokens, N) per-token
+    const int* __restrict__ sorted_tk,   // (M_sum_max,) routing idx per slot, -1=pad
+    int top_k, int N, int M_sum_max
+) {
+    int slot = blockIdx.x;
+    if (slot >= M_sum_max) return;
+    int r = sorted_tk[slot];
+    half* dst = x_grouped + (size_t)slot * N;
+    if (r < 0) {
+        for (int i = threadIdx.x; i < N; i += blockDim.x) dst[i] = __float2half(0.0f);
+    } else {
+        const half* src = x + (size_t)(r / top_k) * N;
+        for (int i = threadIdx.x; i < N; i += blockDim.x) dst[i] = src[i];
+    }
+}
+
+// Grouped TC matmul: copy of glq_matmul_tc_scratch_kernel (stages 1-3 — MoE max)
+// with a uniform per-block expert route prepended. Y(M_sum × M) = X @ dequant(W_e)^T.
+template <int NUM_STAGES>
+__global__ void __launch_bounds__(256, 2)
+glq_matmul_tc_grouped_scratch_kernel(
+    float* __restrict__ scratch,            // (k_splits * B_dim * M) fp32
+    const half* __restrict__ x,             // (B_dim, N) grouped, stride_x
+    const int16_t* __restrict__ qidxs_base, // (E, M, N_BLOCKS)
+    const half* __restrict__ codebook,
+    const int16_t* __restrict__ qidxs2_base,
+    const half* __restrict__ codebook2,
+    const int16_t* __restrict__ qidxs3_base,
+    const half* __restrict__ codebook3,
+    int B_dim, int M, int N, int N_BLOCKS, int stride_x, int bps, int cb2_size,
+    const int* __restrict__ m_indices,      // (B_dim,) expert per slot, -1=pad
+    long qidxs_estride,
+    const float* __restrict__ wscale_dev,   // (E,)
+    const float* __restrict__ inv_rs_dev,   // (E,) or null
+    const float* __restrict__ inv_rs2_dev   // (E,) or null
+) {
+    int b_start = blockIdx.x * 16;
+    // Uniform across the block: the whole 16-row tile is one expert (or pad).
+    int eidx = (b_start < B_dim) ? m_indices[b_start] : -1;
+    if (eidx < 0) return;
+    const int16_t* qidxs = qidxs_base + (long)eidx * qidxs_estride;
+    const int16_t* qidxs2 = (qidxs2_base != nullptr) ? qidxs2_base + (long)eidx * qidxs_estride : nullptr;
+    const int16_t* qidxs3 = (qidxs3_base != nullptr) ? qidxs3_base + (long)eidx * qidxs_estride : nullptr;
+    float wscale = wscale_dev[eidx];
+    float inv_resid_scale = (inv_rs_dev != nullptr) ? inv_rs_dev[eidx] : 0.0f;
+    float inv_resid_scale2 = (inv_rs2_dev != nullptr) ? inv_rs2_dev[eidx] : 0.0f;
+
+    extern __shared__ half smem_cb2[];
+    if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
+        int tid_flat = threadIdx.y * 32 + threadIdx.x;
+        int total = cb2_size * 8;
+        for (int i = tid_flat; i < total; i += 256) smem_cb2[i] = codebook2[i];
+        __syncthreads();
+    }
+
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    const int groupID = lane_id >> 2;
+    const int tid_g = lane_id & 3;
+
+    int m_start = (blockIdx.y * blockDim.y + warp_id) * 8;
+    int k_split = blockIdx.z;
+    if (m_start >= M) return;
+
+    int j_start = k_split * bps;
+    int j_end = min(j_start + bps, N_BLOCKS);
+    float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
+
+    int b_row0 = b_start + groupID;
+    int b_row1 = b_start + groupID + 8;
+    int m_row = m_start + groupID;
+    bool b0_valid = (b_row0 < B_dim);
+    bool b1_valid = (b_row1 < B_dim);
+    bool m_valid = (m_row < M);
+    int k_elem = tid_g * 2;
+
+    for (int j = j_start; j < j_end; j += 2) {
+        bool j1_valid = (j + 1 < N_BLOCKS);
+        uint16_t idx_j = 0, idx_j1 = 0;
+        if (m_valid) {
+            idx_j = (uint16_t)qidxs[m_row * N_BLOCKS + j];
+            if (j1_valid) idx_j1 = (uint16_t)qidxs[m_row * N_BLOCKS + j + 1];
+        }
+        half bv0 = m_valid ? codebook[idx_j * 8 + k_elem]     : __float2half(0.0f);
+        half bv1 = m_valid ? codebook[idx_j * 8 + k_elem + 1] : __float2half(0.0f);
+        half bv2 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem]     : __float2half(0.0f);
+        half bv3 = (m_valid && j1_valid) ? codebook[idx_j1 * 8 + k_elem + 1] : __float2half(0.0f);
+
+        if constexpr (NUM_STAGES >= 2) {
+            if (m_valid) {
+                const half* cb2 = (cb2_size > 0 && cb2_size <= 256) ? smem_cb2 : codebook2;
+                uint16_t i2j = (uint16_t)qidxs2[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(cb2[i2j * 8 + k_elem]) * inv_resid_scale);
+                bv1 = __float2half(__half2float(bv1) + __half2float(cb2[i2j * 8 + k_elem + 1]) * inv_resid_scale);
+                if (j1_valid) {
+                    uint16_t i2j1 = (uint16_t)qidxs2[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(cb2[i2j1 * 8 + k_elem]) * inv_resid_scale);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(cb2[i2j1 * 8 + k_elem + 1]) * inv_resid_scale);
+                }
+            }
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            if (m_valid) {
+                uint16_t i3j = (uint16_t)qidxs3[m_row * N_BLOCKS + j];
+                bv0 = __float2half(__half2float(bv0) + __half2float(codebook3[i3j * 8 + k_elem]) * inv_resid_scale2);
+                bv1 = __float2half(__half2float(bv1) + __half2float(codebook3[i3j * 8 + k_elem + 1]) * inv_resid_scale2);
+                if (j1_valid) {
+                    uint16_t i3j1 = (uint16_t)qidxs3[m_row * N_BLOCKS + j + 1];
+                    bv2 = __float2half(__half2float(bv2) + __half2float(codebook3[i3j1 * 8 + k_elem]) * inv_resid_scale2);
+                    bv3 = __float2half(__half2float(bv3) + __half2float(codebook3[i3j1 * 8 + k_elem + 1]) * inv_resid_scale2);
+                }
+            }
+        }
+
+        __half2 b_h0 = __halves2half2(bv0, bv1);
+        __half2 b_h1 = __halves2half2(bv2, bv3);
+        uint32_t b_reg0 = *reinterpret_cast<uint32_t*>(&b_h0);
+        uint32_t b_reg1 = *reinterpret_cast<uint32_t*>(&b_h1);
+
+        int x_off_j = j * 8 + k_elem;
+        int x_off_j1 = (j + 1) * 8 + k_elem;
+        half av0 = b0_valid ? x[b_row0 * stride_x + x_off_j]     : __float2half(0.0f);
+        half av1 = b0_valid ? x[b_row0 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half av2 = b1_valid ? x[b_row1 * stride_x + x_off_j]     : __float2half(0.0f);
+        half av3 = b1_valid ? x[b_row1 * stride_x + x_off_j + 1] : __float2half(0.0f);
+        half av4 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half av5 = (b0_valid && j1_valid) ? x[b_row0 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+        half av6 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1]     : __float2half(0.0f);
+        half av7 = (b1_valid && j1_valid) ? x[b_row1 * stride_x + x_off_j1 + 1] : __float2half(0.0f);
+
+        __half2 a_h0 = __halves2half2(av0, av1);
+        __half2 a_h1 = __halves2half2(av2, av3);
+        __half2 a_h2 = __halves2half2(av4, av5);
+        __half2 a_h3 = __halves2half2(av6, av7);
+        uint32_t a_reg0 = *reinterpret_cast<uint32_t*>(&a_h0);
+        uint32_t a_reg1 = *reinterpret_cast<uint32_t*>(&a_h1);
+        uint32_t a_reg2 = *reinterpret_cast<uint32_t*>(&a_h2);
+        uint32_t a_reg3 = *reinterpret_cast<uint32_t*>(&a_h3);
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+            " { %0, %1, %2, %3 },"
+            " { %4, %5, %6, %7 },"
+            " { %8, %9 },"
+            " { %0, %1, %2, %3 };"
+            : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+            : "r"(a_reg0), "r"(a_reg1), "r"(a_reg2), "r"(a_reg3),
+              "r"(b_reg0), "r"(b_reg1)
+        );
+    }
+
+    int m_col0 = m_start + tid_g * 2;
+    int m_col1 = m_col0 + 1;
+    size_t k_base = (size_t)k_split * B_dim * M;
+    if (b0_valid && m_col0 < M) scratch[k_base + (size_t)b_row0 * M + m_col0] = z0 * wscale;
+    if (b0_valid && m_col1 < M) scratch[k_base + (size_t)b_row0 * M + m_col1] = z1 * wscale;
+    if (b1_valid && m_col0 < M) scratch[k_base + (size_t)b_row1 * M + m_col0] = z2 * wscale;
+    if (b1_valid && m_col1 < M) scratch[k_base + (size_t)b_row1 * M + m_col1] = z3 * wscale;
+}
+
+// Host launcher: gather per-token x into the grouped buffer, run the grouped TC
+// matmul (deterministic scratch+reduce), return y_grouped (M_sum_max, M) fp32.
+// Standalone op for the increment-2 parity test; scratch is raw_alloc'd here
+// (fine — not under capture). The eventual fused entry pre-allocates scratch.
+torch::Tensor glq_moe_grouped_matmul(
+    torch::Tensor x,            // (num_tokens, N) fp16  (per-token w13 input)
+    torch::Tensor sorted_tk,    // (M_sum_max,) int32
+    torch::Tensor m_indices,    // (M_sum_max,) int32
+    int64_t top_k,
+    torch::Tensor qidxs,        // (E, M, N_BLOCKS) int16
+    torch::Tensor codebook,
+    torch::Tensor qidxs2,       // empty or (E, M, N_BLOCKS)
+    torch::Tensor codebook2,
+    torch::Tensor wscale,       // (E,) fp32
+    torch::Tensor inv_rs,       // empty or (E,)
+    torch::Tensor qidxs3,       // empty or (E, M, N_BLOCKS)
+    torch::Tensor codebook3,
+    torch::Tensor inv_rs2,      // empty or (E,)
+    int64_t num_stages
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(qidxs);
+    CHECK_INPUT(codebook);
+    CHECK_INPUT(m_indices);
+    CHECK_INPUT(sorted_tk);
+
+    int N = (int)x.size(1);
+    int M_sum_max = (int)m_indices.size(0);
+    int M = (int)qidxs.size(1);
+    int N_BLOCKS = (int)qidxs.size(2);
+    bool has_s2 = qidxs2.numel() > 0;
+    bool has_s3 = qidxs3.numel() > 0;
+    long q_estride = (long)M * N_BLOCKS;
+
+    at::DeviceGuard guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static int num_sms_g = 0;
+    if (num_sms_g == 0) {
+        cudaDeviceProp p; cudaGetDeviceProperties(&p, x.get_device());
+        num_sms_g = p.multiProcessorCount;
+    }
+    auto opts_f16 = torch::dtype(torch::kFloat16).device(x.device());
+    auto opts_f32 = torch::dtype(torch::kFloat32).device(x.device());
+
+    // 1. gather per-token x -> grouped (M_sum_max, N)
+    auto x_grouped = torch::empty({(long)M_sum_max, N}, opts_f16);
+    glq_moe_gather_rows_kernel<<<M_sum_max, 256, 0, stream>>>(
+        (half*)x_grouped.data_ptr<c10::Half>(),
+        (const half*)x.data_ptr<c10::Half>(),
+        sorted_tk.data_ptr<int>(), (int)top_k, N, M_sum_max);
+
+    // 2. grouped TC matmul (deterministic scratch+reduce)
+    const int WARPS = 8;
+    int b_tiles = (M_sum_max + 15) / 16;
+    int m_tiles = (M + 7) / 8;
+    int m_grid = (m_tiles + WARPS - 1) / WARPS;
+    int bps = TC_BPS_DEFAULT;
+    int k_splits = (N_BLOCKS + bps - 1) / bps;
+    int total_ctas = b_tiles * m_grid * k_splits;
+    if (total_ctas < num_sms_g * 2 && bps > 16) {
+        bps = max(16, bps / 2);
+        k_splits = (N_BLOCKS + bps - 1) / bps;
+    }
+    dim3 tc_grid(b_tiles, m_grid, k_splits);
+    dim3 tc_block(32, WARPS);
+    int cb2_size = has_s2 ? (int)codebook2.size(0) : 0;
+    int smem = (has_s2 && cb2_size <= 256) ? cb2_size * 8 * (int)sizeof(half) : 0;
+
+    size_t scratch_bytes = (size_t)k_splits * M_sum_max * M * sizeof(float);
+    float* scratch = (float*)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+    auto y = torch::empty({(long)M_sum_max, M}, opts_f32);
+
+    const half* xg = (const half*)x_grouped.data_ptr<c10::Half>();
+    const int16_t* q = qidxs.data_ptr<int16_t>();
+    const half* cb = (const half*)codebook.data_ptr<c10::Half>();
+    const int16_t* q2 = has_s2 ? qidxs2.data_ptr<int16_t>() : nullptr;
+    const half* cb2 = has_s2 ? (const half*)codebook2.data_ptr<c10::Half>() : nullptr;
+    const int16_t* q3 = has_s3 ? qidxs3.data_ptr<int16_t>() : nullptr;
+    const half* cb3 = has_s3 ? (const half*)codebook3.data_ptr<c10::Half>() : nullptr;
+    const float* ws = wscale.data_ptr<float>();
+    const float* irs = (inv_rs.numel() > 0) ? inv_rs.data_ptr<float>() : nullptr;
+    const float* irs2 = (inv_rs2.numel() > 0) ? inv_rs2.data_ptr<float>() : nullptr;
+    const int* mi = m_indices.data_ptr<int>();
+
+#define LAUNCH_GROUPED_TC(NS)                                                   \
+    glq_matmul_tc_grouped_scratch_kernel<NS><<<tc_grid, tc_block, smem, stream>>>( \
+        scratch, xg, q, cb, q2, cb2, q3, cb3,                                   \
+        M_sum_max, M, N, N_BLOCKS, N, bps, cb2_size,                            \
+        mi, q_estride, ws, irs, irs2)
+    switch (num_stages) {
+        case 1: LAUNCH_GROUPED_TC(1); break;
+        case 2: LAUNCH_GROUPED_TC(2); break;
+        case 3: LAUNCH_GROUPED_TC(3); break;
+        default: TORCH_CHECK(false, "grouped MoE num_stages must be 1-3");
+    }
+#undef LAUNCH_GROUPED_TC
+
+    int BM = M_sum_max * M;
+    glq_reduce_splits_2d_kernel<<<(BM + 255) / 256, 256, 0, stream>>>(
+        y.data_ptr<float>(), scratch, BM, k_splits);
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
+    return y;
+}
+
+
 torch::Tensor glq_fused_moe_block_diag_cuda(
     torch::Tensor x,                    // (num_tokens, hidden) fp16
     torch::Tensor topk_ids,             // (num_tokens, top_k) int64
