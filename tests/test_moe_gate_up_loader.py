@@ -121,13 +121,17 @@ def test_gemma4_expert_gate_up_split_roundtrip():
     inter, hidden_blk = 704, 512  # gemma-4-26B-A4B: expert inter 704, hidden 2816->/8 pad
     m_pad = 2 * inter             # 1408 fused gate||up rows
     torch.manual_seed(3)
+    # 3-stage (5/6 bpw) artifacts: Qidxs3 is row-indexed (like Qidxs/Qidxs2),
+    # inv_resid_scale2 is shared (like inv_resid_scale). Both must survive the split.
     arts = {
         "Qidxs": torch.randint(-32768, 32767, (m_pad, hidden_blk), dtype=torch.int16),
         "Qidxs2": torch.randint(-128, 127, (m_pad, hidden_blk), dtype=torch.int16),
+        "Qidxs3": torch.randint(-32768, 32767, (m_pad, hidden_blk), dtype=torch.int16),
         "SU": torch.randn(m_pad, dtype=torch.float16),
         "SV": torch.sign(torch.randn(4096)).to(torch.float16),
         "Wscale": torch.tensor(0.0091, dtype=torch.float32),
         "inv_resid_scale": torch.tensor(7.5, dtype=torch.float32),
+        "inv_resid_scale2": torch.tensor(31.0, dtype=torch.float32),
     }
     gate, up = _split_gate_up(arts, inter)
     for k in _ROW_ARTS & set(arts):
@@ -163,8 +167,61 @@ def test_gemma4_expert_split_then_loader_reassemble():
     assert torch.equal(w2_Q.data, down_Q)
 
 
+# --------------------------------------------------------------------------- #
+# Stage-3 (5/6 bpw) MoE serving regression guard.
+#
+# create_weights registers a (E,1,1) Qidxs3 PLACEHOLDER for <=4 bpw checkpoints
+# (no Qidxs3 key to load). The C++ MoE entries gate stage 3 on the NUMEL check
+# `Qidxs3.numel()>0 && inv_resid_scale2.numel()>0` (glq_cuda.cu ~3481/4332/4533),
+# so a (E,1,1) placeholder (numel E>0) would WRONGLY enable stage 3 -> the kernel
+# reads qidxs3[m_row*N_BLOCKS+j] out of bounds of the 1-elem-per-expert buffer
+# (illegal memory access). process_weights_after_loading collapses any sentinel
+# Qidxs3 (`dim==3 and shape[1]<=1`) to a numel-0 tensor; a real stage-3 buffer
+# (shape[1]=m_pad>1) is left intact. These pin both halves of that contract.
+# --------------------------------------------------------------------------- #
+
+def _is_sentinel(q):
+    """Mirror of the collapse predicate in fused_moe_method.process_weights."""
+    return q.dim() == 3 and q.shape[1] <= 1
+
+
+def _collapse_if_sentinel(q):
+    return torch.empty(0, dtype=torch.int16) if _is_sentinel(q) else q
+
+
+def _cpp_has_s3(qidxs3, inv_rs2):
+    """Mirror of the C++ has_s3 gate: numel-based, both must be non-empty."""
+    return qidxs3.numel() > 0 and inv_rs2.numel() > 0
+
+
+def test_stage3_sentinel_collapse_disables_has_s3():
+    """<=4 bpw: a (E,1,1) Qidxs3 placeholder must collapse to numel-0 so stage 3
+    stays OFF (else the kernel reads OOB). inv_resid_scale2 stays (E,) zeros."""
+    E = 4
+    sentinel_q3 = torch.zeros(E, 1, 1, dtype=torch.int16)
+    inv_rs2 = torch.zeros(E, dtype=torch.float32)  # (E,) zeros, kept for the fallback list
+    assert _is_sentinel(sentinel_q3)
+    collapsed = _collapse_if_sentinel(sentinel_q3)
+    assert collapsed.numel() == 0
+    assert not _cpp_has_s3(collapsed, inv_rs2), "stage 3 wrongly enabled for 2-stage model"
+
+
+def test_stage3_fullshape_qidxs3_enables_has_s3():
+    """5/6 bpw: a real (E, m_pad, n_blocks) Qidxs3 must NOT be collapsed and must
+    enable stage 3 (with a loaded non-empty inv_resid_scale2)."""
+    E, m_pad, nblk = 4, 1408, 512  # gemma-4-26B-A4B fused gate||up rows
+    real_q3 = torch.zeros(E, m_pad, nblk, dtype=torch.int16)
+    inv_rs2 = torch.full((E,), 31.0, dtype=torch.float32)
+    assert not _is_sentinel(real_q3)
+    kept = _collapse_if_sentinel(real_q3)
+    assert kept.shape == (E, m_pad, nblk)
+    assert _cpp_has_s3(kept, inv_rs2), "stage 3 should be enabled for a 3-stage model"
+
+
 if __name__ == "__main__":
     test_gemma4_expert_gate_up_split_roundtrip()
+    test_stage3_sentinel_collapse_disables_has_s3()
+    test_stage3_fullshape_qidxs3_enables_has_s3()
     if not _HAS:
         print("glq_vllm not importable; loader tests run on the box")
     else:
@@ -173,3 +230,4 @@ if __name__ == "__main__":
         test_shared_sv_and_scalars()
         test_gemma4_expert_split_then_loader_reassemble()
         print("OK: gate+up loader reassembly lossless; w2 full copy; shared SV/scalars; gemma-4 experts")
+    print("OK: stage-3 sentinel collapse / full-shape has_s3 gate")

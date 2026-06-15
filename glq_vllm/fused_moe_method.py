@@ -156,6 +156,34 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         layer.w2_inv_resid_scale = _make_glq_param(
             torch.zeros(num_experts, dtype=torch.float32))
 
+        # Stage 3 buffers (5/6 bpw). Unlike the LINEAR path (which registers a tiny
+        # sentinel resized on load by `_glq_weight_loader`), the MoE path loads each
+        # expert through vLLM's FusedMoE default weight_loader, which writes
+        # `param.data[expert_id] = loaded` WITHOUT resizing — so the slot must be
+        # pre-sized at the full (E, m_pad, n_blocks) shape, exactly like Qidxs2 above.
+        # A (E,1,1) sentinel here makes the loaded (m_pad, n_blocks) tensor land in a
+        # 1-element slot, and the stage-3 kernel then reads out of bounds (illegal
+        # memory access during the profiling forward). Only >4 bpw checkpoints carry
+        # Qidxs3, so pre-allocate the full buffer only then; <=4 bpw keeps a tiny
+        # placeholder whose zero inv_resid_scale2 makes the kernel skip stage 3
+        # per-expert (and avoids the per-expert VRAM cost on 2-stage models). Stage 3
+        # reuses the PRIMARY 65536-entry codebook (mirrors the linear path), not cb2.
+        _has_stage3 = float(getattr(self.quant_config, 'bpw', 2)) > 4.0
+        if _has_stage3:
+            layer.w13_Qidxs3 = _make_glq_param(
+                torch.zeros(num_experts, m_pad_w13, n_blocks_w13, dtype=torch.int16))
+            layer.w2_Qidxs3 = _make_glq_param(
+                torch.zeros(num_experts, m_pad_w2, n_blocks_w2, dtype=torch.int16))
+        else:
+            layer.w13_Qidxs3 = _make_glq_param(
+                torch.zeros(num_experts, 1, 1, dtype=torch.int16))
+            layer.w2_Qidxs3 = _make_glq_param(
+                torch.zeros(num_experts, 1, 1, dtype=torch.int16))
+        layer.w13_inv_resid_scale2 = _make_glq_param(
+            torch.zeros(num_experts, dtype=torch.float32))
+        layer.w2_inv_resid_scale2 = _make_glq_param(
+            torch.zeros(num_experts, dtype=torch.float32))
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Ensure codebook is on device. Cache per-expert metadata for fast apply()."""
         device = layer.w13_Qidxs.device
@@ -185,10 +213,27 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         for attr in ['w13_Qidxs', 'w13_SU', 'w13_SV', 'w13_Wscale',
                      'w2_Qidxs', 'w2_SU', 'w2_SV', 'w2_Wscale',
                      'w13_Qidxs2', 'w13_inv_resid_scale',
-                     'w2_Qidxs2', 'w2_inv_resid_scale']:
+                     'w2_Qidxs2', 'w2_inv_resid_scale',
+                     'w13_Qidxs3', 'w13_inv_resid_scale2',
+                     'w2_Qidxs3', 'w2_inv_resid_scale2']:
             t = getattr(layer, attr, None)
             if t is not None and t.device != device:
                 setattr(layer, attr, torch.nn.Parameter(t.data.to(device), requires_grad=False))
+
+        # Disable stage 3 on <=4 bpw layers. create_weights registers a (E,1,1)
+        # Qidxs3 placeholder for 2-stage checkpoints (no Qidxs3 key in the
+        # checkpoint, so it's never written). The C++ MoE entries gate stage 3 on
+        # `Qidxs3.numel() > 0 && inv_resid_scale2.numel() > 0` — a (E,1,1) sentinel
+        # has numel E>0, which would WRONGLY enable stage 3 and make the kernel read
+        # qidxs3[m_row*N_BLOCKS+j] out of bounds of the 1-element-per-expert buffer
+        # (illegal memory access). Collapse the sentinel to a numel-0 tensor so the
+        # check is False. A real stage-3 buffer has shape (E, m_pad, n_blocks) with
+        # m_pad>1, so it is left intact.
+        for qn in ('w13_Qidxs3', 'w2_Qidxs3'):
+            q = getattr(layer, qn, None)
+            if q is not None and q.dim() == 3 and q.shape[1] <= 1:
+                setattr(layer, qn, torch.nn.Parameter(
+                    torch.empty(0, dtype=torch.int16, device=device), requires_grad=False))
 
         # Cache log2 values and per-expert scalars for fast apply().
         # CRITICAL: for non-power-of-2 (block-diagonal) dims the log is 0 — the
@@ -226,6 +271,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         layer.glq_w2_wscale = [layer.w2_Wscale[i].item() for i in range(n)]
         layer.glq_w13_inv_rs = [layer.w13_inv_resid_scale[i].item() for i in range(n)]
         layer.glq_w2_inv_rs = [layer.w2_inv_resid_scale[i].item() for i in range(n)]
+        layer.glq_w13_inv_rs2 = [layer.w13_inv_resid_scale2[i].item() for i in range(n)]
+        layer.glq_w2_inv_rs2 = [layer.w2_inv_resid_scale2[i].item() for i in range(n)]
 
         # Remove weight_loader from params (prevents vLLM v1 serialization issues)
         for name, param in layer.named_parameters():
@@ -317,9 +364,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 layer.glq_log_n_w13, layer.glq_log_m_w13,
                 layer.glq_log_n_w2, layer.glq_log_m_w2,
                 self._activation_type(activation),
-                # stage-3 RVQ: pass empty tensors (2-stage). pybind requires real
-                # tensors here — the C++ `= None` default can't bind to torch::Tensor.
-                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
+                # stage-3 RVQ (5/6 bpw): real Qidxs3 + per-expert inv_resid_scale2;
+                # codebook3 = PRIMARY codebook (cb_half). Kernel skips stage-3 per-expert
+                # when inv_resid_scale2==0 (<=4 bpw), so the 2-stage path is unaffected.
+                layer.w13_Qidxs3, layer.w13_inv_resid_scale2,
+                layer.w2_Qidxs3, layer.w2_inv_resid_scale2, cb_half,
             )
             if dtype != torch.float16:
                 output = output.to(dtype)
@@ -406,7 +455,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 bd2["blocks_n_tensor"], bd2["blocks_m_tensor"],
                 bd2["blocks_n_meta_gpu"], bd2["blocks_m_meta_gpu"],
                 self._activation_type(activation),
-                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
+                layer.w13_Qidxs3, layer.w13_inv_resid_scale2,
+                layer.w2_Qidxs3, layer.w2_inv_resid_scale2, cb_half,
             )
             if dtype != torch.float16:
                 output = output.to(dtype)
@@ -456,8 +506,10 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 bd2["blocks_n_tensor"], bd2["blocks_m_tensor"],
                 bd2["blocks_n_meta_gpu"], bd2["blocks_m_meta_gpu"],
                 self._activation_type(activation),
-                # stage-3 RVQ: empty tensors (2-stage path).
-                _empty_i16, _empty_f32, _empty_i16, _empty_f32, _empty_f16,
+                # stage-3 RVQ (5/6 bpw): per-expert Qidxs3 + inv_resid_scale2;
+                # zero-scale experts skip stage 3 in-kernel. codebook3 = PRIMARY.
+                layer.w13_Qidxs3, layer.w13_inv_resid_scale2,
+                layer.w2_Qidxs3, layer.w2_inv_resid_scale2, cb_half,
             )
             if dtype != torch.float16:
                 output = output.to(dtype)
@@ -484,6 +536,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
             inv_rs_w13 = layer.glq_w13_inv_rs[expert_idx]
             has_s2_w13 = inv_rs_w13 != 0.0
+            # Stage 3 (5/6 bpw): per-expert inv_resid_scale2 != 0 ⇒ Qidxs3 present.
+            # Stages 3-4 reuse the PRIMARY 65536-entry codebook (handled inside
+            # _glq_apply_shard); cb2 is stage-2 only.
+            inv_rs2_w13 = layer.glq_w13_inv_rs2[expert_idx]
+            has_s3_w13 = inv_rs2_w13 != 0.0
             h = _glq_apply_shard(
                 selected_tokens, device, cb, cb2,
                 Qidxs=layer.w13_Qidxs[expert_idx],
@@ -493,6 +550,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 has_stage2=has_s2_w13,
                 inv_rs=inv_rs_w13,
                 Qidxs2=layer.w13_Qidxs2[expert_idx] if has_s2_w13 else None,
+                Qidxs3=layer.w13_Qidxs3[expert_idx] if has_s3_w13 else None,
+                inv_rs2=inv_rs2_w13,
                 out_features=w13_out, in_features=hidden,
                 m_pad=layer.glq_m_pad_w13, n_pad=layer.glq_n_pad_w13,
                 log_n=layer.glq_log_n_w13, log_m=layer.glq_log_m_w13,
@@ -503,6 +562,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
             inv_rs_w2 = layer.glq_w2_inv_rs[expert_idx]
             has_s2_w2 = inv_rs_w2 != 0.0
+            inv_rs2_w2 = layer.glq_w2_inv_rs2[expert_idx]
+            has_s3_w2 = inv_rs2_w2 != 0.0
             h = _glq_apply_shard(
                 h, device, cb, cb2,
                 Qidxs=layer.w2_Qidxs[expert_idx],
@@ -512,6 +573,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 has_stage2=has_s2_w2,
                 inv_rs=inv_rs_w2,
                 Qidxs2=layer.w2_Qidxs2[expert_idx] if has_s2_w2 else None,
+                Qidxs3=layer.w2_Qidxs3[expert_idx] if has_s3_w2 else None,
+                inv_rs2=inv_rs2_w2,
                 out_features=out_dim, in_features=inter_dim,
                 m_pad=layer.glq_m_pad_w2, n_pad=layer.glq_n_pad_w2,
                 log_n=layer.glq_log_n_w2, log_m=layer.glq_log_m_w2,
