@@ -28,6 +28,11 @@ def register():
         register_quantization_config("glq")(GLQvLLMConfig)
         from .custom_ops import _ensure_registered
         _ensure_registered()
+        # Cap cudagraph capture sizes <= GLQ_MOE_BD_MAX_TOKENS for GLQ MoE models,
+        # so vLLM's default (up to 512) doesn't try to capture the >256-token
+        # non-capturable MoE fallback (cudaErrorStreamCaptureUnsupported).
+        from . import _cudagraph_cap
+        _cudagraph_cap.install()
     except ImportError:
         pass
 
