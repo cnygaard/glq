@@ -962,16 +962,30 @@ def enable_compressed_allocation() -> None:
 
     Attention.get_kv_cache_spec = _e8_get_kv_cache_spec
 
-    # -- 1b) register E8 spec subclasses with the manager dispatch --
-    # vLLM's get_manager_for_kv_cache_spec uses type(spec) as a dict
-    # key, so subclassing isn't enough — we must add the entries.
-    from vllm.v1.core.single_type_kv_cache_manager import (
-        spec_manager_map,
-        FullAttentionManager,
-        SlidingWindowManager,
-    )
-    spec_manager_map[E8FullAttentionSpec] = FullAttentionManager
-    spec_manager_map[E8SlidingWindowSpec] = SlidingWindowManager
+    # -- 1b) make the E8 spec subclasses resolve to a manager --
+    # Old vLLM keyed a module-level ``spec_manager_map`` dict by the EXACT
+    # ``type(spec)``, so a subclass needed its own entry. vLLM 0.23+ replaced
+    # that with ``KVCacheSpecRegistry``, whose ``get_manager_class`` walks the
+    # spec's MRO — so our ``E8*Spec`` subclasses of ``FullAttentionSpec`` /
+    # ``SlidingWindowSpec`` resolve to the parent's manager automatically, with
+    # NO entry needed. We must NOT register them here: this runs at plugin-load
+    # while the registry is still empty, and populating it now would trip the
+    # registry's ``_ensure_registered()`` "skip if non-empty" guard and leave
+    # the built-in specs unregistered. So: mutate the dict on old vLLM; rely on
+    # the MRO walk on new vLLM.
+    try:
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            spec_manager_map,
+            FullAttentionManager,
+            SlidingWindowManager,
+        )
+        spec_manager_map[E8FullAttentionSpec] = FullAttentionManager
+        spec_manager_map[E8SlidingWindowSpec] = SlidingWindowManager
+    except ImportError:
+        # vLLM 0.23+: registry-based dispatch resolves subclasses via MRO walk;
+        # nothing to register. Importing the registry asserts the new mechanism
+        # exists — if BOTH are absent the ImportError propagates (unsupported vLLM).
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry  # noqa: F401
 
     # -- 2) patch TritonAttentionBackend.get_kv_cache_shape --
     try:
