@@ -23,10 +23,13 @@ dev = ["pytest"]
 quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepiece"]
 # card generation + HF upload for the batch quantizer (scripts/batch_quantization.py)
 hub = ["jinja2", "huggingface_hub", "pyyaml"]
+# model-performance benchmarking toolkit (glq-bench)
+bench = ["vllm", "datasets", "huggingface_hub", "jinja2", "pyyaml", "matplotlib", "pandas"]
 
 [project.scripts]
 glq-quantize = "glq.quantize_model:main"
 glq-quantize-kv = "glq.quantize_kv:main"
+glq-bench = "glq.bench.cli:main"
 
 [project.entry-points."vllm.general_plugins"]
 glq = "glq_vllm:register"
