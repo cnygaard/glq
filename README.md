@@ -621,8 +621,8 @@ codebook and its tensor-core decode / residual kernels** — the `grid_packed_ab
 codebook plus the `decode_matvec_e8p`, `decompress_packed_e8p`, and E81B
 lookup-matmul kernels in [`glq/csrc/glq_e8p.cu`](glq/csrc/glq_e8p.cu). All credit
 for the E8P codebook and those kernels belongs to the QuIP# authors; this
-repository is an independent port, not an official QuIP# release. Please cite
-QuIP#:
+repository is an independent port, not an official QuIP# release. Please consider
+citing the QuIP# authors if you find the QuIP# part useful:
 
 ```bibtex
 @inproceedings{
