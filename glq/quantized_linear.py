@@ -140,10 +140,16 @@ class E8RHTLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 block_diagonal: bool = False):
+                 block_diagonal: bool = False, codebook_type: str = "e8_shell"):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        # E8P uses int64 tensor-core-packed weights + a pow2 RHT pad (n_pad÷64,
+        # m_pad÷16). Detected here so the right buffers get registered; the
+        # forward early-returns into _forward_e8p, leaving the shell path intact.
+        self._is_e8p = (codebook_type == "e8p")
+        if self._is_e8p:
+            block_diagonal = False
 
         if block_diagonal:
             from .hadamard import _block_decompose
@@ -158,6 +164,10 @@ class E8RHTLinear(nn.Module):
             self.blocks_m = [self.m_pad]
             self.blocks_n = [self.n_pad]
         self.block_diagonal = block_diagonal
+
+        if self._is_e8p:
+            self._init_e8p_buffers(bias)
+            return
 
         # Quantized weight storage
         self.register_buffer('Qidxs', torch.zeros(self.m_pad, self.n_pad // 8, dtype=torch.int16))
@@ -211,6 +221,37 @@ class E8RHTLinear(nn.Module):
         self._empty_i16 = None
         self._empty_f16 = None
 
+    def _init_e8p_buffers(self, bias):
+        """Register the E8P int64 tensor-core-packed buffers (used instead of the
+        shell's int16 Qidxs). The stage-2 buffer (Qidxs2_e8p for 4bpw / Qidxs2_e81b
+        for 3bpw) is registered lazily at load from the checkpoint's exact shape so
+        2/3bpw layers carry no dead weight."""
+        mp16 = max(self.m_pad // 16, 1)
+        nb64 = max(self.n_pad // 64, 1)
+        self.register_buffer('Qidxs_e8p', torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64))
+        self.register_buffer('SU', torch.ones(self.m_pad, dtype=torch.float16))
+        self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
+        self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
+        self.register_buffer('inv_resid_scale', torch.zeros((), dtype=torch.float32))
+        # Stage-2 buffers as 0-size placeholders. from_pretrained's meta-assign path
+        # (set_module_tensor_to_device) only populates buffers that already exist, so
+        # these MUST be registered here (not lazily in _load_from_state_dict). The
+        # recipe uses exactly one — Qidxs2_e8p (4bpw) or Qidxs2_e81b (3bpw) — and the
+        # checkpoint carries only that key, so the unused one stays 0-size (no dead
+        # weight). Non-meta load_state_dict resizes the used one to the checkpoint shape.
+        self.register_buffer('Qidxs2_e8p', torch.zeros(0, dtype=torch.int64))
+        self.register_buffer('Qidxs2_e81b', torch.zeros(0, dtype=torch.int64))
+        if bias:
+            self.register_buffer('bias', torch.zeros(self.out_features, dtype=torch.float16))
+        else:
+            self.bias = None
+        self.codebook = None        # E8PCodebook (grid_packed_abs)
+        self.codebook2 = None       # E8PCodebook (4bpw) or E81BCodebook (3bpw)
+        self._wscale_float = 1.0
+        self._inv_rs_float = 0.0
+        self._e8p_grid_dev = None   # cached grid_packed_abs on the compute device
+        self._e81b_grid_dev = None  # cached e81b_grid on the compute device
+
     @property
     def weight(self):
         """Proxy so code checking weight.device works (e.g. Mamba).
@@ -218,12 +259,26 @@ class E8RHTLinear(nn.Module):
         Returns a zero-element tensor on the same device as the quantized
         weights, without allocating any real memory.
         """
-        return torch.empty(0, dtype=torch.float16, device=self.Qidxs.device)
+        dev = self.SV.device if self._is_e8p else self.Qidxs.device
+        return torch.empty(0, dtype=torch.float16, device=dev)
 
     def set_codebook(self, codebook, codebook2=None):
-        """Attach the shared E8ShellCodebook(s) (called after weight loading)."""
+        """Attach the shared codebook(s) (called after weight loading)."""
         self.codebook = codebook
         self.codebook2 = codebook2
+        if getattr(codebook, 'is_e8p', False):
+            self._is_e8p = True
+        if self._is_e8p:
+            # E8P caches grid_packed_abs / e81b_grid on the compute device lazily
+            # in forward; only the two scalars need resolving here.
+            self._e8p_grid_dev = None
+            self._e81b_grid_dev = None
+            if self.Wscale.device.type == "meta":
+                self._wscale_float = None
+                return
+            self._wscale_float = self.Wscale.item()
+            self._inv_rs_float = self.inv_resid_scale.item()
+            return
         # Skip scalar caching for meta tensors (offloaded layers);
         # values will be resolved lazily in forward() if needed.
         if self.Wscale.device.type == "meta":
@@ -258,6 +313,28 @@ class E8RHTLinear(nn.Module):
         checkpoints by resizing buffers to match the checkpoint's actual shapes.
         Also handles 2bpw models that omit Qidxs2/inv_resid_scale.
         """
+        if self._is_e8p:
+            # E8P buffers are stored at their exact pow2-padded shape — no runtime
+            # padding. Register whichever stage-2 buffer the recipe used (present in
+            # the checkpoint) at its exact shape, and default inv_resid_scale to 0
+            # for 2bpw so a full load doesn't flag it missing.
+            _full = (prefix + 'Qidxs_e8p') in state_dict
+            # Resize the pre-registered 0-size stage-2 buffer to the checkpoint shape
+            # so super()'s copy matches (non-meta path). The meta-assign path replaces
+            # the buffer object wholesale, so this is a no-op there.
+            for suffix in ('Qidxs2_e8p', 'Qidxs2_e81b'):
+                key = prefix + suffix
+                if key in state_dict:
+                    buf = getattr(self, suffix)
+                    t = state_dict[key]
+                    if buf.device.type != 'meta' and buf.shape != t.shape:
+                        buf.resize_(t.shape)
+            if _full and (prefix + 'inv_resid_scale') not in state_dict:
+                state_dict[prefix + 'inv_resid_scale'] = torch.zeros((), dtype=torch.float32)
+            super()._load_from_state_dict(
+                state_dict, prefix, local_metadata,
+                strict, missing_keys, unexpected_keys, error_msgs)
+            return
         # Pad if checkpoint is smaller than current buffers (legacy compat)
         for suffix in ('Qidxs', 'Qidxs2', 'Qidxs3', 'Qidxs4'):
             key = prefix + suffix
@@ -365,6 +442,79 @@ class E8RHTLinear(nn.Module):
         if self.codebook2 is not None and self.codebook2.codebook.device != self.Qidxs.device:
             self.codebook2._move_to_device(self.Qidxs.device)
 
+    def _forward_e8p(self, x: torch.Tensor) -> torch.Tensor:
+        """E8P-RVQ forward: input_rht (CUDA) → N× tensor-core decode → output_rht.
+
+        Reuses glq's CUDA RHT ops (no Python Hadamard). B=1 uses the TC-GEMV
+        (decode_matvec_e8p) and WMMA (lookupmatmul_e81b_k8) matvec kernels; B>1
+        decompresses the weight and runs a dense matmul (prefill / PPL).
+        """
+        from . import inference_kernel as _ik
+        _ik._try_load_cuda_ext()
+        cuda = _ik._glq_cuda
+
+        # Lazy-resolve scalars (layers that were on meta at set_codebook time).
+        if self._wscale_float is None:
+            self._wscale_float = self.Wscale.item()
+            self._inv_rs_float = self.inv_resid_scale.item()
+        # Cache the decode grids on the compute device (once per device).
+        if self._e8p_grid_dev is None or self._e8p_grid_dev.device != x.device:
+            self._e8p_grid_dev = self.codebook.grid_packed_abs.to(x.device)
+            if self.codebook2 is not None and hasattr(self.codebook2, 'e81b_grid'):
+                self._e81b_grid_dev = self.codebook2.e81b_grid.to(x.device)
+        grid = self._e8p_grid_dev
+
+        shape = x.shape
+        x = x.reshape(-1, self.in_features)
+        B = x.shape[0]
+        dtype = x.dtype
+        n_pad, m_pad = self.n_pad, self.m_pad
+        log_n, log_m = int(math.log2(n_pad)), int(math.log2(m_pad))
+        inv_rs = self._inv_rs_float
+        has_e8p2 = self.Qidxs2_e8p.numel() > 0
+        has_e81b = self.Qidxs2_e81b.numel() > 0
+
+        # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
+        x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
+        cuda.glq_input_rht_cuda(
+            x.half().contiguous(), self.SV, x_rht,
+            self.in_features, self.in_features,
+            1.0 / math.sqrt(n_pad), n_pad, log_n)
+
+        # 2. decode + matmul in the RHT domain  →  y_rht (B, m_pad) fp32
+        if B == 1:
+            xh = x_rht[0].half()
+            y_rht = cuda.glq_decode_matvec_e8p(xh, self.Qidxs_e8p, grid)
+            if has_e8p2 and inv_rs != 0.0:
+                y_rht = y_rht + inv_rs * cuda.glq_decode_matvec_e8p(xh, self.Qidxs2_e8p, grid)
+            elif has_e81b and inv_rs != 0.0:
+                X8 = torch.zeros(8, n_pad, dtype=torch.float16, device=x.device)
+                X8[0] = xh
+                Z = torch.zeros(8, m_pad, dtype=torch.float32, device=x.device)
+                cuda.glq_lookupmatmul_e81b_k8(X8, self.Qidxs2_e81b, self._e81b_grid_dev, Z)
+                y_rht = y_rht + inv_rs * Z[0]
+            y_rht = y_rht.unsqueeze(0)
+        else:
+            W = cuda.glq_decompress_packed_e8p(self.Qidxs_e8p, grid).float()
+            if has_e8p2 and inv_rs != 0.0:
+                W = W + inv_rs * cuda.glq_decompress_packed_e8p(self.Qidxs2_e8p, grid).float()
+            elif has_e81b and inv_rs != 0.0:
+                Y = torch.zeros(m_pad, n_pad, dtype=torch.float16, device=x.device)
+                cuda.glq_decompress_e81b_packed(self.Qidxs2_e81b, self._e81b_grid_dev, Y)
+                W = W + inv_rs * Y.float()
+            y_rht = x_rht @ W.T
+
+        # 3. scale + output RHT: FHT + SU signs + unpad  →  (B, out_features)
+        y_rht = (y_rht * self._wscale_float).contiguous()
+        y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
+        cuda.glq_output_rht_cuda(
+            y_rht, self.SU, y, self.out_features, m_pad, log_m,
+            1.0 / math.sqrt(m_pad))
+        y = y.to(dtype)
+        if self.bias is not None:
+            y = y + self.bias.unsqueeze(0).to(dtype)
+        return y.reshape(*shape[:-1], self.out_features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with RHT-domain matmul.
@@ -373,6 +523,8 @@ class E8RHTLinear(nn.Module):
         2. Fused dequant+matmul in RHT domain (Triton) or decode+matmul (fallback)
         3. FHT on y_rht, apply SU signs, unpad → inverse RHT on output
         """
+        if self._is_e8p:
+            return self._forward_e8p(x)
         self._pad_if_needed()
         self._ensure_codebook_device()
         # Lazy-resolve cached scalars (for layers that were on meta at set_codebook time)

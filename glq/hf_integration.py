@@ -102,7 +102,7 @@ def _peek_qidxs_keys(pretrained_path):
                 idx = json.load(f)
             seen_files = set()
             for k, fname in idx.get("weight_map", {}).items():
-                if k.endswith(".Qidxs"):
+                if k.endswith(".Qidxs") or k.endswith(".Qidxs_e8p"):
                     keys.append(k)
                     if sample_shape is None and fname not in seen_files:
                         seen_files.add(fname)
@@ -128,7 +128,7 @@ def _peek_qidxs_keys(pretrained_path):
             return [], None
         with safe_open(st_path, framework="pt") as st:
             for k in st.keys():
-                if k.endswith(".Qidxs"):
+                if k.endswith(".Qidxs") or k.endswith(".Qidxs_e8p"):
                     keys.append(k)
                     if sample_shape is None:
                         sample_shape = st.get_tensor(k).shape
@@ -162,7 +162,11 @@ def _collect_quantized_layer_names(pretrained_path):
     keys, _ = _peek_qidxs_keys(pretrained_path)
     if not keys:
         return None
-    return {k[:-len(".Qidxs")] for k in keys}
+    out = set()
+    for k in keys:
+        suffix = ".Qidxs_e8p" if k.endswith(".Qidxs_e8p") else ".Qidxs"
+        out.add(k[:-len(suffix)])
+    return out
 
 
 def replace_with_glq_embedding(model, quantized_layers=None):
@@ -216,7 +220,8 @@ def replace_with_glq_embedding(model, quantized_layers=None):
     return has_replaced
 
 
-def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None):
+def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None,
+                            codebook_type="e8_shell"):
     """Replace nn.Linear modules with E8RHTLinear on meta device.
 
     When ``quantized_layers`` is provided, only ``nn.Linear`` modules whose
@@ -243,6 +248,7 @@ def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None):
                 module.out_features,
                 bias=module.bias is not None,
                 block_diagonal=block_diagonal,
+                codebook_type=codebook_type,
             )
         new_module.requires_grad_(False)
         model.set_submodule(name, new_module)
@@ -394,6 +400,11 @@ class GLQQuantizer(HfQuantizer):
         cfg = getattr(model, "config", None)
         pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
         block_diag = _detect_block_diagonal(pretrained_path) if pretrained_path else False
+        # E8P checkpoints are stored pow2-padded (not block-diagonal); its linear
+        # needs codebook_type="e8p" so the int64 tensor-core buffers are registered.
+        cb_type = getattr(self.quantization_config, "codebook", "e8_shell")
+        if cb_type == "e8p":
+            block_diag = False
         # Scope the nn.Linear -> E8RHTLinear replacement to exactly the
         # layers that have GLQ payload in the saved safetensors. Multimodal
         # models (e.g. Gemma-4) only quantize the language decoder; vision
@@ -414,7 +425,8 @@ class GLQQuantizer(HfQuantizer):
         if n_fused:
             install_nemotron_h_state_dict_renames(model)
         replaced = replace_with_glq_linear(
-            model, block_diagonal=block_diag, quantized_layers=quantized_layers)
+            model, block_diagonal=block_diag, quantized_layers=quantized_layers,
+            codebook_type=cb_type)
         # Gemma-4 PLE embedding (and any other quantized nn.Embedding) gets
         # swapped to E8RHTEmbedding when the saved checkpoint has its GLQ
         # payload. No-op for older single-modal checkpoints.
@@ -439,8 +451,17 @@ class GLQQuantizer(HfQuantizer):
         #   3) enumerate fresh (last-resort fallback)
         codebook = None
         cfg = getattr(model, "config", None)
+        # Codebook variant selected at quantization time (round-trips via GLQConfig).
+        # Algebraic variants are constructed deterministically (no bundled .pt).
+        cb_type = getattr(self.quantization_config, "codebook", "e8_shell")
+        if cb_type == "e8_relaxed":
+            from .codebook_relaxed import E8RelaxedCodebook
+            codebook = E8RelaxedCodebook(device='cpu', verbose=False)
+        elif cb_type == "e8p":
+            from .codebook_e8p import E8PCodebook
+            codebook = E8PCodebook(device='cpu', verbose=False)
         pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
-        if pretrained_path:
+        if codebook is None and pretrained_path:
             try:
                 from transformers.utils.hub import cached_file
                 cb_path = cached_file(
@@ -469,7 +490,14 @@ class GLQQuantizer(HfQuantizer):
             max_bpw = int(global_bpw) if isinstance(global_bpw, (int, float)) else 2
 
         codebook2 = None
-        if max_bpw >= 4:
+        if cb_type == "e8p":
+            # E8P RVQ: 4bpw stage-2 reuses the E8P codebook; 3bpw uses E81B.
+            if max_bpw >= 4:
+                codebook2 = codebook
+            elif max_bpw >= 3:
+                from .codebook_e8p import E81BCodebook
+                codebook2 = E81BCodebook(device='cpu', verbose=False)
+        elif max_bpw >= 4:
             codebook2 = codebook
         elif max_bpw >= 3:
             codebook2 = codebook.make_small(256)

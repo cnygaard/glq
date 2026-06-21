@@ -1,0 +1,388 @@
+/*
+ * E8P (QuIP#) tensor-core decode kernels, ported into the GLQ extension so the `--codebook e8p` path
+ * is self-contained (no external quiptools dependency). Verbatim from
+ * quip-sharp/quiptools/quiptools_e8p_gemv.cu: a 1KB-L1 sign-symmetric codebook is bit-expanded
+ * (lop3 + add.f16x2 + parity/sign XOR + ±1/4) and the dot runs on tensor cores (mma.sync.m16n8k16).
+ * Host fns are renamed glq_* and bound in glq_bindings.cpp. Self-contained TU (local static helpers).
+ */
+#include <vector>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <mma.h>
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/Atomic.cuh>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/types.h>
+#include <torch/extension.h>
+
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffff
+#endif
+
+using namespace nvcuda;                 // wmma fragments for the e81b (1-bit residual) lookup-matmul
+#define E8P_DECOMPRESS_E81B_BLOCK_SIZE 4
+
+#define E8P_CHECK_CUDA(x)       TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define E8P_CHECK_CONTIG(x)     TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define E8P_CHECK_INPUT(x)      do { E8P_CHECK_CUDA(x); E8P_CHECK_CONTIG(x); } while (false)
+
+__host__ static inline void e8pAssert(cudaError_t code, const char *file, int line) {
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPUassert[%s:%d]: %s\n", file, line, cudaGetErrorString(code));
+        exit(code);
+    }
+}
+#define E8P_ERRCHK(ans) do { e8pAssert((ans), __FILE__, __LINE__); } while (false)
+
+__device__ static inline uint32_t e8p_add_as_half2(uint32_t x, uint32_t y) {
+    uint32_t z;
+    asm("add.f16x2 %0,%1,%2;" : "=r"(z) : "r"(x), "r"(y));
+    return z;
+}
+
+__device__ static inline uint32_t e8p_mask_lop3(uint32_t x, uint32_t m0, uint32_t m1) {
+    uint32_t y;
+    asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(y) : "r"(x), "r"(m0), "r"(m1));
+    return y;
+}
+
+#define E8P_BASE_OFFSET 0xd080d080
+#define E8P_XMASK 0x00f000f0
+#define E8P_WMASK 0x50085008
+
+
+__global__ static void glq_decode_matvec_e8p_kernel(
+    float *__restrict__ output,
+    const uint2 *__restrict__ input,
+    const uint2 *__restrict__ weights_compressed,
+    const uint32_t *__restrict__ codebook_abs,
+    int N, int K
+) {
+    int warpId = threadIdx.y;
+    int laneId = threadIdx.x;
+
+    for (int iin = blockIdx.x; iin < (N >> 4); iin += gridDim.x) {
+        float z0 = 0.0, z1 = 0.0, z2 = 0.0, z3 = 0.0;
+
+        for (int iik = warpId; iik < (K >> 6); iik += 32) {
+            uint2 w_compr = weights_compressed[laneId + 32 * iik + (K >> 1) * iin];
+            uint32_t a = w_compr.x;
+            uint32_t b = w_compr.y;
+
+            uint32_t s = b;
+            s = s ^ (s >> 4);
+            s = s ^ (s >> 8);
+            s = s ^ (s >> 16);
+            uint32_t sb = (s & 15);
+            s = b ^ sb;
+            sb = sb | (sb << 16);
+
+            uint32_t input_to_warp = ((const uint32_t *)(&input[16 * iik]))[laneId];
+            uint32_t shifted_laneId = (laneId & 3) << 3;
+
+            /// BLOCK 01
+            {
+            uint32_t x = codebook_abs[(a >> 0) & 255];
+            x = x ^ ((s & 0x11111111) * 14);
+            uint32_t o = E8P_BASE_OFFSET | ((sb & 0x00010001) << 4);
+            uint32_t w00 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w01 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w02 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w03 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            x = codebook_abs[(a >> 8) & 255];
+            x = x ^ ((s & 0x22222222) * 7);
+            o = E8P_BASE_OFFSET | ((sb & 0x00020002) << 3);
+            uint32_t w10 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w11 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w12 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w13 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            uint32_t x_in0 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 0);
+            uint32_t x_in1 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 1);
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w00), "r"(w10), "r"(w01), "r"(w11), "r"(x_in0), "r"(x_in1));
+            x_in0 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 2);
+            x_in1 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 3);
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w02), "r"(w12), "r"(w03), "r"(w13), "r"(x_in0), "r"(x_in1));
+            }
+            /// BLOCK 23
+            {
+            uint32_t x = codebook_abs[(a >> 16) & 255];
+            s = s >> 2;
+            x = x ^ ((s & 0x11111111) * 14);
+            uint32_t o = E8P_BASE_OFFSET | ((sb & 0x00040004) << 2);
+            uint32_t w00 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w01 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w02 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w03 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            x = codebook_abs[(a >> 24) & 255];
+            x = x ^ ((s & 0x22222222) * 7);
+            o = E8P_BASE_OFFSET | ((sb & 0x00080008) << 1);
+            uint32_t w10 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w11 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w12 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w13 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            uint32_t x_in0 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 4);
+            uint32_t x_in1 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 5);
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w00), "r"(w10), "r"(w01), "r"(w11), "r"(x_in0), "r"(x_in1));
+            x_in0 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 6);
+            x_in1 = __shfl_sync(FULL_MASK, input_to_warp, shifted_laneId | 7);
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w02), "r"(w12), "r"(w03), "r"(w13), "r"(x_in0), "r"(x_in1));
+            }
+        }
+        if ((laneId & 1) == 0) {
+            atomicAdd(output + (iin << 4) + (laneId >> 1), (laneId & 2) ? z2 : z0);
+        }
+    }
+}
+
+
+torch::Tensor glq_decode_matvec_e8p(
+    torch::Tensor x, torch::Tensor weights_compressed, torch::Tensor codebook_abs
+) {
+    E8P_CHECK_INPUT(x);
+    E8P_CHECK_INPUT(weights_compressed);
+    E8P_CHECK_INPUT(codebook_abs);
+    TORCH_CHECK(x.dim() == 1);
+    TORCH_CHECK(weights_compressed.dim() == 4 && weights_compressed.size(3) == 4 &&
+                weights_compressed.size(2) == 8);
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16);
+    TORCH_CHECK(weights_compressed.scalar_type() == torch::kInt64);
+    TORCH_CHECK(codebook_abs.scalar_type() == torch::kInt32 && codebook_abs.size(-1) == 256);
+    TORCH_CHECK(x.size(-1) == weights_compressed.size(1) << 6);
+
+    int64_t N = weights_compressed.size(0) * 16;
+    int64_t K = x.size(-1);
+    TORCH_CHECK(K % 64 == 0 && N % 16 == 0 && K < 65536 && N < 65536);
+
+    at::DeviceGuard guard(x.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    torch::Tensor output = torch::zeros({N}, options);
+
+    static int64_t grid_size = 0;
+    if (grid_size == 0) {
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, x.get_device());
+        grid_size = static_cast<int64_t>(deviceProp.multiProcessorCount);
+    }
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    glq_decode_matvec_e8p_kernel<<<grid_size, dim3(32, 32), 0, stream>>>(
+        output.data_ptr<float>(),
+        (const uint2 *)x.data_ptr<c10::Half>(),
+        (const uint2 *)weights_compressed.data_ptr<int64_t>(),
+        (const uint32_t *)codebook_abs.data_ptr<int32_t>(),
+        N, K);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    return output;
+}
+
+
+__global__ static void glq_decompress_packed_e8p_kernel(
+    uint32_t *__restrict__ output,
+    const uint2 *__restrict__ weights_compressed,
+    const uint32_t *__restrict__ codebook_abs,
+    int N, int K
+) {
+    int warpId = threadIdx.y;
+    int laneId = threadIdx.x;
+    for (int iin = blockIdx.x; iin < (N >> 4); iin += gridDim.x) {
+        for (int iik = warpId; iik < (K >> 6); iik += 32) {
+            uint2 w_compr = weights_compressed[laneId + 32 * iik + (K >> 1) * iin];
+            uint32_t a = w_compr.x;
+            uint32_t b = w_compr.y;
+            uint32_t s = b;
+            s = s ^ (s >> 4); s = s ^ (s >> 8); s = s ^ (s >> 16);
+            uint32_t sb = (s & 15);
+            s = b ^ sb;
+            sb = sb | (sb << 16);
+            {
+            uint32_t x = codebook_abs[(a >> 0) & 255];
+            x = x ^ ((s & 0x11111111) * 14);
+            uint32_t o = E8P_BASE_OFFSET | ((sb & 0x00010001) << 4);
+            uint32_t w00 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w01 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w02 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w03 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            x = codebook_abs[(a >> 8) & 255];
+            x = x ^ ((s & 0x22222222) * 7);
+            o = E8P_BASE_OFFSET | ((sb & 0x00020002) << 3);
+            uint32_t w10 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w11 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w12 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w13 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 0] = w00;
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 1] = w01;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 0] = w10;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 1] = w11;
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 2] = w02;
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 3] = w03;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 2] = w12;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 0*4 + ((laneId&3)<<3) + 3] = w13;
+            }
+            {
+            uint32_t x = codebook_abs[(a >> 16) & 255];
+            s = s >> 2;
+            x = x ^ ((s & 0x11111111) * 14);
+            uint32_t o = E8P_BASE_OFFSET | ((sb & 0x00040004) << 2);
+            uint32_t w00 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w01 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w02 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w03 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            x = codebook_abs[(a >> 24) & 255];
+            x = x ^ ((s & 0x22222222) * 7);
+            o = E8P_BASE_OFFSET | ((sb & 0x00080008) << 1);
+            uint32_t w10 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w11 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w12 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w13 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 0] = w00;
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 1] = w01;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 0] = w10;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 1] = w11;
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 2] = w02;
+            output[iin*8*K + (laneId>>2)*K + 0*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 3] = w03;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 2] = w12;
+            output[iin*8*K + (laneId>>2)*K + 1*(K>>1) + iik*32 + 1*4 + ((laneId&3)<<3) + 3] = w13;
+            }
+        }
+    }
+}
+
+
+torch::Tensor glq_decompress_packed_e8p(torch::Tensor weights_compressed, torch::Tensor codebook_abs) {
+    E8P_CHECK_INPUT(weights_compressed);
+    E8P_CHECK_INPUT(codebook_abs);
+    TORCH_CHECK(weights_compressed.dim() == 4 && weights_compressed.size(3) == 4 &&
+                weights_compressed.size(2) == 8);
+    TORCH_CHECK(weights_compressed.scalar_type() == torch::kInt64);
+    TORCH_CHECK(codebook_abs.scalar_type() == torch::kInt32 && codebook_abs.size(-1) == 256);
+
+    int64_t N = weights_compressed.size(0) * 16;
+    int64_t K = weights_compressed.size(1) << 6;
+    TORCH_CHECK(K % 64 == 0 && N % 16 == 0 && K < 65536 && N < 65536);
+
+    at::DeviceGuard guard(codebook_abs.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
+    torch::Tensor output = torch::zeros({N, K}, options);
+
+    static int64_t grid_size = 0;
+    if (grid_size == 0) {
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, weights_compressed.get_device());
+        grid_size = static_cast<int64_t>(deviceProp.multiProcessorCount);
+    }
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    glq_decompress_packed_e8p_kernel<<<grid_size, dim3(32, 32), 0, stream>>>(
+        (uint32_t *)output.data_ptr<c10::Half>(),
+        (const uint2 *)weights_compressed.data_ptr<int64_t>(),
+        (const uint32_t *)codebook_abs.data_ptr<int32_t>(),
+        N, K);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    return output;
+}
+
+
+// ---- E81B (3-bit RVQ stage-2 residual) kernels: WMMA lookup-matmul (B=1/k<=8) + dense decompress ----
+// Ported verbatim from quiptools.cu:541-675. CB is 256x8 fp16 (the 255-entry grid padded to 256).
+
+__global__ static void glq_lookupmatmul_e81b_k8_kernel(
+    const c10::Half *__restrict__ X,      // k x n
+    const int64_t *__restrict__ YIs,      // m x (n/64)
+    const c10::Half *__restrict__ CB,     // 256 x 8
+    float *__restrict__ Z,                // k x m, accumulated into (pre-zeroed by caller)
+    size_t K, size_t M, size_t N
+) {
+    long m1 = blockIdx.x;
+    long k1 = blockIdx.y;
+    __shared__ c10::Half Y_cache0[32 * 16];
+    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a0;
+    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b0;
+    __shared__ c10::Half Y_cache1[32 * 16];
+    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a1;
+    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b1;
+    wmma::fragment<wmma::accumulator, 8, 32, 16, float> c;
+    fill_fragment(c, 0.0);
+#pragma unroll
+    for (long jn = 0; jn < N / 32; jn++) {
+        uint32_t packed = ((uint32_t *)YIs)[(m1 * 32 + threadIdx.x) * (N / 32) + jn];
+#pragma unroll
+        for (long r = 0; r < 2; r++) {
+            uint32_t yidx = packed & 255;
+            ((uint64_t *)Y_cache0)[(threadIdx.x * 2 + r) * 2] = ((uint64_t *)CB)[yidx * 2];
+            ((uint64_t *)Y_cache0)[(threadIdx.x * 2 + r) * 2 + 1] = ((uint64_t *)CB)[yidx * 2 + 1];
+            packed = packed >> 8;
+        }
+#pragma unroll
+        for (long r = 0; r < 2; r++) {
+            uint32_t yidx = packed & 255;
+            ((uint64_t *)Y_cache1)[(threadIdx.x * 2 + r) * 2] = ((uint64_t *)CB)[yidx * 2];
+            ((uint64_t *)Y_cache1)[(threadIdx.x * 2 + r) * 2 + 1] = ((uint64_t *)CB)[yidx * 2 + 1];
+            packed = packed >> 8;
+        }
+        load_matrix_sync(a0, (const __half *)(X + 8 * N * k1 + 32 * jn), N);
+        load_matrix_sync(b0, (const __half *)Y_cache0, 16);
+        mma_sync(c, a0, b0, c);
+        load_matrix_sync(a1, (const __half *)(X + 8 * N * k1 + 32 * jn + 16), N);
+        load_matrix_sync(b1, (const __half *)Y_cache1, 16);
+        mma_sync(c, a1, b1, c);
+    }
+    store_matrix_sync(&Z[8 * M * k1 + 32 * m1], c, M, wmma::mem_row_major);
+}
+
+
+void glq_lookupmatmul_e81b_k8(torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z) {
+    E8P_CHECK_INPUT(X); E8P_CHECK_INPUT(YIs); E8P_CHECK_INPUT(CB); E8P_CHECK_INPUT(Z);
+    auto k = X.size(0), m = YIs.size(0), n = X.size(1);
+    TORCH_CHECK(Z.size(0) == k && Z.size(1) == m && YIs.size(1) * 64 == n);
+    TORCH_CHECK(k <= 8 && m % 32 == 0 && n % 32 == 0);
+    TORCH_CHECK(X.scalar_type() == torch::kFloat16 && CB.scalar_type() == torch::kFloat16);
+    TORCH_CHECK(YIs.scalar_type() == torch::kInt64 && Z.scalar_type() == torch::kFloat32);
+    at::DeviceGuard guard(CB.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    glq_lookupmatmul_e81b_k8_kernel<<<dim3(m / 32, k / 8), dim3(32), 0, stream>>>(
+        X.data_ptr<c10::Half>(), YIs.data_ptr<int64_t>(), CB.data_ptr<c10::Half>(),
+        Z.data_ptr<float>(), k, m, n);
+    E8P_ERRCHK(cudaPeekAtLastError());
+}
+
+
+__global__ static void glq_decompress_e81b_packed_kernel(
+    const int64_t *__restrict__ YIs, const c10::Half *__restrict__ CB, c10::Half *__restrict__ Y
+) {
+    const long i = threadIdx.x + E8P_DECOMPRESS_E81B_BLOCK_SIZE * blockIdx.x;
+    uint64_t packed = YIs[i];
+#pragma unroll
+    for (long j = 0; j < 8; j++) {
+        uint64_t yidx = packed & 255;
+        ((uint64_t *)Y)[(i * 8 + j) * 2] = ((uint64_t *)CB)[yidx * 2];
+        ((uint64_t *)Y)[(i * 8 + j) * 2 + 1] = ((uint64_t *)CB)[yidx * 2 + 1];
+        packed = packed >> 8;
+    }
+}
+
+
+void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y) {
+    E8P_CHECK_INPUT(YIs); E8P_CHECK_INPUT(CB); E8P_CHECK_INPUT(Y);
+    size_t m = Y.size(0), n = Y.size(1);
+    TORCH_CHECK(YIs.size(0) == m && YIs.size(1) * 64 == n);
+    TORCH_CHECK(CB.size(0) == 256 && CB.size(1) == 8);
+    at::DeviceGuard guard(CB.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    glq_decompress_e81b_packed_kernel<<<dim3(m * n / (64 * E8P_DECOMPRESS_E81B_BLOCK_SIZE)),
+                                        dim3(E8P_DECOMPRESS_E81B_BLOCK_SIZE), 0, stream>>>(
+        YIs.data_ptr<int64_t>(), CB.data_ptr<c10::Half>(), Y.data_ptr<c10::Half>());
+    E8P_ERRCHK(cudaPeekAtLastError());
+}

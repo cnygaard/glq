@@ -44,12 +44,14 @@ def _try_load_cuda_ext():
         _csrc = os.path.join(os.path.dirname(__file__), 'csrc')
         cu_file = os.path.join(_csrc, 'glq_cuda.cu')
         cpp_file = os.path.join(_csrc, 'glq_bindings.cpp')
+        e8p_file = os.path.join(_csrc, 'glq_e8p.cu')          # E8P TC-GEMV decode (--codebook e8p)
         if not os.path.exists(cu_file):
             _cuda_ext_available = False
             return False
+        sources = [cu_file, cpp_file] + ([e8p_file] if os.path.exists(e8p_file) else [])
         _glq_cuda = _load_ext(
             'glq_cuda',
-            sources=[cu_file, cpp_file],
+            sources=sources,
             extra_cuda_cflags=['-O3', '--use_fast_math'],
             verbose=False,
         )
