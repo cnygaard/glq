@@ -589,4 +589,4 @@ Inspired by [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng et al., 2024).
 
 ## License
 
-Apache 2.0
+GNU General Public License v3.0 (GPL-3.0). See [LICENSE](LICENSE).
