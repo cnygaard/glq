@@ -328,6 +328,13 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
     W_f = W.float().to(dev)
     H_f = H.float().to(dev)
 
+    # E8P's tensor-core decode packs weights as (m_pad//16, n_pad//64, 8, 4), so the
+    # RHT must pad to a single power of 2 (n_pad÷64, m_pad÷16) rather than the
+    # block-diagonal sum-of-pow2 layout the shell kernels use.
+    is_e8p = getattr(codebook, 'is_e8p', False)
+    if is_e8p:
+        block_diagonal = False
+
     # Dampen Hessian diagonal for numerical stability
     damp = 0.01 * torch.mean(torch.diag(H_f))
     diag = torch.arange(H_f.shape[-1], device=dev)
@@ -343,6 +350,27 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
 
     def _run_ldlq(W_p, H_p):
         from .ldlq import quantize_ldlq_codebook_nstage
+        if is_e8p:
+            # E8P always uses the generic N-stage LDLQ so every bpw returns the
+            # same (all_indices, cum_inv_rs) contract. RVQ recipe + fixed QuIP#
+            # residual scales (validated to match the prototype PPL): 2=[E8P],
+            # 3=[E8P, E81B] rs 2.04, 4=[E8P, E8P] rs 3.45.
+            if bpw == 2:
+                return quantize_ldlq_codebook_nstage(
+                    W_p, H_p, codebooks=[codebook], resid_scales=[],
+                    tune_iters=tune_iters)
+            elif bpw == 3:
+                from .codebook_e8p import E81BCodebook
+                cb_e81b = E81BCodebook(device=dev, verbose=False)
+                return quantize_ldlq_codebook_nstage(
+                    W_p, H_p, codebooks=[codebook, cb_e81b], resid_scales=[2.04],
+                    tune_iters=tune_iters)
+            elif bpw == 4:
+                return quantize_ldlq_codebook_nstage(
+                    W_p, H_p, codebooks=[codebook, codebook], resid_scales=[3.45],
+                    tune_iters=tune_iters)
+            else:
+                raise ValueError(f"e8p codebook supports bpw 2/3/4 only, got {bpw}")
         # ``resid_scale`` between two stages must be tuned for the actual
         # (primary, secondary) pair. ``codebook.resid_scale`` was tuned for
         # self-self (= 4/6/8 bpw uniform recipes). For 3/5/7 bpw recipes
@@ -424,7 +452,26 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
         'Wscale': torch.tensor(result['Wscale'], dtype=torch.float32),  # scalar
     }
 
-    if bpw == 2:
+    if is_e8p:
+        # E8P stores int64 tensor-core-packed weights (not the shell's int16 Qidxs):
+        #   Qidxs_e8p   (m_pad//16, n_pad//64, 8, 4)  — stage-0 E8P, for decode_matvec_e8p
+        #   Qidxs2_e8p  (same)                        — 4bpw stage-1 (E8P residual)
+        #   Qidxs2_e81b (m_pad, n_pad//64)            — 3bpw stage-1 (E81B residual)
+        all_idx = result['all_indices']
+        cum_inv_rs = result['cum_inv_rs']
+        m_pad = all_idx[0].shape[0]
+        n_pad = all_idx[0].shape[1] * 8
+        artifacts['Qidxs_e8p'] = codebook.maybe_pack_idxs(
+            all_idx[0].to(torch.int64)).view(m_pad // 16, n_pad // 64, 8, 4).contiguous()
+        if len(all_idx) > 1:
+            artifacts['inv_resid_scale'] = torch.tensor(cum_inv_rs[1], dtype=torch.float32)
+            if bpw == 4:
+                artifacts['Qidxs2_e8p'] = codebook.maybe_pack_idxs(
+                    all_idx[1].to(torch.int64)).view(m_pad // 16, n_pad // 64, 8, 4).contiguous()
+            else:  # bpw == 3 → E81B residual stage
+                from .codebook_e8p import E81BCodebook
+                artifacts['Qidxs2_e81b'] = E81BCodebook.pack_e81b(all_idx[1].to(torch.int64))
+    elif bpw == 2:
         artifacts['Qidxs'] = result['indices'].to(torch.int16)
         # Don't store Qidxs2/inv_resid_scale at 2bpw — they're all zeros.
         # E8RHTLinear._load_from_state_dict handles missing keys.
@@ -533,6 +580,7 @@ def quantize(
     streaming: bool = False,
     workers: int = 0,
     codebook_size: int = None,
+    codebook_type: str = "e8_shell",
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -724,8 +772,15 @@ def quantize(
     print(f"  {n_chunks} sequences of length {seqlen}")
 
     # ---- Build codebook ----
-    print(f"\nBuilding E8 shell codebook ...")
-    codebook = E8ShellCodebook(device=device, target_size=codebook_size)
+    print(f"\nBuilding {codebook_type} codebook ...")
+    if codebook_type == "e8_relaxed":
+        from .codebook_relaxed import E8RelaxedCodebook
+        codebook = E8RelaxedCodebook(device=device, target_size=codebook_size)
+    elif codebook_type == "e8p":
+        from .codebook_e8p import E8PCodebook
+        codebook = E8PCodebook(device=device)         # QuIP# padded-D̂8, TC-GEMV decode (2/3/4 bpw)
+    else:
+        codebook = E8ShellCodebook(device=device, target_size=codebook_size)
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
@@ -1614,7 +1669,7 @@ def quantize(
             layer_bpw_out[p] = int(bpw)
     config_dict["quantization_config"] = {
         "quant_method": "glq",
-        "codebook": "e8_shell",
+        "codebook": codebook_type,
         "codesz": 8,
         "bpw": effective_bpw,
         "layer_bpw": layer_bpw_out,
@@ -1627,7 +1682,7 @@ def quantize(
     # 4. Save quantize_config.json (metadata)
     quant_meta = {
         "quant_method": "glq",
-        "codebook": "e8_shell",
+        "codebook": codebook_type,
         "codesz": 8,
         "bpw": effective_bpw,
         "tune_iters": tune_iters,
@@ -1748,6 +1803,11 @@ def main():
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers for CPU quantization "
                              "(0=auto, 1=sequential, ignored on GPU)")
+    parser.add_argument("--codebook", type=str, default="e8_shell",
+                        choices=["e8_shell", "e8_relaxed", "e8p"],
+                        help="Codebook variant: e8_shell (default, optimal ball), "
+                             "e8_relaxed (D~8 for KV), e8p (QuIP# padded-D̂8 + RVQ, "
+                             "tensor-core decode, bpw 2/3/4).")
     parser.add_argument("--codebook-size", type=int, default=None,
                         help="E8 codebook entry count. Default 65 536 "
                              "(shells 0-5 in full + 8 655 from shell 6). "
@@ -1780,6 +1840,7 @@ def main():
         streaming=args.streaming,
         workers=args.workers,
         codebook_size=args.codebook_size,
+        codebook_type=args.codebook,
     )
 
 
