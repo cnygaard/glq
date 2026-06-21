@@ -17,10 +17,12 @@ from .embedding_method import GLQEmbeddingMethod
 class GLQvLLMConfig(QuantizationConfig):
     """vLLM quantization config for GLQ (E8 lattice codebook + RHT)."""
 
-    def __init__(self, bpw: int = 2, layer_bpw: dict | None = None):
+    def __init__(self, bpw: int = 2, layer_bpw: dict | None = None,
+                 codebook: str = "e8_shell"):
         super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
+        self.codebook = codebook
 
     def get_name(self) -> str:
         return "glq"
@@ -41,6 +43,7 @@ class GLQvLLMConfig(QuantizationConfig):
         return cls(
             bpw=config.get("bpw", 2),
             layer_bpw=config.get("layer_bpw", None),
+            codebook=config.get("codebook", "e8_shell"),
         )
 
     def _lookup_bpw(self, prefix: str) -> int | None:
@@ -109,7 +112,8 @@ class GLQvLLMConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return GLQLinearMethod(
                 self, bpw=bpw if bpw is not None else self.bpw,
-                pre_fused=self._is_prefused(prefix))
+                pre_fused=self._is_prefused(prefix),
+                codebook_type=self.codebook)
 
         # VocabParallelEmbedding (and subclasses, e.g. ParallelLMHead).
         # Quantized embeddings — currently only Gemma-4's PLE — appear in

@@ -244,6 +244,35 @@ def _ensure_registered():
     _glq_lib.impl("embedding_dequant", _dequant_embedding_rows, dispatch_key)
     _glq_lib._register_fake("embedding_dequant", _embedding_dequant_fake)
 
+    # -- 12. E8P (--codebook e8p) tensor-core decode ops. Pybind-only otherwise,
+    #        so torch.dynamo can't trace the e8p forward; registering them as
+    #        torch.ops.glq.* lets the e8p decode path compile + cudagraph-capture
+    #        like the shell. decode_matvec_e8p / decompress_packed_e8p return a
+    #        tensor; the e81b ops accumulate into a pre-zeroed out arg. --
+    if hasattr(cuda, "glq_decode_matvec_e8p"):
+        _glq_lib.define(
+            "decode_matvec_e8p(Tensor x, Tensor weights_compressed, "
+            "Tensor codebook_abs) -> Tensor")
+        _glq_lib.impl("decode_matvec_e8p", cuda.glq_decode_matvec_e8p, dispatch_key)
+        _glq_lib._register_fake("decode_matvec_e8p", _decode_matvec_e8p_fake)
+
+        _glq_lib.define(
+            "decompress_packed_e8p(Tensor weights_compressed, "
+            "Tensor codebook_abs) -> Tensor")
+        _glq_lib.impl("decompress_packed_e8p", cuda.glq_decompress_packed_e8p, dispatch_key)
+        _glq_lib._register_fake("decompress_packed_e8p", _decompress_packed_e8p_fake)
+
+        _glq_lib.define(
+            "lookupmatmul_e81b_k8(Tensor X, Tensor YIs, Tensor CB, "
+            "Tensor(a!) Z) -> ()")
+        _glq_lib.impl("lookupmatmul_e81b_k8", cuda.glq_lookupmatmul_e81b_k8, dispatch_key)
+        _glq_lib._register_fake("lookupmatmul_e81b_k8", _lookupmatmul_e81b_k8_fake)
+
+        _glq_lib.define(
+            "decompress_e81b_packed(Tensor YIs, Tensor CB, Tensor(a!) Y) -> ()")
+        _glq_lib.impl("decompress_e81b_packed", cuda.glq_decompress_e81b_packed, dispatch_key)
+        _glq_lib._register_fake("decompress_e81b_packed", _decompress_e81b_packed_fake)
+
 
 # --- Fake implementations for torch.compile tracing ---
 
@@ -278,6 +307,27 @@ def _embedding_dequant_fake(input_ids, qidxs, sv, wscale, codebook, qidxs2,
     # on input_ids' device — matches _dequant_embedding_rows' real return.
     dt = out_dtype if out_dtype is not None else sv.dtype
     return input_ids.new_empty((*input_ids.shape, embedding_dim), dtype=dt)
+
+
+def _decode_matvec_e8p_fake(x, weights_compressed, codebook_abs):
+    # weights_compressed is (m_pad//16, n_pad//64, 8, 4) → output (m_pad,) fp32.
+    M = weights_compressed.shape[0] * 16
+    return torch.empty(M, dtype=torch.float32, device=x.device)
+
+
+def _decompress_packed_e8p_fake(weights_compressed, codebook_abs):
+    # (m_pad//16, n_pad//64, 8, 4) → dense (m_pad, n_pad) fp16.
+    m = weights_compressed.shape[0] * 16
+    n = weights_compressed.shape[1] * 64
+    return torch.empty(m, n, dtype=torch.float16, device=weights_compressed.device)
+
+
+def _lookupmatmul_e81b_k8_fake(X, YIs, CB, Z):
+    return None  # accumulates into the pre-zeroed Z (mutating op, no return)
+
+
+def _decompress_e81b_packed_fake(YIs, CB, Y):
+    return None  # fills the pre-allocated Y (mutating op, no return)
 
 
 def _gather_kv_paged_dequant_impl(idx1, idx2, idx3, idx_s1, scale,
