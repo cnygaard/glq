@@ -13,6 +13,11 @@ try:
 except ImportError:
     _triton_available = False
 
+# Kill-switch for the single-call fused E8P linear op (glq_fused_linear_e8p_cuda).
+# Default on; flip to False to fall back to the multi-op E8P apply (used by the
+# bit-exact A/B test and as a production escape hatch).
+_GLQ_FUSED_E8P_ENABLED = True
+
 
 def _pack_block_meta(block_sizes):
     """Pack (col_offset, bs, log_bs, _) per sub-block as CPU int32 (N, 4).
@@ -249,6 +254,8 @@ class E8RHTLinear(nn.Module):
         self.codebook2 = None       # E8PCodebook (4bpw) or E81BCodebook (3bpw)
         self._wscale_float = 1.0
         self._inv_rs_float = 0.0
+        self._e8p_has_stage2 = False   # cached stage-flags (set on first forward / set_codebook)
+        self._e8p_has_e81b = False
         self._e8p_grid_dev = None   # cached grid_packed_abs on the compute device
         self._e81b_grid_dev = None  # cached e81b_grid on the compute device
 
@@ -449,71 +456,120 @@ class E8RHTLinear(nn.Module):
         (decode_matvec_e8p) and WMMA (lookupmatmul_e81b_k8) matvec kernels; B>1
         decompresses the weight and runs a dense matmul (prefill / PPL).
         """
-        from . import inference_kernel as _ik
-        _ik._try_load_cuda_ext()
-        cuda = _ik._glq_cuda
-
-        # Lazy-resolve scalars (layers that were on meta at set_codebook time).
+        # Resolve cached scalars / grids / stage-flags once (lazily for layers on
+        # meta at set_codebook time). After this the shared core has no host syncs.
         if self._wscale_float is None:
             self._wscale_float = self.Wscale.item()
             self._inv_rs_float = self.inv_resid_scale.item()
-        # Cache the decode grids on the compute device (once per device).
         if self._e8p_grid_dev is None or self._e8p_grid_dev.device != x.device:
             self._e8p_grid_dev = self.codebook.grid_packed_abs.to(x.device)
             if self.codebook2 is not None and hasattr(self.codebook2, 'e81b_grid'):
                 self._e81b_grid_dev = self.codebook2.e81b_grid.to(x.device)
-        grid = self._e8p_grid_dev
+            self._e8p_has_stage2 = self.Qidxs2_e8p.numel() > 0
+            self._e8p_has_e81b = self.Qidxs2_e81b.numel() > 0
 
         shape = x.shape
-        x = x.reshape(-1, self.in_features)
-        B = x.shape[0]
-        dtype = x.dtype
-        n_pad, m_pad = self.n_pad, self.m_pad
+        x2d = x.reshape(-1, self.in_features)
+        y = self._e8p_linear_apply(
+            x2d, self.SV, self.SU, self.Qidxs_e8p, self.Qidxs2_e8p, self.Qidxs2_e81b,
+            self._e8p_grid_dev, self._e81b_grid_dev, self._wscale_float, self._inv_rs_float,
+            self._e8p_has_stage2, self._e8p_has_e81b, self.in_features, self.out_features,
+            self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype)
+        return y.reshape(*shape[:-1], self.out_features)
+
+    @staticmethod
+    def _e8p_linear_apply(x2d, SV, SU, Qidxs_e8p, Qidxs2_e8p, Qidxs2_e81b, grid, e81b_grid,
+                          wscale, inv_rs, has_e8p2, has_e81b, in_features, out_features,
+                          n_pad, m_pad, bias=None, out_dtype=torch.float16):
+        """Capture-safe E8P linear core: input_rht → N× TC-GEMV decode → ×Wscale → output_rht.
+
+        x2d: (B, in_features) → (B, out_features) in out_dtype, bias applied. Prefers the
+        registered torch.ops.glq.* ops (traceable / cudagraph-capturable) over the pybind
+        extension. Shared by E8RHTLinear._forward_e8p (HF) and glq_vllm's e8p apply (serving)
+        so both run one validated path. `has_e8p2` (4bpw E8P residual) and `has_e81b` (3bpw
+        E81B residual) are independent + mutually exclusive per layer."""
+        from . import inference_kernel as _ik
+        _ik._try_load_cuda_ext()
+        cuda = _ik._glq_cuda
+        _ops = (torch.ops.glq if (hasattr(torch.ops, "glq")
+                and hasattr(torch.ops.glq, "decode_matvec_e8p")) else None)
+        if _ops is not None:
+            _input_rht, _output_rht = _ops.input_rht, _ops.output_rht
+            _decode, _decompress = _ops.decode_matvec_e8p, _ops.decompress_packed_e8p
+            _e81b_mm, _e81b_dec = _ops.lookupmatmul_e81b_k8, _ops.decompress_e81b_packed
+        else:
+            _input_rht, _output_rht = cuda.glq_input_rht_cuda, cuda.glq_output_rht_cuda
+            _decode, _decompress = cuda.glq_decode_matvec_e8p, cuda.glq_decompress_packed_e8p
+            _e81b_mm, _e81b_dec = cuda.glq_lookupmatmul_e81b_k8, cuda.glq_decompress_e81b_packed
+
+        B = x2d.shape[0]
+        dev = x2d.device
         log_n, log_m = int(math.log2(n_pad)), int(math.log2(m_pad))
-        inv_rs = self._inv_rs_float
-        has_e8p2 = self.Qidxs2_e8p.numel() > 0
-        has_e81b = self.Qidxs2_e81b.numel() > 0
+        rsqrt_n, rsqrt_m = 1.0 / math.sqrt(n_pad), 1.0 / math.sqrt(m_pad)
+
+        # Fast path: the entire linear (input_rht + N-stage decode/matmul + ×Wscale
+        # + output_rht) as ONE opaque op — one torch.ops dispatch, traced as a single
+        # node so vLLM's cudagraph capture matches the shell's fused_linear instead of
+        # a multi-op chain inductor pads with copies. Covers stage-1 (2bpw) + E8P
+        # stage-2 (4bpw) + E81B stage-2 (3bpw). E81B needs its grid; if it's absent
+        # (e.g. codebook not cached) fall through to the multi-op path below.
+        if (_ops is not None and _GLQ_FUSED_E8P_ENABLED
+                and hasattr(_ops, "fused_linear_e8p")
+                and (not has_e81b or e81b_grid is not None)):
+            q2 = Qidxs2_e8p if has_e8p2 else Qidxs_e8p.new_empty(0)
+            q2b = Qidxs2_e81b if has_e81b else Qidxs_e8p.new_empty(0)
+            cb_e81b = e81b_grid if has_e81b else SV.new_empty(0)
+            rs = float(inv_rs) if (has_e8p2 or has_e81b) else 0.0
+            y = _ops.fused_linear_e8p(
+                x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, grid, cb_e81b,
+                float(wscale), rs, in_features, out_features,
+                n_pad, m_pad, log_n, log_m).to(out_dtype)
+            if bias is not None:
+                y = y + bias.unsqueeze(0).to(out_dtype)
+            return y
 
         # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
-        x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=x.device)
-        cuda.glq_input_rht_cuda(
-            x.half().contiguous(), self.SV, x_rht,
-            self.in_features, self.in_features,
-            1.0 / math.sqrt(n_pad), n_pad, log_n)
+        x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=dev)
+        _input_rht(x2d.half().contiguous(), SV, x_rht, in_features, in_features, rsqrt_n, n_pad, log_n)
 
         # 2. decode + matmul in the RHT domain  →  y_rht (B, m_pad) fp32
         if B == 1:
             xh = x_rht[0].half()
-            y_rht = cuda.glq_decode_matvec_e8p(xh, self.Qidxs_e8p, grid)
+            y_rht = _decode(xh, Qidxs_e8p, grid)
             if has_e8p2 and inv_rs != 0.0:
-                y_rht = y_rht + inv_rs * cuda.glq_decode_matvec_e8p(xh, self.Qidxs2_e8p, grid)
+                y_rht = y_rht + inv_rs * _decode(xh, Qidxs2_e8p, grid)
             elif has_e81b and inv_rs != 0.0:
-                X8 = torch.zeros(8, n_pad, dtype=torch.float16, device=x.device)
+                X8 = torch.zeros(8, n_pad, dtype=torch.float16, device=dev)
                 X8[0] = xh
-                Z = torch.zeros(8, m_pad, dtype=torch.float32, device=x.device)
-                cuda.glq_lookupmatmul_e81b_k8(X8, self.Qidxs2_e81b, self._e81b_grid_dev, Z)
+                Z = torch.zeros(8, m_pad, dtype=torch.float32, device=dev)
+                _e81b_mm(X8, Qidxs2_e81b, e81b_grid, Z)
                 y_rht = y_rht + inv_rs * Z[0]
             y_rht = y_rht.unsqueeze(0)
         else:
-            W = cuda.glq_decompress_packed_e8p(self.Qidxs_e8p, grid).float()
+            # Anchor the decompressed dense weights to the activation device.
+            # The decompress custom op's fake derives its output device from
+            # ``weights_compressed.device``; under vLLM's fullgraph dynamo trace
+            # that param fake can mis-propagate (one operand lands cpu), so the
+            # ``W + inv_rs*W2`` add hits a cuda/cpu mismatch even though every
+            # buffer is genuinely on-device at runtime. ``.to(dev)`` (a no-op on
+            # the live tensors) forces a consistent fake device == x2d's.
+            W = _decompress(Qidxs_e8p, grid).float().to(dev)
             if has_e8p2 and inv_rs != 0.0:
-                W = W + inv_rs * cuda.glq_decompress_packed_e8p(self.Qidxs2_e8p, grid).float()
+                W = W + inv_rs * _decompress(Qidxs2_e8p, grid).float().to(dev)
             elif has_e81b and inv_rs != 0.0:
-                Y = torch.zeros(m_pad, n_pad, dtype=torch.float16, device=x.device)
-                cuda.glq_decompress_e81b_packed(self.Qidxs2_e81b, self._e81b_grid_dev, Y)
+                Y = torch.zeros(m_pad, n_pad, dtype=torch.float16, device=dev)
+                _e81b_dec(Qidxs2_e81b, e81b_grid, Y)
                 W = W + inv_rs * Y.float()
             y_rht = x_rht @ W.T
 
         # 3. scale + output RHT: FHT + SU signs + unpad  →  (B, out_features)
-        y_rht = (y_rht * self._wscale_float).contiguous()
-        y = torch.empty(B, self.out_features, dtype=torch.float16, device=x.device)
-        cuda.glq_output_rht_cuda(
-            y_rht, self.SU, y, self.out_features, m_pad, log_m,
-            1.0 / math.sqrt(m_pad))
-        y = y.to(dtype)
-        if self.bias is not None:
-            y = y + self.bias.unsqueeze(0).to(dtype)
-        return y.reshape(*shape[:-1], self.out_features)
+        y_rht = (y_rht * wscale).contiguous()
+        y = torch.empty(B, out_features, dtype=torch.float16, device=dev)
+        _output_rht(y_rht, SU, y, out_features, m_pad, log_m, rsqrt_m)
+        y = y.to(out_dtype)
+        if bias is not None:
+            y = y + bias.unsqueeze(0).to(out_dtype)
+        return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

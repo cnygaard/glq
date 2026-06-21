@@ -2733,6 +2733,100 @@ torch::Tensor glq_fused_linear_cuda(
 
 
 /* ─────────────────────────────────────────────────────────────────────
+ * Fused E8P linear: input_rht + N-stage E8P decode/matmul + ×wscale + output_rht
+ * in ONE host call. Collapses the ~5 torch.ops dispatches the Python e8p apply
+ * issues per linear (input_rht, decode×stages, combine/scale, output_rht) into a
+ * single opaque custom op — so vLLM's fullgraph dynamo trace sees one node (like
+ * the shell's glq_fused_linear_cuda) instead of a multi-op chain inductor pads
+ * with materialised copies. Reuses the existing host fns (no new kernels). Covers
+ * stage-1 (2bpw) + optional E8P stage-2 (4bpw); the E81B (3bpw) residual stays on
+ * the Python path. Defined in glq_e8p.cu:
+ * ───────────────────────────────────────────────────────────────────── */
+torch::Tensor glq_decode_matvec_e8p(
+    torch::Tensor x, torch::Tensor weights_compressed, torch::Tensor codebook_abs);
+torch::Tensor glq_decompress_packed_e8p(
+    torch::Tensor weights_compressed, torch::Tensor codebook_abs);
+void glq_lookupmatmul_e81b_k8(
+    torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z);
+void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y);
+
+torch::Tensor glq_fused_linear_e8p_cuda(
+    torch::Tensor x,            // (B, in_features) fp16, contiguous
+    torch::Tensor sv,           // (n_pad,) fp16 — input RHT sign vector
+    torch::Tensor su,           // (m_pad,) fp16 — output RHT sign vector
+    torch::Tensor qidxs_e8p,    // (m_pad//16, n_pad//64, 8, 4) int64 — stage-1
+    torch::Tensor qidxs2_e8p,   // empty or same shape — E8P stage-2 (4bpw)
+    torch::Tensor qidxs2_e81b,  // empty or (m_pad, n_pad//64) int64 — E81B stage-2 (3bpw)
+    torch::Tensor codebook_abs, // (256,) int32 — grid_packed_abs (E8P)
+    torch::Tensor e81b_codebook,// empty or (256, 8) fp16 — E81B grid
+    double wscale,
+    double inv_resid_scale,
+    int64_t in_features,
+    int64_t out_features,
+    int64_t n_pad, int64_t m_pad,
+    int64_t log_n, int64_t log_m
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(qidxs_e8p);
+    CHECK_INPUT(codebook_abs);
+
+    int B = x.size(0);
+    bool has_e8p2 = (qidxs2_e8p.numel() > 0 && inv_resid_scale != 0.0);
+    bool has_e81b = (qidxs2_e81b.numel() > 0 && inv_resid_scale != 0.0);
+    at::DeviceGuard guard(x.device());
+
+    // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
+    auto x_rht = torch::empty({B, (long)n_pad},
+                              torch::dtype(torch::kFloat32).device(x.device()));
+    float rsqrt_n = 1.0f / sqrtf((float)n_pad);
+    glq_input_rht_cuda(x.contiguous(), sv, x_rht,
+                       (int)in_features, (int)in_features, rsqrt_n, (int)n_pad, (int)log_n);
+
+    // ---- Step 2: decode + matmul in the RHT domain → y_rht (B, m_pad) fp32 ----
+    torch::Tensor y_rht;
+    if (B == 1) {
+        auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
+        y_rht = glq_decode_matvec_e8p(xh, qidxs_e8p, codebook_abs);   // (m_pad,) fp32
+        if (has_e8p2) {
+            auto y2 = glq_decode_matvec_e8p(xh, qidxs2_e8p, codebook_abs);
+            y_rht = y_rht + (float)inv_resid_scale * y2;
+        } else if (has_e81b) {
+            // E81B residual: WMMA lookup-matmul needs k≤8 — row 0 of an (8,n_pad)
+            // input carries xh, Z[0] is the stage-2 contribution (mirrors the
+            // multi-op _e8p_linear_apply B==1 e81b branch).
+            auto X8 = torch::zeros({8, (long)n_pad},
+                                   torch::dtype(torch::kFloat16).device(x.device()));
+            X8.select(0, 0).copy_(xh);
+            auto Z = torch::zeros({8, (long)m_pad},
+                                  torch::dtype(torch::kFloat32).device(x.device()));
+            glq_lookupmatmul_e81b_k8(X8, qidxs2_e81b, e81b_codebook, Z);
+            y_rht = y_rht + (float)inv_resid_scale * Z.select(0, 0);
+        }
+        y_rht = (y_rht * (float)wscale).view({1, (long)m_pad}).contiguous();
+    } else {
+        auto W = glq_decompress_packed_e8p(qidxs_e8p, codebook_abs).to(torch::kFloat32);
+        if (has_e8p2) {
+            W = W + (float)inv_resid_scale *
+                glq_decompress_packed_e8p(qidxs2_e8p, codebook_abs).to(torch::kFloat32);
+        } else if (has_e81b) {
+            auto Y = torch::zeros({(long)m_pad, (long)n_pad},
+                                  torch::dtype(torch::kFloat16).device(x.device()));
+            glq_decompress_e81b_packed(qidxs2_e81b, e81b_codebook, Y);
+            W = W + (float)inv_resid_scale * Y.to(torch::kFloat32);
+        }
+        y_rht = (at::matmul(x_rht, W.t()) * (float)wscale).contiguous();  // (B, m_pad) fp32
+    }
+
+    // ---- Step 3: output RHT → y (B, out_features) fp16 ----
+    auto y = torch::empty({B, (long)out_features},
+                          torch::dtype(torch::kFloat16).device(x.device()));
+    float rsqrt_m = 1.0f / sqrtf((float)m_pad);
+    glq_output_rht_cuda(y_rht, su, y, (int)out_features, (int)m_pad, (int)log_m, rsqrt_m);
+    return y;
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────
  * Block-diagonal fused linear: input_rht(blocks) + dequant_matmul + output_rht(blocks)
  * ───────────────────────────────────────────────────────────────────── */
 

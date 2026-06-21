@@ -56,7 +56,9 @@ def get_abs_grid():
 
 
 def get_full_grid(packed_abs_grid):
-    synth_codebook = torch.zeros(1 << 16, 8)
+    # Explicit fp32 — built at module import, which may run under a non-fp32 default
+    # dtype (e.g. vLLM sets float16 during model init); the grid must stay fp32.
+    synth_codebook = torch.zeros(1 << 16, 8, dtype=torch.float32)
     parity_idx = []
     shuffle_map = [0, 4, 1, 5, 2, 6, 3, 7]
     for c in range(1 << 16):
@@ -123,7 +125,8 @@ class E8PCodebook:
             print(f"E8PCodebook: 65536-entry padded-D̂8, opt_scale={self.opt_scale:.4f}")
 
     def round(self, X, grid, grid_norm):
-        Xqidx = (2 * X @ grid.T - grid_norm).argmax(-1)
+        # fp32-safe: construction may run under a non-fp32 default dtype.
+        Xqidx = (2 * X.float() @ grid.float().T - grid_norm.float()).argmax(-1)
         return grid[Xqidx], Xqidx
 
     def _fast_quantize_part(self, X, parity):

@@ -51,9 +51,34 @@ def _get_empty_sentinels(device):
     return s
 
 
-def _ensure_codebook(device, max_bpw: int = 2):
-    """Lazy-load codebook and move to target device. Upgrades cb2 if higher bpw needed."""
+_codebook_e8p = None
+_codebook_e81b = None
+_codebook_e8p_device = None
+
+
+def _ensure_codebook(device, max_bpw: int = 2, codebook_type: str = "e8_shell"):
+    """Lazy-load codebook and move to target device. Upgrades cb2 if higher bpw needed.
+
+    For ``codebook_type == "e8p"`` returns the E8PCodebook (.grid_packed_abs) + E81BCodebook
+    (.e81b_grid) singletons instead of the shell pair."""
     global _codebook, _codebook2_small, _codebook_device
+    global _codebook_e8p, _codebook_e81b, _codebook_e8p_device
+
+    if codebook_type == "e8p":
+        if _codebook_e8p is not None and _codebook_e8p_device == device:
+            return _codebook_e8p, _codebook_e81b
+        from glq.codebook_e8p import E8PCodebook, E81BCodebook
+        # vLLM sets the default dtype to fp16 during model init; the codebook's
+        # construction matmuls (E8P nearest-codeword `round`) assume fp32, so pin it.
+        _prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            cb = E8PCodebook(device=device, verbose=False)
+            cb2 = E81BCodebook(device=device, verbose=False)
+        finally:
+            torch.set_default_dtype(_prev_dtype)
+        _codebook_e8p, _codebook_e81b, _codebook_e8p_device = cb, cb2, device
+        return cb, cb2
 
     if _codebook is not None and _codebook_device == device:
         # Upgrade codebook2 if a higher bpw layer is encountered later
@@ -528,6 +553,32 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
     )
 
 
+def _glq_apply_e8p(x, layer):
+    """E8P apply: one validated, torch.ops-dispatched (cudagraph-capturable) call per
+    (shard), reusing E8RHTLinear._e8p_linear_apply. Single layer → one call; fused QKV/
+    gate_up → one call per shard, concatenated (mirrors the shell fused loop)."""
+    from glq.quantized_linear import E8RHTLinear
+    _apply = E8RHTLinear._e8p_linear_apply
+    grid = layer._glq_e8p_grid
+    e81b_grid = layer._glq_e81b_grid
+    if getattr(layer, 'glq_is_fused', False):
+        outs = []
+        for i, meta in enumerate(layer._glq_e8p_meta):
+            outs.append(_apply(
+                x, layer.SV.get_shard(i), layer.SU.get_shard(i),
+                layer.Qidxs_e8p.get_shard(i), layer.Qidxs2_e8p.get_shard(i),
+                layer.Qidxs2_e81b.get_shard(i), grid, e81b_grid,
+                meta['wscale'], meta['inv_rs'], meta['has_e8p2'], meta['has_e81b'],
+                meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
+                bias=None, out_dtype=x.dtype))
+        return torch.cat(outs, dim=-1)
+    meta = layer._glq_e8p_meta[0]
+    return _apply(
+        x, layer.SV, layer.SU, layer.Qidxs_e8p, layer.Qidxs2_e8p, layer.Qidxs2_e81b,
+        grid, e81b_grid, meta['wscale'], meta['inv_rs'], meta['has_e8p2'], meta['has_e81b'],
+        meta['in'], meta['out'], meta['n_pad'], meta['m_pad'], bias=None, out_dtype=x.dtype)
+
+
 class GLQLinearMethod(LinearMethodBase):
     """GLQ fused dequant+matmul linear method for vLLM.
 
@@ -535,9 +586,11 @@ class GLQLinearMethod(LinearMethodBase):
     Supports standard linear layers AND fused QKV (per-shard buffers).
     """
 
-    def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False):
+    def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False,
+                 codebook_type: str = "e8_shell"):
         self.quant_config = quant_config
         self.bpw = bpw
+        self.codebook_type = codebook_type
         # ``pre_fused``: the checkpoint stores this fused linear as ONE
         # jointly-quantized matrix (e.g. sarvam/Bailing's ``query_key_value``),
         # not as separate per-shard weights merged at load. A jointly-quantized
@@ -564,10 +617,34 @@ class GLQLinearMethod(LinearMethodBase):
         layer.glq_is_fused = is_fused
         layer.glq_in_features = input_size_per_partition
         layer.glq_bpw = self.bpw
+        is_e8p = (self.codebook_type == "e8p")
+        layer.glq_is_e8p = is_e8p
 
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        if is_fused:
+        if is_fused and is_e8p:
+            # Fused QKV/gate_up for e8p: per-shard int64 TC-packed buffers. The
+            # GLQShardedParameter loaders use empty_like, so sentinel=True placeholders
+            # are replaced by the loaded q/k/v (or gate/up) Qidxs_e8p on load.
+            layer.glq_shard_sizes = output_partition_sizes
+            layer.glq_num_shards = len(output_partition_sizes)
+            n_pad = _glq_pad(input_size_per_partition)
+            ops = output_partition_sizes
+            layer.Qidxs_e8p = GLQShardedParameter(ops, 1, torch.int64,
+                                                  weight_loader=weight_loader, sentinel=True)
+            layer.Qidxs2_e8p = GLQShardedParameter(ops, 1, torch.int64,
+                                                   weight_loader=weight_loader, sentinel=True)
+            layer.Qidxs2_e81b = GLQShardedParameter(ops, 1, torch.int64,
+                                                    weight_loader=weight_loader, sentinel=True)
+            layer.SU = GLQShardedParameter(ops, -1, torch.float16, weight_loader=weight_loader)
+            layer.SV = GLQShardedParameter([n_pad] * len(ops), -1, torch.float16,
+                                           weight_loader=weight_loader)
+            layer.Wscale = GLQShardedParameter([1] * len(ops), 0, torch.float32,
+                                               weight_loader=weight_loader)
+            layer.inv_resid_scale = GLQShardedParameter([1] * len(ops), 0, torch.float32,
+                                                        weight_loader=weight_loader)
+            layer.glq_n_pad = n_pad
+        elif is_fused:
             # Fused QKV: use GLQShardedParameter for per-shard storage
             layer.glq_shard_sizes = output_partition_sizes
             layer.glq_num_shards = len(output_partition_sizes)
@@ -622,8 +699,38 @@ class GLQLinearMethod(LinearMethodBase):
             # Standard: single set of GLQ buffers (no suffix)
             out_sz = sum(output_partition_sizes)
             layer.glq_out_features = out_sz
-            m_pad, n_pad = _register_glq_buffers(
-                layer, '', out_sz, input_size_per_partition)
+            if is_e8p:
+                m_pad, n_pad = _glq_pad(out_sz), _glq_pad(input_size_per_partition)
+                mp16, nb64 = max(m_pad // 16, 1), max(n_pad // 64, 1)
+                layer.Qidxs_e8p = _make_glq_param(
+                    torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64))
+                layer.SU = _make_glq_param(torch.ones(m_pad, dtype=torch.float16))
+                layer.SV = _make_glq_param(torch.ones(n_pad, dtype=torch.float16))
+                layer.Wscale = _make_glq_param(torch.ones((), dtype=torch.float32))
+                layer.inv_resid_scale = _make_glq_param(torch.zeros((), dtype=torch.float32))
+                # Stage-2 residual: register at the FINAL shape the checkpoint
+                # carries so the loader takes the in-place ``copy_`` branch (shape
+                # match) and keeps the create_weights CUDA storage. The empty(0)
+                # sentinel path would force ``param.data = empty_like(loaded)``,
+                # repointing .data at fresh CPU storage; for a registered
+                # nn.Parameter vLLM manages/restores .data, so a later move back
+                # to CUDA is reverted and the decompress kernel aborts on a CPU
+                # tensor at cudagraph capture. (The fused GLQShardedParameter path
+                # is immune — it moves its private ``_shard_data`` list, not a
+                # managed param.) bpw 4 → E8P residual; bpw 3 → E81B residual.
+                if self.bpw >= 4:
+                    layer.Qidxs2_e8p = _make_glq_param(
+                        torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64))
+                else:
+                    layer.Qidxs2_e8p = _make_glq_param(torch.empty(0, dtype=torch.int64))
+                if self.bpw == 3:
+                    layer.Qidxs2_e81b = _make_glq_param(
+                        torch.zeros(m_pad, nb64, dtype=torch.int64))
+                else:
+                    layer.Qidxs2_e81b = _make_glq_param(torch.empty(0, dtype=torch.int64))
+            else:
+                m_pad, n_pad = _register_glq_buffers(
+                    layer, '', out_sz, input_size_per_partition)
             layer.glq_m_pad = m_pad
             layer.glq_n_pad = n_pad
 
@@ -631,6 +738,10 @@ class GLQLinearMethod(LinearMethodBase):
         """Set up codebook and cache scalars. Dequant Mamba layers to dense."""
         device = next(layer.parameters()).device
         bpw = getattr(layer, 'glq_bpw', 2)
+
+        if getattr(layer, 'glq_is_e8p', False):
+            self._setup_e8p_weights(layer, device)
+            return
 
         # NOTE: a previous Mamba dequant fallback (matched on
         # ``layer.weight.numel() <= 1``) accidentally caught our own dummy
@@ -801,6 +912,65 @@ class GLQLinearMethod(LinearMethodBase):
             except (AttributeError, TypeError):
                 pass
 
+    def _setup_e8p_weights(self, layer, device):
+        """e8p: cache codebook grids + per-(shard) scalars/flags. Pow2-padded (no block-diag)."""
+        grid_cb, e81b_cb = _ensure_codebook(device, max_bpw=4, codebook_type="e8p")
+        _try_load_cuda_ext()
+        layer._glq_e8p_grid = grid_cb.grid_packed_abs.to(device)
+        layer._glq_e81b_grid = e81b_cb.e81b_grid.to(device) if e81b_cb is not None else None
+
+        # Move e8p buffers to device (GLQShardedParameter per-shard lists + plain params).
+        for attr in ['Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs2_e81b', 'SU', 'SV',
+                     'Wscale', 'inv_resid_scale']:
+            t = getattr(layer, attr, None)
+            if t is None:
+                continue
+            if isinstance(t, GLQShardedParameter):
+                for i, sd in enumerate(t._shard_data):
+                    if sd.device != device:
+                        t._shard_data[i] = sd.to(device)
+            elif hasattr(t, 'device') and t.device != device:
+                # Move the data IN PLACE — keep the same registered Parameter
+                # object. ``setattr(layer, attr, nn.Parameter(...))`` creates a
+                # NEW object; vLLM still holds the original (CPU) param it
+                # registered at build time and effectively reverts ``layer.attr``
+                # back to it after process_weights, so the moved data is lost and
+                # the decompress kernel aborts on a CPU tensor (confirmed on the
+                # non-fused stage-2 Qidxs2_e8p, which the loader resized via
+                # ``empty_like(loaded)`` onto CPU). Mutating ``.data`` preserves
+                # object identity — as the full-size Qidxs_e8p and the fused
+                # ``_shard_data`` moves already do — so the move sticks.
+                t.data = t.data.to(device)
+
+        def _meta(Qe8p, Q2e8p, Q2e81b, wscale, inv_rs, out_sz):
+            return {
+                'wscale': wscale, 'inv_rs': inv_rs,
+                'has_e8p2': bool(Q2e8p is not None and Q2e8p.numel() > 0),
+                'has_e81b': bool(Q2e81b is not None and Q2e81b.numel() > 0),
+                'm_pad': Qe8p.shape[0] * 16, 'n_pad': Qe8p.shape[1] * 64,
+                'out': out_sz, 'in': layer.glq_in_features,
+            }
+
+        if getattr(layer, 'glq_is_fused', False):
+            layer._glq_e8p_meta = [
+                _meta(layer.Qidxs_e8p.get_shard(i), layer.Qidxs2_e8p.get_shard(i),
+                      layer.Qidxs2_e81b.get_shard(i), layer.Wscale.get_shard(i).item(),
+                      layer.inv_resid_scale.get_shard(i).item(), layer.glq_shard_sizes[i])
+                for i in range(layer.glq_num_shards)]
+        else:
+            layer._glq_e8p_meta = [_meta(
+                layer.Qidxs_e8p, layer.Qidxs2_e8p, layer.Qidxs2_e81b,
+                layer.Wscale.item(), layer.inv_resid_scale.item(), layer.glq_out_features)]
+
+        # Drop weight_loaders (function refs break vLLM v1 serialization).
+        for _name, param in layer.named_parameters():
+            try:
+                if hasattr(param, 'weight_loader') and not isinstance(
+                        type(param).__dict__.get('weight_loader'), property):
+                    del param.weight_loader
+            except (AttributeError, TypeError):
+                pass
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -816,7 +986,12 @@ class GLQLinearMethod(LinearMethodBase):
         device = x.device
         cb, cb2 = _codebook, _codebook2_small
 
-        if getattr(layer, 'glq_is_fused', False):
+        if getattr(layer, 'glq_is_e8p', False):
+            y = _glq_apply_e8p(x, layer)
+            out_features = (sum(layer.glq_shard_sizes)
+                            if getattr(layer, 'glq_is_fused', False)
+                            else layer.glq_out_features)
+        elif getattr(layer, 'glq_is_fused', False):
             # Fused QKV: dequant each shard independently, concatenate
             shard_outputs = []
             for i in range(layer.glq_num_shards):
