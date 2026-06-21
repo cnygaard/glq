@@ -1,9 +1,21 @@
 /*
- * E8P (QuIP#) tensor-core decode kernels, ported into the GLQ extension so the `--codebook e8p` path
- * is self-contained (no external quiptools dependency). Verbatim from
- * quip-sharp/quiptools/quiptools_e8p_gemv.cu: a 1KB-L1 sign-symmetric codebook is bit-expanded
- * (lop3 + add.f16x2 + parity/sign XOR + ±1/4) and the dot runs on tensor cores (mma.sync.m16n8k16).
- * Host fns are renamed glq_* and bound in glq_bindings.cpp. Self-contained TU (local static helpers).
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * E8P (QuIP#) tensor-core decode kernels.
+ *
+ * Derived from QuIP# (https://github.com/Cornell-RelaxML/quip-sharp), licensed
+ * under the GNU General Public License v3 — Copyright (c) the QuIP# authors
+ * (Cornell-RelaxML). Ported from quiptools/quiptools_e8p_gemv.cu and
+ * quiptools/quiptools.cu, then modified for the GLQ project (2026): host
+ * functions renamed glq_* and bound in glq_bindings.cpp, and assembled into
+ * this self-contained translation unit. Distributed under GPL-3.0, the same
+ * license as the upstream and as this project. Full QuIP# citation in the
+ * project README.
+ *
+ * Technical: a 1KB-L1 sign-symmetric codebook is bit-expanded (lop3 +
+ * add.f16x2 + parity/sign XOR + ±1/4) and the dot runs on tensor cores
+ * (mma.sync.m16n8k16). The E81B (1-bit residual) lookup-matmul and dense
+ * decompress kernels below are ported from quiptools/quiptools.cu.
  */
 #include <vector>
 #include <cuda.h>

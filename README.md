@@ -478,6 +478,38 @@ hidden sizes use block-diagonal FHT (v0.2.9+) — e.g. 2688 is
 decomposed as `2048 + 512 + 128` so on-disk storage matches the
 nominal rate exactly.
 
+### E8P codebook (`--codebook e8p`) — derivative of QuIP#
+
+`--codebook e8p` is **derivative work that ports the E8P codebook and its
+tensor-core decode kernels from
+[QuIP#](https://github.com/Cornell-RelaxML/quip-sharp)** (Tseng et al., 2024).
+It swaps the default E8-shell codebook for QuIP#'s 2-bit **E8P** (padded-D̂8)
+grid decoded on tensor cores (`mma.sync` GEMV), plus residual vector
+quantization for the higher rates. The port is self-contained (no `quiptools`
+dependency); full credit and the citation are in
+[Acknowledgments](#acknowledgments).
+
+| bpw | RVQ recipe | stage-2 decode |
+|-----|------------|----------------|
+| 2   | `[E8P]`         | —                                  |
+| 3   | `[E8P, E81B]`   | 1-bit residual (WMMA lookup-matmul) |
+| 4   | `[E8P, E8P]`    | second E8P tensor-core stage        |
+
+```bash
+glq-quantize --model HuggingFaceTB/SmolLM2-360M --output ./out \
+    --codebook e8p --bpw 4 --nsamples 128
+```
+
+The entire linear — input RHT → E8P tensor-core decode (all RVQ stages) →
+×Wscale → output RHT — runs as a **single fused CUDA op**
+(`glq_fused_linear_e8p_cuda`), so vLLM captures B=1 decode in a **FULL CUDA
+graph** exactly like the default path (HF inference is supported too). On
+SmolLM3-3B 4 bpw (RTX PRO 6000 Blackwell, vLLM 0.23) that fused op runs B=1
+decode at **~85 tok/s**; collapsing the per-linear dispatch into one opaque op
+is what makes cudagraph a win here — the equivalent unfused multi-op path is
+~7× slower under capture. The fused op is bit-exact against the unfused
+reference across 2/3/4 bpw.
+
 ### Serving with sglang
 
 A fork of sglang with GLQ support lives at
@@ -581,7 +613,29 @@ glq_vllm/              # vLLM integration: weight + KV cache (v0.3.0+)
 
 ## Acknowledgments
 
-Inspired by [QuIP#](https://arxiv.org/abs/2402.04396) (Tseng et al., 2024).
+This project builds on **[QuIP#](https://github.com/Cornell-RelaxML/quip-sharp)**
+(Tseng et al., 2024). The default E8-shell pipeline is *inspired by* its
+Hadamard-incoherence + lattice-codebook formulation, and the optional
+`--codebook e8p` path is **derivative work that ports QuIP#'s E8P (padded-D̂8)
+codebook and its tensor-core decode / residual kernels** — the `grid_packed_abs`
+codebook plus the `decode_matvec_e8p`, `decompress_packed_e8p`, and E81B
+lookup-matmul kernels in [`glq/csrc/glq_e8p.cu`](glq/csrc/glq_e8p.cu). All credit
+for the E8P codebook and those kernels belongs to the QuIP# authors; this
+repository is an independent port, not an official QuIP# release. Please cite
+QuIP#:
+
+```bibtex
+@inproceedings{
+    tseng2024quip,
+    title={Qu{IP}\${\textbackslash}\#\$: Even Better {LLM} Quantization with Hadamard Incoherence and Lattice Codebooks},
+    author={Albert Tseng and Jerry Chee and Qingyao Sun and Volodymyr Kuleshov and Christopher De Sa},
+    booktitle={Forty-first International Conference on Machine Learning},
+    year={2024},
+    url={https://openreview.net/forum?id=9BrydUVcoe}
+}
+```
+
+Other foundations:
 
 - E8 lattice: Korkin & Zolotarev (1872); Gosset (1900); Conway & Sloane, *Sphere Packings, Lattices and Groups*; [Viazovska (2016)](https://arxiv.org/abs/1603.04246) — sphere-packing optimality in 8 dimensions.
 - Block-feedback quantization: [GPTQ](https://arxiv.org/abs/2210.17323) (Frantar et al., 2022).
