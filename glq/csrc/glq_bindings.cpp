@@ -198,7 +198,8 @@ void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tens
 // Fused E8P linear (defined in glq_cuda.cu): input_rht + N-stage decode/matmul + output_rht
 torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
-    torch::Tensor qidxs_e8p, torch::Tensor qidxs2_e8p, torch::Tensor codebook_abs,
+    torch::Tensor qidxs_e8p, torch::Tensor qidxs2_e8p, torch::Tensor qidxs2_e81b,
+    torch::Tensor codebook_abs, torch::Tensor e81b_codebook,
     double wscale, double inv_resid_scale,
     int64_t in_features, int64_t out_features,
     int64_t n_pad, int64_t m_pad, int64_t log_n, int64_t log_m);

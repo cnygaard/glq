@@ -511,13 +511,17 @@ class E8RHTLinear(nn.Module):
         # + output_rht) as ONE opaque op — one torch.ops dispatch, traced as a single
         # node so vLLM's cudagraph capture matches the shell's fused_linear instead of
         # a multi-op chain inductor pads with copies. Covers stage-1 (2bpw) + E8P
-        # stage-2 (4bpw); E81B (3bpw) falls through to the multi-op path below.
+        # stage-2 (4bpw) + E81B stage-2 (3bpw). E81B needs its grid; if it's absent
+        # (e.g. codebook not cached) fall through to the multi-op path below.
         if (_ops is not None and _GLQ_FUSED_E8P_ENABLED
-                and hasattr(_ops, "fused_linear_e8p") and not has_e81b):
-            q2 = Qidxs2_e8p if has_e8p2 else Qidxs2_e8p.new_empty(0)
-            rs = float(inv_rs) if has_e8p2 else 0.0
+                and hasattr(_ops, "fused_linear_e8p")
+                and (not has_e81b or e81b_grid is not None)):
+            q2 = Qidxs2_e8p if has_e8p2 else Qidxs_e8p.new_empty(0)
+            q2b = Qidxs2_e81b if has_e81b else Qidxs_e8p.new_empty(0)
+            cb_e81b = e81b_grid if has_e81b else SV.new_empty(0)
+            rs = float(inv_rs) if (has_e8p2 or has_e81b) else 0.0
             y = _ops.fused_linear_e8p(
-                x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, grid,
+                x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, grid, cb_e81b,
                 float(wscale), rs, in_features, out_features,
                 n_pad, m_pad, log_n, log_m).to(out_dtype)
             if bias is not None:

@@ -279,7 +279,8 @@ def _ensure_registered():
         if hasattr(cuda, "glq_fused_linear_e8p_cuda"):
             _glq_lib.define(
                 "fused_linear_e8p(Tensor x, Tensor sv, Tensor su, "
-                "Tensor qidxs_e8p, Tensor qidxs2_e8p, Tensor codebook_abs, "
+                "Tensor qidxs_e8p, Tensor qidxs2_e8p, Tensor qidxs2_e81b, "
+                "Tensor codebook_abs, Tensor e81b_codebook, "
                 "float wscale, float inv_resid_scale, "
                 "int in_features, int out_features, "
                 "int n_pad, int m_pad, int log_n, int log_m) -> Tensor")
@@ -343,7 +344,8 @@ def _decompress_e81b_packed_fake(YIs, CB, Y):
     return None  # fills the pre-allocated Y (mutating op, no return)
 
 
-def _fused_linear_e8p_fake(x, sv, su, qidxs_e8p, qidxs2_e8p, codebook_abs,
+def _fused_linear_e8p_fake(x, sv, su, qidxs_e8p, qidxs2_e8p, qidxs2_e81b,
+                           codebook_abs, e81b_codebook,
                            wscale, inv_resid_scale, in_features, out_features,
                            n_pad, m_pad, log_n, log_m):
     # (B, in_features) → (B, out_features) fp16.
