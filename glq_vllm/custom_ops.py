@@ -273,6 +273,19 @@ def _ensure_registered():
         _glq_lib.impl("decompress_e81b_packed", cuda.glq_decompress_e81b_packed, dispatch_key)
         _glq_lib._register_fake("decompress_e81b_packed", _decompress_e81b_packed_fake)
 
+        # Fused E8P linear: the whole input_rht + N-stage decode/matmul + ×wscale +
+        # output_rht as ONE opaque op (collapses ~5 dispatches/linear → 1), so the
+        # decode path traces as a single node like the shell's fused_linear.
+        if hasattr(cuda, "glq_fused_linear_e8p_cuda"):
+            _glq_lib.define(
+                "fused_linear_e8p(Tensor x, Tensor sv, Tensor su, "
+                "Tensor qidxs_e8p, Tensor qidxs2_e8p, Tensor codebook_abs, "
+                "float wscale, float inv_resid_scale, "
+                "int in_features, int out_features, "
+                "int n_pad, int m_pad, int log_n, int log_m) -> Tensor")
+            _glq_lib.impl("fused_linear_e8p", cuda.glq_fused_linear_e8p_cuda, dispatch_key)
+            _glq_lib._register_fake("fused_linear_e8p", _fused_linear_e8p_fake)
+
 
 # --- Fake implementations for torch.compile tracing ---
 
@@ -328,6 +341,13 @@ def _lookupmatmul_e81b_k8_fake(X, YIs, CB, Z):
 
 def _decompress_e81b_packed_fake(YIs, CB, Y):
     return None  # fills the pre-allocated Y (mutating op, no return)
+
+
+def _fused_linear_e8p_fake(x, sv, su, qidxs_e8p, qidxs2_e8p, codebook_abs,
+                           wscale, inv_resid_scale, in_features, out_features,
+                           n_pad, m_pad, log_n, log_m):
+    # (B, in_features) → (B, out_features) fp16.
+    return torch.empty((x.shape[0], out_features), dtype=torch.float16, device=x.device)
 
 
 def _gather_kv_paged_dequant_impl(idx1, idx2, idx3, idx_s1, scale,

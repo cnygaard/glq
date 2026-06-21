@@ -195,6 +195,14 @@ void glq_lookupmatmul_e81b_k8(
     torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z);
 void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y);
 
+// Fused E8P linear (defined in glq_cuda.cu): input_rht + N-stage decode/matmul + output_rht
+torch::Tensor glq_fused_linear_e8p_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor su,
+    torch::Tensor qidxs_e8p, torch::Tensor qidxs2_e8p, torch::Tensor codebook_abs,
+    double wscale, double inv_resid_scale,
+    int64_t in_features, int64_t out_features,
+    int64_t n_pad, int64_t m_pad, int64_t log_n, int64_t log_m);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decode_matvec_e8p", &glq_decode_matvec_e8p,
           "E8P tensor-core GEMV B=1 decode (CUDA)");
@@ -208,6 +216,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "GLQ fused input_rht + dequant_matmul + output_rht (CUDA)");
     m.def("glq_fused_linear_block_diag_cuda", &glq_fused_linear_block_diag_cuda,
           "GLQ fused block-diagonal input_rht + dequant_matmul + output_rht (CUDA)");
+    m.def("glq_fused_linear_e8p_cuda", &glq_fused_linear_e8p_cuda,
+          "GLQ fused E8P input_rht + decode/matmul + output_rht, one host call (CUDA)");
     m.def("glq_fused_moe_cuda", &glq_fused_moe_cuda,
           "GLQ fused MoE expert dispatch (CUDA)",
           py::arg("x"),

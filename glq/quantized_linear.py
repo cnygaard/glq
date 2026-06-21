@@ -13,6 +13,11 @@ try:
 except ImportError:
     _triton_available = False
 
+# Kill-switch for the single-call fused E8P linear op (glq_fused_linear_e8p_cuda).
+# Default on; flip to False to fall back to the multi-op E8P apply (used by the
+# bit-exact A/B test and as a production escape hatch).
+_GLQ_FUSED_E8P_ENABLED = True
+
 
 def _pack_block_meta(block_sizes):
     """Pack (col_offset, bs, log_bs, _) per sub-block as CPU int32 (N, 4).
@@ -501,6 +506,23 @@ class E8RHTLinear(nn.Module):
         dev = x2d.device
         log_n, log_m = int(math.log2(n_pad)), int(math.log2(m_pad))
         rsqrt_n, rsqrt_m = 1.0 / math.sqrt(n_pad), 1.0 / math.sqrt(m_pad)
+
+        # Fast path: the entire linear (input_rht + N-stage decode/matmul + ×Wscale
+        # + output_rht) as ONE opaque op — one torch.ops dispatch, traced as a single
+        # node so vLLM's cudagraph capture matches the shell's fused_linear instead of
+        # a multi-op chain inductor pads with copies. Covers stage-1 (2bpw) + E8P
+        # stage-2 (4bpw); E81B (3bpw) falls through to the multi-op path below.
+        if (_ops is not None and _GLQ_FUSED_E8P_ENABLED
+                and hasattr(_ops, "fused_linear_e8p") and not has_e81b):
+            q2 = Qidxs2_e8p if has_e8p2 else Qidxs2_e8p.new_empty(0)
+            rs = float(inv_rs) if has_e8p2 else 0.0
+            y = _ops.fused_linear_e8p(
+                x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, grid,
+                float(wscale), rs, in_features, out_features,
+                n_pad, m_pad, log_n, log_m).to(out_dtype)
+            if bias is not None:
+                y = y + bias.unsqueeze(0).to(out_dtype)
+            return y
 
         # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
         x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=dev)
