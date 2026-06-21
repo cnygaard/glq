@@ -621,19 +621,9 @@ codebook and its tensor-core decode / residual kernels** — the `grid_packed_ab
 codebook plus the `decode_matvec_e8p`, `decompress_packed_e8p`, and E81B
 lookup-matmul kernels in [`glq/csrc/glq_e8p.cu`](glq/csrc/glq_e8p.cu). All credit
 for the E8P codebook and those kernels belongs to the QuIP# authors; this
-repository is an independent port, not an official QuIP# release. Please consider
-citing the QuIP# authors if you find the QuIP# part useful:
-
-```bibtex
-@inproceedings{
-    tseng2024quip,
-    title={Qu{IP}\${\textbackslash}\#\$: Even Better {LLM} Quantization with Hadamard Incoherence and Lattice Codebooks},
-    author={Albert Tseng and Jerry Chee and Qingyao Sun and Volodymyr Kuleshov and Christopher De Sa},
-    booktitle={Forty-first International Conference on Machine Learning},
-    year={2024},
-    url={https://openreview.net/forum?id=9BrydUVcoe}
-}
-```
+repository is an independent port, not an official QuIP# release. See the
+[QuIP# repository](https://github.com/Cornell-RelaxML/quip-sharp) for the paper
+and citation.
 
 Other foundations:
 
