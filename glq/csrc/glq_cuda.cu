@@ -10,6 +10,7 @@
  * entries (4 nibbles per half2 pair), reducing L2 gather traffic 4×.
  */
 
+#include <cstdlib>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -2744,6 +2745,8 @@ torch::Tensor glq_fused_linear_cuda(
  * ───────────────────────────────────────────────────────────────────── */
 torch::Tensor glq_decode_matvec_e8p(
     torch::Tensor x, torch::Tensor weights_compressed, torch::Tensor codebook_abs);
+torch::Tensor glq_matmul_e8p(
+    torch::Tensor x, torch::Tensor weights_compressed, torch::Tensor codebook_abs);
 torch::Tensor glq_decompress_packed_e8p(
     torch::Tensor weights_compressed, torch::Tensor codebook_abs);
 void glq_lookupmatmul_e81b_k8(
@@ -2803,7 +2806,10 @@ torch::Tensor glq_fused_linear_e8p_cuda(
             y_rht = y_rht + (float)inv_resid_scale * Z.select(0, 0);
         }
         y_rht = (y_rht * (float)wscale).view({1, (long)m_pad}).contiguous();
-    } else {
+    } else if (std::getenv("GLQ_E8P_DENSE_B1") != nullptr) {
+        // Guarded fallback (env GLQ_E8P_DENSE_B1): dense decompress + at::matmul. This is
+        // the pre-batched-kernel path, kept as the A/B reference and a safety net — it fully
+        // decompresses every weight to dense fp16 each step (the B>1 decode cliff this fixes).
         auto W = glq_decompress_packed_e8p(qidxs_e8p, codebook_abs).to(torch::kFloat32);
         if (has_e8p2) {
             W = W + (float)inv_resid_scale *
@@ -2815,6 +2821,28 @@ torch::Tensor glq_fused_linear_e8p_cuda(
             W = W + (float)inv_resid_scale * Y.to(torch::kFloat32);
         }
         y_rht = (at::matmul(x_rht, W.t()) * (float)wscale).contiguous();  // (B, m_pad) fp32
+    } else {
+        // Compressed batched E8P TC-GEMM: weights stay packed, decode amortized over the
+        // batch (each weight tile bit-expanded once, reused across up to 8 tokens per mma).
+        auto xh = x_rht.to(torch::kFloat16);                    // (B, n_pad)
+        y_rht = glq_matmul_e8p(xh, qidxs_e8p, codebook_abs);    // (B, m_pad) fp32
+        if (has_e8p2) {
+            y_rht = y_rht + (float)inv_resid_scale *
+                    glq_matmul_e8p(xh, qidxs2_e8p, codebook_abs);
+        } else if (has_e81b) {
+            // E81B residual: the WMMA lookup-matmul takes k<=8, so tile the batch by 8.
+            for (int b0 = 0; b0 < B; b0 += 8) {
+                int nb = (B - b0) < 8 ? (B - b0) : 8;
+                auto X8 = torch::zeros({8, (long)n_pad},
+                                       torch::dtype(torch::kFloat16).device(x.device()));
+                X8.narrow(0, 0, nb).copy_(xh.narrow(0, b0, nb));
+                auto Z = torch::zeros({8, (long)m_pad},
+                                      torch::dtype(torch::kFloat32).device(x.device()));
+                glq_lookupmatmul_e81b_k8(X8, qidxs2_e81b, e81b_codebook, Z);
+                y_rht.narrow(0, b0, nb).add_((float)inv_resid_scale * Z.narrow(0, 0, nb));
+            }
+        }
+        y_rht = (y_rht * (float)wscale).contiguous();           // (B, m_pad) fp32
     }
 
     // ---- Step 3: output RHT → y (B, out_features) fp16 ----

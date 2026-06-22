@@ -189,6 +189,8 @@ torch::Tensor glq_fused_linear_block_diag_cuda(
 // E8P (QuIP#) tensor-core decode kernels (defined in glq_e8p.cu) for the --codebook e8p path
 torch::Tensor glq_decode_matvec_e8p(
     torch::Tensor x, torch::Tensor weights_compressed, torch::Tensor codebook_abs);
+torch::Tensor glq_matmul_e8p(
+    torch::Tensor x, torch::Tensor weights_compressed, torch::Tensor codebook_abs);
 torch::Tensor glq_decompress_packed_e8p(
     torch::Tensor weights_compressed, torch::Tensor codebook_abs);
 void glq_lookupmatmul_e81b_k8(
@@ -207,6 +209,8 @@ torch::Tensor glq_fused_linear_e8p_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decode_matvec_e8p", &glq_decode_matvec_e8p,
           "E8P tensor-core GEMV B=1 decode (CUDA)");
+    m.def("glq_matmul_e8p", &glq_matmul_e8p,
+          "E8P compressed batched tensor-core GEMM B>1 decode (CUDA)");
     m.def("glq_decompress_packed_e8p", &glq_decompress_packed_e8p,
           "E8P dense decompress to fp16 weight (CUDA)");
     m.def("glq_lookupmatmul_e81b_k8", &glq_lookupmatmul_e81b_k8,
