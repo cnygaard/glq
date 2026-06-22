@@ -11,6 +11,7 @@ Data structure (the easy-to-read surface):
         "google/gemma-4-12B-it":     {"bpw": 5.0, "min_bpw": 4, "max_bpw": 8},
         "google/gemma-4-26B-A4B-it": {"bpw": 5.0, "min_bpw": 4, "max_bpw": 8,
                                       "streaming": True},
+        "HuggingFaceTB/SmolLM3-3B":  {"bpw": 2, "codebook": "e8p"},   # tensor-core RVQ
     }
 
   * key   = HF model id (or a plain label if you add ``"model": <id>`` to the value,
@@ -20,6 +21,9 @@ Data structure (the easy-to-read surface):
   * bpw semantics: an *integer* bpw with no min/max  -> uniform quant (1 pass).
                    a fractional bpw, or any min/max  -> mixed precision (2 passes:
                    the avg target is ``bpw``; the allocator stays within [min,max]).
+  * codebook: ``e8_shell`` (default) | ``e8_relaxed`` | ``e8p``. ``e8p`` is the QuIP#
+              tensor-core RVQ recipe — uniform integer bpw 2/3/4 only (no mixed precision,
+              no ``codebook_size``); its output dir is tagged ``…-GLQ-<n>bpw-e8p``.
 
 Mixed precision is TWO ``glq-quantize`` invocations (the CLI itself splits them):
     pass 1 (profile):  --bpw <avg> --min-bpw <m> --max-bpw <M>
@@ -116,7 +120,9 @@ class QuantJob:
     bpw: float                        # avg target if mixed; uniform if integer & no min/max
     min_bpw: int | None = None        # mixed-precision floor (2..8)
     max_bpw: int | None = None        # mixed-precision ceiling (2..8)
-    codebook_size: int | None = None  # E8 entries (default 65536; 4096 = Blackwell smem)
+    codebook_size: int | None = None  # E8 shell entries (default 65536; 4096 = Blackwell smem)
+    codebook: str = "e8_shell"        # codebook type: e8_shell | e8_relaxed | e8p
+                                      # (e8p = QuIP# tensor-core RVQ, uniform bpw 2/3/4)
     nsamples: int = 128               # CLAUDE.md mandate
     seqlen: int = 2048
     tune_iters: int = 0
@@ -146,6 +152,24 @@ class QuantJob:
             raise ValueError(
                 f"{self.model}: avg bpw {self.bpw} not within "
                 f"[{self.min_bpw}, {self.max_bpw}]")
+        valid_cb = ("e8_shell", "e8_relaxed", "e8p")
+        if self.codebook not in valid_cb:
+            raise ValueError(
+                f"{self.model}: codebook must be one of {valid_cb}, got {self.codebook!r}")
+        if self.codebook == "e8p":
+            # e8p is a fixed-grid RVQ recipe (2=[E8P], 3=[E8P,E81B], 4=[E8P,E8P]) — uniform
+            # integer bpw only, no mixed precision, and codebook_size (a shell knob) doesn't apply.
+            if self.is_mixed:
+                raise ValueError(
+                    f"{self.model}: codebook 'e8p' is uniform-only — drop min/max and use an "
+                    f"integer bpw of 2, 3, or 4 (no mixed precision)")
+            if int(self.bpw) not in (2, 3, 4):
+                raise ValueError(
+                    f"{self.model}: codebook 'e8p' supports bpw 2/3/4 only, got {self.bpw}")
+            if self.codebook_size is not None:
+                raise ValueError(
+                    f"{self.model}: codebook_size is an e8_shell/e8_relaxed knob — not valid "
+                    f"with 'e8p' (it uses the fixed 65536-entry grid)")
 
 
 def jobs_from_dict(d: dict) -> list[QuantJob]:
@@ -175,15 +199,17 @@ def jobs_from_dict(d: dict) -> list[QuantJob]:
 
 
 def output_name(job: QuantJob) -> str:
-    """Auto dir name matching the published convention (Gemma-4-31B-it-GLQ-5.0bpw-mix3-8)."""
+    """Auto dir name matching the published convention (Gemma-4-31B-it-GLQ-5.0bpw-mix3-8).
+    Non-default codebooks get a suffix: e8p -> '-e8p', e8_relaxed -> '-relaxed'."""
     if job.output:
         return job.output
     base = job.model.rstrip("/").split("/")[-1]
+    cb = {"e8p": "-e8p", "e8_relaxed": "-relaxed"}.get(job.codebook, "")
     if job.is_mixed:
         mn = job.min_bpw if job.min_bpw is not None else 2
         mx = job.max_bpw if job.max_bpw is not None else 4
-        return f"{base}-GLQ-{float(job.bpw):.1f}bpw-mix{mn}-{mx}"
-    return f"{base}-GLQ-{int(job.bpw)}bpw"
+        return f"{base}-GLQ-{float(job.bpw):.1f}bpw-mix{mn}-{mx}{cb}"
+    return f"{base}-GLQ-{int(job.bpw)}bpw{cb}"
 
 
 def _shared_flags(job: QuantJob, device: str) -> list[str]:
@@ -194,6 +220,8 @@ def _shared_flags(job: QuantJob, device: str) -> list[str]:
         f += ["--tune-iters", str(job.tune_iters)]
     if job.codebook_size is not None:
         f += ["--codebook-size", str(job.codebook_size)]
+    if job.codebook != "e8_shell":
+        f += ["--codebook", job.codebook]
     if job.streaming:
         f += ["--streaming"]
     if job.trust_remote_code:
