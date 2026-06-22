@@ -148,3 +148,52 @@ def test_ledger_no_tmp_left_behind(tmp_path):
     batchq.record_progress(p, "ns", {}, JOB, status="done")
     leftovers = list(tmp_path.glob("*.tmp"))
     assert not leftovers, f"temp file not cleaned up: {leftovers}"
+
+
+# --------------------------------------------------------------------------- #
+# codebook routing — e8p is first-class (forwarded flag, tagged name, guarded)
+# --------------------------------------------------------------------------- #
+
+
+def _uniform_argv(job):
+    cmds = batchq.commands_for(job, Path("/tmp/out"), "glq-quantize", "cuda")
+    assert len(cmds) == 1, "uniform job should be a single pass"
+    return cmds[0][1]
+
+
+def test_e8p_job_forwards_codebook_flag():
+    job = batchq.QuantJob(model="HuggingFaceTB/SmolLM3-3B", bpw=2, codebook="e8p")
+    argv = _uniform_argv(job)
+    assert "--codebook" in argv and argv[argv.index("--codebook") + 1] == "e8p"
+
+
+def test_default_codebook_omits_flag():
+    # e8_shell is the default -> no --codebook flag (keeps existing commands unchanged)
+    assert "--codebook" not in _uniform_argv(batchq.QuantJob(model="m", bpw=4))
+
+
+def test_e8p_output_name_tagged():
+    job = batchq.QuantJob(model="HuggingFaceTB/SmolLM3-3B", bpw=3, codebook="e8p")
+    assert batchq.output_name(job) == "SmolLM3-3B-GLQ-3bpw-e8p"
+
+
+def test_e8p_rejects_mixed_precision():
+    with pytest.raises(ValueError, match="uniform-only"):
+        batchq.QuantJob(model="m", bpw=3.5, codebook="e8p")          # fractional
+    with pytest.raises(ValueError, match="uniform-only"):
+        batchq.QuantJob(model="m", bpw=3, min_bpw=2, max_bpw=4, codebook="e8p")  # min/max
+
+
+def test_e8p_rejects_bad_bpw():
+    with pytest.raises(ValueError, match="bpw 2/3/4 only"):
+        batchq.QuantJob(model="m", bpw=5, codebook="e8p")
+
+
+def test_e8p_rejects_codebook_size():
+    with pytest.raises(ValueError, match="codebook_size"):
+        batchq.QuantJob(model="m", bpw=2, codebook="e8p", codebook_size=4096)
+
+
+def test_invalid_codebook_rejected():
+    with pytest.raises(ValueError, match="codebook must be one of"):
+        batchq.QuantJob(model="m", bpw=2, codebook="bogus")
