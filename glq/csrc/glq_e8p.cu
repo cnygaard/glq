@@ -73,8 +73,26 @@ __device__ static inline uint32_t e8p_mask_lop3(uint32_t x, uint32_t m0, uint32_
 #define E8P_MM_WARPS 8
 
 
+// Fixed-order reduction over the k-split planes -> deterministic output. One thread per
+// (b,m) element sums scratch[0..n_splits-1] in order (local copy of the shell's
+// glq_reduce_splits_2d_kernel; kept in this TU since the build has no -rdc=true). Shared
+// by the B=1 GEMV (BN=N) and the batched GEMM (BN=B*N).
+__global__ static void __launch_bounds__(256) glq_reduce_splits_2d_e8p_kernel(
+    float *__restrict__ output, const float *__restrict__ scratch, int BN, int n_splits
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= BN) return;
+    float sum = 0.0f;
+    for (int k = 0; k < n_splits; ++k) sum += scratch[(size_t)k * BN + i];
+    output[i] = sum;
+}
+
+
+// B=1 decode GEMV. The 32 warps split K; each warp writes its own scratch plane
+// scratch[warpId*N + row] (no atomics → deterministic) and glq_reduce_splits_2d_e8p_kernel
+// sums the planes in fixed order (scratch = 32*N floats, tiny for B=1).
 __global__ static void glq_decode_matvec_e8p_kernel(
-    float *__restrict__ output,
+    float *__restrict__ scratch,           // (32, N) fp32 k-split planes
     const uint2 *__restrict__ input,
     const uint2 *__restrict__ weights_compressed,
     const uint32_t *__restrict__ codebook_abs,
@@ -162,8 +180,9 @@ __global__ static void glq_decode_matvec_e8p_kernel(
                 : "r"(w02), "r"(w12), "r"(w03), "r"(w13), "r"(x_in0), "r"(x_in1));
             }
         }
+        // Plain store to this warp's plane (unique slot) — no atomics → deterministic.
         if ((laneId & 1) == 0) {
-            atomicAdd(output + (iin << 4) + (laneId >> 1), (laneId & 2) ? z2 : z0);
+            scratch[(size_t)warpId * N + (iin << 4) + (laneId >> 1)] = (laneId & 2) ? z2 : z0;
         }
     }
 }
@@ -189,7 +208,7 @@ torch::Tensor glq_decode_matvec_e8p(
 
     at::DeviceGuard guard(x.device());
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    torch::Tensor output = torch::zeros({N}, options);
+    torch::Tensor output = torch::empty({N}, options);  // reduce overwrites every elem
 
     static int64_t grid_size = 0;
     if (grid_size == 0) {
@@ -198,28 +217,25 @@ torch::Tensor glq_decode_matvec_e8p(
         grid_size = static_cast<int64_t>(deviceProp.multiProcessorCount);
     }
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    // Deterministic scratch+reduce: 32 k-split planes (one per warp), fixed-order summed.
+    size_t scratch_bytes = (size_t)32 * N * sizeof(float);
+    float *scratch = (float *)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
     glq_decode_matvec_e8p_kernel<<<grid_size, dim3(32, 32), 0, stream>>>(
-        output.data_ptr<float>(),
+        scratch,
         (const uint2 *)x.data_ptr<c10::Half>(),
         (const uint2 *)weights_compressed.data_ptr<int64_t>(),
         (const uint32_t *)codebook_abs.data_ptr<int32_t>(),
         N, K);
     E8P_ERRCHK(cudaPeekAtLastError());
+
+    int reduce_threads = 256;
+    int reduce_blocks = (int)((N + reduce_threads - 1) / reduce_threads);
+    glq_reduce_splits_2d_e8p_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+        output.data_ptr<float>(), scratch, (int)N, 32);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
     return output;
-}
-
-
-// Fixed-order reduction over the k-split planes -> deterministic output. One thread per
-// (b,m) element sums scratch[0..n_splits-1] in order (local copy of the shell's
-// glq_reduce_splits_2d_kernel; kept in this TU since the build has no -rdc=true).
-__global__ static void __launch_bounds__(256) glq_reduce_splits_2d_e8p_kernel(
-    float *__restrict__ output, const float *__restrict__ scratch, int BN, int n_splits
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= BN) return;
-    float sum = 0.0f;
-    for (int k = 0; k < n_splits; ++k) sum += scratch[(size_t)k * BN + i];
-    output[i] = sum;
 }
 
 
