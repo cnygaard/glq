@@ -27,6 +27,7 @@
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/types.h>
 #include <torch/extension.h>
 
@@ -64,6 +65,12 @@ __device__ static inline uint32_t e8p_mask_lop3(uint32_t x, uint32_t m0, uint32_
 #define E8P_BASE_OFFSET 0xd080d080
 #define E8P_XMASK 0x00f000f0
 #define E8P_WMASK 0x50085008
+
+// Warps per block that split the K dimension in the batched GEMM. Each warp owns a
+// unique scratch plane (k-split) for deterministic reduction; scratch = NW * B * N
+// floats, so fewer warps = less scratch traffic at the cost of K parallelism. 8
+// matches the shell TC matmul's WARPS and bounds B=32 scratch below the weight traffic.
+#define E8P_MM_WARPS 8
 
 
 __global__ static void glq_decode_matvec_e8p_kernel(
@@ -202,6 +209,20 @@ torch::Tensor glq_decode_matvec_e8p(
 }
 
 
+// Fixed-order reduction over the k-split planes -> deterministic output. One thread per
+// (b,m) element sums scratch[0..n_splits-1] in order (local copy of the shell's
+// glq_reduce_splits_2d_kernel; kept in this TU since the build has no -rdc=true).
+__global__ static void __launch_bounds__(256) glq_reduce_splits_2d_e8p_kernel(
+    float *__restrict__ output, const float *__restrict__ scratch, int BN, int n_splits
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= BN) return;
+    float sum = 0.0f;
+    for (int k = 0; k < n_splits; ++k) sum += scratch[(size_t)k * BN + i];
+    output[i] = sum;
+}
+
+
 // ---- Compressed batched E8P tensor-core GEMM (B>1 decode) ----
 // Forks glq_decode_matvec_e8p_kernel. The B=1 GEMV broadcasts one token across all
 // 8 mma n-columns and keeps only n=0; here each n-column carries a distinct token, so
@@ -212,8 +233,11 @@ torch::Tensor glq_decode_matvec_e8p(
 //   mma-row groupID+8 (w1x) -> natural output row 2*groupID+1 (harvested from z2/z3)
 //   mma-k 2t <-> natural-k 64*iik+16t  =>  token's 8 consecutive uint32 at 32*iik+8t+[0..7]
 // n-column g == token (base + g); base = 8 * blockIdx.y (one n-tile of <=8 tokens).
+// Determinism: the E8P_MM_WARPS warps split K; each warp writes its own scratch plane
+// scratch[warpId*B*N + ...] (no atomics, planes disjoint by warpId, rows disjoint by
+// block) and glq_reduce_splits_2d_e8p_kernel sums the planes in fixed order.
 __global__ static void glq_decode_matmul_e8p_kernel(
-    float *__restrict__ output,            // (B, N) fp32, pre-zeroed
+    float *__restrict__ scratch,           // (E8P_MM_WARPS, B, N) fp32 k-split planes
     const uint32_t *__restrict__ input,    // (B, K) fp16 viewed as (B, K/2) uint32
     const uint2 *__restrict__ weights_compressed,
     const uint32_t *__restrict__ codebook_abs,
@@ -228,11 +252,12 @@ __global__ static void glq_decode_matmul_e8p_kernel(
     int tok_n = base + g;                   // token this lane loads into n-column g
     bool active = tok_n < B;
     const uint32_t *tok = input + (size_t)tok_n * K2;
+    size_t kplane = (size_t)warpId * B * N; // this warp's unique scratch plane
 
     for (int iin = blockIdx.x; iin < (N >> 4); iin += gridDim.x) {
         float z0 = 0.0, z1 = 0.0, z2 = 0.0, z3 = 0.0;
 
-        for (int iik = warpId; iik < (K >> 6); iik += 32) {
+        for (int iik = warpId; iik < (K >> 6); iik += E8P_MM_WARPS) {
             uint2 w_compr = weights_compressed[laneId + 32 * iik + K2 * iin];
             uint32_t a = w_compr.x;
             uint32_t b = w_compr.y;
@@ -308,18 +333,19 @@ __global__ static void glq_decode_matmul_e8p_kernel(
                 : "r"(w02), "r"(w12), "r"(w03), "r"(w13), "r"(xr6), "r"(xr7));
             }
         }
-        // z0=C[g,2t] z1=C[g,2t+1] z2=C[g+8,2t] z3=C[g+8,2t+1]; col n==token, row 2g/2g+1
+        // z0=C[g,2t] z1=C[g,2t+1] z2=C[g+8,2t] z3=C[g+8,2t+1]; col n==token, row 2g/2g+1.
+        // Plain stores to this warp's plane (unique slot) — no atomics → deterministic.
         int row_e = (iin << 4) + (g << 1);     // mma-row g    -> output feature 2g
         int row_o = row_e + 1;                 // mma-row g+8  -> output feature 2g+1
         int tok0 = base + (t << 1);            // n = 2t   -> z0,z2
         int tok1 = tok0 + 1;                   // n = 2t+1 -> z1,z3
         if (tok0 < B) {
-            atomicAdd(output + (size_t)tok0 * N + row_e, z0);
-            atomicAdd(output + (size_t)tok0 * N + row_o, z2);
+            scratch[kplane + (size_t)tok0 * N + row_e] = z0;
+            scratch[kplane + (size_t)tok0 * N + row_o] = z2;
         }
         if (tok1 < B) {
-            atomicAdd(output + (size_t)tok1 * N + row_e, z1);
-            atomicAdd(output + (size_t)tok1 * N + row_o, z3);
+            scratch[kplane + (size_t)tok1 * N + row_e] = z1;
+            scratch[kplane + (size_t)tok1 * N + row_o] = z3;
         }
     }
 }
@@ -347,7 +373,7 @@ torch::Tensor glq_matmul_e8p(
 
     at::DeviceGuard guard(x.device());
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    torch::Tensor output = torch::zeros({B, N}, options);
+    torch::Tensor output = torch::empty({B, N}, options);  // reduce overwrites every elem
 
     static int64_t grid_size = 0;
     if (grid_size == 0) {
@@ -358,13 +384,25 @@ torch::Tensor glq_matmul_e8p(
     int64_t n_tiles = (B + 7) >> 3;
     dim3 grid(grid_size, n_tiles);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
-    glq_decode_matmul_e8p_kernel<<<grid, dim3(32, 32), 0, stream>>>(
-        output.data_ptr<float>(),
+
+    // Deterministic scratch+reduce: E8P_MM_WARPS k-split planes, fixed-order summed.
+    size_t scratch_bytes = (size_t)E8P_MM_WARPS * B * N * sizeof(float);
+    float *scratch = (float *)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+    glq_decode_matmul_e8p_kernel<<<grid, dim3(32, E8P_MM_WARPS), 0, stream>>>(
+        scratch,
         (const uint32_t *)x.data_ptr<c10::Half>(),
         (const uint2 *)weights_compressed.data_ptr<int64_t>(),
         (const uint32_t *)codebook_abs.data_ptr<int32_t>(),
         N, K, B);
     E8P_ERRCHK(cudaPeekAtLastError());
+
+    int64_t BN = B * N;
+    int reduce_threads = 256;
+    int reduce_blocks = (int)((BN + reduce_threads - 1) / reduce_threads);
+    glq_reduce_splits_2d_e8p_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+        output.data_ptr<float>(), scratch, (int)BN, E8P_MM_WARPS);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
     return output;
 }
 
