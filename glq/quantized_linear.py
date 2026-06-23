@@ -540,9 +540,23 @@ class E8RHTLinear(nn.Module):
         # a multi-op chain inductor pads with copies. Covers stage-1 (2bpw) + E8P
         # stage-2 (4bpw) + E81B stage-2 (3bpw). E81B needs its grid; if it's absent
         # (e.g. codebook not cached) fall through to the multi-op path below.
-        if (_ops is not None and _GLQ_FUSED_E8P_ENABLED
-                and hasattr(_ops, "fused_linear_e8p")
-                and (not has_e81b or e81b_grid is not None)):
+        # Resolve the fused e8p op. Prefer the registered torch.op (traceable, so
+        # vLLM's cudagraph capture sees one node); fall back to the raw pybind
+        # binding when torch.ops.glq isn't registered — that is the case for a
+        # plain ``import glq.hf_integration`` run (the ops are registered by
+        # glq_vllm/custom_ops.py, only imported on the vLLM path). Both call the
+        # SAME block-diagonal-correct C++ kernel (glq_output_rht_blockdiag_cuda),
+        # so block-diag e8p works in HF eager too. The multi-op fallback below
+        # only handles single-block (pow2) RHT, so a multi-block m_pad/n_pad MUST
+        # go through here — otherwise it hits glq_output_rht_cuda with a non-pow2
+        # m_pad and reads out of bounds.
+        _fused = None
+        if _GLQ_FUSED_E8P_ENABLED:
+            if _ops is not None and hasattr(_ops, "fused_linear_e8p"):
+                _fused = _ops.fused_linear_e8p
+            elif hasattr(cuda, "glq_fused_linear_e8p_cuda"):
+                _fused = cuda.glq_fused_linear_e8p_cuda
+        if (_fused is not None and (not has_e81b or e81b_grid is not None)):
             q2 = Qidxs2_e8p if has_e8p2 else Qidxs_e8p.new_empty(0)
             q2b = Qidxs2_e81b if has_e81b else Qidxs_e8p.new_empty(0)
             cb_e81b = e81b_grid if has_e81b else SV.new_empty(0)
@@ -552,7 +566,7 @@ class E8RHTLinear(nn.Module):
             bm = blocks_m if blocks_m is not None else torch.tensor([m_pad], dtype=torch.int64)
             bnm = blocks_n_meta if blocks_n_meta is not None else SV.new_empty(0, dtype=torch.int32)
             bmm = blocks_m_meta if blocks_m_meta is not None else SV.new_empty(0, dtype=torch.int32)
-            y = _ops.fused_linear_e8p(
+            y = _fused(
                 x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, grid, cb_e81b,
                 bn, bm, bnm, bmm,
                 float(wscale), rs, in_features, out_features,
@@ -561,12 +575,13 @@ class E8RHTLinear(nn.Module):
                 y = y + bias.unsqueeze(0).to(out_dtype)
             return y
 
-        # Multi-op fallback (fused op disabled): single-block / pow2 RHT only — the
-        # standalone input/output RHT ops aren't block-diagonal-aware. Block-diag e8p
-        # requires the fused op above.
-        if blocks_n is not None and blocks_n.numel() > 1:
+        # Multi-op fallback (fused op force-disabled): single-block / pow2 RHT only —
+        # the standalone input/output RHT ops aren't block-diagonal-aware. Block-diag
+        # e8p requires the fused op above.
+        if ((blocks_n is not None and blocks_n.numel() > 1)
+                or (blocks_m is not None and blocks_m.numel() > 1)):
             raise RuntimeError(
-                "block-diagonal e8p requires the fused op (torch.ops.glq.fused_linear_e8p); "
+                "block-diagonal e8p requires the fused op (glq_fused_linear_e8p_cuda); "
                 "the multi-op fallback only supports single-block (pow2) RHT")
 
         # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
