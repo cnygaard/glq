@@ -328,19 +328,18 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
     W_f = W.float().to(dev)
     H_f = H.float().to(dev)
 
-    # E8P's tensor-core decode packs weights as (m_pad//16, n_pad//64, 8, 4), so the
-    # RHT must pad to a single power of 2 (n_pad÷64, m_pad÷16) rather than the
-    # block-diagonal sum-of-pow2 layout the shell kernels use.
+    # E8P's tensor-core decode packs weights as (m_pad//16, n_pad//64, 8, 4), so the RHT
+    # must keep n_pad a multiple of 64 (cols) and m_pad a multiple of 16 (rows). RHT(e8p=True)
+    # uses a block-diagonal decomposition floored to those multiples — minimal padding instead
+    # of padding the whole dim to the next power of 2 (e.g. gemma-4-31B "3bpw" 27GB -> ~11GB).
     is_e8p = getattr(codebook, 'is_e8p', False)
-    if is_e8p:
-        block_diagonal = False
 
     # Dampen Hessian diagonal for numerical stability
     damp = 0.01 * torch.mean(torch.diag(H_f))
     diag = torch.arange(H_f.shape[-1], device=dev)
     H_f[diag, diag] += damp
 
-    rht = RHT(m, n, device=dev, block_diagonal=block_diagonal, apply_left=apply_left)
+    rht = RHT(m, n, device=dev, block_diagonal=block_diagonal, apply_left=apply_left, e8p=is_e8p)
     W_tilde = rht.transform_weights(W_f)
     H_tilde = rht.transform_hessian(H_f)
 

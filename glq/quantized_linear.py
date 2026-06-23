@@ -154,9 +154,18 @@ class E8RHTLinear(nn.Module):
         # forward early-returns into _forward_e8p, leaving the shell path intact.
         self._is_e8p = (codebook_type == "e8p")
         if self._is_e8p:
-            block_diagonal = False
-
-        if block_diagonal:
+            # e8p is block-diagonal too, but its qidxs tile layout needs n_pad a
+            # multiple of 64 / m_pad a multiple of 16, so floor the smallest block.
+            # (Legacy pow2 e8p checkpoints load fine: _load_from_state_dict re-derives
+            # n_pad/m_pad/blocks from the loaded Qidxs_e8p shape — a pow2 n_pad decomposes
+            # to a single block → the full-RHT path, unchanged.)
+            from .hadamard import _block_decompose_min
+            self.blocks_m = _block_decompose_min(out_features, 16)
+            self.blocks_n = _block_decompose_min(in_features, 64)
+            self.m_pad = sum(self.blocks_m)
+            self.n_pad = sum(self.blocks_n)
+            block_diagonal = len(self.blocks_n) > 1 or len(self.blocks_m) > 1
+        elif block_diagonal:
             from .hadamard import _block_decompose
             self.blocks_m = _block_decompose(out_features)
             self.blocks_n = _block_decompose(in_features)

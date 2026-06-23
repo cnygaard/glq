@@ -1,7 +1,8 @@
 """Randomized Hadamard Transform (RHT) for incoherence processing."""
 
 import torch
-from .hadamard import fast_hadamard_transform, block_diagonal_fht, _block_decompose
+from .hadamard import (fast_hadamard_transform, block_diagonal_fht,
+                       _block_decompose, _block_decompose_min)
 
 
 def _next_pow2(n):
@@ -37,16 +38,25 @@ class RHT:
     """
 
     def __init__(self, m: int, n: int, device='cpu', seed=42,
-                 block_diagonal: bool = True, apply_left: bool = True):
+                 block_diagonal: bool = True, apply_left: bool = True,
+                 e8p: bool = False):
         self.m_orig, self.n_orig = m, n
         self.device = device
-        self.block_diagonal = block_diagonal
+        self.block_diagonal = block_diagonal or e8p
         # When apply_left=False, the row-direction (SU + left FHT) is omitted
         # so rows of the transformed matrix stay independent — required for
         # per-row gather such as embedding lookup.
         self.apply_left = apply_left
 
-        if block_diagonal:
+        if e8p:
+            # e8p tensor-core path: block-diagonal (no pow2 pad) but the qidxs tile
+            # layout needs n_pad a multiple of 64 (cols) and m_pad a multiple of 16
+            # (rows), so floor the smallest block accordingly.
+            self.blocks_m = _block_decompose_min(m, 16)
+            self.blocks_n = _block_decompose_min(n, 64)
+            self.m_pad = sum(self.blocks_m)
+            self.n_pad = sum(self.blocks_n)
+        elif block_diagonal:
             self.blocks_m = _block_decompose(m)
             self.blocks_n = _block_decompose(n)
             self.m_pad = sum(self.blocks_m)  # = m (no padding)
