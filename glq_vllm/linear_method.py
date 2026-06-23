@@ -156,6 +156,15 @@ def _glq_pad(n):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def _e8p_pad(d, min_block):
+    """e8p block-diagonal padded dim = sum of pow2 blocks each >= min_block (a multiple of
+    min_block). For an already-pow2 dim this equals _glq_pad. Sizing the e8p create_weights
+    buffers at this (the checkpoint) shape lets the loader take the in-place copy_ branch so
+    the post-load .data→GPU move sticks (vLLM reverts moves on shape-mismatch replacements)."""
+    from glq.hadamard import _block_decompose_min
+    return sum(_block_decompose_min(d, min_block))
+
+
 def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
@@ -557,23 +566,16 @@ def _glq_apply_e8p(x, layer):
     """E8P apply: one validated, torch.ops-dispatched (cudagraph-capturable) call per
     (shard), reusing E8RHTLinear._e8p_linear_apply. Single layer → one call; fused QKV/
     gate_up → one call per shard, concatenated (mirrors the shell fused loop)."""
-    from glq.quantized_linear import E8RHTLinear, _pack_block_meta
-    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import E8RHTLinear
     _apply = E8RHTLinear._e8p_linear_apply
     grid = layer._glq_e8p_grid
     e81b_grid = layer._glq_e81b_grid
 
+    # Block-diagonal RHT tensors are precomputed once in _setup_e8p_weights
+    # (before compile/capture) and held on each meta dict, so dynamo lifts them
+    # as frozen constants rather than tracing a per-forward torch.tensor alloc.
+    # A pow2 n_pad decomposes to a single block → the C++ op takes the full RHT.
     def _blocks(meta):
-        # Block-diagonal RHT tensors derived from the (block-diag-sized) n_pad/m_pad and
-        # cached per device. A pow2 n_pad decomposes to a single block → full RHT (unchanged).
-        if meta.get('_bn_dev') != x.device:
-            bn = _block_decompose(meta['n_pad'])
-            bm = _block_decompose(meta['m_pad'])
-            meta['_bn'] = torch.tensor(bn, dtype=torch.int64)
-            meta['_bm'] = torch.tensor(bm, dtype=torch.int64)
-            meta['_bnm'] = _pack_block_meta(bn).to(x.device)
-            meta['_bmm'] = _pack_block_meta(bm).to(x.device)
-            meta['_bn_dev'] = x.device
         return meta['_bn'], meta['_bm'], meta['_bnm'], meta['_bmm']
 
     if getattr(layer, 'glq_is_fused', False):
@@ -647,7 +649,7 @@ class GLQLinearMethod(LinearMethodBase):
             # are replaced by the loaded q/k/v (or gate/up) Qidxs_e8p on load.
             layer.glq_shard_sizes = output_partition_sizes
             layer.glq_num_shards = len(output_partition_sizes)
-            n_pad = _glq_pad(input_size_per_partition)
+            n_pad = _e8p_pad(input_size_per_partition, 64)
             ops = output_partition_sizes
             layer.Qidxs_e8p = GLQShardedParameter(ops, 1, torch.int64,
                                                   weight_loader=weight_loader, sentinel=True)
@@ -719,7 +721,8 @@ class GLQLinearMethod(LinearMethodBase):
             out_sz = sum(output_partition_sizes)
             layer.glq_out_features = out_sz
             if is_e8p:
-                m_pad, n_pad = _glq_pad(out_sz), _glq_pad(input_size_per_partition)
+                # Block-diagonal dims (= the checkpoint shape; equals _glq_pad for pow2 dims).
+                m_pad, n_pad = _e8p_pad(out_sz, 16), _e8p_pad(input_size_per_partition, 64)
                 mp16, nb64 = max(m_pad // 16, 1), max(n_pad // 64, 1)
                 layer.Qidxs_e8p = _make_glq_param(
                     torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64))
@@ -932,7 +935,9 @@ class GLQLinearMethod(LinearMethodBase):
                 pass
 
     def _setup_e8p_weights(self, layer, device):
-        """e8p: cache codebook grids + per-(shard) scalars/flags. Pow2-padded (no block-diag)."""
+        """e8p: cache codebook grids + per-(shard) scalars/flags. Block-diag dims are read
+        back from the loaded Qidxs shape in ``_meta`` (m_pad=rows*16, n_pad=cols*64), so a
+        block-diag or a legacy pow2 checkpoint both resolve to their stored padded dims."""
         grid_cb, e81b_cb = _ensure_codebook(device, max_bpw=4, codebook_type="e8p")
         _try_load_cuda_ext()
         layer._glq_e8p_grid = grid_cb.grid_packed_abs.to(device)
@@ -980,6 +985,26 @@ class GLQLinearMethod(LinearMethodBase):
             layer._glq_e8p_meta = [_meta(
                 layer.Qidxs_e8p, layer.Qidxs2_e8p, layer.Qidxs2_e81b,
                 layer.Wscale.item(), layer.inv_resid_scale.item(), layer.glq_out_features)]
+
+        # Precompute the block-diagonal RHT tensors ONCE, here in
+        # process_weights_after_loading — *before* torch.compile/cudagraph
+        # capture — mirroring the shell block-diag path (``_glq_bd_meta``).
+        # Building them lazily inside apply() would make dynamo trace the
+        # ``torch.tensor(...)`` CPU allocation into the captured graph, and the
+        # resulting CPU tensor triggers "Cannot copy between CPU and CUDA
+        # tensors during CUDA graph capture". As stable layer-held constants the
+        # inductor pass lifts them as frozen graph inputs instead. ``_bn``/``_bm``
+        # stay on CPU (the C++ op reads block sizes host-side via data_ptr); the
+        # packed ``_bnm``/``_bmm`` are GPU int32 (the multiblock kernel reads them).
+        from glq.hadamard import _block_decompose as _bd
+        from glq.quantized_linear import _pack_block_meta as _pbm
+        for meta in layer._glq_e8p_meta:
+            bn = _bd(meta['n_pad'])
+            bm = _bd(meta['m_pad'])
+            meta['_bn'] = torch.tensor(bn, dtype=torch.int64, device='cpu')
+            meta['_bm'] = torch.tensor(bm, dtype=torch.int64, device='cpu')
+            meta['_bnm'] = _pbm(bn).to(device)
+            meta['_bmm'] = _pbm(bm).to(device)
 
         # Drop weight_loaders (function refs break vLLM v1 serialization).
         for _name, param in layer.named_parameters():
