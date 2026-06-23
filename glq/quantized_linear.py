@@ -473,6 +473,28 @@ class E8RHTLinear(nn.Module):
         (decode_matvec_e8p) and WMMA (lookupmatmul_e81b_k8) matvec kernels; B>1
         decompresses the weight and runs a dense matmul (prefill / PPL).
         """
+        # Re-derive padded dims + block structure from the LOADED Qidxs_e8p shape
+        # (once). __init__ sizes these from in/out_features assuming block-diag, but
+        # the checkpoint is authoritative: a legacy pow2 e8p checkpoint has
+        # n_pad/m_pad padded to the next power of two (one full-Hadamard block),
+        # while a block-diag checkpoint matches __init__. Covers every load path
+        # incl. accelerate device_map dispatch (which bypasses _load_from_state_dict).
+        # _block_decompose(pow2) == [pow2] → single block → full RHT, so both formats
+        # resolve correctly and the TC kernel's K==Qidxs.cols*64 check passes.
+        actual_n = self.Qidxs_e8p.shape[1] * 64
+        actual_m = self.Qidxs_e8p.shape[0] * 16
+        if actual_n != self.n_pad or actual_m != self.m_pad:
+            from .hadamard import _block_decompose
+            self.n_pad, self.m_pad = actual_n, actual_m
+            self.blocks_n = _block_decompose(actual_n)
+            self.blocks_m = _block_decompose(actual_m)
+            self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+            self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+            self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+            self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+            self._blocks_n_meta_gpu = None
+            self._blocks_m_meta_gpu = None
+
         # Resolve cached scalars / grids / stage-flags once (lazily for layers on
         # meta at set_codebook time). After this the shared core has no host syncs.
         if self._wscale_float is None:
