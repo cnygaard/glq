@@ -267,6 +267,14 @@ class E8RHTLinear(nn.Module):
         self._e8p_has_e81b = False
         self._e8p_grid_dev = None   # cached grid_packed_abs on the compute device
         self._e81b_grid_dev = None  # cached e81b_grid on the compute device
+        # Block-diagonal RHT metadata for the fused e8p op (single block = full pow2 RHT).
+        # CPU int64 block sizes + packed int4 meta (pushed to GPU lazily in forward).
+        self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+        self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+        self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+        self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+        self._blocks_n_meta_gpu = None
+        self._blocks_m_meta_gpu = None
 
     @property
     def weight(self):
@@ -477,19 +485,29 @@ class E8RHTLinear(nn.Module):
             self._e8p_has_stage2 = self.Qidxs2_e8p.numel() > 0
             self._e8p_has_e81b = self.Qidxs2_e81b.numel() > 0
 
+        # Block-diagonal RHT meta → GPU (lazy, device-cached; single block = full pow2 RHT)
+        if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
+            self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
+            self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
+
         shape = x.shape
         x2d = x.reshape(-1, self.in_features)
         y = self._e8p_linear_apply(
             x2d, self.SV, self.SU, self.Qidxs_e8p, self.Qidxs2_e8p, self.Qidxs2_e81b,
             self._e8p_grid_dev, self._e81b_grid_dev, self._wscale_float, self._inv_rs_float,
             self._e8p_has_stage2, self._e8p_has_e81b, self.in_features, self.out_features,
-            self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype)
+            self.n_pad, self.m_pad,
+            self._blocks_n_tensor, self._blocks_m_tensor,
+            self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
+            bias=self.bias, out_dtype=x.dtype)
         return y.reshape(*shape[:-1], self.out_features)
 
     @staticmethod
     def _e8p_linear_apply(x2d, SV, SU, Qidxs_e8p, Qidxs2_e8p, Qidxs2_e81b, grid, e81b_grid,
                           wscale, inv_rs, has_e8p2, has_e81b, in_features, out_features,
-                          n_pad, m_pad, bias=None, out_dtype=torch.float16):
+                          n_pad, m_pad, blocks_n=None, blocks_m=None,
+                          blocks_n_meta=None, blocks_m_meta=None,
+                          bias=None, out_dtype=torch.float16):
         """Capture-safe E8P linear core: input_rht → N× TC-GEMV decode → ×Wscale → output_rht.
 
         x2d: (B, in_features) → (B, out_features) in out_dtype, bias applied. Prefers the
@@ -529,13 +547,27 @@ class E8RHTLinear(nn.Module):
             q2b = Qidxs2_e81b if has_e81b else Qidxs_e8p.new_empty(0)
             cb_e81b = e81b_grid if has_e81b else SV.new_empty(0)
             rs = float(inv_rs) if (has_e8p2 or has_e81b) else 0.0
+            # Block-diagonal RHT structure (single block [n_pad] = full pow2 RHT).
+            bn = blocks_n if blocks_n is not None else torch.tensor([n_pad], dtype=torch.int64)
+            bm = blocks_m if blocks_m is not None else torch.tensor([m_pad], dtype=torch.int64)
+            bnm = blocks_n_meta if blocks_n_meta is not None else SV.new_empty(0, dtype=torch.int32)
+            bmm = blocks_m_meta if blocks_m_meta is not None else SV.new_empty(0, dtype=torch.int32)
             y = _ops.fused_linear_e8p(
                 x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, grid, cb_e81b,
+                bn, bm, bnm, bmm,
                 float(wscale), rs, in_features, out_features,
                 n_pad, m_pad, log_n, log_m).to(out_dtype)
             if bias is not None:
                 y = y + bias.unsqueeze(0).to(out_dtype)
             return y
+
+        # Multi-op fallback (fused op disabled): single-block / pow2 RHT only — the
+        # standalone input/output RHT ops aren't block-diagonal-aware. Block-diag e8p
+        # requires the fused op above.
+        if blocks_n is not None and blocks_n.numel() > 1:
+            raise RuntimeError(
+                "block-diagonal e8p requires the fused op (torch.ops.glq.fused_linear_e8p); "
+                "the multi-op fallback only supports single-block (pow2) RHT")
 
         # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
         x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=dev)

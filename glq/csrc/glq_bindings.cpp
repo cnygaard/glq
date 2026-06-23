@@ -197,11 +197,14 @@ void glq_lookupmatmul_e81b_k8(
     torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z);
 void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y);
 
-// Fused E8P linear (defined in glq_cuda.cu): input_rht + N-stage decode/matmul + output_rht
+// Fused E8P linear (defined in glq_cuda.cu): input_rht + N-stage decode/matmul + output_rht.
+// blocks_n/blocks_m + *_meta carry the block-diagonal RHT structure (single-block = full pow2 RHT).
 torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
     torch::Tensor qidxs_e8p, torch::Tensor qidxs2_e8p, torch::Tensor qidxs2_e81b,
     torch::Tensor codebook_abs, torch::Tensor e81b_codebook,
+    torch::Tensor blocks_n, torch::Tensor blocks_m,
+    torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
     double wscale, double inv_resid_scale,
     int64_t in_features, int64_t out_features,
     int64_t n_pad, int64_t m_pad, int64_t log_n, int64_t log_m);

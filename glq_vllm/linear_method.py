@@ -557,26 +557,45 @@ def _glq_apply_e8p(x, layer):
     """E8P apply: one validated, torch.ops-dispatched (cudagraph-capturable) call per
     (shard), reusing E8RHTLinear._e8p_linear_apply. Single layer → one call; fused QKV/
     gate_up → one call per shard, concatenated (mirrors the shell fused loop)."""
-    from glq.quantized_linear import E8RHTLinear
+    from glq.quantized_linear import E8RHTLinear, _pack_block_meta
+    from glq.hadamard import _block_decompose
     _apply = E8RHTLinear._e8p_linear_apply
     grid = layer._glq_e8p_grid
     e81b_grid = layer._glq_e81b_grid
+
+    def _blocks(meta):
+        # Block-diagonal RHT tensors derived from the (block-diag-sized) n_pad/m_pad and
+        # cached per device. A pow2 n_pad decomposes to a single block → full RHT (unchanged).
+        if meta.get('_bn_dev') != x.device:
+            bn = _block_decompose(meta['n_pad'])
+            bm = _block_decompose(meta['m_pad'])
+            meta['_bn'] = torch.tensor(bn, dtype=torch.int64)
+            meta['_bm'] = torch.tensor(bm, dtype=torch.int64)
+            meta['_bnm'] = _pack_block_meta(bn).to(x.device)
+            meta['_bmm'] = _pack_block_meta(bm).to(x.device)
+            meta['_bn_dev'] = x.device
+        return meta['_bn'], meta['_bm'], meta['_bnm'], meta['_bmm']
+
     if getattr(layer, 'glq_is_fused', False):
         outs = []
         for i, meta in enumerate(layer._glq_e8p_meta):
+            bn, bm, bnm, bmm = _blocks(meta)
             outs.append(_apply(
                 x, layer.SV.get_shard(i), layer.SU.get_shard(i),
                 layer.Qidxs_e8p.get_shard(i), layer.Qidxs2_e8p.get_shard(i),
                 layer.Qidxs2_e81b.get_shard(i), grid, e81b_grid,
                 meta['wscale'], meta['inv_rs'], meta['has_e8p2'], meta['has_e81b'],
                 meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
+                bn, bm, bnm, bmm,
                 bias=None, out_dtype=x.dtype))
         return torch.cat(outs, dim=-1)
     meta = layer._glq_e8p_meta[0]
+    bn, bm, bnm, bmm = _blocks(meta)
     return _apply(
         x, layer.SV, layer.SU, layer.Qidxs_e8p, layer.Qidxs2_e8p, layer.Qidxs2_e81b,
         grid, e81b_grid, meta['wscale'], meta['inv_rs'], meta['has_e8p2'], meta['has_e81b'],
-        meta['in'], meta['out'], meta['n_pad'], meta['m_pad'], bias=None, out_dtype=x.dtype)
+        meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
+        bn, bm, bnm, bmm, bias=None, out_dtype=x.dtype)
 
 
 class GLQLinearMethod(LinearMethodBase):
