@@ -154,9 +154,18 @@ class E8RHTLinear(nn.Module):
         # forward early-returns into _forward_e8p, leaving the shell path intact.
         self._is_e8p = (codebook_type == "e8p")
         if self._is_e8p:
-            block_diagonal = False
-
-        if block_diagonal:
+            # e8p is block-diagonal too, but its qidxs tile layout needs n_pad a
+            # multiple of 64 / m_pad a multiple of 16, so floor the smallest block.
+            # (Legacy pow2 e8p checkpoints load fine: _load_from_state_dict re-derives
+            # n_pad/m_pad/blocks from the loaded Qidxs_e8p shape — a pow2 n_pad decomposes
+            # to a single block → the full-RHT path, unchanged.)
+            from .hadamard import _block_decompose_min
+            self.blocks_m = _block_decompose_min(out_features, 16)
+            self.blocks_n = _block_decompose_min(in_features, 64)
+            self.m_pad = sum(self.blocks_m)
+            self.n_pad = sum(self.blocks_n)
+            block_diagonal = len(self.blocks_n) > 1 or len(self.blocks_m) > 1
+        elif block_diagonal:
             from .hadamard import _block_decompose
             self.blocks_m = _block_decompose(out_features)
             self.blocks_n = _block_decompose(in_features)
@@ -258,6 +267,14 @@ class E8RHTLinear(nn.Module):
         self._e8p_has_e81b = False
         self._e8p_grid_dev = None   # cached grid_packed_abs on the compute device
         self._e81b_grid_dev = None  # cached e81b_grid on the compute device
+        # Block-diagonal RHT metadata for the fused e8p op (single block = full pow2 RHT).
+        # CPU int64 block sizes + packed int4 meta (pushed to GPU lazily in forward).
+        self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+        self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+        self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+        self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+        self._blocks_n_meta_gpu = None
+        self._blocks_m_meta_gpu = None
 
     @property
     def weight(self):
@@ -456,6 +473,28 @@ class E8RHTLinear(nn.Module):
         (decode_matvec_e8p) and WMMA (lookupmatmul_e81b_k8) matvec kernels; B>1
         decompresses the weight and runs a dense matmul (prefill / PPL).
         """
+        # Re-derive padded dims + block structure from the LOADED Qidxs_e8p shape
+        # (once). __init__ sizes these from in/out_features assuming block-diag, but
+        # the checkpoint is authoritative: a legacy pow2 e8p checkpoint has
+        # n_pad/m_pad padded to the next power of two (one full-Hadamard block),
+        # while a block-diag checkpoint matches __init__. Covers every load path
+        # incl. accelerate device_map dispatch (which bypasses _load_from_state_dict).
+        # _block_decompose(pow2) == [pow2] → single block → full RHT, so both formats
+        # resolve correctly and the TC kernel's K==Qidxs.cols*64 check passes.
+        actual_n = self.Qidxs_e8p.shape[1] * 64
+        actual_m = self.Qidxs_e8p.shape[0] * 16
+        if actual_n != self.n_pad or actual_m != self.m_pad:
+            from .hadamard import _block_decompose
+            self.n_pad, self.m_pad = actual_n, actual_m
+            self.blocks_n = _block_decompose(actual_n)
+            self.blocks_m = _block_decompose(actual_m)
+            self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+            self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+            self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+            self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+            self._blocks_n_meta_gpu = None
+            self._blocks_m_meta_gpu = None
+
         # Resolve cached scalars / grids / stage-flags once (lazily for layers on
         # meta at set_codebook time). After this the shared core has no host syncs.
         if self._wscale_float is None:
@@ -468,19 +507,29 @@ class E8RHTLinear(nn.Module):
             self._e8p_has_stage2 = self.Qidxs2_e8p.numel() > 0
             self._e8p_has_e81b = self.Qidxs2_e81b.numel() > 0
 
+        # Block-diagonal RHT meta → GPU (lazy, device-cached; single block = full pow2 RHT)
+        if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
+            self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
+            self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
+
         shape = x.shape
         x2d = x.reshape(-1, self.in_features)
         y = self._e8p_linear_apply(
             x2d, self.SV, self.SU, self.Qidxs_e8p, self.Qidxs2_e8p, self.Qidxs2_e81b,
             self._e8p_grid_dev, self._e81b_grid_dev, self._wscale_float, self._inv_rs_float,
             self._e8p_has_stage2, self._e8p_has_e81b, self.in_features, self.out_features,
-            self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype)
+            self.n_pad, self.m_pad,
+            self._blocks_n_tensor, self._blocks_m_tensor,
+            self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
+            bias=self.bias, out_dtype=x.dtype)
         return y.reshape(*shape[:-1], self.out_features)
 
     @staticmethod
     def _e8p_linear_apply(x2d, SV, SU, Qidxs_e8p, Qidxs2_e8p, Qidxs2_e81b, grid, e81b_grid,
                           wscale, inv_rs, has_e8p2, has_e81b, in_features, out_features,
-                          n_pad, m_pad, bias=None, out_dtype=torch.float16):
+                          n_pad, m_pad, blocks_n=None, blocks_m=None,
+                          blocks_n_meta=None, blocks_m_meta=None,
+                          bias=None, out_dtype=torch.float16):
         """Capture-safe E8P linear core: input_rht → N× TC-GEMV decode → ×Wscale → output_rht.
 
         x2d: (B, in_features) → (B, out_features) in out_dtype, bias applied. Prefers the
@@ -513,20 +562,49 @@ class E8RHTLinear(nn.Module):
         # a multi-op chain inductor pads with copies. Covers stage-1 (2bpw) + E8P
         # stage-2 (4bpw) + E81B stage-2 (3bpw). E81B needs its grid; if it's absent
         # (e.g. codebook not cached) fall through to the multi-op path below.
-        if (_ops is not None and _GLQ_FUSED_E8P_ENABLED
-                and hasattr(_ops, "fused_linear_e8p")
-                and (not has_e81b or e81b_grid is not None)):
+        # Resolve the fused e8p op. Prefer the registered torch.op (traceable, so
+        # vLLM's cudagraph capture sees one node); fall back to the raw pybind
+        # binding when torch.ops.glq isn't registered — that is the case for a
+        # plain ``import glq.hf_integration`` run (the ops are registered by
+        # glq_vllm/custom_ops.py, only imported on the vLLM path). Both call the
+        # SAME block-diagonal-correct C++ kernel (glq_output_rht_blockdiag_cuda),
+        # so block-diag e8p works in HF eager too. The multi-op fallback below
+        # only handles single-block (pow2) RHT, so a multi-block m_pad/n_pad MUST
+        # go through here — otherwise it hits glq_output_rht_cuda with a non-pow2
+        # m_pad and reads out of bounds.
+        _fused = None
+        if _GLQ_FUSED_E8P_ENABLED:
+            if _ops is not None and hasattr(_ops, "fused_linear_e8p"):
+                _fused = _ops.fused_linear_e8p
+            elif hasattr(cuda, "glq_fused_linear_e8p_cuda"):
+                _fused = cuda.glq_fused_linear_e8p_cuda
+        if (_fused is not None and (not has_e81b or e81b_grid is not None)):
             q2 = Qidxs2_e8p if has_e8p2 else Qidxs_e8p.new_empty(0)
             q2b = Qidxs2_e81b if has_e81b else Qidxs_e8p.new_empty(0)
             cb_e81b = e81b_grid if has_e81b else SV.new_empty(0)
             rs = float(inv_rs) if (has_e8p2 or has_e81b) else 0.0
-            y = _ops.fused_linear_e8p(
+            # Block-diagonal RHT structure (single block [n_pad] = full pow2 RHT).
+            bn = blocks_n if blocks_n is not None else torch.tensor([n_pad], dtype=torch.int64)
+            bm = blocks_m if blocks_m is not None else torch.tensor([m_pad], dtype=torch.int64)
+            bnm = blocks_n_meta if blocks_n_meta is not None else SV.new_empty(0, dtype=torch.int32)
+            bmm = blocks_m_meta if blocks_m_meta is not None else SV.new_empty(0, dtype=torch.int32)
+            y = _fused(
                 x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, grid, cb_e81b,
+                bn, bm, bnm, bmm,
                 float(wscale), rs, in_features, out_features,
                 n_pad, m_pad, log_n, log_m).to(out_dtype)
             if bias is not None:
                 y = y + bias.unsqueeze(0).to(out_dtype)
             return y
+
+        # Multi-op fallback (fused op force-disabled): single-block / pow2 RHT only —
+        # the standalone input/output RHT ops aren't block-diagonal-aware. Block-diag
+        # e8p requires the fused op above.
+        if ((blocks_n is not None and blocks_n.numel() > 1)
+                or (blocks_m is not None and blocks_m.numel() > 1)):
+            raise RuntimeError(
+                "block-diagonal e8p requires the fused op (glq_fused_linear_e8p_cuda); "
+                "the multi-op fallback only supports single-block (pow2) RHT")
 
         # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
         x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=dev)

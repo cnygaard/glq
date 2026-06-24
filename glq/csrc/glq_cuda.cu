@@ -2753,6 +2753,114 @@ void glq_lookupmatmul_e81b_k8(
     torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z);
 void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y);
 
+// ── Block-diagonal RHT host helpers (shared by the shell block-diag fused op and the
+// thin e8p fused op). A single block (legacy pow2 / already-pow2 dim) falls back to the
+// full-dim glq_input/output_rht_cuda; multiple pow2 blocks use the multiblock FHT (or a
+// per-block loop when a block is too large for the multiblock smem). Lifted verbatim from
+// glq_fused_linear_block_diag_cuda's inlined Step 1 / Step 3 so the e8p op stays thin. ──
+void glq_input_rht_blockdiag_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor x_rht,
+    int in_features, int n_pad,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta
+) {
+    int num_n_blocks = blocks_n.size(0);
+    if (num_n_blocks <= 1) {
+        glq_input_rht_cuda(x.contiguous(), sv, x_rht, in_features, in_features,
+                           1.0f / sqrtf((float)n_pad), n_pad, __builtin_ctz((unsigned)n_pad));
+        return;
+    }
+    int B = x.size(0);
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const half* x_ptr = (const half*)x.data_ptr<c10::Half>();
+    const half* sv_ptr = (const half*)sv.data_ptr<c10::Half>();
+    float* x_rht_ptr = x_rht.data_ptr<float>();
+    int64_t* bn = blocks_n.data_ptr<int64_t>();
+    int max_bs_n = 0;
+    for (int bi = 0; bi < num_n_blocks; bi++) { int bs = (int)bn[bi]; if (bs > max_bs_n) max_bs_n = bs; }
+    bool use_multiblock = (max_bs_n <= 8192) && (blocks_n_meta.numel() > 0) && blocks_n_meta.is_cuda();
+    if (use_multiblock) {
+        int threads = min(max_bs_n, 1024);
+        int smem = 2 * max_bs_n * (int)sizeof(float);
+        if (smem > 48 * 1024)
+            cudaFuncSetAttribute(glq_input_rht_multiblock_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        dim3 grid(B, num_n_blocks);
+        glq_input_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
+            x_ptr, sv_ptr, x_rht_ptr, in_features, in_features, n_pad,
+            (const int4*)blocks_n_meta.data_ptr<int32_t>());
+    } else {
+        int col_offset = 0;
+        for (int bi = 0; bi < num_n_blocks; bi++) {
+            int bs = (int)bn[bi];
+            int log_bs = __builtin_ctz((unsigned)bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024)
+                cudaFuncSetAttribute(glq_input_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            glq_input_rht_kernel<<<B, threads, smem, stream>>>(
+                x_ptr, sv_ptr, x_rht_ptr, in_features, in_features,
+                1.0f / sqrtf((float)bs), bs, log_bs, use_single, col_offset, n_pad);
+            col_offset += bs;
+        }
+    }
+}
+
+void glq_output_rht_blockdiag_cuda(
+    torch::Tensor y_rht, torch::Tensor su, torch::Tensor y,
+    int out_features, int m_pad,
+    torch::Tensor blocks_m, torch::Tensor blocks_m_meta
+) {
+    int num_m_blocks = blocks_m.size(0);
+    if (num_m_blocks <= 1) {
+        glq_output_rht_cuda(y_rht, su, y, out_features, m_pad,
+                            __builtin_ctz((unsigned)m_pad), 1.0f / sqrtf((float)m_pad));
+        return;
+    }
+    int B = y_rht.size(0);
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const half* su_ptr = (const half*)su.data_ptr<c10::Half>();
+    half* y_ptr = (half*)y.data_ptr<c10::Half>();
+    float* y_rht_ptr = y_rht.data_ptr<float>();
+    int64_t* bm = blocks_m.data_ptr<int64_t>();
+    int max_bs_m = 0;
+    for (int bi = 0; bi < num_m_blocks; bi++) { int bs = (int)bm[bi]; if (bs > max_bs_m) max_bs_m = bs; }
+    bool use_multiblock = (max_bs_m <= 8192) && (blocks_m_meta.numel() > 0) && blocks_m_meta.is_cuda();
+    if (use_multiblock) {
+        int threads = min(max_bs_m, 1024);
+        int smem = 2 * max_bs_m * (int)sizeof(float);
+        if (smem > 48 * 1024)
+            cudaFuncSetAttribute(glq_output_rht_multiblock_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        dim3 grid(B, num_m_blocks);
+        glq_output_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
+            y_rht_ptr, su_ptr, y_ptr, out_features, m_pad, out_features,
+            (const int4*)blocks_m_meta.data_ptr<int32_t>());
+    } else {
+        int col_offset = 0;
+        for (int bi = 0; bi < num_m_blocks; bi++) {
+            int bs = (int)bm[bi];
+            int log_bs = __builtin_ctz((unsigned)bs);
+            int threads = min(bs, 1024);
+            int double_buf = 2 * bs * (int)sizeof(float);
+            int single_buf = bs * (int)sizeof(float);
+            int use_single = (double_buf > 96 * 1024) ? 1 : 0;
+            int smem = use_single ? single_buf : double_buf;
+            if (smem > 48 * 1024)
+                cudaFuncSetAttribute(glq_output_rht_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            glq_output_rht_kernel<<<B, threads, smem, stream>>>(
+                y_rht_ptr, su_ptr, y_ptr, out_features, bs, log_bs,
+                1.0f / sqrtf((float)bs), use_single, col_offset, m_pad, out_features);
+            col_offset += bs;
+        }
+    }
+}
+
+
 torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor x,            // (B, in_features) fp16, contiguous
     torch::Tensor sv,           // (n_pad,) fp16 — input RHT sign vector
@@ -2762,6 +2870,10 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor qidxs2_e81b,  // empty or (m_pad, n_pad//64) int64 — E81B stage-2 (3bpw)
     torch::Tensor codebook_abs, // (256,) int32 — grid_packed_abs (E8P)
     torch::Tensor e81b_codebook,// empty or (256, 8) fp16 — E81B grid
+    torch::Tensor blocks_n,     // (num_n_blocks,) int64 CPU — input RHT block sizes
+    torch::Tensor blocks_m,     // (num_m_blocks,) int64 CPU — output RHT block sizes
+    torch::Tensor blocks_n_meta,// (num_n_blocks, 4) int32 GPU — packed block meta (or empty)
+    torch::Tensor blocks_m_meta,// (num_m_blocks, 4) int32 GPU
     double wscale,
     double inv_resid_scale,
     int64_t in_features,
@@ -2778,12 +2890,11 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     bool has_e81b = (qidxs2_e81b.numel() > 0 && inv_resid_scale != 0.0);
     at::DeviceGuard guard(x.device());
 
-    // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
+    // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 (block-diagonal or full) ----
     auto x_rht = torch::empty({B, (long)n_pad},
                               torch::dtype(torch::kFloat32).device(x.device()));
-    float rsqrt_n = 1.0f / sqrtf((float)n_pad);
-    glq_input_rht_cuda(x.contiguous(), sv, x_rht,
-                       (int)in_features, (int)in_features, rsqrt_n, (int)n_pad, (int)log_n);
+    glq_input_rht_blockdiag_cuda(x.contiguous(), sv, x_rht,
+                                 (int)in_features, (int)n_pad, blocks_n, blocks_n_meta);
 
     // ---- Step 2: decode + matmul in the RHT domain → y_rht (B, m_pad) fp32 ----
     torch::Tensor y_rht;
@@ -2845,11 +2956,11 @@ torch::Tensor glq_fused_linear_e8p_cuda(
         y_rht = (y_rht * (float)wscale).contiguous();           // (B, m_pad) fp32
     }
 
-    // ---- Step 3: output RHT → y (B, out_features) fp16 ----
+    // ---- Step 3: output RHT → y (B, out_features) fp16 (block-diagonal or full) ----
     auto y = torch::empty({B, (long)out_features},
                           torch::dtype(torch::kFloat16).device(x.device()));
-    float rsqrt_m = 1.0f / sqrtf((float)m_pad);
-    glq_output_rht_cuda(y_rht, su, y, (int)out_features, (int)m_pad, (int)log_m, rsqrt_m);
+    glq_output_rht_blockdiag_cuda(y_rht, su, y, (int)out_features, (int)m_pad,
+                                  blocks_m, blocks_m_meta);
     return y;
 }
 

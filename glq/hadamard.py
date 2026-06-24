@@ -146,6 +146,23 @@ def _block_decompose(n: int) -> list[int]:
     return blocks
 
 
+def _block_decompose_min(n: int, min_block: int) -> list[int]:
+    """Block-diagonal decomposition whose every block is a power of 2 >= ``min_block``
+    (``min_block`` must itself be a power of 2). Used by the e8p tensor-core path, whose
+    qidxs tile layout needs ``sum(blocks)`` to be a multiple of 64 (cols) / 16 (rows):
+    pad ``n`` up to the next multiple of ``min_block``, then decompose — a multiple of a
+    power of two has its lowest set bit >= that power, so no block falls below the floor.
+
+    >>> _block_decompose_min(5376, 64)
+    [4096, 1024, 256]
+    >>> _block_decompose_min(2080, 64)
+    [2048, 64]
+    """
+    assert (min_block & (min_block - 1)) == 0, "min_block must be a power of 2"
+    n_pad = ((n + min_block - 1) // min_block) * min_block
+    return _block_decompose(n_pad)
+
+
 def block_diagonal_fht(x: torch.Tensor, block_sizes: list[int]) -> torch.Tensor:
     """Apply FHT independently to each power-of-2 block along the last dim.
 

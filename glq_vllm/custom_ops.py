@@ -281,6 +281,7 @@ def _ensure_registered():
                 "fused_linear_e8p(Tensor x, Tensor sv, Tensor su, "
                 "Tensor qidxs_e8p, Tensor qidxs2_e8p, Tensor qidxs2_e81b, "
                 "Tensor codebook_abs, Tensor e81b_codebook, "
+                "Tensor blocks_n, Tensor blocks_m, Tensor blocks_n_meta, Tensor blocks_m_meta, "
                 "float wscale, float inv_resid_scale, "
                 "int in_features, int out_features, "
                 "int n_pad, int m_pad, int log_n, int log_m) -> Tensor")
@@ -346,6 +347,7 @@ def _decompress_e81b_packed_fake(YIs, CB, Y):
 
 def _fused_linear_e8p_fake(x, sv, su, qidxs_e8p, qidxs2_e8p, qidxs2_e81b,
                            codebook_abs, e81b_codebook,
+                           blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
                            wscale, inv_resid_scale, in_features, out_features,
                            n_pad, m_pad, log_n, log_m):
     # (B, in_features) → (B, out_features) fp16.
