@@ -22,7 +22,7 @@ Data structure (the easy-to-read surface):
                    a fractional bpw, or any min/max  -> mixed precision (2 passes:
                    the avg target is ``bpw``; the allocator stays within [min,max]).
   * codebook: ``e8_shell`` (default) | ``e8_relaxed`` | ``e8p``. ``e8p`` is the QuIP#
-              tensor-core RVQ recipe — uniform integer bpw 2/3/4 only (no mixed precision,
+              tensor-core RVQ recipe — uniform integer bpw 2-8 only (no mixed precision,
               no ``codebook_size``); its output dir is tagged ``…-GLQ-<n>bpw-e8p``.
 
 Mixed precision is TWO ``glq-quantize`` invocations (the CLI itself splits them):
@@ -157,15 +157,17 @@ class QuantJob:
             raise ValueError(
                 f"{self.model}: codebook must be one of {valid_cb}, got {self.codebook!r}")
         if self.codebook == "e8p":
-            # e8p is a fixed-grid RVQ recipe (2=[E8P], 3=[E8P,E81B], 4=[E8P,E8P]) — uniform
-            # integer bpw only, no mixed precision, and codebook_size (a shell knob) doesn't apply.
+            # e8p is a fixed-grid N-stage RVQ recipe (E8P=+2bpw, E81B=+1bpw final
+            # stage of odd bpw): 2=[E8P] … 8=[E8P×4). Uniform integer bpw only at
+            # the batch level, no mixed precision, and codebook_size (a shell knob)
+            # doesn't apply.
             if self.is_mixed:
                 raise ValueError(
                     f"{self.model}: codebook 'e8p' is uniform-only — drop min/max and use an "
-                    f"integer bpw of 2, 3, or 4 (no mixed precision)")
-            if int(self.bpw) not in (2, 3, 4):
+                    f"integer bpw in 2-8 (no mixed precision)")
+            if int(self.bpw) not in (2, 3, 4, 5, 6, 7, 8):
                 raise ValueError(
-                    f"{self.model}: codebook 'e8p' supports bpw 2/3/4 only, got {self.bpw}")
+                    f"{self.model}: codebook 'e8p' supports bpw 2-8 only, got {self.bpw}")
             if self.codebook_size is not None:
                 raise ValueError(
                     f"{self.model}: codebook_size is an e8_shell/e8_relaxed knob — not valid "

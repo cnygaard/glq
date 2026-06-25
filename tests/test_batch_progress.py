@@ -184,9 +184,15 @@ def test_e8p_rejects_mixed_precision():
         batchq.QuantJob(model="m", bpw=3, min_bpw=2, max_bpw=4, codebook="e8p")  # min/max
 
 
+def test_e8p_accepts_5_to_8_bpw():
+    # e8p now supports the full 2-8 RVQ depth (E8P=+2bpw, E81B=+1bpw final stage).
+    for b in (5, 6, 7, 8):
+        batchq.QuantJob(model="m", bpw=b, codebook="e8p")  # no raise
+
+
 def test_e8p_rejects_bad_bpw():
-    with pytest.raises(ValueError, match="bpw 2/3/4 only"):
-        batchq.QuantJob(model="m", bpw=5, codebook="e8p")
+    with pytest.raises(ValueError, match="bpw 2-8 only"):
+        batchq.QuantJob(model="m", bpw=9, codebook="e8p")
 
 
 def test_e8p_rejects_codebook_size():
