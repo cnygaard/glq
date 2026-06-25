@@ -561,3 +561,41 @@ class TestEffectiveBpw:
                          for p in all_artifacts)
         assert total_w == 3 * 2048
         assert round(total_bits / total_w, 2) == 3.0
+
+
+# ---- PLE-embedding codebook routing (e8p models quantize the PLE with shell) ----
+
+class TestPLECodebook:
+    """The Gemma-4 PLE embedding is decoded per-row by the shell E8 lookup at
+    inference (no e8p TC path), so it must be quantized with a shell codebook
+    even under --codebook e8p. These lock the root cause + the routing."""
+
+    def test_shell_codebook_produces_shell_keys(self, codebook):
+        # PLE recipe: apply_left=False, block_diagonal=False, bpw=4 (2-stage).
+        W = torch.randn(64, 64) * 0.1
+        _, arts, _ = quantize_layer_e8_shell_rht(
+            W, torch.eye(64), codebook, bpw=4,
+            apply_left=False, block_diagonal=False)
+        assert 'Qidxs' in arts and 'Qidxs2' in arts
+        assert 'Qidxs_e8p' not in arts  # the key the PLE assembly reads
+
+    def test_e8p_codebook_produces_e8p_key(self):
+        # Documents the bug: passing the e8p codebook stores 'Qidxs_e8p', so the
+        # PLE assembly's unconditional arts['Qidxs'] read would KeyError.
+        from glq.codebook_e8p import E8PCodebook
+        cb = E8PCodebook(device='cpu', verbose=False)
+        W = torch.randn(64, 64) * 0.1
+        _, arts, _ = quantize_layer_e8_shell_rht(
+            W, torch.eye(64), cb, bpw=4,
+            apply_left=False, block_diagonal=False)
+        assert 'Qidxs_e8p' in arts
+        assert 'Qidxs' not in arts
+
+    def test_embedding_codebooks_selector(self):
+        # hf_integration routes embeddings to a shell codebook under e8p
+        # (full-shell stage-2 for the 4bpw PLE); shell/relaxed reuse the linears'.
+        from glq.hf_integration import _embedding_codebooks
+        e8p, e8p2, shell, shell2 = object(), object(), object(), object()
+        assert _embedding_codebooks("e8p", e8p, e8p2, shell) == (shell, shell)
+        assert _embedding_codebooks("e8_shell", shell, shell2, None) == (shell, shell2)
+        assert _embedding_codebooks("e8_relaxed", shell, shell2, None) == (shell, shell2)

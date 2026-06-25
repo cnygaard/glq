@@ -255,6 +255,46 @@ def test_glq_embedding_dequant_matches_hf():
     torch.testing.assert_close(hf_out, direct_out, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.skipif(
+    not _HAS_TRANSFORMERS, reason="transformers not installed"
+)
+def test_shell_ple_quant_decode_roundtrip():
+    """A PLE chunk quantized with the SHELL codebook via quantize_layer_e8_shell_rht
+    (apply_left=False, bpw=4) — the path a Gemma-4 E2B/E4B now takes under
+    --codebook e8p — loads into E8RHTEmbedding and reconstructs the original rows.
+    Proves shell indices + a shell codebook decode correctly (no Qidxs_e8p, no
+    codebook mismatch) end-to-end."""
+    import glq.hf_integration  # noqa: F401 (registers types)
+    from glq.codebook import E8ShellCodebook
+    from glq.quantize_model import quantize_layer_e8_shell_rht
+    from glq.quantized_linear import E8RHTEmbedding
+
+    torch.manual_seed(0)
+    vocab, dim = 64, 64
+    cb = E8ShellCodebook.build(device="cpu", verbose=False)
+    W = torch.randn(vocab, dim) * 0.1
+    _, arts, _ = quantize_layer_e8_shell_rht(
+        W, torch.eye(dim), cb, bpw=4, apply_left=False, block_diagonal=False)
+    assert {'Qidxs', 'Qidxs2', 'SV', 'Wscale', 'inv_resid_scale'} <= set(arts)
+    assert 'Qidxs_e8p' not in arts
+
+    emb = E8RHTEmbedding(num_embeddings=vocab, embedding_dim=dim, embed_scale=1.0)
+    assert emb.Qidxs.shape == arts['Qidxs'].shape  # n_pad matches the quant output
+    emb.Qidxs.copy_(arts['Qidxs'])
+    emb.Qidxs2.copy_(arts['Qidxs2'])
+    emb.SV.copy_(arts['SV'])
+    emb.Wscale.fill_(float(arts['Wscale']))          # one chunk -> one scalar, broadcast per-row
+    emb.inv_resid_scale.fill_(float(arts['inv_resid_scale']))
+    emb.set_codebook(cb, codebook2=cb)               # full-shell stage-2 (4bpw PLE)
+    assert emb._n_stages == 2
+
+    out = emb(torch.arange(vocab))
+    assert out.shape == (vocab, dim) and torch.isfinite(out).all()
+    cos = torch.nn.functional.cosine_similarity(
+        out.flatten().float(), W.flatten().float(), dim=0).item()
+    assert cos > 0.8, f"reconstruction cosine {cos:.3f} too low"
+
+
 # ── Test 2b: _lookup_bpw across vLLM prefix transforms ─────────────────
 
 @requires_vllm
