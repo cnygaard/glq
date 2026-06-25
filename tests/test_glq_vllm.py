@@ -120,6 +120,67 @@ def test_glq_config_from_config():
     assert torch.float16 in cfg.get_supported_act_dtypes()
 
 
+@requires_vllm
+def test_glq_config_block_diagonal_flag():
+    """``block_diagonal`` is parsed from config and threaded to the per-layer
+    method. It records the e8p RHT layout so the loader sizes the weight
+    buffers to match the checkpoint: True = block-diagonal padding (the
+    0.6.6+ default), False = legacy full pow2 Hadamard. Absent → True for
+    back-compat with the block-diagonal default, NOT the older pow2 uploads
+    (which must set it explicitly)."""
+    from vllm.model_executor.layers.linear import LinearBase
+    from glq_vllm.config import GLQvLLMConfig
+    from glq_vllm.linear_method import GLQLinearMethod
+
+    # Absent → defaults to True (block-diagonal e8p).
+    cfg = GLQvLLMConfig.from_config({"bpw": 3, "codebook": "e8p"})
+    assert cfg.block_diagonal is True
+
+    # Explicit False (legacy pow2 e8p checkpoint).
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "e8p", "block_diagonal": False,
+        "layer_bpw": {"model.layers.0.mlp.down_proj": 3},
+    })
+    assert cfg.block_diagonal is False
+
+    # Threaded into the per-layer GLQLinearMethod.
+    layer = LinearBase.__new__(LinearBase)
+    method = cfg.get_quant_method(layer, "model.layers.0.mlp.down_proj")
+    assert isinstance(method, GLQLinearMethod)
+    assert method.block_diagonal is False
+    assert method.codebook_type == "e8p"
+
+
+@requires_vllm
+def test_e8p_create_weights_block_diagonal_sizing():
+    """e8p create_weights sizes the Qidxs buffers per the ``block_diagonal``
+    flag — block-diag pads to a mult-of-64 (cols) / mult-of-16 (rows), pow2
+    pads each dim to the next power of two. A non-pow2 shape distinguishes
+    them: 11008 stays 11008 block-diag but inflates to 16384 pow2; 3072 stays
+    3072 block-diag but inflates to 4096 pow2. CPU-only (no codebook load)."""
+    from glq_vllm.linear_method import GLQLinearMethod, _glq_pad, _e8p_pad
+
+    in_sz, out_sz = 11008, 3072
+    assert _e8p_pad(in_sz, 64) == 11008 and _glq_pad(in_sz) == 16384
+    assert _e8p_pad(out_sz, 16) == 3072 and _glq_pad(out_sz) == 4096
+
+    def make(block_diagonal):
+        m = GLQLinearMethod(None, bpw=3, codebook_type="e8p",
+                            block_diagonal=block_diagonal)
+        layer = torch.nn.Module()
+        m.create_weights(layer, in_sz, [out_sz], in_sz, out_sz,
+                         torch.float16)
+        return layer
+
+    bd = make(True)
+    assert tuple(bd.Qidxs_e8p.shape) == (3072 // 16, 11008 // 64, 8, 4)
+    assert bd.glq_n_pad == 11008 and bd.glq_m_pad == 3072
+
+    pw = make(False)
+    assert tuple(pw.Qidxs_e8p.shape) == (4096 // 16, 16384 // 64, 8, 4)
+    assert pw.glq_n_pad == 16384 and pw.glq_m_pad == 4096
+
+
 # ── GLQ embedding-method dispatch + dequant equivalence ───────────────
 
 @requires_vllm

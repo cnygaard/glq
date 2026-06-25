@@ -608,10 +608,16 @@ class GLQLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False,
-                 codebook_type: str = "e8_shell"):
+                 codebook_type: str = "e8_shell", block_diagonal: bool = True):
         self.quant_config = quant_config
         self.bpw = bpw
         self.codebook_type = codebook_type
+        # RHT layout for the e8p managed-param buffers. True (default) =
+        # block-diagonal padding (mult-of-64 cols / mult-of-16 rows); False =
+        # legacy full pow2 Hadamard (one block spanning the next pow2). The
+        # shell path sizes via ``_glq_pad`` and self-corrects on load, so this
+        # flag only affects how the e8p Qidxs buffers are pre-sized here.
+        self.block_diagonal = block_diagonal
         # ``pre_fused``: the checkpoint stores this fused linear as ONE
         # jointly-quantized matrix (e.g. sarvam/Bailing's ``query_key_value``),
         # not as separate per-shard weights merged at load. A jointly-quantized
@@ -649,7 +655,10 @@ class GLQLinearMethod(LinearMethodBase):
             # are replaced by the loaded q/k/v (or gate/up) Qidxs_e8p on load.
             layer.glq_shard_sizes = output_partition_sizes
             layer.glq_num_shards = len(output_partition_sizes)
-            n_pad = _e8p_pad(input_size_per_partition, 64)
+            # block-diag (default) pads to a mult-of-64; legacy pow2 checkpoints
+            # (block_diagonal=False) pad the input dim to the next power of two.
+            n_pad = (_e8p_pad(input_size_per_partition, 64)
+                     if self.block_diagonal else _glq_pad(input_size_per_partition))
             ops = output_partition_sizes
             layer.Qidxs_e8p = GLQShardedParameter(ops, 1, torch.int64,
                                                   weight_loader=weight_loader, sentinel=True)
@@ -722,7 +731,12 @@ class GLQLinearMethod(LinearMethodBase):
             layer.glq_out_features = out_sz
             if is_e8p:
                 # Block-diagonal dims (= the checkpoint shape; equals _glq_pad for pow2 dims).
-                m_pad, n_pad = _e8p_pad(out_sz, 16), _e8p_pad(input_size_per_partition, 64)
+                # Legacy pow2 checkpoints (block_diagonal=False) sized every dim to
+                # the next power of two, so size the buffers the same way to load them.
+                if self.block_diagonal:
+                    m_pad, n_pad = _e8p_pad(out_sz, 16), _e8p_pad(input_size_per_partition, 64)
+                else:
+                    m_pad, n_pad = _glq_pad(out_sz), _glq_pad(input_size_per_partition)
                 mp16, nb64 = max(m_pad // 16, 1), max(n_pad // 64, 1)
                 layer.Qidxs_e8p = _make_glq_param(
                     torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64))
