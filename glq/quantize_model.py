@@ -99,6 +99,25 @@ def pad_hessian(H, block_size=8):
     return H
 
 
+def _artifact_padded_weights(arts: dict) -> int:
+    """Padded weight count (m_pad * n_pad) for a quantized sublayer's artifact dict.
+
+    Codebook-aware: the shell codebook stores int16 ``Qidxs`` of shape
+    ``(m_pad, n_pad//8)`` (one group index per 8 weights), so the padded weight
+    count is ``s0 * s1 * 8``. The e8p codebook stores int64 TC-packed
+    ``Qidxs_e8p`` of shape ``(m_pad//16, n_pad//64, 8, 4)``, so the count is
+    ``s0*16 * s1*64``. Every quantized entry carries exactly one of the two keys
+    (the e8p PLE embedding edge case is handled upstream), so this resolves any
+    mix of shell + e8p layers — e.g. a mixed-bpw e8p run whose PLE embedding is
+    shell — without assuming a single codebook.
+    """
+    qe = arts.get('Qidxs_e8p')
+    if qe is not None:
+        return qe.shape[0] * 16 * qe.shape[1] * 64
+    q = arts['Qidxs']
+    return q.shape[0] * q.shape[1] * 8
+
+
 # ---- model profiles ----
 # Each profile encapsulates architecture-specific paths for layer access,
 # embedding access, state dict key prefix, and forward kwargs.
@@ -1630,11 +1649,12 @@ def quantize(
             config_dict["architectures"] = [causal_cls.__name__]
     # Compute effective average bpw
     if bpw_map is not None:
-        total_w = sum(
-            all_artifacts[p]['Qidxs'].shape[0] * all_artifacts[p]['Qidxs'].shape[1] * 8
-            for p in all_artifacts)
+        # Codebook-aware padded weight count per sublayer (shell ``Qidxs`` vs
+        # e8p ``Qidxs_e8p``) so a mixed-bpw e8p run reports a real average bpw
+        # instead of KeyError-ing on the absent shell ``Qidxs`` key.
+        total_w = sum(_artifact_padded_weights(all_artifacts[p]) for p in all_artifacts)
         total_bits = sum(
-            bpw_map.get(p, 2) * all_artifacts[p]['Qidxs'].shape[0] * all_artifacts[p]['Qidxs'].shape[1] * 8
+            bpw_map.get(p, 2) * _artifact_padded_weights(all_artifacts[p])
             for p in all_artifacts)
         effective_bpw = round(total_bits / total_w, 2) if total_w > 0 else 2
     else:

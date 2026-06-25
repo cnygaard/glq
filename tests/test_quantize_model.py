@@ -10,6 +10,7 @@ from glq.quantize_model import (
     HessianCapture,
     pad_to_multiple,
     pad_hessian,
+    _artifact_padded_weights,
     quantize_layer_e8_shell_rht,
     _detect_profile,
     _resolve_attr,
@@ -518,3 +519,45 @@ class TestCLIArgparse:
                 assert kwargs['trust_remote_code'] is True
                 assert kwargs['streaming'] is True
                 assert kwargs['workers'] == 8
+
+
+# ---- effective_bpw / footprint weight count (codebook-aware) ----
+
+class TestEffectiveBpw:
+    """``_artifact_padded_weights`` must count padded weights for BOTH the shell
+    ``Qidxs`` and the e8p ``Qidxs_e8p`` index layout, so the mixed-bpw
+    effective_bpw sum in ``quantize()`` works on an e8p (or mixed) checkpoint
+    instead of KeyError-ing on the absent shell ``Qidxs`` key."""
+
+    def test_shell_padded_weights(self):
+        # shell Qidxs is int16 (m_pad, n_pad//8) -> m_pad*n_pad = s0*s1*8.
+        arts = {'Qidxs': torch.zeros(32, 8, dtype=torch.int16)}
+        assert _artifact_padded_weights(arts) == 32 * 8 * 8  # m_pad=32, n_pad=64
+
+    def test_e8p_padded_weights(self):
+        # e8p Qidxs_e8p is int64 (m_pad//16, n_pad//64, 8, 4) -> s0*16 * s1*64.
+        arts = {'Qidxs_e8p': torch.zeros(2, 1, 8, 4, dtype=torch.int64)}
+        assert _artifact_padded_weights(arts) == 2 * 16 * 1 * 64  # m_pad=32, n_pad=64
+
+    def test_e8p_preferred_over_shell_key(self):
+        # An entry should resolve via Qidxs_e8p when present (e8p never writes
+        # a shell 'Qidxs', but assert the precedence is explicit).
+        arts = {'Qidxs_e8p': torch.zeros(2, 1, 8, 4, dtype=torch.int64)}
+        assert 'Qidxs' not in arts
+        assert _artifact_padded_weights(arts) == 2048
+
+    def test_mixed_effective_bpw(self):
+        """Reproduce the quantize() mixed-bpw sum across a shell + e8p + shell
+        mix (each 2048 padded weights) and assert the weighted average bpw.
+        Pre-fix this KeyErrors on the e8p entry; post-fix it is 3.0."""
+        all_artifacts = {
+            'a': {'Qidxs': torch.zeros(32, 8, dtype=torch.int16)},        # shell, 2048
+            'b': {'Qidxs_e8p': torch.zeros(2, 1, 8, 4, dtype=torch.int64)},  # e8p, 2048
+            'c': {'Qidxs': torch.zeros(32, 8, dtype=torch.int16)},        # shell, 2048
+        }
+        bpw_map = {'a': 2, 'b': 4, 'c': 3}
+        total_w = sum(_artifact_padded_weights(all_artifacts[p]) for p in all_artifacts)
+        total_bits = sum(bpw_map.get(p, 2) * _artifact_padded_weights(all_artifacts[p])
+                         for p in all_artifacts)
+        assert total_w == 3 * 2048
+        assert round(total_bits / total_w, 2) == 3.0
