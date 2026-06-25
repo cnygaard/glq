@@ -384,6 +384,38 @@ def _patch_nemotron_h_decode_cache(model):
     )
 
 
+def _resolve_shell_codebook(pretrained_path):
+    """Build the default E8 shell codebook (65536-entry) for shell-decoded
+    weights: try the model dir's ``e8_codebook.pt``, then the bundled copy,
+    then enumerate fresh. The enumeration is deterministic and matches the
+    bundle, so any of the three paths yields the same table."""
+    if pretrained_path:
+        try:
+            from transformers.utils.hub import cached_file
+            cb_path = cached_file(
+                pretrained_path, "e8_codebook.pt",
+                _raise_exceptions_for_missing_entries=False)
+            if cb_path is not None and os.path.exists(cb_path):
+                return E8ShellCodebook.load(cb_path, device='cpu')
+        except Exception:
+            pass
+    bundled = os.path.join(os.path.dirname(__file__), "e8_codebook.pt")
+    if os.path.exists(bundled):
+        return E8ShellCodebook.load(bundled, device='cpu')
+    return E8ShellCodebook(device='cpu', verbose=False)
+
+
+def _embedding_codebooks(cb_type, linear_cb, linear_cb2, shell_cb):
+    """Codebooks for E8RHTEmbedding. Embeddings always decode via the shell E8
+    lookup (no e8p tensor-core path), and an e8p model's PLE is shell-quantized
+    (see quantize_model), so under ``e8p`` use the shell codebook here — with a
+    full-shell stage-2, since the PLE is quantized at 4 bpw (two full-shell
+    stages). Shell/relaxed models reuse the same codebook as their linears."""
+    if cb_type == "e8p":
+        return shell_cb, shell_cb
+    return linear_cb, linear_cb2
+
+
 @register_quantizer("glq")
 class GLQQuantizer(HfQuantizer):
     """HuggingFace quantizer for GLQ (E8 shell codebook + RHT)."""
@@ -461,22 +493,8 @@ class GLQQuantizer(HfQuantizer):
             from .codebook_e8p import E8PCodebook
             codebook = E8PCodebook(device='cpu', verbose=False)
         pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
-        if codebook is None and pretrained_path:
-            try:
-                from transformers.utils.hub import cached_file
-                cb_path = cached_file(
-                    pretrained_path, "e8_codebook.pt",
-                    _raise_exceptions_for_missing_entries=False)
-                if cb_path is not None and os.path.exists(cb_path):
-                    codebook = E8ShellCodebook.load(cb_path, device='cpu')
-            except Exception:
-                pass
         if codebook is None:
-            bundled = os.path.join(os.path.dirname(__file__), "e8_codebook.pt")
-            if os.path.exists(bundled):
-                codebook = E8ShellCodebook.load(bundled, device='cpu')
-        if codebook is None:
-            codebook = E8ShellCodebook(device='cpu', verbose=False)
+            codebook = _resolve_shell_codebook(pretrained_path)
 
         # Secondary codebook for 3/4bpw
         # For mixed-precision models, use the max bpw to build the largest
@@ -512,11 +530,19 @@ class GLQQuantizer(HfQuantizer):
         if isinstance(compute_dtype, str):
             compute_dtype = getattr(torch, compute_dtype, torch.bfloat16)
 
+        # E8RHTEmbedding always decodes via the shell E8 lookup; under e8p the
+        # PLE is shell-quantized (see quantize_model), so give embeddings a shell
+        # codebook (full-shell stage-2 for the 4bpw PLE) while the linears keep
+        # the e8p codebook. Shell/relaxed models reuse the same codebook for both.
+        emb_shell_cb = (_resolve_shell_codebook(pretrained_path)
+                        if cb_type == "e8p" else None)
+        emb_cb, emb_cb2 = _embedding_codebooks(cb_type, codebook, codebook2, emb_shell_cb)
         for module in model.modules():
-            if isinstance(module, (E8RHTLinear, E8RHTEmbedding)):
-                module.set_codebook(codebook, codebook2=codebook2)
             if isinstance(module, E8RHTEmbedding):
+                module.set_codebook(emb_cb, codebook2=emb_cb2)
                 module._compute_dtype = compute_dtype
+            elif isinstance(module, E8RHTLinear):
+                module.set_codebook(codebook, codebook2=codebook2)
 
         # Quantized KV cache: attach a factory so callers can build
         # fresh cache instances via ``cache = model._glq_kv_cache_factory()``

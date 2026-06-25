@@ -1500,11 +1500,18 @@ def quantize(
         ple_wscale_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
         ple_inv_rs_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
         ple_sqnr_chunks = []
+        # E8RHTEmbedding decodes the PLE per-row via the shell E8 lookup (no e8p
+        # tensor-core decode path), so quantize it with a shell codebook even
+        # under --codebook e8p — otherwise the e8p path stores 'Qidxs_e8p' and
+        # the shell-key assembly below KeyErrors. Shell/relaxed runs reuse the
+        # global codebook unchanged (it is already shell-decodable).
+        ple_codebook = (E8ShellCodebook(device=device)
+                        if getattr(codebook, 'is_e8p', False) else codebook)
         for r0 in range(0, vocab_size_ple, chunk_rows):
             r1 = min(r0 + chunk_rows, vocab_size_ple)
             chunk = ple_w[r0:r1].to(device)
             _, arts_chunk, met_chunk = quantize_layer_e8_shell_rht(
-                chunk, H_id, codebook,
+                chunk, H_id, ple_codebook,
                 bpw=ple_embed_bpw, tune_iters=0,
                 apply_left=False, block_diagonal=False)
             ple_qidxs_chunks.append(arts_chunk['Qidxs'].cpu())
@@ -1536,7 +1543,7 @@ def quantize(
               f"({len(ple_qidxs_chunks)} chunks, per-row Wscale)")
         all_artifacts[ple_embed_prefix] = ple_arts
         all_sqnr.append(avg_chunk_sqnr)
-        del ple_w, H_id, ple_qidxs_chunks, ple_qidxs2_chunks
+        del ple_w, H_id, ple_qidxs_chunks, ple_qidxs2_chunks, ple_codebook
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
