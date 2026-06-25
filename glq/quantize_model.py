@@ -1666,9 +1666,16 @@ def quantize(
             layer_bpw_out[p] = 4  # matches ple_embed_bpw above
         else:
             layer_bpw_out[p] = int(bpw)
+    # Record the RHT layout so the runtime sizes the weight buffers correctly.
+    # e8p quantizes block-diagonally by default; GLQ_E8P_POW2 forces the legacy
+    # full power-of-two Hadamard (one block spanning the pow2-padded dim). Shell
+    # and relaxed are always block-diagonal. block_diagonal=False tells the vLLM
+    # loader to size the e8p buffers to pow2 instead of the block-diagonal dims.
+    block_diagonal = not (codebook_type == "e8p" and bool(os.environ.get("GLQ_E8P_POW2")))
     config_dict["quantization_config"] = {
         "quant_method": "glq",
         "codebook": codebook_type,
+        "block_diagonal": block_diagonal,
         "codesz": 8,
         "bpw": effective_bpw,
         "layer_bpw": layer_bpw_out,
@@ -1682,6 +1689,7 @@ def quantize(
     quant_meta = {
         "quant_method": "glq",
         "codebook": codebook_type,
+        "block_diagonal": block_diagonal,
         "codesz": 8,
         "bpw": effective_bpw,
         "tune_iters": tune_iters,

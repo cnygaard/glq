@@ -18,11 +18,16 @@ class GLQvLLMConfig(QuantizationConfig):
     """vLLM quantization config for GLQ (E8 lattice codebook + RHT)."""
 
     def __init__(self, bpw: int = 2, layer_bpw: dict | None = None,
-                 codebook: str = "e8_shell"):
+                 codebook: str = "e8_shell", block_diagonal: bool = True):
         super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
         self.codebook = codebook
+        # RHT layout from the checkpoint: True (default) = block-diagonal padding,
+        # False = legacy full pow2 Hadamard. Controls how the e8p weight buffers
+        # are sized so the loader can copy in place. Absent in pre-0.6.7
+        # checkpoints — default True matches the block-diagonal e8p default.
+        self.block_diagonal = block_diagonal
 
     def get_name(self) -> str:
         return "glq"
@@ -44,6 +49,7 @@ class GLQvLLMConfig(QuantizationConfig):
             bpw=config.get("bpw", 2),
             layer_bpw=config.get("layer_bpw", None),
             codebook=config.get("codebook", "e8_shell"),
+            block_diagonal=config.get("block_diagonal", True),
         )
 
     def _lookup_bpw(self, prefix: str) -> int | None:
@@ -113,7 +119,8 @@ class GLQvLLMConfig(QuantizationConfig):
             return GLQLinearMethod(
                 self, bpw=bpw if bpw is not None else self.bpw,
                 pre_fused=self._is_prefused(prefix),
-                codebook_type=self.codebook)
+                codebook_type=self.codebook,
+                block_diagonal=self.block_diagonal)
 
         # VocabParallelEmbedding (and subclasses, e.g. ParallelLMHead).
         # Quantized embeddings — currently only Gemma-4's PLE — appear in
