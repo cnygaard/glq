@@ -118,6 +118,41 @@ def _artifact_padded_weights(arts: dict) -> int:
     return q.shape[0] * q.shape[1] * 8
 
 
+def _e8p_stage_is_e81b(bpw):
+    """Per-stage codebook type for the e8p N-stage RVQ recipe (bpw 2-8).
+
+    True = E81B (256-entry, +1 bpw) residual; False = E8P (65536, +2 bpw).
+    Each E8P stage adds 2 bpw and an E81B stage adds 1 bpw, so an odd bpw ends
+    in a single E81B stage and an even bpw is all E8P — mirroring the shell
+    full/small256 recipe. Single source of truth for both the quantize recipe
+    and the artifact-storage naming so the two can never diverge.
+    """
+    if not (2 <= bpw <= 8):
+        raise ValueError(f"e8p codebook supports bpw 2-8, got {bpw}")
+    n_full = bpw // 2
+    return [False] * n_full + ([True] if bpw % 2 == 1 else [])
+
+
+def _e8p_rvq_recipe(bpw, e8p_cb, dev):
+    """``(codebooks, resid_scales)`` for the e8p N-stage RVQ at ``bpw`` (2-8).
+
+    Residual scales reuse the validated QuIP# constants: 3.45 (E8P->E8P) and
+    2.04 (E8P->E81B). The scale between stage k-1 and k is set by stage k's
+    codebook (the preceding stage is always E8P). Mirrors how the shell recipe
+    reuses ``rs_self``/``rs_to_small`` across stages.
+    """
+    RS_E8P, RS_E81B = 3.45, 2.04
+    stage_is_e81b = _e8p_stage_is_e81b(bpw)
+    e81b_cb = None
+    if any(stage_is_e81b):
+        from .codebook_e8p import E81BCodebook
+        e81b_cb = E81BCodebook(device=dev, verbose=False)
+    codebooks = [e81b_cb if t else e8p_cb for t in stage_is_e81b]
+    resid_scales = [RS_E81B if stage_is_e81b[k] else RS_E8P
+                    for k in range(1, len(codebooks))]
+    return codebooks, resid_scales
+
+
 # ---- model profiles ----
 # Each profile encapsulates architecture-specific paths for layer access,
 # embedding access, state dict key prefix, and forward kwargs.
@@ -370,25 +405,13 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
         from .ldlq import quantize_ldlq_codebook_nstage
         if is_e8p:
             # E8P always uses the generic N-stage LDLQ so every bpw returns the
-            # same (all_indices, cum_inv_rs) contract. RVQ recipe + fixed QuIP#
-            # residual scales (validated to match the prototype PPL): 2=[E8P],
-            # 3=[E8P, E81B] rs 2.04, 4=[E8P, E8P] rs 3.45.
-            if bpw == 2:
-                return quantize_ldlq_codebook_nstage(
-                    W_p, H_p, codebooks=[codebook], resid_scales=[],
-                    tune_iters=tune_iters)
-            elif bpw == 3:
-                from .codebook_e8p import E81BCodebook
-                cb_e81b = E81BCodebook(device=dev, verbose=False)
-                return quantize_ldlq_codebook_nstage(
-                    W_p, H_p, codebooks=[codebook, cb_e81b], resid_scales=[2.04],
-                    tune_iters=tune_iters)
-            elif bpw == 4:
-                return quantize_ldlq_codebook_nstage(
-                    W_p, H_p, codebooks=[codebook, codebook], resid_scales=[3.45],
-                    tune_iters=tune_iters)
-            else:
-                raise ValueError(f"e8p codebook supports bpw 2/3/4 only, got {bpw}")
+            # same (all_indices, cum_inv_rs) contract. RVQ recipe (E8P=+2bpw,
+            # E81B=+1bpw final stage of odd bpw) + fixed QuIP# residual scales
+            # (3.45 E8P->E8P, 2.04 E8P->E81B). bpw 2-8; see _e8p_rvq_recipe.
+            codebooks, resid_scales = _e8p_rvq_recipe(bpw, codebook, dev)
+            return quantize_ldlq_codebook_nstage(
+                W_p, H_p, codebooks=codebooks, resid_scales=resid_scales,
+                tune_iters=tune_iters)
         # ``resid_scale`` between two stages must be tuned for the actual
         # (primary, secondary) pair. ``codebook.resid_scale`` was tuned for
         # self-self (= 4/6/8 bpw uniform recipes). For 3/5/7 bpw recipes
@@ -471,24 +494,32 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
     }
 
     if is_e8p:
-        # E8P stores int64 tensor-core-packed weights (not the shell's int16 Qidxs):
-        #   Qidxs_e8p   (m_pad//16, n_pad//64, 8, 4)  — stage-0 E8P, for decode_matvec_e8p
-        #   Qidxs2_e8p  (same)                        — 4bpw stage-1 (E8P residual)
-        #   Qidxs2_e81b (m_pad, n_pad//64)            — 3bpw stage-1 (E81B residual)
+        # E8P stores int64 tensor-core-packed weights (not the shell's int16 Qidxs),
+        # one buffer per RVQ stage (bpw 2-8 → 1-4 stages; see _e8p_rvq_recipe):
+        #   Qidxs_e8p                  (m_pad//16, n_pad//64, 8, 4)  — stage-0 E8P
+        #   Qidxs{k+1}_e8p  (same)     — E8P residual stage k (decode_matvec_e8p)
+        #   Qidxs{k+1}_e81b (m_pad, n_pad//64)  — E81B residual stage k (final, odd bpw)
+        # inv_resid_scale{k} = cum_inv_rs[k] (cumulative 1/Πrs); stage k=1 drops the suffix.
+        from .codebook_e8p import E81BCodebook
         all_idx = result['all_indices']
         cum_inv_rs = result['cum_inv_rs']
         m_pad = all_idx[0].shape[0]
         n_pad = all_idx[0].shape[1] * 8
-        artifacts['Qidxs_e8p'] = codebook.maybe_pack_idxs(
-            all_idx[0].to(torch.int64)).view(m_pad // 16, n_pad // 64, 8, 4).contiguous()
-        if len(all_idx) > 1:
-            artifacts['inv_resid_scale'] = torch.tensor(cum_inv_rs[1], dtype=torch.float32)
-            if bpw == 4:
-                artifacts['Qidxs2_e8p'] = codebook.maybe_pack_idxs(
-                    all_idx[1].to(torch.int64)).view(m_pad // 16, n_pad // 64, 8, 4).contiguous()
-            else:  # bpw == 3 → E81B residual stage
-                from .codebook_e8p import E81BCodebook
-                artifacts['Qidxs2_e81b'] = E81BCodebook.pack_e81b(all_idx[1].to(torch.int64))
+        stage_is_e81b = _e8p_stage_is_e81b(bpw)
+
+        def _pack_e8p(idx):
+            return codebook.maybe_pack_idxs(idx.to(torch.int64)).view(
+                m_pad // 16, n_pad // 64, 8, 4).contiguous()
+
+        artifacts['Qidxs_e8p'] = _pack_e8p(all_idx[0])  # stage 0 is always E8P
+        for k in range(1, len(all_idx)):
+            name = f'Qidxs{k + 1}'
+            if stage_is_e81b[k]:
+                artifacts[f'{name}_e81b'] = E81BCodebook.pack_e81b(all_idx[k].to(torch.int64))
+            else:
+                artifacts[f'{name}_e8p'] = _pack_e8p(all_idx[k])
+            scale_name = 'inv_resid_scale' if k == 1 else f'inv_resid_scale{k}'
+            artifacts[scale_name] = torch.tensor(cum_inv_rs[k], dtype=torch.float32)
     elif bpw == 2:
         artifacts['Qidxs'] = result['indices'].to(torch.int16)
         # Don't store Qidxs2/inv_resid_scale at 2bpw — they're all zeros.
@@ -796,7 +827,7 @@ def quantize(
         codebook = E8RelaxedCodebook(device=device, target_size=codebook_size)
     elif codebook_type == "e8p":
         from .codebook_e8p import E8PCodebook
-        codebook = E8PCodebook(device=device)         # QuIP# padded-D̂8, TC-GEMV decode (2/3/4 bpw)
+        codebook = E8PCodebook(device=device)         # QuIP# padded-D̂8, TC-GEMV decode (2-8 bpw RVQ)
     else:
         codebook = E8ShellCodebook(device=device, target_size=codebook_size)
 
@@ -1841,7 +1872,7 @@ def main():
                         choices=["e8_shell", "e8_relaxed", "e8p"],
                         help="Codebook variant: e8_shell (default, optimal ball), "
                              "e8_relaxed (D~8 for KV), e8p (QuIP# padded-D̂8 + RVQ, "
-                             "tensor-core decode, bpw 2/3/4).")
+                             "tensor-core decode, bpw 2-8).")
     parser.add_argument("--codebook-size", type=int, default=None,
                         help="E8 codebook entry count. Default 65 536 "
                              "(shells 0-5 in full + 8 655 from shell 6). "

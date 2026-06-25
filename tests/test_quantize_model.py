@@ -599,3 +599,73 @@ class TestPLECodebook:
         assert _embedding_codebooks("e8p", e8p, e8p2, shell) == (shell, shell)
         assert _embedding_codebooks("e8_shell", shell, shell2, None) == (shell, shell2)
         assert _embedding_codebooks("e8_relaxed", shell, shell2, None) == (shell, shell2)
+
+
+# ---- e8p N-stage RVQ recipe (2-8 bpw) ----
+
+@pytest.fixture(scope="module")
+def e8p_codebook():
+    from glq.codebook_e8p import E8PCodebook
+    return E8PCodebook(device="cpu", verbose=False)
+
+
+class TestE8PNStageRecipe:
+    """e8p extends to 2-8 bpw via N-stage RVQ: E8P=+2bpw (65536), E81B=+1bpw
+    (256) as the final stage of odd bpw — mirrors shell's full/small256."""
+
+    def test_stage_is_e81b(self):
+        from glq.quantize_model import _e8p_stage_is_e81b
+        assert _e8p_stage_is_e81b(2) == [False]
+        assert _e8p_stage_is_e81b(3) == [False, True]
+        assert _e8p_stage_is_e81b(4) == [False, False]
+        assert _e8p_stage_is_e81b(5) == [False, False, True]
+        assert _e8p_stage_is_e81b(6) == [False, False, False]
+        assert _e8p_stage_is_e81b(7) == [False, False, False, True]
+        assert _e8p_stage_is_e81b(8) == [False, False, False, False]
+        for bad in (1, 9):
+            with pytest.raises(ValueError, match="bpw 2-8"):
+                _e8p_stage_is_e81b(bad)
+
+    def test_rvq_recipe(self, e8p_codebook):
+        from glq.quantize_model import _e8p_rvq_recipe
+        from glq.codebook_e8p import E81BCodebook
+        cb = e8p_codebook
+        # 6bpw: 3 E8P stages, both transitions E8P->E8P (3.45).
+        codebooks, scales = _e8p_rvq_recipe(6, cb, "cpu")
+        assert len(codebooks) == 3 and all(c is cb for c in codebooks)
+        assert scales == [3.45, 3.45]
+        # 7bpw: 3 E8P + final E81B; last transition is E8P->E81B (2.04).
+        codebooks, scales = _e8p_rvq_recipe(7, cb, "cpu")
+        assert [c is cb for c in codebooks] == [True, True, True, False]
+        assert isinstance(codebooks[3], E81BCodebook)
+        assert scales == [3.45, 3.45, 2.04]
+
+    @pytest.mark.parametrize("bpw,expected", [
+        (5, {'Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs3_e81b',
+             'inv_resid_scale', 'inv_resid_scale2'}),
+        (6, {'Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs3_e8p',
+             'inv_resid_scale', 'inv_resid_scale2'}),
+        (7, {'Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs3_e8p', 'Qidxs4_e81b',
+             'inv_resid_scale', 'inv_resid_scale2', 'inv_resid_scale3'}),
+        (8, {'Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs3_e8p', 'Qidxs4_e8p',
+             'inv_resid_scale', 'inv_resid_scale2', 'inv_resid_scale3'}),
+    ])
+    def test_quant_stores_nstage_keys(self, e8p_codebook, bpw, expected):
+        torch.manual_seed(0)
+        W = torch.randn(128, 256) * 0.1
+        _, arts, _ = quantize_layer_e8_shell_rht(W, torch.eye(256), e8p_codebook, bpw=bpw)
+        assert expected <= set(arts), f"missing {expected - set(arts)}"
+        assert 'Qidxs' not in arts  # e8p never writes the shell key
+        assert {'SU', 'SV', 'Wscale'} <= set(arts)
+
+    def test_sqnr_improves_with_bpw(self, e8p_codebook):
+        # Each added RVQ stage must reduce residual error — validates the
+        # reused 3.45/2.04 resid scales hold at the deeper stages.
+        torch.manual_seed(0)
+        W = torch.randn(128, 256) * 0.1
+        H = torch.eye(256)
+        sqnr = {b: quantize_layer_e8_shell_rht(W, H, e8p_codebook, bpw=b)[2]['sqnr']
+                for b in (4, 5, 6, 7, 8)}
+        assert sqnr[8] > sqnr[6] > sqnr[4]            # full E8P stages strictly help
+        assert sqnr[4] <= sqnr[5] <= sqnr[6] + 1e-6   # odd bpw's E81B lands between
+        assert sqnr[6] <= sqnr[7] <= sqnr[8] + 1e-6
