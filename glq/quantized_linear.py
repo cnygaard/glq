@@ -255,6 +255,16 @@ class E8RHTLinear(nn.Module):
         # weight). Non-meta load_state_dict resizes the used one to the checkpoint shape.
         self.register_buffer('Qidxs2_e8p', torch.zeros(0, dtype=torch.int64))
         self.register_buffer('Qidxs2_e81b', torch.zeros(0, dtype=torch.int64))
+        # Stage-3/4 residual buffers (5-8 bpw RVQ): same 0-size-placeholder scheme.
+        # Each stage is E8P (Qidxs{k}_e8p) or E81B (Qidxs{k}_e81b); the checkpoint
+        # carries only the keys its bpw uses. inv_resid_scale2/3 are the cumulative
+        # 1/Πrs for stages 3/4 (== cum_inv_rs[2]/[3]).
+        self.register_buffer('Qidxs3_e8p', torch.zeros(0, dtype=torch.int64))
+        self.register_buffer('Qidxs3_e81b', torch.zeros(0, dtype=torch.int64))
+        self.register_buffer('Qidxs4_e8p', torch.zeros(0, dtype=torch.int64))
+        self.register_buffer('Qidxs4_e81b', torch.zeros(0, dtype=torch.int64))
+        self.register_buffer('inv_resid_scale2', torch.zeros((), dtype=torch.float32))
+        self.register_buffer('inv_resid_scale3', torch.zeros((), dtype=torch.float32))
         if bias:
             self.register_buffer('bias', torch.zeros(self.out_features, dtype=torch.float16))
         else:
@@ -265,6 +275,12 @@ class E8RHTLinear(nn.Module):
         self._inv_rs_float = 0.0
         self._e8p_has_stage2 = False   # cached stage-flags (set on first forward / set_codebook)
         self._e8p_has_e81b = False
+        self._e8p_has_e8p3 = False     # stage-3/4 flags (5-8 bpw)
+        self._e8p_has_e81b3 = False
+        self._e8p_has_e8p4 = False
+        self._e8p_has_e81b4 = False
+        self._inv_rs2_float = 0.0
+        self._inv_rs3_float = 0.0
         self._e8p_grid_dev = None   # cached grid_packed_abs on the compute device
         self._e81b_grid_dev = None  # cached e81b_grid on the compute device
         # Block-diagonal RHT metadata for the fused e8p op (single block = full pow2 RHT).
@@ -346,7 +362,8 @@ class E8RHTLinear(nn.Module):
             # Resize the pre-registered 0-size stage-2 buffer to the checkpoint shape
             # so super()'s copy matches (non-meta path). The meta-assign path replaces
             # the buffer object wholesale, so this is a no-op there.
-            for suffix in ('Qidxs2_e8p', 'Qidxs2_e81b'):
+            for suffix in ('Qidxs2_e8p', 'Qidxs2_e81b',
+                           'Qidxs3_e8p', 'Qidxs3_e81b', 'Qidxs4_e8p', 'Qidxs4_e81b'):
                 key = prefix + suffix
                 if key in state_dict:
                     buf = getattr(self, suffix)
@@ -495,17 +512,29 @@ class E8RHTLinear(nn.Module):
             self._blocks_n_meta_gpu = None
             self._blocks_m_meta_gpu = None
 
-        # Resolve cached scalars / grids / stage-flags once (lazily for layers on
-        # meta at set_codebook time). After this the shared core has no host syncs.
-        if self._wscale_float is None:
-            self._wscale_float = self.Wscale.item()
-            self._inv_rs_float = self.inv_resid_scale.item()
+        # Resolve cached scalars / grids / stage-flags once on the first forward —
+        # which is guaranteed to run AFTER weight load (set_codebook sets
+        # _e8p_grid_dev=None). The stage SCALES must be resolved HERE, in the same
+        # block as the stage FLAGS, so the two stay consistent: set_codebook's e8p
+        # branch caches only wscale + inv_rs (stage-1), NOT inv_resid_scale2/3, so
+        # resolving them under a separate `_wscale_float is None` gate left them at
+        # the 0.0 init for 5-8 bpw → has_e8pK=True but rs=0 → the C++ op's
+        # `if (scale==0) continue` SILENTLY DROPPED stage 3/4 (decoded as a bad
+        # 2-stage). After this block the shared core has no host syncs.
         if self._e8p_grid_dev is None or self._e8p_grid_dev.device != x.device:
             self._e8p_grid_dev = self.codebook.grid_packed_abs.to(x.device)
             if self.codebook2 is not None and hasattr(self.codebook2, 'e81b_grid'):
                 self._e81b_grid_dev = self.codebook2.e81b_grid.to(x.device)
+            self._wscale_float = self.Wscale.item()
+            self._inv_rs_float = self.inv_resid_scale.item()
+            self._inv_rs2_float = self.inv_resid_scale2.item()
+            self._inv_rs3_float = self.inv_resid_scale3.item()
             self._e8p_has_stage2 = self.Qidxs2_e8p.numel() > 0
             self._e8p_has_e81b = self.Qidxs2_e81b.numel() > 0
+            self._e8p_has_e8p3 = self.Qidxs3_e8p.numel() > 0
+            self._e8p_has_e81b3 = self.Qidxs3_e81b.numel() > 0
+            self._e8p_has_e8p4 = self.Qidxs4_e8p.numel() > 0
+            self._e8p_has_e81b4 = self.Qidxs4_e81b.numel() > 0
 
         # Block-diagonal RHT meta → GPU (lazy, device-cached; single block = full pow2 RHT)
         if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
@@ -521,6 +550,11 @@ class E8RHTLinear(nn.Module):
             self.n_pad, self.m_pad,
             self._blocks_n_tensor, self._blocks_m_tensor,
             self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
+            Qidxs3_e8p=self.Qidxs3_e8p, Qidxs3_e81b=self.Qidxs3_e81b,
+            Qidxs4_e8p=self.Qidxs4_e8p, Qidxs4_e81b=self.Qidxs4_e81b,
+            has_e8p3=self._e8p_has_e8p3, has_e81b3=self._e8p_has_e81b3,
+            has_e8p4=self._e8p_has_e8p4, has_e81b4=self._e8p_has_e81b4,
+            inv_rs2=self._inv_rs2_float, inv_rs3=self._inv_rs3_float,
             bias=self.bias, out_dtype=x.dtype)
         return y.reshape(*shape[:-1], self.out_features)
 
@@ -529,6 +563,9 @@ class E8RHTLinear(nn.Module):
                           wscale, inv_rs, has_e8p2, has_e81b, in_features, out_features,
                           n_pad, m_pad, blocks_n=None, blocks_m=None,
                           blocks_n_meta=None, blocks_m_meta=None,
+                          Qidxs3_e8p=None, Qidxs3_e81b=None, Qidxs4_e8p=None, Qidxs4_e81b=None,
+                          has_e8p3=False, has_e81b3=False, has_e8p4=False, has_e81b4=False,
+                          inv_rs2=0.0, inv_rs3=0.0,
                           bias=None, out_dtype=torch.float16):
         """Capture-safe E8P linear core: input_rht → N× TC-GEMV decode → ×Wscale → output_rht.
 
@@ -578,20 +615,28 @@ class E8RHTLinear(nn.Module):
                 _fused = _ops.fused_linear_e8p
             elif hasattr(cuda, "glq_fused_linear_e8p_cuda"):
                 _fused = cuda.glq_fused_linear_e8p_cuda
-        if (_fused is not None and (not has_e81b or e81b_grid is not None)):
-            q2 = Qidxs2_e8p if has_e8p2 else Qidxs_e8p.new_empty(0)
-            q2b = Qidxs2_e81b if has_e81b else Qidxs_e8p.new_empty(0)
-            cb_e81b = e81b_grid if has_e81b else SV.new_empty(0)
+        _any_e81b = has_e81b or has_e81b3 or has_e81b4
+        if (_fused is not None and (not _any_e81b or e81b_grid is not None)):
+            _empty = Qidxs_e8p.new_empty(0)
+            q2 = Qidxs2_e8p if has_e8p2 else _empty
+            q2b = Qidxs2_e81b if has_e81b else _empty
+            q3 = Qidxs3_e8p if has_e8p3 else _empty
+            q3b = Qidxs3_e81b if has_e81b3 else _empty
+            q4 = Qidxs4_e8p if has_e8p4 else _empty
+            q4b = Qidxs4_e81b if has_e81b4 else _empty
+            cb_e81b = e81b_grid if _any_e81b else SV.new_empty(0)
             rs = float(inv_rs) if (has_e8p2 or has_e81b) else 0.0
+            rs2 = float(inv_rs2) if (has_e8p3 or has_e81b3) else 0.0
+            rs3 = float(inv_rs3) if (has_e8p4 or has_e81b4) else 0.0
             # Block-diagonal RHT structure (single block [n_pad] = full pow2 RHT).
             bn = blocks_n if blocks_n is not None else torch.tensor([n_pad], dtype=torch.int64)
             bm = blocks_m if blocks_m is not None else torch.tensor([m_pad], dtype=torch.int64)
             bnm = blocks_n_meta if blocks_n_meta is not None else SV.new_empty(0, dtype=torch.int32)
             bmm = blocks_m_meta if blocks_m_meta is not None else SV.new_empty(0, dtype=torch.int32)
             y = _fused(
-                x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, grid, cb_e81b,
-                bn, bm, bnm, bmm,
-                float(wscale), rs, in_features, out_features,
+                x2d.half().contiguous(), SV, SU, Qidxs_e8p, q2, q2b, q3, q3b, q4, q4b,
+                grid, cb_e81b, bn, bm, bnm, bmm,
+                float(wscale), rs, rs2, rs3, in_features, out_features,
                 n_pad, m_pad, log_n, log_m).to(out_dtype)
             if bias is not None:
                 y = y + bias.unsqueeze(0).to(out_dtype)
@@ -605,6 +650,10 @@ class E8RHTLinear(nn.Module):
             raise RuntimeError(
                 "block-diagonal e8p requires the fused op (glq_fused_linear_e8p_cuda); "
                 "the multi-op fallback only supports single-block (pow2) RHT")
+        if has_e8p3 or has_e81b3 or has_e8p4 or has_e81b4:
+            raise NotImplementedError(
+                "e8p 5-8 bpw (3-4 RVQ stages) requires the fused op; the multi-op "
+                "fallback only decodes stage-0 + one residual (2/3/4 bpw)")
 
         # 1. input RHT: pad + SV signs + FHT  →  (B, n_pad) fp32
         x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=dev)

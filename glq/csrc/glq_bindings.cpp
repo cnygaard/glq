@@ -202,10 +202,13 @@ void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tens
 torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
     torch::Tensor qidxs_e8p, torch::Tensor qidxs2_e8p, torch::Tensor qidxs2_e81b,
+    torch::Tensor qidxs3_e8p, torch::Tensor qidxs3_e81b,
+    torch::Tensor qidxs4_e8p, torch::Tensor qidxs4_e81b,
     torch::Tensor codebook_abs, torch::Tensor e81b_codebook,
     torch::Tensor blocks_n, torch::Tensor blocks_m,
     torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
     double wscale, double inv_resid_scale,
+    double inv_resid_scale2, double inv_resid_scale3,
     int64_t in_features, int64_t out_features,
     int64_t n_pad, int64_t m_pad, int64_t log_n, int64_t log_m);
 

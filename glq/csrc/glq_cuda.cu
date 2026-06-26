@@ -2868,6 +2868,10 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor qidxs_e8p,    // (m_pad//16, n_pad//64, 8, 4) int64 — stage-1
     torch::Tensor qidxs2_e8p,   // empty or same shape — E8P stage-2 (4bpw)
     torch::Tensor qidxs2_e81b,  // empty or (m_pad, n_pad//64) int64 — E81B stage-2 (3bpw)
+    torch::Tensor qidxs3_e8p,   // empty or stage-3 E8P (6/7/8bpw)
+    torch::Tensor qidxs3_e81b,  // empty or stage-3 E81B (5bpw final residual)
+    torch::Tensor qidxs4_e8p,   // empty or stage-4 E8P (8bpw)
+    torch::Tensor qidxs4_e81b,  // empty or stage-4 E81B (7bpw final residual)
     torch::Tensor codebook_abs, // (256,) int32 — grid_packed_abs (E8P)
     torch::Tensor e81b_codebook,// empty or (256, 8) fp16 — E81B grid
     torch::Tensor blocks_n,     // (num_n_blocks,) int64 CPU — input RHT block sizes
@@ -2875,7 +2879,9 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor blocks_n_meta,// (num_n_blocks, 4) int32 GPU — packed block meta (or empty)
     torch::Tensor blocks_m_meta,// (num_m_blocks, 4) int32 GPU
     double wscale,
-    double inv_resid_scale,
+    double inv_resid_scale,     // cum_inv_rs[1] (stage-2)
+    double inv_resid_scale2,    // cum_inv_rs[2] (stage-3)
+    double inv_resid_scale3,    // cum_inv_rs[3] (stage-4)
     int64_t in_features,
     int64_t out_features,
     int64_t n_pad, int64_t m_pad,
@@ -2886,9 +2892,16 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     CHECK_INPUT(codebook_abs);
 
     int B = x.size(0);
-    bool has_e8p2 = (qidxs2_e8p.numel() > 0 && inv_resid_scale != 0.0);
-    bool has_e81b = (qidxs2_e81b.numel() > 0 && inv_resid_scale != 0.0);
     at::DeviceGuard guard(x.device());
+
+    // Residual stages 2/3/4 (RVQ indices 1/2/3). Each stage is E8P (res_e8p[s] non-empty)
+    // or E81B (res_e81b[s] non-empty) or absent (both empty / scale 0). res_scale[s] is the
+    // CUMULATIVE inverse residual scale cum_inv_rs[s+1]; matmul linearity lets us decode each
+    // stage independently and sum the outputs (== summing the weights before one matmul).
+    // Back-compat: a 2/3/4-bpw checkpoint sets only stage s=0 (inv_resid_scale2/3 default 0).
+    torch::Tensor res_e8p[3]  = {qidxs2_e8p,  qidxs3_e8p,  qidxs4_e8p};
+    torch::Tensor res_e81b[3] = {qidxs2_e81b, qidxs3_e81b, qidxs4_e81b};
+    double res_scale[3]       = {inv_resid_scale, inv_resid_scale2, inv_resid_scale3};
 
     // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 (block-diagonal or full) ----
     auto x_rht = torch::empty({B, (long)n_pad},
@@ -2900,57 +2913,65 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     torch::Tensor y_rht;
     if (B == 1) {
         auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
-        y_rht = glq_decode_matvec_e8p(xh, qidxs_e8p, codebook_abs);   // (m_pad,) fp32
-        if (has_e8p2) {
-            auto y2 = glq_decode_matvec_e8p(xh, qidxs2_e8p, codebook_abs);
-            y_rht = y_rht + (float)inv_resid_scale * y2;
-        } else if (has_e81b) {
-            // E81B residual: WMMA lookup-matmul needs k≤8 — row 0 of an (8,n_pad)
-            // input carries xh, Z[0] is the stage-2 contribution (mirrors the
-            // multi-op _e8p_linear_apply B==1 e81b branch).
-            auto X8 = torch::zeros({8, (long)n_pad},
-                                   torch::dtype(torch::kFloat16).device(x.device()));
-            X8.select(0, 0).copy_(xh);
-            auto Z = torch::zeros({8, (long)m_pad},
-                                  torch::dtype(torch::kFloat32).device(x.device()));
-            glq_lookupmatmul_e81b_k8(X8, qidxs2_e81b, e81b_codebook, Z);
-            y_rht = y_rht + (float)inv_resid_scale * Z.select(0, 0);
+        y_rht = glq_decode_matvec_e8p(xh, qidxs_e8p, codebook_abs);   // (m_pad,) fp32 — stage-0
+        for (int s = 0; s < 3; ++s) {
+            if (res_scale[s] == 0.0) continue;
+            if (res_e8p[s].numel() > 0) {
+                auto yk = glq_decode_matvec_e8p(xh, res_e8p[s], codebook_abs);
+                y_rht = y_rht + (float)res_scale[s] * yk;
+            } else if (res_e81b[s].numel() > 0) {
+                // E81B residual: WMMA lookup-matmul needs k≤8 — row 0 of an (8,n_pad)
+                // input carries xh, Z[0] is this stage's contribution.
+                auto X8 = torch::zeros({8, (long)n_pad},
+                                       torch::dtype(torch::kFloat16).device(x.device()));
+                X8.select(0, 0).copy_(xh);
+                auto Z = torch::zeros({8, (long)m_pad},
+                                      torch::dtype(torch::kFloat32).device(x.device()));
+                glq_lookupmatmul_e81b_k8(X8, res_e81b[s], e81b_codebook, Z);
+                y_rht = y_rht + (float)res_scale[s] * Z.select(0, 0);
+            }
         }
         y_rht = (y_rht * (float)wscale).view({1, (long)m_pad}).contiguous();
     } else if (std::getenv("GLQ_E8P_DENSE_B1") != nullptr) {
-        // Guarded fallback (env GLQ_E8P_DENSE_B1): dense decompress + at::matmul. This is
-        // the pre-batched-kernel path, kept as the A/B reference and a safety net — it fully
-        // decompresses every weight to dense fp16 each step (the B>1 decode cliff this fixes).
+        // Guarded fallback (env GLQ_E8P_DENSE_B1): dense decompress + at::matmul. The
+        // pre-batched-kernel path, kept as the bit-exact A/B reference — fully decompresses
+        // every weight (summing all stages into W) then a single matmul.
         auto W = glq_decompress_packed_e8p(qidxs_e8p, codebook_abs).to(torch::kFloat32);
-        if (has_e8p2) {
-            W = W + (float)inv_resid_scale *
-                glq_decompress_packed_e8p(qidxs2_e8p, codebook_abs).to(torch::kFloat32);
-        } else if (has_e81b) {
-            auto Y = torch::zeros({(long)m_pad, (long)n_pad},
-                                  torch::dtype(torch::kFloat16).device(x.device()));
-            glq_decompress_e81b_packed(qidxs2_e81b, e81b_codebook, Y);
-            W = W + (float)inv_resid_scale * Y.to(torch::kFloat32);
+        for (int s = 0; s < 3; ++s) {
+            if (res_scale[s] == 0.0) continue;
+            if (res_e8p[s].numel() > 0) {
+                W = W + (float)res_scale[s] *
+                    glq_decompress_packed_e8p(res_e8p[s], codebook_abs).to(torch::kFloat32);
+            } else if (res_e81b[s].numel() > 0) {
+                auto Y = torch::zeros({(long)m_pad, (long)n_pad},
+                                      torch::dtype(torch::kFloat16).device(x.device()));
+                glq_decompress_e81b_packed(res_e81b[s], e81b_codebook, Y);
+                W = W + (float)res_scale[s] * Y.to(torch::kFloat32);
+            }
         }
         y_rht = (at::matmul(x_rht, W.t()) * (float)wscale).contiguous();  // (B, m_pad) fp32
     } else {
         // Compressed batched E8P TC-GEMM: weights stay packed, decode amortized over the
         // batch (each weight tile bit-expanded once, reused across up to 8 tokens per mma).
         auto xh = x_rht.to(torch::kFloat16);                    // (B, n_pad)
-        y_rht = glq_matmul_e8p(xh, qidxs_e8p, codebook_abs);    // (B, m_pad) fp32
-        if (has_e8p2) {
-            y_rht = y_rht + (float)inv_resid_scale *
-                    glq_matmul_e8p(xh, qidxs2_e8p, codebook_abs);
-        } else if (has_e81b) {
-            // E81B residual: the WMMA lookup-matmul takes k<=8, so tile the batch by 8.
-            for (int b0 = 0; b0 < B; b0 += 8) {
-                int nb = (B - b0) < 8 ? (B - b0) : 8;
-                auto X8 = torch::zeros({8, (long)n_pad},
-                                       torch::dtype(torch::kFloat16).device(x.device()));
-                X8.narrow(0, 0, nb).copy_(xh.narrow(0, b0, nb));
-                auto Z = torch::zeros({8, (long)m_pad},
-                                      torch::dtype(torch::kFloat32).device(x.device()));
-                glq_lookupmatmul_e81b_k8(X8, qidxs2_e81b, e81b_codebook, Z);
-                y_rht.narrow(0, b0, nb).add_((float)inv_resid_scale * Z.narrow(0, 0, nb));
+        y_rht = glq_matmul_e8p(xh, qidxs_e8p, codebook_abs);    // (B, m_pad) fp32 — stage-0
+        for (int s = 0; s < 3; ++s) {
+            if (res_scale[s] == 0.0) continue;
+            if (res_e8p[s].numel() > 0) {
+                y_rht = y_rht + (float)res_scale[s] *
+                        glq_matmul_e8p(xh, res_e8p[s], codebook_abs);
+            } else if (res_e81b[s].numel() > 0) {
+                // E81B residual: the WMMA lookup-matmul takes k<=8, so tile the batch by 8.
+                for (int b0 = 0; b0 < B; b0 += 8) {
+                    int nb = (B - b0) < 8 ? (B - b0) : 8;
+                    auto X8 = torch::zeros({8, (long)n_pad},
+                                           torch::dtype(torch::kFloat16).device(x.device()));
+                    X8.narrow(0, 0, nb).copy_(xh.narrow(0, b0, nb));
+                    auto Z = torch::zeros({8, (long)m_pad},
+                                          torch::dtype(torch::kFloat32).device(x.device()));
+                    glq_lookupmatmul_e81b_k8(X8, res_e81b[s], e81b_codebook, Z);
+                    y_rht.narrow(0, b0, nb).add_((float)res_scale[s] * Z.narrow(0, 0, nb));
+                }
             }
         }
         y_rht = (y_rht * (float)wscale).contiguous();           // (B, m_pad) fp32
