@@ -509,12 +509,17 @@ class GLQQuantizer(HfQuantizer):
 
         codebook2 = None
         if cb_type == "e8p":
-            # E8P RVQ: 4bpw stage-2 reuses the E8P codebook; 3bpw uses E81B.
-            if max_bpw >= 4:
-                codebook2 = codebook
-            elif max_bpw >= 3:
+            # E8P RVQ: the E8P residual stages decode against the stage-0 grid
+            # (`codebook`); `codebook2` only supplies the E81B grid for the E81B
+            # residual stage — the final stage of any ODD bpw (3/5/7). Even bpw
+            # (4/6/8) has no E81B stage, so codebook2 reuses the E8P codebook
+            # (its e81b grid is never read).
+            bpws = list(layer_bpw.values()) if layer_bpw else [max_bpw]
+            if any(int(b) % 2 == 1 for b in bpws):
                 from .codebook_e8p import E81BCodebook
                 codebook2 = E81BCodebook(device='cpu', verbose=False)
+            elif max_bpw >= 4:
+                codebook2 = codebook
         elif max_bpw >= 4:
             codebook2 = codebook
         elif max_bpw >= 3:

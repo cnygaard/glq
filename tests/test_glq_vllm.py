@@ -109,6 +109,48 @@ def test_fused_linear_fake_shape():
 
 
 @requires_vllm
+def test_fused_linear_e8p_fake_shape():
+    """The e8p N-stage fused op carries 26 args (stage-0 + 3 residual stages,
+    each E8P+E81B, plus 3 cumulative scales). This pins the schema⇆fake arg
+    count/order: an off-by-one between the ``define`` string and
+    ``_fused_linear_e8p_fake`` would raise here rather than at serve time.
+    Meta-device, so it runs without the CUDA ext."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear_e8p"):
+        pytest.skip("fused_linear_e8p not registered (no CUDA ext loaded)")
+
+    B, in_features, out_features = 2, 1024, 768
+    n_pad, m_pad = 1024, 1024
+    meta = torch.device("meta")
+    x = torch.empty(B, in_features, dtype=torch.float16, device=meta)
+    sv = torch.empty(n_pad, dtype=torch.float16, device=meta)
+    su = torch.empty(m_pad, dtype=torch.float16, device=meta)
+    # stage-0 E8P weights: (m_pad//16, n_pad//64, 8, 4) int64
+    qidxs = torch.empty(m_pad // 16, n_pad // 64, 8, 4, dtype=torch.int64, device=meta)
+    cb_abs = torch.empty(256, dtype=torch.int32, device=meta)  # grid_packed_abs
+    empty_i64 = torch.empty(0, dtype=torch.int64, device=meta)
+    empty_f16 = torch.empty(0, dtype=torch.float16, device=meta)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    blk_n = torch.tensor([n_pad], dtype=torch.int64, device=meta)
+    blk_m = torch.tensor([m_pad], dtype=torch.int64, device=meta)
+
+    fy = torch.ops.glq.fused_linear_e8p(
+        x, sv, su, qidxs,
+        empty_i64, empty_i64,   # qidxs2_e8p, qidxs2_e81b
+        empty_i64, empty_i64,   # qidxs3_e8p, qidxs3_e81b
+        empty_i64, empty_i64,   # qidxs4_e8p, qidxs4_e81b
+        cb_abs, empty_f16,      # codebook_abs, e81b_codebook
+        blk_n, blk_m, empty_i32, empty_i32,
+        1.0, 0.0, 0.0, 0.0,     # wscale, inv_resid_scale, inv_resid_scale2/3
+        in_features, out_features, n_pad, m_pad, 10, 10,
+    )
+    assert fy.shape == (B, out_features), f"got {tuple(fy.shape)}"
+    assert fy.dtype == torch.float16
+    assert fy.device.type == "meta"
+
+
+@requires_vllm
 def test_glq_config_from_config():
     """GLQvLLMConfig should parse bpw and layer_bpw from dict."""
     from glq_vllm.config import GLQvLLMConfig

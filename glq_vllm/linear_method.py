@@ -589,6 +589,13 @@ def _glq_apply_e8p(x, layer):
                 meta['wscale'], meta['inv_rs'], meta['has_e8p2'], meta['has_e81b'],
                 meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
                 bn, bm, bnm, bmm,
+                Qidxs3_e8p=layer.Qidxs3_e8p.get_shard(i),
+                Qidxs3_e81b=layer.Qidxs3_e81b.get_shard(i),
+                Qidxs4_e8p=layer.Qidxs4_e8p.get_shard(i),
+                Qidxs4_e81b=layer.Qidxs4_e81b.get_shard(i),
+                has_e8p3=meta['has_e8p3'], has_e81b3=meta['has_e81b3'],
+                has_e8p4=meta['has_e8p4'], has_e81b4=meta['has_e81b4'],
+                inv_rs2=meta['inv_rs2'], inv_rs3=meta['inv_rs3'],
                 bias=None, out_dtype=x.dtype))
         return torch.cat(outs, dim=-1)
     meta = layer._glq_e8p_meta[0]
@@ -597,7 +604,13 @@ def _glq_apply_e8p(x, layer):
         x, layer.SV, layer.SU, layer.Qidxs_e8p, layer.Qidxs2_e8p, layer.Qidxs2_e81b,
         grid, e81b_grid, meta['wscale'], meta['inv_rs'], meta['has_e8p2'], meta['has_e81b'],
         meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
-        bn, bm, bnm, bmm, bias=None, out_dtype=x.dtype)
+        bn, bm, bnm, bmm,
+        Qidxs3_e8p=layer.Qidxs3_e8p, Qidxs3_e81b=layer.Qidxs3_e81b,
+        Qidxs4_e8p=layer.Qidxs4_e8p, Qidxs4_e81b=layer.Qidxs4_e81b,
+        has_e8p3=meta['has_e8p3'], has_e81b3=meta['has_e81b3'],
+        has_e8p4=meta['has_e8p4'], has_e81b4=meta['has_e81b4'],
+        inv_rs2=meta['inv_rs2'], inv_rs3=meta['inv_rs3'],
+        bias=None, out_dtype=x.dtype)
 
 
 class GLQLinearMethod(LinearMethodBase):
@@ -666,6 +679,16 @@ class GLQLinearMethod(LinearMethodBase):
                                                    weight_loader=weight_loader, sentinel=True)
             layer.Qidxs2_e81b = GLQShardedParameter(ops, 1, torch.int64,
                                                     weight_loader=weight_loader, sentinel=True)
+            # Stage-3/4 residual buffers (5-8 bpw) — sentinel: each shard resizes to
+            # whatever its checkpoint key carries (E8P or E81B), or stays numel-0.
+            layer.Qidxs3_e8p = GLQShardedParameter(ops, 1, torch.int64,
+                                                   weight_loader=weight_loader, sentinel=True)
+            layer.Qidxs3_e81b = GLQShardedParameter(ops, 1, torch.int64,
+                                                    weight_loader=weight_loader, sentinel=True)
+            layer.Qidxs4_e8p = GLQShardedParameter(ops, 1, torch.int64,
+                                                   weight_loader=weight_loader, sentinel=True)
+            layer.Qidxs4_e81b = GLQShardedParameter(ops, 1, torch.int64,
+                                                    weight_loader=weight_loader, sentinel=True)
             layer.SU = GLQShardedParameter(ops, -1, torch.float16, weight_loader=weight_loader)
             layer.SV = GLQShardedParameter([n_pad] * len(ops), -1, torch.float16,
                                            weight_loader=weight_loader)
@@ -673,6 +696,10 @@ class GLQLinearMethod(LinearMethodBase):
                                                weight_loader=weight_loader)
             layer.inv_resid_scale = GLQShardedParameter([1] * len(ops), 0, torch.float32,
                                                         weight_loader=weight_loader)
+            layer.inv_resid_scale2 = GLQShardedParameter([1] * len(ops), 0, torch.float32,
+                                                         weight_loader=weight_loader)
+            layer.inv_resid_scale3 = GLQShardedParameter([1] * len(ops), 0, torch.float32,
+                                                         weight_loader=weight_loader)
             layer.glq_n_pad = n_pad
         elif is_fused:
             # Fused QKV: use GLQShardedParameter for per-shard storage
@@ -753,17 +780,25 @@ class GLQLinearMethod(LinearMethodBase):
                 # to CUDA is reverted and the decompress kernel aborts on a CPU
                 # tensor at cudagraph capture. (The fused GLQShardedParameter path
                 # is immune — it moves its private ``_shard_data`` list, not a
-                # managed param.) bpw 4 → E8P residual; bpw 3 → E81B residual.
-                if self.bpw >= 4:
-                    layer.Qidxs2_e8p = _make_glq_param(
-                        torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64))
-                else:
-                    layer.Qidxs2_e8p = _make_glq_param(torch.empty(0, dtype=torch.int64))
-                if self.bpw == 3:
-                    layer.Qidxs2_e81b = _make_glq_param(
-                        torch.zeros(m_pad, nb64, dtype=torch.int64))
-                else:
-                    layer.Qidxs2_e81b = _make_glq_param(torch.empty(0, dtype=torch.int64))
+                # managed param.) Residual stages 2/3/4 (bpw 2-8): each is E8P
+                # (TC-packed (mp16,nb64,8,4)) or E81B ((m_pad,nb64)) — stage k is
+                # E81B only as the final stage of odd bpw. (mirror _e8p_stage_is_e81b)
+                _nf = int(self.bpw) // 2
+                _st = [False] * _nf + ([True] if int(self.bpw) % 2 == 1 else [])
+
+                def _res_buf(k):  # residual stage k=1/2/3 -> (Qidxs{k+1}_e8p, _e81b)
+                    act = len(_st) > k
+                    e8p = (torch.zeros(mp16, nb64, 8, 4, dtype=torch.int64)
+                           if act and not _st[k] else torch.empty(0, dtype=torch.int64))
+                    e81b = (torch.zeros(m_pad, nb64, dtype=torch.int64)
+                            if act and _st[k] else torch.empty(0, dtype=torch.int64))
+                    return _make_glq_param(e8p), _make_glq_param(e81b)
+
+                layer.Qidxs2_e8p, layer.Qidxs2_e81b = _res_buf(1)
+                layer.Qidxs3_e8p, layer.Qidxs3_e81b = _res_buf(2)
+                layer.Qidxs4_e8p, layer.Qidxs4_e81b = _res_buf(3)
+                layer.inv_resid_scale2 = _make_glq_param(torch.zeros((), dtype=torch.float32))
+                layer.inv_resid_scale3 = _make_glq_param(torch.zeros((), dtype=torch.float32))
             else:
                 m_pad, n_pad = _register_glq_buffers(
                     layer, '', out_sz, input_size_per_partition)
@@ -952,14 +987,16 @@ class GLQLinearMethod(LinearMethodBase):
         """e8p: cache codebook grids + per-(shard) scalars/flags. Block-diag dims are read
         back from the loaded Qidxs shape in ``_meta`` (m_pad=rows*16, n_pad=cols*64), so a
         block-diag or a legacy pow2 checkpoint both resolve to their stored padded dims."""
-        grid_cb, e81b_cb = _ensure_codebook(device, max_bpw=4, codebook_type="e8p")
+        grid_cb, e81b_cb = _ensure_codebook(device, max_bpw=8, codebook_type="e8p")
         _try_load_cuda_ext()
         layer._glq_e8p_grid = grid_cb.grid_packed_abs.to(device)
         layer._glq_e81b_grid = e81b_cb.e81b_grid.to(device) if e81b_cb is not None else None
 
         # Move e8p buffers to device (GLQShardedParameter per-shard lists + plain params).
-        for attr in ['Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs2_e81b', 'SU', 'SV',
-                     'Wscale', 'inv_resid_scale']:
+        for attr in ['Qidxs_e8p', 'Qidxs2_e8p', 'Qidxs2_e81b',
+                     'Qidxs3_e8p', 'Qidxs3_e81b', 'Qidxs4_e8p', 'Qidxs4_e81b',
+                     'SU', 'SV', 'Wscale',
+                     'inv_resid_scale', 'inv_resid_scale2', 'inv_resid_scale3']:
             t = getattr(layer, attr, None)
             if t is None:
                 continue
@@ -980,11 +1017,15 @@ class GLQLinearMethod(LinearMethodBase):
                 # ``_shard_data`` moves already do — so the move sticks.
                 t.data = t.data.to(device)
 
-        def _meta(Qe8p, Q2e8p, Q2e81b, wscale, inv_rs, out_sz):
+        def _meta(Qe8p, Q2e8p, Q2e81b, Q3e8p, Q3e81b, Q4e8p, Q4e81b,
+                  wscale, inv_rs, inv_rs2, inv_rs3, out_sz):
+            def _nz(t):
+                return bool(t is not None and t.numel() > 0)
             return {
-                'wscale': wscale, 'inv_rs': inv_rs,
-                'has_e8p2': bool(Q2e8p is not None and Q2e8p.numel() > 0),
-                'has_e81b': bool(Q2e81b is not None and Q2e81b.numel() > 0),
+                'wscale': wscale, 'inv_rs': inv_rs, 'inv_rs2': inv_rs2, 'inv_rs3': inv_rs3,
+                'has_e8p2': _nz(Q2e8p), 'has_e81b': _nz(Q2e81b),
+                'has_e8p3': _nz(Q3e8p), 'has_e81b3': _nz(Q3e81b),
+                'has_e8p4': _nz(Q4e8p), 'has_e81b4': _nz(Q4e81b),
                 'm_pad': Qe8p.shape[0] * 16, 'n_pad': Qe8p.shape[1] * 64,
                 'out': out_sz, 'in': layer.glq_in_features,
             }
@@ -992,13 +1033,21 @@ class GLQLinearMethod(LinearMethodBase):
         if getattr(layer, 'glq_is_fused', False):
             layer._glq_e8p_meta = [
                 _meta(layer.Qidxs_e8p.get_shard(i), layer.Qidxs2_e8p.get_shard(i),
-                      layer.Qidxs2_e81b.get_shard(i), layer.Wscale.get_shard(i).item(),
-                      layer.inv_resid_scale.get_shard(i).item(), layer.glq_shard_sizes[i])
+                      layer.Qidxs2_e81b.get_shard(i),
+                      layer.Qidxs3_e8p.get_shard(i), layer.Qidxs3_e81b.get_shard(i),
+                      layer.Qidxs4_e8p.get_shard(i), layer.Qidxs4_e81b.get_shard(i),
+                      layer.Wscale.get_shard(i).item(),
+                      layer.inv_resid_scale.get_shard(i).item(),
+                      layer.inv_resid_scale2.get_shard(i).item(),
+                      layer.inv_resid_scale3.get_shard(i).item(), layer.glq_shard_sizes[i])
                 for i in range(layer.glq_num_shards)]
         else:
             layer._glq_e8p_meta = [_meta(
                 layer.Qidxs_e8p, layer.Qidxs2_e8p, layer.Qidxs2_e81b,
-                layer.Wscale.item(), layer.inv_resid_scale.item(), layer.glq_out_features)]
+                layer.Qidxs3_e8p, layer.Qidxs3_e81b, layer.Qidxs4_e8p, layer.Qidxs4_e81b,
+                layer.Wscale.item(), layer.inv_resid_scale.item(),
+                layer.inv_resid_scale2.item(), layer.inv_resid_scale3.item(),
+                layer.glq_out_features)]
 
         # Precompute the block-diagonal RHT tensors ONCE, here in
         # process_weights_after_loading — *before* torch.compile/cudagraph

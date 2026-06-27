@@ -280,9 +280,10 @@ def _ensure_registered():
             _glq_lib.define(
                 "fused_linear_e8p(Tensor x, Tensor sv, Tensor su, "
                 "Tensor qidxs_e8p, Tensor qidxs2_e8p, Tensor qidxs2_e81b, "
+                "Tensor qidxs3_e8p, Tensor qidxs3_e81b, Tensor qidxs4_e8p, Tensor qidxs4_e81b, "
                 "Tensor codebook_abs, Tensor e81b_codebook, "
                 "Tensor blocks_n, Tensor blocks_m, Tensor blocks_n_meta, Tensor blocks_m_meta, "
-                "float wscale, float inv_resid_scale, "
+                "float wscale, float inv_resid_scale, float inv_resid_scale2, float inv_resid_scale3, "
                 "int in_features, int out_features, "
                 "int n_pad, int m_pad, int log_n, int log_m) -> Tensor")
             _glq_lib.impl("fused_linear_e8p", cuda.glq_fused_linear_e8p_cuda, dispatch_key)
@@ -346,9 +347,11 @@ def _decompress_e81b_packed_fake(YIs, CB, Y):
 
 
 def _fused_linear_e8p_fake(x, sv, su, qidxs_e8p, qidxs2_e8p, qidxs2_e81b,
+                           qidxs3_e8p, qidxs3_e81b, qidxs4_e8p, qidxs4_e81b,
                            codebook_abs, e81b_codebook,
                            blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
-                           wscale, inv_resid_scale, in_features, out_features,
+                           wscale, inv_resid_scale, inv_resid_scale2, inv_resid_scale3,
+                           in_features, out_features,
                            n_pad, m_pad, log_n, log_m):
     # (B, in_features) → (B, out_features) fp16.
     return torch.empty((x.shape[0], out_features), dtype=torch.float16, device=x.device)
