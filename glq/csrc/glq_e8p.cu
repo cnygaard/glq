@@ -423,6 +423,183 @@ torch::Tensor glq_matmul_e8p(
 }
 
 
+// ---- Grouped (per-expert) E8P TC-GEMM for fused MoE serving ----
+// Fork of glq_decode_matmul_e8p_kernel with a uniform per-block expert route
+// (m_indices, like glq_matmul_tc_grouped_scratch_kernel) + per-expert Wscale
+// folded into the scratch store. The bit-expand + mma decode body is byte-
+// identical to the single kernel; only the weight base, wscale, and pad-tile
+// early-return are added. Input/scratch are pre-grouped over M_sum_max token
+// slots (8-token n-tiles; the host's 16-pad makes each tile expert-uniform).
+__global__ static void glq_decode_matmul_e8p_grouped_kernel(
+    float *__restrict__ scratch,           // (E8P_MM_WARPS, M_sum_max, N) fp32 k-split planes
+    const uint32_t *__restrict__ input,    // (M_sum_max, K) fp16 as (M_sum_max, K/2) uint32, GROUPED
+    const uint2 *__restrict__ weights_compressed,  // (E, N/16, K/64, 8, 4); per-expert via w_estride
+    const uint32_t *__restrict__ codebook_abs,
+    const int *__restrict__ m_indices,     // (M_sum_max,) expert per slot, -1 = pad
+    const float *__restrict__ wscale_dev,  // (E,) per-expert Wscale
+    const float *__restrict__ inv_rs_dev,  // (E,) or null — residual stage folds wscale*inv_rs
+    long w_estride,                        // uint2 elements per expert = (N/16)*(K/2)
+    int N, int K, int B                    // B = M_sum_max
+) {
+    int warpId = threadIdx.y;
+    int laneId = threadIdx.x;
+    int g = laneId >> 2;                    // groupID 0..7 -> feeds n-column g
+    int t = laneId & 3;
+    int K2 = K >> 1;
+    int base = blockIdx.y << 3;             // first token slot of this 8-token n-tile
+    int eidx = (base < B) ? m_indices[base] : -1;
+    if (eidx < 0) return;                   // fully-pad tile -> skip (output discarded)
+    const uint2 *wexp = weights_compressed + (size_t)eidx * w_estride;
+    float wscale = wscale_dev[eidx];
+    if (inv_rs_dev != nullptr) wscale *= inv_rs_dev[eidx];   // residual stage: wscale * inv_resid_scale
+
+    int tok_n = base + g;
+    bool active = tok_n < B;
+    const uint32_t *tok = input + (size_t)tok_n * K2;
+    size_t kplane = (size_t)warpId * B * N;
+
+    for (int iin = blockIdx.x; iin < (N >> 4); iin += gridDim.x) {
+        float z0 = 0.0, z1 = 0.0, z2 = 0.0, z3 = 0.0;
+
+        for (int iik = warpId; iik < (K >> 6); iik += E8P_MM_WARPS) {
+            uint2 w_compr = wexp[laneId + 32 * iik + K2 * iin];
+            uint32_t a = w_compr.x;
+            uint32_t b = w_compr.y;
+
+            uint32_t s = b;
+            s = s ^ (s >> 4);
+            s = s ^ (s >> 8);
+            s = s ^ (s >> 16);
+            uint32_t sb = (s & 15);
+            s = b ^ sb;
+            sb = sb | (sb << 16);
+
+            const uint32_t *xp = tok + 32 * iik + 8 * t;
+            uint32_t xr0 = active ? xp[0] : 0u;
+            uint32_t xr1 = active ? xp[1] : 0u;
+            uint32_t xr2 = active ? xp[2] : 0u;
+            uint32_t xr3 = active ? xp[3] : 0u;
+            uint32_t xr4 = active ? xp[4] : 0u;
+            uint32_t xr5 = active ? xp[5] : 0u;
+            uint32_t xr6 = active ? xp[6] : 0u;
+            uint32_t xr7 = active ? xp[7] : 0u;
+
+            /// BLOCK 01
+            {
+            uint32_t x = codebook_abs[(a >> 0) & 255];
+            x = x ^ ((s & 0x11111111) * 14);
+            uint32_t o = E8P_BASE_OFFSET | ((sb & 0x00010001) << 4);
+            uint32_t w00 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w01 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w02 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w03 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            x = codebook_abs[(a >> 8) & 255];
+            x = x ^ ((s & 0x22222222) * 7);
+            o = E8P_BASE_OFFSET | ((sb & 0x00020002) << 3);
+            uint32_t w10 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w11 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w12 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w13 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w00), "r"(w10), "r"(w01), "r"(w11), "r"(xr0), "r"(xr1));
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w02), "r"(w12), "r"(w03), "r"(w13), "r"(xr2), "r"(xr3));
+            }
+            /// BLOCK 23
+            {
+            uint32_t x = codebook_abs[(a >> 16) & 255];
+            s = s >> 2;
+            x = x ^ ((s & 0x11111111) * 14);
+            uint32_t o = E8P_BASE_OFFSET | ((sb & 0x00040004) << 2);
+            uint32_t w00 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w01 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w02 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w03 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            x = codebook_abs[(a >> 24) & 255];
+            x = x ^ ((s & 0x22222222) * 7);
+            o = E8P_BASE_OFFSET | ((sb & 0x00080008) << 1);
+            uint32_t w10 = e8p_add_as_half2(e8p_mask_lop3(x << 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w11 = e8p_add_as_half2(e8p_mask_lop3(x << 0, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w12 = e8p_add_as_half2(e8p_mask_lop3(x >> 4, E8P_XMASK, E8P_WMASK), o);
+            uint32_t w13 = e8p_add_as_half2(e8p_mask_lop3(x >> 8, E8P_XMASK, E8P_WMASK), o);
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w00), "r"(w10), "r"(w01), "r"(w11), "r"(xr4), "r"(xr5));
+            asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                " { %0, %1, %2, %3 }, { %4, %5, %6, %7 }, { %8, %9 }, { %0, %1, %2, %3 };"
+                : "+f"(z0), "+f"(z1), "+f"(z2), "+f"(z3)
+                : "r"(w02), "r"(w12), "r"(w03), "r"(w13), "r"(xr6), "r"(xr7));
+            }
+        }
+        // col n == token (base + 2t/2t+1), row 2g/2g+1; fold per-expert Wscale.
+        int row_e = (iin << 4) + (g << 1);
+        int row_o = row_e + 1;
+        int tok0 = base + (t << 1);
+        int tok1 = tok0 + 1;
+        if (tok0 < B) {
+            scratch[kplane + (size_t)tok0 * N + row_e] = z0 * wscale;
+            scratch[kplane + (size_t)tok0 * N + row_o] = z2 * wscale;
+        }
+        if (tok1 < B) {
+            scratch[kplane + (size_t)tok1 * N + row_e] = z1 * wscale;
+            scratch[kplane + (size_t)tok1 * N + row_o] = z3 * wscale;
+        }
+    }
+}
+
+
+// Accumulating variant of the deterministic reduce: output[i] += sum_k scratch[k,i].
+// Lets RVQ stages compose by linearity (stage-0 overwrite, stage-k>=1 accumulate).
+__global__ static void __launch_bounds__(256) glq_reduce_splits_2d_e8p_accum_kernel(
+    float *__restrict__ output, const float *__restrict__ scratch, int BN, int n_splits
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= BN) return;
+    float sum = 0.0f;
+    for (int k = 0; k < n_splits; ++k) sum += scratch[(size_t)k * BN + i];
+    output[i] += sum;
+}
+
+
+// Grouped E8P matmul over a PRE-GROUPED input (no gather), for the fused MoE
+// host entry in glq_cuda.cu. Non-static (cross-TU). RVQ stages compose by
+// linearity: stage-0 (qb0, wscale) overwrites y_out; stage-1 (qb1, wscale*inv_rs)
+// accumulates. Caller passes pre-allocated scratch (capture-safe).
+void launch_grouped_matmul_e8p(
+    float *scratch, float *y_out, const half *x_grouped,
+    const uint2 *qb0, const uint2 *qb1, const uint32_t *codebook_abs,
+    int M_sum_max, int N, int K, long w_estride,
+    const int *m_indices, const float *wscale_dev, const float *inv_rs_dev,
+    cudaStream_t stream
+) {
+    dim3 grid((N + 15) / 16, (M_sum_max + 7) / 8);
+    dim3 block(32, E8P_MM_WARPS);
+    int64_t BN = (int64_t)M_sum_max * N;
+    int rblocks = (int)((BN + 255) / 256);
+
+    // stage 0 (primary): wscale only, overwrite.
+    glq_decode_matmul_e8p_grouped_kernel<<<grid, block, 0, stream>>>(
+        scratch, (const uint32_t *)x_grouped, qb0, codebook_abs, m_indices,
+        wscale_dev, nullptr, w_estride, N, K, M_sum_max);
+    glq_reduce_splits_2d_e8p_kernel<<<rblocks, 256, 0, stream>>>(
+        y_out, scratch, (int)BN, E8P_MM_WARPS);
+
+    // stage 1 (E8P residual): wscale * inv_resid_scale, accumulate.
+    if (qb1 != nullptr) {
+        glq_decode_matmul_e8p_grouped_kernel<<<grid, block, 0, stream>>>(
+            scratch, (const uint32_t *)x_grouped, qb1, codebook_abs, m_indices,
+            wscale_dev, inv_rs_dev, w_estride, N, K, M_sum_max);
+        glq_reduce_splits_2d_e8p_accum_kernel<<<rblocks, 256, 0, stream>>>(
+            y_out, scratch, (int)BN, E8P_MM_WARPS);
+    }
+}
+
+
 __global__ static void glq_decompress_packed_e8p_kernel(
     uint32_t *__restrict__ output,
     const uint2 *__restrict__ weights_compressed,
