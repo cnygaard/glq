@@ -547,6 +547,109 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
     return W_hat, artifacts, metrics
 
 
+def quantize_experts_e8_shell_rht_batched(W_stack, H_stack, codebook, bpw=2,
+                                          tune_iters=0, apply_left=True,
+                                          block_diagonal=True):
+    """Batched expert quant: ``quantize_layer_e8_shell_rht`` over a leading E dim.
+
+    Quantizes E identically-shaped MoE experts in one stacked pass. Every expert
+    shares the RHT (the seed is fixed, so all experts get the same SU/SV — exactly
+    what the per-expert path produces with its default seed), so a single RHT and
+    one batched N-stage LDLQ serve the whole group, eliminating the per-expert
+    launch-overhead bottleneck. Returns a list of E per-expert
+    ``(W_hat, artifacts, metrics)`` tuples matching ``quantize_layer_e8_shell_rht``'s
+    contract, so the existing store/writeback path is unchanged.
+
+    Only the e8p codebook path is implemented (the MoE decode-speed target).
+
+    Args:
+        W_stack: (E, m, n) stacked expert weights (identical shape).
+        H_stack: (E, n, n) stacked per-expert Hessians.
+        codebook: an E8PCodebook (``is_e8p`` True).
+        bpw, tune_iters, apply_left, block_diagonal: as in the single-expert path.
+
+    Returns:
+        list of (W_hat_e (m,n) on device, artifacts_e dict, metrics_e dict).
+    """
+    is_e8p = getattr(codebook, 'is_e8p', False)
+    assert is_e8p, "batched expert quant currently supports only the e8p codebook"
+    assert tune_iters == 0, "batched expert quant does not support tune_iters>0"
+    from .ldlq import quantize_ldlq_codebook_nstage_batched
+    from .codebook_e8p import E81BCodebook
+
+    dev = codebook.device
+    assert W_stack.dim() == 3 and H_stack.dim() == 3
+    E, m, n = W_stack.shape
+    W_f = W_stack.float().to(dev)
+    H_f = H_stack.float().to(dev)
+
+    # One shared RHT (fixed seed -> identical SU/SV for every expert).
+    rht = RHT(m, n, device=dev, block_diagonal=block_diagonal,
+              apply_left=apply_left, e8p=is_e8p)
+    W_tilde = rht.transform_weights_batched(W_f)        # (E, m_pad, n_pad)
+    H_tilde = rht.transform_hessian_batched(H_f)        # (E, n_pad, n_pad)
+
+    n_tilde = W_tilde.shape[-1]
+    # e8p RHT keeps n_pad a multiple of 64 (>= codesz 8) and m_pad a multiple of
+    # 16, so no further pad-to-codesz is needed (unlike the single shell path).
+    assert n_tilde % codebook.codesz == 0, \
+        f"e8p n_pad={n_tilde} must be divisible by codesz {codebook.codesz}"
+
+    codebooks, resid_scales = _e8p_rvq_recipe(bpw, codebook, dev)
+    result = quantize_ldlq_codebook_nstage_batched(
+        W_tilde, H_tilde, codebooks=codebooks, resid_scales=resid_scales,
+        tune_iters=tune_iters)
+
+    # Batched inverse transform for error propagation / writeback.
+    W_hat_tilde = result['W_hat'][:, :, :n_tilde]
+    W_hat = rht.inverse_transform_weights_batched(W_hat_tilde)   # (E, m, n)
+
+    # Per-expert SQNR.
+    num = W_f.pow(2).flatten(1).sum(dim=1)
+    den = (W_f - W_hat).pow(2).flatten(1).sum(dim=1).clamp(min=1e-20)
+    sqnr = 10 * torch.log10(num / den)                  # (E,)
+
+    all_idx = result['all_indices']                     # list of (E, m_pad, num_blocks)
+    cum_inv_rs = result['cum_inv_rs']
+    Wscale = result['Wscale']                           # (E,)
+    proxy_loss = result['proxy_loss']                   # (E,)
+    m_pad = all_idx[0].shape[1]
+    n_pad = all_idx[0].shape[2] * 8
+    stage_is_e81b = _e8p_stage_is_e81b(bpw)
+
+    # SU/SV are shared across the whole group (one RHT); read-only downstream.
+    su_h = rht.su.half()
+    sv_h = rht.sv.half()
+
+    def _pack_e8p_one(idx2d):
+        return codebook.maybe_pack_idxs(idx2d.to(torch.int64)).view(
+            m_pad // 16, n_pad // 64, 8, 4).contiguous()
+
+    results = []
+    for e in range(E):
+        artifacts = {
+            'SU': su_h,
+            'SV': sv_h,
+            'Wscale': Wscale[e].to(torch.float32),
+        }
+        artifacts['Qidxs_e8p'] = _pack_e8p_one(all_idx[0][e])
+        for k in range(1, len(all_idx)):
+            name = f'Qidxs{k + 1}'
+            if stage_is_e81b[k]:
+                artifacts[f'{name}_e81b'] = E81BCodebook.pack_e81b(
+                    all_idx[k][e].to(torch.int64))
+            else:
+                artifacts[f'{name}_e8p'] = _pack_e8p_one(all_idx[k][e])
+            scale_name = 'inv_resid_scale' if k == 1 else f'inv_resid_scale{k}'
+            artifacts[scale_name] = torch.tensor(cum_inv_rs[k], dtype=torch.float32)
+
+        metrics = {'sqnr': sqnr[e].item(), 'bpw': result['bpw'],
+                   'Wscale': Wscale[e].item(), 'proxy_loss': proxy_loss[e].item()}
+        results.append((W_hat[e], artifacts, metrics))
+
+    return results
+
+
 # ---- main quantization pipeline ----
 
 def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
@@ -1263,8 +1366,44 @@ def quantize(
 
         # Output-row-indexed artifacts get row-split between gate/up; the rest
         # (input-side SV, scalar Wscale/inv_resid_scale) are shared -> duplicated.
+        # E8P stores TC-packed Qidxs*_e8p whose axis-0 is in 16-row mma tiles
+        # (m_pad//16), so those split at rows//16; shell Qidxs/SU and *_e81b are
+        # one entry per row. SV/Wscale/inv_resid_scale* are shared (input-side/scalar).
         _ROW_ARTS = {'Qidxs', 'Qidxs2', 'Qidxs3', 'SU'}
         _SHARED_ARTS = {'SV', 'Wscale', 'inv_resid_scale', 'inv_resid_scale2'}
+
+        def _is_shared_art(k):
+            return k in _SHARED_ARTS or k.startswith('inv_resid_scale')
+
+        def _is_row_art(k):
+            return k in _ROW_ARTS or k.endswith('_e8p') or k.endswith('_e81b')
+
+        def _split_gate_up_arts(arts, gate_rows, up_rows):
+            """Row-split jointly-quantized [gate; up] artifacts into per-proj dicts.
+            e8p TC-packed ``*_e8p`` buffers are tiled in 16-row mma tiles (axis-0 =
+            rows//16); shell Qidxs/SU and ``*_e81b`` are one entry per row. Asserts
+            the gate/up boundary is tile-aligned and the split covers the buffer."""
+            gate_arts, up_arts = {}, {}
+            for k, v in arts.items():
+                if _is_shared_art(k):
+                    gate_arts[k] = v.clone()
+                    up_arts[k] = v.clone()
+                elif _is_row_art(k):
+                    t = 16 if k.endswith('_e8p') else 1
+                    assert gate_rows % t == 0 and up_rows % t == 0, (
+                        f"gate_up split: rows ({gate_rows},{up_rows}) not multiples "
+                        f"of mma tile {t} for {k!r}")
+                    g, u = gate_rows // t, up_rows // t
+                    assert g + u == v.shape[0], (
+                        f"gate_up split for {k!r}: (gate+up)//{t}={g + u} != axis-0 "
+                        f"{v.shape[0]} (non-16-aligned or RHT-padded m-dim)")
+                    gate_arts[k] = v[:g].clone()
+                    up_arts[k] = v[g:g + u].clone()
+                else:
+                    raise ValueError(
+                        f"gate_up split: unhandled artifact key {k!r}; classify it "
+                        f"in _is_row_art / _is_shared_art")
+            return gate_arts, up_arts
 
         def _store_artifacts(name, arts):
             """Record quantized artifacts under their checkpoint prefix(es).
@@ -1275,18 +1414,7 @@ def quantize(
                 # [gate; up]; row-split into per-expert gate_proj/up_proj (dup the
                 # shared SV/Wscale) so vLLM's FusedMoE w13 mapping reassembles it.
                 gate_name, up_name, inter = moe_gate_up[name]
-                gate_arts, up_arts = {}, {}
-                for k, v in arts.items():
-                    if k in _ROW_ARTS:
-                        gate_arts[k] = v[:inter].clone()
-                        up_arts[k] = v[inter:2 * inter].clone()
-                    elif k in _SHARED_ARTS:
-                        gate_arts[k] = v.clone()
-                        up_arts[k] = v.clone()
-                    else:
-                        raise ValueError(
-                            f"gemma4 expert gate_up split: unhandled artifact "
-                            f"key {k!r}; add it to _ROW_ARTS or _SHARED_ARTS")
+                gate_arts, up_arts = _split_gate_up_arts(arts, inter, inter)
                 all_artifacts[f"{sd_prefix}.{layer_idx}.{gate_name}"] = gate_arts
                 all_artifacts[f"{sd_prefix}.{layer_idx}.{up_name}"] = up_arts
                 return
@@ -1295,18 +1423,7 @@ def quantize(
                 return
             real_gate, real_up, gate_out, gate_name, up_name = gate_up_fusion[name]
             up_out = real_up.weight.data.shape[0]
-            gate_arts, up_arts = {}, {}
-            for k, v in arts.items():
-                if k in _ROW_ARTS:
-                    gate_arts[k] = v[:gate_out].clone()
-                    up_arts[k] = v[gate_out:gate_out + up_out].clone()
-                elif k in _SHARED_ARTS:
-                    gate_arts[k] = v.clone()
-                    up_arts[k] = v.clone()
-                else:
-                    raise ValueError(
-                        f"gate_up split: unhandled artifact key {k!r}; add it to "
-                        f"_ROW_ARTS or _SHARED_ARTS in _store_artifacts")
+            gate_arts, up_arts = _split_gate_up_arts(arts, gate_out, up_out)
             all_artifacts[f"{sd_prefix}.{layer_idx}.{gate_name}"] = gate_arts
             all_artifacts[f"{sd_prefix}.{layer_idx}.{up_name}"] = up_arts
 
@@ -1381,6 +1498,15 @@ def quantize(
                 all_sqnr.append(metrics['sqnr'])
                 all_proxy_losses[layer_prefix] = metrics['proxy_loss']
 
+            def _sub_bpw(name):
+                """Resolve a sublayer's target bpw (same logic as _quantize_one)."""
+                layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
+                if bpw_map is not None:
+                    return bpw_map.get(layer_prefix, bpw_map.get('default', 2))
+                if mixed_precision:
+                    return 2
+                return bpw
+
             # Non-experts: sequential (few, large, may share GPU resources)
             for name in non_expert_names:
                 t0 = time.perf_counter()
@@ -1398,28 +1524,70 @@ def quantize(
                 if use_gpu:
                     torch.cuda.empty_cache()
 
-            # Experts: parallel via ThreadPoolExecutor + CUDA streams
+            # Experts.
             if expert_names:
-                from concurrent.futures import ThreadPoolExecutor
-                n_parallel = min(8, len(expert_names))
                 t0_experts = time.perf_counter()
+                expert_sqnrs = []
 
-                with ThreadPoolExecutor(max_workers=n_parallel) as expert_pool:
-                    futures = {}
+                if getattr(codebook, 'is_e8p', False):
+                    # e8p: the 128 identically-shaped, independent experts share
+                    # the RHT, so quantize each (shape, bpw) group in one stacked
+                    # batched LDLQ pass. The per-expert loop was GIL/launch-bound
+                    # (GPU ~22%, millions of 1-12us kernels); batching gives one
+                    # GPU-filling kernel per op. Chunk to bound memory.
+                    from collections import OrderedDict
+                    groups = OrderedDict()           # (shape, bpw) -> [names]
                     for name in expert_names:
-                        f = expert_pool.submit(_quantize_one, name)
-                        futures[f] = name
+                        key = (tuple(linears[name].weight.data.shape), _sub_bpw(name))
+                        groups.setdefault(key, []).append(name)
 
-                    expert_sqnrs = []
-                    for f in futures:
-                        name, W_hat, artifacts_cpu, metrics = f.result()
-                        _collect_result(name, W_hat, artifacts_cpu, metrics)
-                        expert_sqnrs.append(metrics['sqnr'])
+                    chunk = max(1, int(os.environ.get("GLQ_QUANT_EXPERT_BATCH", "32")))
+                    n_batches = 0
+                    for (_shape, sub_bpw), names in groups.items():
+                        for i in range(0, len(names), chunk):
+                            sub = names[i:i + chunk]
+                            W_stack = torch.stack(
+                                [linears[nm].weight.data.to(device) for nm in sub])
+                            H_stack = torch.stack(
+                                [hessians[nm].to(device) for nm in sub])
+                            batch = quantize_experts_e8_shell_rht_batched(
+                                W_stack, H_stack, codebook, bpw=sub_bpw,
+                                tune_iters=tune_iters)
+                            del W_stack, H_stack
+                            for nm, (W_hat, artifacts, metrics) in zip(sub, batch):
+                                artifacts_cpu = {k: v.cpu() for k, v in artifacts.items()}
+                                _collect_result(nm, W_hat, artifacts_cpu, metrics)
+                                expert_sqnrs.append(metrics['sqnr'])
+                            del batch
+                            n_batches += 1
+                            if use_gpu:
+                                torch.cuda.empty_cache()
 
-                dt_experts = time.perf_counter() - t0_experts
-                avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
-                print(f"  {len(expert_names)} experts in {dt_experts:.1f}s "
-                      f"({n_parallel} parallel) avg SQNR={avg_sqnr:.1f}dB")
+                    dt_experts = time.perf_counter() - t0_experts
+                    avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
+                    print(f"  {len(expert_names)} experts in {dt_experts:.1f}s "
+                          f"(batched, {n_batches} groups×chunks, chunk={chunk}) "
+                          f"avg SQNR={avg_sqnr:.1f}dB")
+                else:
+                    # Shell codebook: keep the proven per-expert ThreadPool until a
+                    # shell quantize_fast-batches parity test lands.
+                    from concurrent.futures import ThreadPoolExecutor
+                    n_parallel = min(int(os.environ.get("GLQ_QUANT_EXPERT_WORKERS", "8")),
+                                     len(expert_names))
+                    with ThreadPoolExecutor(max_workers=n_parallel) as expert_pool:
+                        futures = {}
+                        for name in expert_names:
+                            f = expert_pool.submit(_quantize_one, name)
+                            futures[f] = name
+                        for f in futures:
+                            name, W_hat, artifacts_cpu, metrics = f.result()
+                            _collect_result(name, W_hat, artifacts_cpu, metrics)
+                            expert_sqnrs.append(metrics['sqnr'])
+
+                    dt_experts = time.perf_counter() - t0_experts
+                    avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
+                    print(f"  {len(expert_names)} experts in {dt_experts:.1f}s "
+                          f"({n_parallel} parallel) avg SQNR={avg_sqnr:.1f}dB")
 
         del hessians
 

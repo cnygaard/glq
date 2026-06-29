@@ -36,6 +36,57 @@ def block_LDL(H: torch.Tensor, block_size: int = 8) -> Tuple[torch.Tensor, torch
     return L, D
 
 
+def block_LDL_batched(H: torch.Tensor, block_size: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched block LDL: ``block_LDL`` over a leading expert dim ``E``.
+
+    Identical math to :func:`block_LDL` with an ``E`` dim prepended to every
+    tensor (``torch.mm``/diagonal/inv/einsum all carry the batch). The one
+    difference is failure handling: ``torch.linalg.cholesky`` aborts the whole
+    batch if *any* matrix is non-PD, so this uses ``cholesky_ex`` and re-damps
+    only the failing experts (0.1·mean-diag, then identity) — the per-expert
+    analogue of the single path's 3-tier ``_LinAlgError`` fallback in
+    ``quantize_layer_e8_shell_rht``. The caller is expected to have already
+    applied the base 0.01·mean-diag damp (as the single N-stage path does).
+
+    Args:
+        H: (E, n, n) symmetric matrices, each ~PD after the caller's base damp.
+        block_size: b, must divide n.
+
+    Returns:
+        (L, D): L is (E, n, n) block unit-lower-triangular, D is (E, n//b, b, b).
+    """
+    assert H.dim() == 3, f"expected (E, n, n), got {tuple(H.shape)}"
+    E, n, _ = H.shape
+    b = block_size
+    assert n % b == 0, f"n={n} must be divisible by block_size={b}"
+    m = n // b
+
+    eye = torch.eye(n, device=H.device, dtype=H.dtype)
+    Hc = H.clone()
+    # Progressive masked damping: factor as-is, then add 0.1·mean-diag to the
+    # failing experts, then fall back to identity for any that still fail.
+    L_chol, info = torch.linalg.cholesky_ex(Hc)
+    for tier in range(2):
+        bad = info > 0
+        if not bad.any():
+            break
+        if tier == 0:
+            extra = 0.1 * torch.diagonal(Hc[bad], dim1=-2, dim2=-1).mean(dim=-1)
+            Hc[bad] = Hc[bad] + extra[:, None, None] * eye
+        else:
+            Hc[bad] = eye                       # last resort: identity (always PD)
+        L_chol, info = torch.linalg.cholesky_ex(Hc)
+
+    DL = torch.diagonal(L_chol.reshape(E, m, b, m, b), dim1=1, dim2=3).permute(0, 3, 1, 2)
+    D = DL @ DL.transpose(-1, -2)
+    DL_inv = torch.linalg.inv(DL)
+    # Per block-column i and per expert e: right-multiply L_chol's block column
+    # by DL_inv[e, i] so the diagonal block becomes identity.
+    L = torch.einsum('enib,eibj->enij', L_chol.reshape(E, n, m, b), DL_inv).reshape(E, n, n)
+
+    return L, D
+
+
 def quantize_ldlq_codebook(
     W: torch.Tensor,
     H: torch.Tensor,
@@ -570,6 +621,160 @@ def quantize_ldlq_codebook_nstage(
         'W_hat': W_hat,
         'all_indices': all_indices,  # list of N tensors
         'Wscale': Wscale,
+        'resid_scales': resid_scales,
+        'cum_inv_rs': cum_inv_rs,
+        'bpw': bpw,
+        'quant_mse': quant_mse,
+        'proxy_loss': proxy_loss,
+        'tune_iters': tune_iters,
+    }
+
+
+def quantize_ldlq_codebook_nstage_batched(
+    W: torch.Tensor,
+    H: torch.Tensor,
+    codebooks: list,
+    resid_scales: list[float],
+    tune_iters: int = 0,
+    Wscale: Optional[torch.Tensor] = None,
+):
+    """Batched N-stage LDLQ: :func:`quantize_ldlq_codebook_nstage` over a leading
+    expert dim ``E``.
+
+    Quantizes E independent, identically shaped weight matrices in one stacked
+    pass. Each expert's LDLQ feedback stays inside its own (m, n) slice, so this
+    is mathematically per-expert-identical to looping the single-expert function
+    — but the heavy ops run batched (one GPU-filling kernel instead of E tiny
+    ones), which is the point: the per-expert MoE loop is launch-overhead-bound.
+
+    The feedback matmul becomes ``torch.bmm`` and the per-block codebook NN runs
+    on the flattened ``(E*m, b)`` view (the NN is per-row, so flattening the
+    expert and row axes is exact). Determinism is preserved: the block sweep is
+    the same fixed reversed order with no atomics.
+
+    Args:
+        W: (E, m, n) weight matrices. n divisible by codebooks[0].codesz.
+        H: (E, n, n) Hessians.
+        codebooks: list of codebooks [cb1, ..., cbN] (shared across experts).
+        resid_scales: list of N-1 scale factors.
+        tune_iters: must be 0 (batched refinement not implemented; e8p RVQ uses 0).
+        Wscale: optional (E,) global scales. If None, computed per-expert from rms.
+
+    Returns:
+        dict with W_hat (E,m,n), all_indices (list of N (E,m,num_blocks) longs),
+        Wscale (E,), resid_scales, cum_inv_rs, bpw, quant_mse (E,), proxy_loss (E,).
+    """
+    assert tune_iters == 0, "batched N-stage LDLQ does not support tune_iters>0"
+    n_stages = len(codebooks)
+    assert len(resid_scales) == n_stages - 1, \
+        f"Need {n_stages - 1} resid_scales for {n_stages} stages, got {len(resid_scales)}"
+
+    device = codebooks[0].device
+    assert W.dim() == 3 and H.dim() == 3, "W,H must be (E,m,n)/(E,n,n)"
+    E, m, n = W.shape
+    b = codebooks[0].codesz
+    assert n % b == 0
+    num_blocks = n // b
+
+    W = W.float().to(device)
+    H = H.float().to(device)
+
+    # Per-expert diagonal damping (0.01·mean-diag), then batched block-LDL with
+    # the per-expert PD retry living inside block_LDL_batched.
+    damp = 0.01 * torch.diagonal(H, dim1=-2, dim2=-1).mean(dim=-1)        # (E,)
+    eye = torch.eye(n, device=device)
+    H_reg = H + damp[:, None, None] * eye
+    L, D = block_LDL_batched(H_reg, block_size=b)
+
+    if Wscale is None:
+        W_rms = W.pow(2).mean(dim=(-2, -1)).sqrt()                        # (E,)
+        opt_scale = codebooks[0].opt_scale
+        Wscale = torch.where(W_rms > 1e-10, W_rms * opt_scale,
+                             torch.ones_like(W_rms))                      # (E,)
+    Wscale_t = Wscale.to(device).view(E, 1, 1)
+    Wr = W / Wscale_t                                                     # (E, m, n)
+
+    # Index storage: one (E, m, num_blocks) tensor per stage.
+    all_indices = [
+        torch.zeros(E, m, num_blocks, dtype=torch.long, device=device)
+        for _ in range(n_stages)
+    ]
+
+    # Cumulative inverse resid_scales for reconstruction (stage k weight 1/Πrs).
+    cum_inv_rs = [1.0]
+    for rs in resid_scales:
+        cum_inv_rs.append(cum_inv_rs[-1] / rs)
+
+    # fp16 working precision on CUDA (matches the single CUDA path); fp32 on CPU
+    # (the bit-exact parity reference).
+    work_dtype = torch.float16 if torch.device(device).type == 'cuda' else torch.float32
+    L_w = L.to(work_dtype)
+    Wr_w = Wr.to(work_dtype)
+    R_w = Wr_w.clone()
+    hatWr_w = torch.zeros_like(Wr_w)
+
+    # Per-block reusable buffers; flat views feed the per-row codebook NN
+    # (quantize_fast needs a 2D (R, b) input, which (E*m, b) is).
+    target_buf = torch.empty(E, m, b, dtype=work_dtype, device=device)
+    resid_buf = torch.empty(E, m, b, dtype=work_dtype, device=device)
+    dec_buf = torch.empty(E, m, b, dtype=work_dtype, device=device)
+    idx_buf = torch.empty(E, m, dtype=torch.int64, device=device)
+    target_flat = target_buf.view(E * m, b)
+    resid_flat = resid_buf.view(E * m, b)
+    dec_flat = dec_buf.view(E * m, b)
+    idx_flat = idx_buf.view(E * m)
+
+    for k in reversed(range(num_blocks)):
+        kb, ke = k * b, (k + 1) * b
+        if ke < n:
+            torch.bmm(R_w[:, :, ke:], L_w[:, ke:, kb:ke], out=target_buf)
+            target_buf.add_(Wr_w[:, :, kb:ke])
+        else:
+            target_buf.copy_(Wr_w[:, :, kb:ke])
+
+        recon = torch.zeros(E, m, b, dtype=work_dtype, device=device)
+
+        for s in range(n_stages):
+            if s == 0:
+                codebooks[s].quantize_fast(target_flat,
+                                           decoded_out=dec_flat, idx_out=idx_flat)
+                all_indices[s][:, :, k] = idx_buf
+                recon.add_(dec_buf)
+                torch.sub(target_buf, dec_buf, out=resid_buf)
+                if s < n_stages - 1:
+                    resid_buf.mul_(resid_scales[s])
+            else:
+                codebooks[s].quantize_fast(resid_flat,
+                                           decoded_out=dec_flat, idx_out=idx_flat)
+                all_indices[s][:, :, k] = idx_buf
+                recon.add_(dec_buf, alpha=cum_inv_rs[s])
+                if s < n_stages - 1:
+                    torch.sub(resid_buf, dec_buf, out=resid_buf)
+                    resid_buf.mul_(resid_scales[s])
+
+        hatWr_w[:, :, kb:ke] = recon
+        R_w[:, :, kb:ke] = Wr_w[:, :, kb:ke] - hatWr_w[:, :, kb:ke]
+
+    hatWr = hatWr_w.float()
+    W_hat = hatWr * Wscale_t
+
+    diff = W - W_hat
+    quant_mse = (diff ** 2).mean(dim=(-2, -1))                           # (E,)
+    # proxy_loss per expert = mean_i diag(diff @ H @ diff^T)_i, via bmm to avoid
+    # the huge (E,m,n,n) einsum intermediate.
+    diffH = torch.bmm(diff, H)                                           # (E, m, n)
+    proxy_loss = (diffH * diff).sum(dim=-1).mean(dim=-1)                 # (E,)
+
+    total_bits = sum(
+        math.ceil(math.log2(cb.codebook.shape[0])) if cb.codebook.shape[0] > 1 else 0
+        for cb in codebooks
+    )
+    bpw = total_bits / b + 32.0 / (m * n)
+
+    return {
+        'W_hat': W_hat,
+        'all_indices': all_indices,  # list of N (E, m, num_blocks) tensors
+        'Wscale': Wscale.to(device),
         'resid_scales': resid_scales,
         'cum_inv_rs': cum_inv_rs,
         'bpw': bpw,
