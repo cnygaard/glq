@@ -79,6 +79,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config, moe=None):
         super().__init__(moe)
         self.quant_config = quant_config
+        # e8p MoE: register int64 TC-packed buffers + decode via the e8p path.
+        # Loading is codebook-agnostic (vLLM's prefix expert-mapping carries the
+        # `Qidxs_e8p` suffix; GLQ's shape-based _glq_weight_loader handles the
+        # 16-row-tiled gate/up split), so only create_weights/process/apply differ.
+        self.codebook_type = getattr(quant_config, 'codebook', 'e8_shell')
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -99,6 +104,12 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         if is_gated is None:
             is_gated = getattr(layer, 'is_act_and_mul', False)
         w13_out = 2 * intermediate_size_per_partition if is_gated else intermediate_size_per_partition
+
+        if self.codebook_type == "e8p":
+            self._create_weights_e8p(layer, num_experts, hidden_size,
+                                     intermediate_size_per_partition, is_gated, w13_out)
+            return
+
         # GLQ (post-v0.2.9) stores BLOCK-DIAGONAL artifacts: m_pad/n_pad equal the
         # TRUE out/in dims (n rounded to a multiple of 8), NOT padded to a power of
         # 2. Allocate the buffers at those true dims so (a) the gate/up loader's
@@ -184,8 +195,184 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         layer.w2_inv_resid_scale2 = _make_glq_param(
             torch.zeros(num_experts, dtype=torch.float32))
 
+    def _create_weights_e8p(self, layer, num_experts, hidden_size, inter, is_gated, w13_out):
+        """e8p MoE buffers: int64 TC-packed Qidxs_e8p (+ RVQ residual stages) per expert,
+        registered FULL-SIZE so vLLM's FusedMoE loader copies in-place per expert. Names
+        carry the `_e8p`/`_e81b` suffixes so vLLM's prefix expert-mapping + the shape-based
+        `_glq_weight_loader` route `gate_proj.Qidxs_e8p` -> `w13_Qidxs_e8p` (gate/up split on
+        the per-expert slot's mp16 axis-0). Mirrors the single-linear e8p create_weights."""
+        from .linear_method import _e8p_pad
+
+        def _dims(out_sz, in_sz):
+            m_pad, n_pad = _e8p_pad(out_sz, 16), _e8p_pad(in_sz, 64)
+            return m_pad, n_pad, max(m_pad // 16, 1), max(n_pad // 64, 1)
+
+        m_pad_w13, n_pad_w13, mp16_w13, nb64_w13 = _dims(w13_out, hidden_size)
+        m_pad_w2, n_pad_w2, mp16_w2, nb64_w2 = _dims(hidden_size, inter)
+
+        layer.glq_num_experts = num_experts
+        layer.glq_hidden_size = hidden_size
+        layer.glq_intermediate_size = inter
+        layer.glq_w13_out = w13_out
+        layer.glq_is_gated = is_gated
+        layer.glq_m_pad_w13, layer.glq_n_pad_w13 = m_pad_w13, n_pad_w13
+        layer.glq_m_pad_w2, layer.glq_n_pad_w2 = m_pad_w2, n_pad_w2
+        layer.glq_is_e8p = True
+
+        bpw = int(float(getattr(self.quant_config, 'bpw', 4)))
+        # Residual stage codebook per stage k (0-indexed): E8P unless E81B-final of odd bpw.
+        _nf = bpw // 2
+        _st = [False] * _nf + ([True] if bpw % 2 == 1 else [])
+
+        def _reg(prefix, mp16, nb64, m_pad, n_pad):
+            setattr(layer, f"{prefix}_Qidxs_e8p", _make_glq_param(
+                torch.zeros(num_experts, mp16, nb64, 8, 4, dtype=torch.int64)))
+            setattr(layer, f"{prefix}_SU", _make_glq_param(
+                torch.ones(num_experts, m_pad, dtype=torch.float16)))
+            setattr(layer, f"{prefix}_SV", _make_glq_param(
+                torch.ones(n_pad, dtype=torch.float16)))
+            setattr(layer, f"{prefix}_Wscale", _make_glq_param(
+                torch.ones(num_experts, dtype=torch.float32)))
+            setattr(layer, f"{prefix}_inv_resid_scale", _make_glq_param(
+                torch.zeros(num_experts, dtype=torch.float32)))
+            setattr(layer, f"{prefix}_inv_resid_scale2", _make_glq_param(
+                torch.zeros(num_experts, dtype=torch.float32)))
+            setattr(layer, f"{prefix}_inv_resid_scale3", _make_glq_param(
+                torch.zeros(num_experts, dtype=torch.float32)))
+            # Residual stages k=1,2,3 -> Qidxs{k+1}_(e8p|e81b). Register the variant the
+            # recipe uses at FULL (E,...) shape; the other variant + inactive stages are
+            # (E,1,...) sentinels collapsed to numel-0 in process (the decode numel-gates them).
+            for k in (1, 2, 3):
+                active = len(_st) > k
+                is_e81b = active and _st[k]
+                e8p_t = (torch.zeros(num_experts, mp16, nb64, 8, 4, dtype=torch.int64)
+                         if active and not is_e81b
+                         else torch.zeros(num_experts, 1, 1, 1, 1, dtype=torch.int64))
+                e81b_t = (torch.zeros(num_experts, m_pad, nb64, dtype=torch.int64)
+                          if is_e81b
+                          else torch.zeros(num_experts, 1, 1, dtype=torch.int64))
+                setattr(layer, f"{prefix}_Qidxs{k + 1}_e8p", _make_glq_param(e8p_t))
+                setattr(layer, f"{prefix}_Qidxs{k + 1}_e81b", _make_glq_param(e81b_t))
+
+        _reg("w13", mp16_w13, nb64_w13, m_pad_w13, n_pad_w13)
+        _reg("w2", mp16_w2, nb64_w2, m_pad_w2, n_pad_w2)
+
+    def _process_e8p(self, layer):
+        """e8p MoE: cache grids + block-diag RHT tensors + per-expert scalars; collapse
+        unused residual sentinels to numel-0. Mirrors linear_method._setup_e8p_weights."""
+        from .linear_method import _ensure_codebook, _try_load_cuda_ext
+        from glq.hadamard import _block_decompose as _bd
+        from glq.quantized_linear import _pack_block_meta as _pbm
+
+        dev = layer.w13_Qidxs_e8p.device
+        grid_cb, e81b_cb = _ensure_codebook(dev, max_bpw=8, codebook_type="e8p")
+        _try_load_cuda_ext()
+        layer._glq_e8p_grid = grid_cb.grid_packed_abs.to(dev)
+        layer._glq_e81b_grid = e81b_cb.e81b_grid.to(dev) if e81b_cb is not None else None
+
+        # Re-read padded dims from the loaded stage-0 buffers (pow2/block-diag agnostic).
+        layer.glq_m_pad_w13 = layer.w13_Qidxs_e8p.shape[1] * 16
+        layer.glq_n_pad_w13 = layer.w13_Qidxs_e8p.shape[2] * 64
+        layer.glq_m_pad_w2 = layer.w2_Qidxs_e8p.shape[1] * 16
+        layer.glq_n_pad_w2 = layer.w2_Qidxs_e8p.shape[2] * 64
+
+        # Move e8p buffers to device IN PLACE (mutate .data — never reassign Parameter);
+        # collapse residual sentinels (per-expert slot is 1 element) to numel-0 so the
+        # decode's numel gate skips the inactive stage/variant.
+        for prefix in ("w13", "w2"):
+            for attr in [f"{prefix}_Qidxs_e8p", f"{prefix}_SU", f"{prefix}_SV",
+                         f"{prefix}_Wscale", f"{prefix}_inv_resid_scale",
+                         f"{prefix}_inv_resid_scale2", f"{prefix}_inv_resid_scale3"]:
+                t = getattr(layer, attr, None)
+                if t is not None and t.device != dev:
+                    t.data = t.data.to(dev)
+            for k in (2, 3, 4):
+                for var in ("e8p", "e81b"):
+                    t = getattr(layer, f"{prefix}_Qidxs{k}_{var}", None)
+                    if t is None:
+                        continue
+                    if t.dim() >= 2 and t.shape[1] <= 1:           # sentinel -> numel-0
+                        t.data = torch.empty(0, dtype=torch.int64, device=dev)
+                    elif t.device != dev:
+                        t.data = t.data.to(dev)
+
+        # Block-diagonal RHT tensors — shared across experts (same shape per prefix).
+        def _blocks(m_pad, n_pad):
+            bn, bm = _bd(n_pad), _bd(m_pad)
+            return {'_bn': torch.tensor(bn, dtype=torch.int64, device='cpu'),
+                    '_bm': torch.tensor(bm, dtype=torch.int64, device='cpu'),
+                    '_bnm': _pbm(bn).to(dev), '_bmm': _pbm(bm).to(dev)}
+        layer._glq_e8p_blocks_w13 = _blocks(layer.glq_m_pad_w13, layer.glq_n_pad_w13)
+        layer._glq_e8p_blocks_w2 = _blocks(layer.glq_m_pad_w2, layer.glq_n_pad_w2)
+
+        # Per-expert scalars (avoid a GPU->CPU sync each forward).
+        n = layer.glq_num_experts
+        for pfx in ("w13", "w2"):
+            setattr(layer, f"glq_{pfx}_wscale",
+                    [getattr(layer, f"{pfx}_Wscale")[i].item() for i in range(n)])
+            for s, attr in ((1, "inv_resid_scale"), (2, "inv_resid_scale2"), (3, "inv_resid_scale3")):
+                setattr(layer, f"glq_{pfx}_inv_rs{'' if s == 1 else s}",
+                        [getattr(layer, f"{pfx}_{attr}")[i].item() for i in range(n)])
+
+        for _name, param in layer.named_parameters():
+            if hasattr(param, 'weight_loader'):
+                del param.weight_loader
+
+    def _apply_e8p(self, layer, x, topk_weights, topk_ids):
+        """e8p MoE baseline: per-expert loop reusing E8RHTLinear._e8p_linear_apply (the
+        proven single-linear e8p decode). Correct + compressed; eager (not cudagraph).
+        The fused grouped-e8p op replaces this in Phase B."""
+        from glq.quantized_linear import E8RHTLinear
+        _apply = E8RHTLinear._e8p_linear_apply
+        dtype, device = x.dtype, x.device
+        grid, e81b_grid = layer._glq_e8p_grid, layer._glq_e81b_grid
+        n = layer.glq_num_experts
+        hidden, inter, w13_out = (layer.glq_hidden_size, layer.glq_intermediate_size,
+                                  layer.glq_w13_out)
+        activation = getattr(layer, 'activation', None)
+        _empty = torch.empty(0, dtype=torch.int64, device=device)
+
+        def _sl(buf, e):
+            return buf[e] if (buf is not None and buf.numel() > 0 and buf.shape[0] == n) else _empty
+
+        def _shard(pfx, xin, in_f, out_f, e):
+            blk = getattr(layer, f"_glq_e8p_blocks_{pfx}")
+            q2e, q2b = _sl(getattr(layer, f"{pfx}_Qidxs2_e8p"), e), _sl(getattr(layer, f"{pfx}_Qidxs2_e81b"), e)
+            q3e, q3b = _sl(getattr(layer, f"{pfx}_Qidxs3_e8p"), e), _sl(getattr(layer, f"{pfx}_Qidxs3_e81b"), e)
+            q4e, q4b = _sl(getattr(layer, f"{pfx}_Qidxs4_e8p"), e), _sl(getattr(layer, f"{pfx}_Qidxs4_e81b"), e)
+            return _apply(
+                xin, getattr(layer, f"{pfx}_SV"), getattr(layer, f"{pfx}_SU")[e],
+                getattr(layer, f"{pfx}_Qidxs_e8p")[e], q2e, q2b, grid, e81b_grid,
+                getattr(layer, f"glq_{pfx}_wscale")[e],
+                getattr(layer, f"glq_{pfx}_inv_rs")[e],
+                q2e.numel() > 0, q2b.numel() > 0,
+                in_f, out_f, getattr(layer, f"glq_n_pad_{pfx}"), getattr(layer, f"glq_m_pad_{pfx}"),
+                blk['_bn'], blk['_bm'], blk['_bnm'], blk['_bmm'],
+                Qidxs3_e8p=q3e, Qidxs3_e81b=q3b, Qidxs4_e8p=q4e, Qidxs4_e81b=q4b,
+                has_e8p3=q3e.numel() > 0, has_e81b3=q3b.numel() > 0,
+                has_e8p4=q4e.numel() > 0, has_e81b4=q4b.numel() > 0,
+                inv_rs2=getattr(layer, f"glq_{pfx}_inv_rs2")[e],
+                inv_rs3=getattr(layer, f"glq_{pfx}_inv_rs3")[e],
+                bias=None, out_dtype=torch.float16)
+
+        out = torch.zeros(x.shape[0], hidden, dtype=dtype, device=device)
+        for et in topk_ids.unique():
+            e = int(et.item())
+            mask = (topk_ids == e)
+            token_mask = mask.any(dim=1)
+            ew = (topk_weights * mask.float()).sum(dim=1)[token_mask]
+            xt = x[token_mask].to(torch.float16)
+            h = _shard("w13", xt, hidden, w13_out, e)
+            h = _apply_activation(h, activation)
+            y = _shard("w2", h, inter, hidden, e)
+            out[token_mask] += y.to(dtype) * ew.unsqueeze(-1)
+        return out
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Ensure codebook is on device. Cache per-expert metadata for fast apply()."""
+        if getattr(layer, 'glq_is_e8p', False):
+            self._process_e8p(layer)
+            return
         device = layer.w13_Qidxs.device
         bpw = getattr(self.quant_config, 'bpw', 2)
 
@@ -306,6 +493,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         GLQLinearMethod via the layer_bpw whitelist). ``**kwargs`` absorbs any
         further runner-only kwargs added by newer vLLM versions.
         """
+        if getattr(layer, 'glq_is_e8p', False):
+            # e8p MoE: per-expert e8p decode loop (Phase A baseline; the fused
+            # grouped-e8p op replaces this in Phase B).
+            return self._apply_e8p(layer, x, topk_weights, topk_ids)
+
         from . import linear_method as _lm
         from glq import inference_kernel as _ik
 
