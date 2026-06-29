@@ -130,6 +130,21 @@ torch::Tensor glq_fused_moe_grouped_gemm_cuda(
     torch::Tensor w13_Qidxs3, torch::Tensor w13_inv_rs2,
     torch::Tensor w2_Qidxs3, torch::Tensor w2_inv_rs2, torch::Tensor codebook3);
 
+torch::Tensor glq_fused_moe_e8p_cuda(
+    torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w13_Qidxs_e8p, torch::Tensor w13_Qidxs2_e8p,
+    torch::Tensor w13_SU, torch::Tensor w13_SV, torch::Tensor w13_Wscale, torch::Tensor w13_inv_rs,
+    torch::Tensor w2_Qidxs_e8p, torch::Tensor w2_Qidxs2_e8p,
+    torch::Tensor w2_SU, torch::Tensor w2_SV, torch::Tensor w2_Wscale, torch::Tensor w2_inv_rs,
+    torch::Tensor codebook_abs,
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2,
+    torch::Tensor blocks_n_w13, torch::Tensor blocks_m_w13,
+    torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
+    torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
+    torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
+    int activation_type);
+
 std::vector<torch::Tensor> glq_moe_build_grouping(
     torch::Tensor topk_ids, int64_t num_experts, int64_t top_k, int64_t tile);
 
@@ -295,6 +310,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("w2_Qidxs3") = torch::Tensor(),
           py::arg("w2_inv_rs2") = torch::Tensor(),
           py::arg("codebook3") = torch::Tensor());
+    m.def("glq_fused_moe_e8p_cuda", &glq_fused_moe_e8p_cuda,
+          "GLQ fused E8P grouped-MoE (sort-by-expert + e8p TC decode, gated activation)",
+          py::arg("x"), py::arg("topk_ids"), py::arg("topk_weights"),
+          py::arg("w13_Qidxs_e8p"), py::arg("w13_Qidxs2_e8p"),
+          py::arg("w13_SU"), py::arg("w13_SV"), py::arg("w13_Wscale"), py::arg("w13_inv_rs"),
+          py::arg("w2_Qidxs_e8p"), py::arg("w2_Qidxs2_e8p"),
+          py::arg("w2_SU"), py::arg("w2_SV"), py::arg("w2_Wscale"), py::arg("w2_inv_rs"),
+          py::arg("codebook_abs"),
+          py::arg("hidden_size"), py::arg("intermediate_size"), py::arg("w13_out_features"),
+          py::arg("n_pad_w13"), py::arg("m_pad_w13"), py::arg("n_pad_w2"), py::arg("m_pad_w2"),
+          py::arg("blocks_n_w13"), py::arg("blocks_m_w13"),
+          py::arg("blocks_n_w13_meta"), py::arg("blocks_m_w13_meta"),
+          py::arg("blocks_n_w2"), py::arg("blocks_m_w2"),
+          py::arg("blocks_n_w2_meta"), py::arg("blocks_m_w2_meta"),
+          py::arg("activation_type"));
     m.def("glq_moe_build_grouping", &glq_moe_build_grouping,
           "GLQ MoE token grouping: count+padded-cumsum+scatter -> "
           "(expert_offset, m_indices, sorted_tk), capturable",

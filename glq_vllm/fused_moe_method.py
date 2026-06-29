@@ -314,6 +314,22 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 setattr(layer, f"glq_{pfx}_inv_rs{'' if s == 1 else s}",
                         [getattr(layer, f"{pfx}_{attr}")[i].item() for i in range(n)])
 
+        # Eligibility for the fused grouped-e8p op (v1 = 4bpw: E8P stage-0 + optional
+        # E8P stage-1). The fused op consumes only Qidxs_e8p + Qidxs2_e8p; recipes with
+        # an E81B stage or a stage-2/3 E8P residual (odd / 5-8 bpw) fall back to the
+        # per-expert loop. Computed once at load (the sentinels are already collapsed).
+        def _fused_ok(pfx):
+            for k in (2, 3, 4):                      # no E81B residual at any stage
+                t = getattr(layer, f"{pfx}_Qidxs{k}_e81b", None)
+                if t is not None and t.numel() > 0:
+                    return False
+            for k in (3, 4):                          # no E8P stage-2/3 residual
+                t = getattr(layer, f"{pfx}_Qidxs{k}_e8p", None)
+                if t is not None and t.numel() > 0:
+                    return False
+            return True
+        layer.glq_e8p_fused_ok = _fused_ok("w13") and _fused_ok("w2")
+
         for _name, param in layer.named_parameters():
             if hasattr(param, 'weight_loader'):
                 del param.weight_loader
@@ -494,8 +510,51 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         further runner-only kwargs added by newer vLLM versions.
         """
         if getattr(layer, 'glq_is_e8p', False):
-            # e8p MoE: per-expert e8p decode loop (Phase A baseline; the fused
-            # grouped-e8p op replaces this in Phase B).
+            import os as _os
+            from glq import inference_kernel as _ik
+            num_tokens_e8p = x.shape[0]
+            activation = getattr(layer, 'activation', None)
+            _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
+            # Fused grouped-e8p op: device-side expert dispatch (no host sync) so the
+            # whole MoE decode step is capturable under FULL cudagraph; per-expert
+            # tensor-core e8p decode. v1 = 4bpw (E8P stage-0 + optional E8P stage-1) —
+            # `glq_e8p_fused_ok` is False for E81B/5-8bpw recipes, which take the loop.
+            # GLQ_MOE_FORCE_FALLBACK=1 forces the loop (A/B isolation). Tokens > cap
+            # (prefill) also take the loop, which is faster for many tokens (eager).
+            if (getattr(layer, 'glq_e8p_fused_ok', False)
+                    and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                    and num_tokens_e8p <= _bd_cap
+                    and self._activation_type(activation) < 3
+                    and _ik._try_load_cuda_ext()
+                    and hasattr(_ik._glq_cuda, 'glq_fused_moe_e8p_cuda')
+                    and hasattr(torch.ops, 'glq')
+                    and hasattr(torch.ops.glq, 'fused_moe_e8p')
+                    and layer.glq_n_pad_w13 <= 16384 and layer.glq_m_pad_w13 <= 16384
+                    and layer.glq_n_pad_w2 <= 16384 and layer.glq_m_pad_w2 <= 16384):
+                dtype = x.dtype
+                blk13 = layer._glq_e8p_blocks_w13
+                blk2 = layer._glq_e8p_blocks_w2
+                output = torch.ops.glq.fused_moe_e8p(
+                    x.half().contiguous(),
+                    topk_ids.to(torch.int64),
+                    topk_weights.float().contiguous(),
+                    layer.w13_Qidxs_e8p, layer.w13_Qidxs2_e8p,
+                    layer.w13_SU, layer.w13_SV, layer.w13_Wscale, layer.w13_inv_resid_scale,
+                    layer.w2_Qidxs_e8p, layer.w2_Qidxs2_e8p,
+                    layer.w2_SU, layer.w2_SV, layer.w2_Wscale, layer.w2_inv_resid_scale,
+                    layer._glq_e8p_grid,
+                    layer.glq_hidden_size, layer.glq_intermediate_size, layer.glq_w13_out,
+                    layer.glq_n_pad_w13, layer.glq_m_pad_w13,
+                    layer.glq_n_pad_w2, layer.glq_m_pad_w2,
+                    blk13['_bn'], blk13['_bm'], blk13['_bnm'], blk13['_bmm'],
+                    blk2['_bn'], blk2['_bm'], blk2['_bnm'], blk2['_bmm'],
+                    self._activation_type(activation),
+                )
+                if dtype != torch.float16:
+                    output = output.to(dtype)
+                return output
+            # Fallback: per-expert e8p decode loop (Phase A baseline; eager, correct,
+            # compressed). Used for prefill (> cap), E81B/5-8bpw recipes, or forced A/B.
             return self._apply_e8p(layer, x, topk_weights, topk_ids)
 
         from . import linear_method as _lm
