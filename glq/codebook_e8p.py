@@ -172,11 +172,13 @@ class E8PCodebook:
         idxs = idxs.view(m // 2, 2, (n * 8) // 16, 2).transpose(1, 2).contiguous()
         abs32 = (idxs[:, :, 0, 0] >> 8) + ((idxs[:, :, 1, 0] >> 8) << 8) + \
             ((idxs[:, :, 0, 1] >> 8) << 16) + ((idxs[:, :, 1, 1] >> 8) << 24)
-        sign32 = torch.zeros(abs32.shape, dtype=abs32.dtype, device=abs32.device)
-        for i in range(4):
-            wt = idxs[:, :, i % 2, i // 2]
-            for j in range(8):
-                sign32 += ((wt >> j) & 1) << (4 * j + i)
+        # Vectorized sign-pack (was a 4x8 Python loop, CPU-serial per expert/stage):
+        # sign32 = sum_{i<4, j<8} bit_j(wt_i) << (4j + i), wt_i = idxs[:, :, i%2, i//2].
+        wts = torch.stack([idxs[:, :, i % 2, i // 2] for i in range(4)], dim=-1)        # (.., 4)
+        bits = (wts.unsqueeze(-1) >> torch.arange(8, device=idxs.device)) & 1           # (.., 4, 8)
+        shifts = (4 * torch.arange(8, device=idxs.device)).view(1, 8) \
+            + torch.arange(4, device=idxs.device).view(4, 1)                            # (4, 8) = 4j+i
+        sign32 = (bits << shifts).sum(dim=(-1, -2))                                     # (..)
         out = (sign32 << 32) + abs32
         return out.reshape(m // 16, 8, n // 8, 4).transpose(1, 2).contiguous().view(m, n // 4)
 
