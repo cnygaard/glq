@@ -228,6 +228,27 @@ def _ensure_registered():
         _glq_lib._register_fake("fused_moe_grouped_gemm",
                                 _fused_moe_block_diag_fake)
 
+    # -- 10c. fused_moe_e8p: grouped-GEMM MoE with the e8p tensor-core decode
+    #         (int64 TC-packed Qidxs_e8p + codebook_abs grid). v1: 4bpw (E8P+E8P).
+    #         Output shape identical to the shell MoE ops -> own fake (different sig). --
+    if hasattr(cuda, "glq_fused_moe_e8p_cuda"):
+        _glq_lib.define(
+            "fused_moe_e8p(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+            "Tensor w13_Qidxs_e8p, Tensor w13_Qidxs2_e8p, "
+            "Tensor w13_SU, Tensor w13_SV, Tensor w13_Wscale, Tensor w13_inv_rs, "
+            "Tensor w2_Qidxs_e8p, Tensor w2_Qidxs2_e8p, "
+            "Tensor w2_SU, Tensor w2_SV, Tensor w2_Wscale, Tensor w2_inv_rs, "
+            "Tensor codebook_abs, "
+            "int hidden_size, int intermediate_size, int w13_out_features, "
+            "int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2, "
+            "Tensor blocks_n_w13, Tensor blocks_m_w13, "
+            "Tensor blocks_n_w13_meta, Tensor blocks_m_w13_meta, "
+            "Tensor blocks_n_w2, Tensor blocks_m_w2, "
+            "Tensor blocks_n_w2_meta, Tensor blocks_m_w2_meta, "
+            "int activation_type) -> Tensor")
+        _glq_lib.impl("fused_moe_e8p", cuda.glq_fused_moe_e8p_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_moe_e8p", _fused_moe_e8p_fake)
+
     # -- 11. embedding_dequant: GLQ per-row embedding lookup (gather + dequant +
     #         inverse RHT) for the Gemma-4 GLQ-quantized PLE embedding. The shared
     #         helper's raw ``fast_hadamard_transform`` is a kernel dynamo can't
@@ -488,6 +509,24 @@ def _fused_linear_block_diag_fake(x, sv, su, qidxs, codebook, wscale,
                                    qidxs3, codebook3, inv_resid_scale2,
                                    qidxs4, codebook4, inv_resid_scale3):
     return torch.empty((*x.shape[:-1], out_features),
+                       dtype=torch.float16, device=x.device)
+
+
+def _fused_moe_e8p_fake(x, topk_ids, topk_weights,
+                        w13_Qidxs_e8p, w13_Qidxs2_e8p,
+                        w13_SU, w13_SV, w13_Wscale, w13_inv_rs,
+                        w2_Qidxs_e8p, w2_Qidxs2_e8p,
+                        w2_SU, w2_SV, w2_Wscale, w2_inv_rs,
+                        codebook_abs,
+                        hidden_size, intermediate_size, w13_out_features,
+                        n_pad_w13, m_pad_w13, n_pad_w2, m_pad_w2,
+                        blocks_n_w13, blocks_m_w13,
+                        blocks_n_w13_meta, blocks_m_w13_meta,
+                        blocks_n_w2, blocks_m_w2,
+                        blocks_n_w2_meta, blocks_m_w2_meta,
+                        activation_type):
+    # Same output contract as the shell grouped MoE op: (num_tokens, hidden) fp16.
+    return torch.empty((*x.shape[:-1], hidden_size),
                        dtype=torch.float16, device=x.device)
 
 
