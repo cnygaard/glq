@@ -154,6 +154,69 @@ class RHT:
 
         return W_t[:self.m_orig, :self.n_orig]
 
+    # ---- batched (leading expert dim) variants ----
+    # Identical math to the 2D methods above, applied to a stacked (E, ., .)
+    # tensor: SU/SV broadcast on the relevant last dim and ``.transpose(-2, -1)``
+    # replaces ``.T``. The FHT helpers already broadcast over leading dims. Used
+    # to quantize all MoE experts of a layer in one batched LDLQ pass — every
+    # expert shares this RHT (seed is fixed), so one instance serves all of them.
+
+    def _fht_rows_batched(self, X: torch.Tensor) -> torch.Tensor:
+        """FHT along dim -2 (the row/m_pad axis) of a (..., m_pad, n_pad) tensor."""
+        if len(self.blocks_m) == 1 and self.blocks_m[0] == X.shape[-2]:
+            return fast_hadamard_transform(
+                X.transpose(-2, -1).contiguous()).transpose(-2, -1)
+        return block_diagonal_fht(
+            X.transpose(-2, -1).contiguous(), self.blocks_m).transpose(-2, -1)
+
+    def transform_weights_batched(self, W: torch.Tensor) -> torch.Tensor:
+        """Batched :meth:`transform_weights`. W: (E, m, n) -> (E, m_pad, n_pad)."""
+        E = W.shape[0]
+        m, n = W.shape[-2:]
+        dtype = W.dtype
+
+        W_padded = torch.zeros(E, self.m_pad, self.n_pad, device=self.device, dtype=dtype)
+        W_padded[:, :m, :n] = W.to(self.device)
+
+        W_t = W_padded * self.sv.to(dtype)                       # SV on last dim (n_pad)
+        W_t = self._fht_cols(W_t)
+
+        if self.apply_left:
+            W_t = W_t.transpose(-2, -1).contiguous()             # (E, n_pad, m_pad)
+            W_t = W_t * self.su.to(dtype)                        # SU on last dim (m_pad)
+            W_t = self._fht_rows_batched(W_t.transpose(-2, -1).contiguous())
+
+        return W_t
+
+    def transform_hessian_batched(self, H: torch.Tensor) -> torch.Tensor:
+        """Batched :meth:`transform_hessian`. H: (E, n, n) -> (E, n_pad, n_pad)."""
+        E = H.shape[0]
+        n = H.shape[-1]
+        dtype = H.dtype
+
+        H_pad = torch.zeros(E, self.n_pad, self.n_pad, device=self.device, dtype=dtype)
+        H_pad[:, :n, :n] = H.to(self.device)
+
+        sv = self.sv.to(dtype)
+        H_pad = H_pad * sv * sv.unsqueeze(-1)                    # SV on dim -1 and dim -2
+        H_pad = self._fht_cols(H_pad)
+        H_pad = self._fht_cols(H_pad.transpose(-2, -1).contiguous()).transpose(-2, -1)
+
+        return H_pad
+
+    def inverse_transform_weights_batched(self, W_tilde: torch.Tensor) -> torch.Tensor:
+        """Batched :meth:`inverse_transform_weights`. (E, m_pad, n_pad) -> (E, m, n)."""
+        dtype = W_tilde.dtype
+
+        W_t = self._fht_cols(W_tilde.clone())
+        W_t = W_t * self.sv.to(dtype)                            # SV on last dim (n_pad)
+
+        if self.apply_left:
+            W_t = self._fht_rows_batched(W_t)
+            W_t = W_t * self.su.to(dtype).unsqueeze(-1)          # SU on dim -2 (m_pad)
+
+        return W_t[:, :self.m_orig, :self.n_orig]
+
     def transform_input(self, x: torch.Tensor) -> torch.Tensor:
         """Transform input activation: x_hat = Had(SV * pad(x))."""
         x_padded = torch.zeros(*x.shape[:-1], self.n_pad, device=self.device, dtype=x.dtype)

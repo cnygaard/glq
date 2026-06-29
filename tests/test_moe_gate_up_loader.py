@@ -93,23 +93,36 @@ def test_shared_sv_and_scalars():
 # reassembly applies. These pin both halves of that contract.
 # --------------------------------------------------------------------------- #
 
-# Must match _ROW_ARTS / _SHARED_ARTS in glq/quantize_model.py:_store_artifacts.
+# Must match _is_row_art / _is_shared_art / _split_gate_up_arts in
+# glq/quantize_model.py:_store_artifacts. E8P stores TC-packed Qidxs*_e8p tiled in
+# 16-row mma tiles (axis-0 = rows//16); shell Qidxs/SU and *_e81b are one per row.
 _ROW_ARTS = {"Qidxs", "Qidxs2", "Qidxs3", "SU"}
 _SHARED_ARTS = {"SV", "Wscale", "inv_resid_scale", "inv_resid_scale2"}
 
 
+def _is_shared(k):
+    return k in _SHARED_ARTS or k.startswith("inv_resid_scale")
+
+
+def _is_row(k):
+    return k in _ROW_ARTS or k.endswith("_e8p") or k.endswith("_e81b")
+
+
 def _split_gate_up(arts: dict, inter: int):
-    """Mirror of _store_artifacts' moe_gate_up branch: row-split row-indexed
-    artifacts into gate (rows [0:inter]) + up (rows [inter:2*inter]); duplicate
-    the shared input-side artifacts."""
+    """Mirror of _store_artifacts._split_gate_up_arts (gate_rows==up_rows==inter):
+    row-split row-indexed artifacts into gate/up; ``*_e8p`` split at inter//16
+    (16-row mma tiles), shell/SU/``*_e81b`` at inter; shared artifacts duplicated."""
     gate, up = {}, {}
     for k, v in arts.items():
-        if k in _ROW_ARTS:
-            gate[k] = v[:inter].clone()
-            up[k] = v[inter:2 * inter].clone()
-        elif k in _SHARED_ARTS:
+        if _is_shared(k):
             gate[k] = v.clone()
             up[k] = v.clone()
+        elif _is_row(k):
+            t = 16 if k.endswith("_e8p") else 1
+            g = inter // t
+            assert 2 * g == v.shape[0], f"{k}: 2*(inter//{t})={2 * g} != axis0 {v.shape[0]}"
+            gate[k] = v[:g].clone()
+            up[k] = v[g:2 * g].clone()
         else:
             raise AssertionError(f"unhandled artifact {k!r}")
     return gate, up
@@ -140,6 +153,37 @@ def test_gemma4_expert_gate_up_split_roundtrip():
         assert gate[k].shape[0] == inter and up[k].shape[0] == inter
     for k in _SHARED_ARTS & set(arts):
         assert torch.equal(gate[k], arts[k]) and torch.equal(up[k], arts[k])
+
+
+def test_gemma4_expert_e8p_gate_up_split_roundtrip():
+    """E8P MoE: TC-packed Qidxs*_e8p (axis-0 = m_pad//16 mma tiles) row-splits at
+    inter//16 and reassembles losslessly; *_e81b residual + SU split at full rows;
+    SV/scalars (incl inv_resid_scale3 for 6-8 bpw) duplicated. Pins the e8p expert
+    split contract — catches a //16 vs //1 slip on the tiled buffers."""
+    inter, n64 = 704, 44          # 26B-A4B: inter 704 (=16*44), hidden 2816 -> n_pad//64=44
+    m_pad = 2 * inter             # 1408 fused gate||up rows; m_pad//16 = 88 tiles
+    torch.manual_seed(5)
+    arts = {
+        # 4bpw e8p = [E8P, E8P]: two TC-tiled stages, axis-0 = m_pad//16
+        "Qidxs_e8p":  torch.randint(0, 2**31, (m_pad // 16, n64, 8, 4), dtype=torch.int64),
+        "Qidxs2_e8p": torch.randint(0, 2**31, (m_pad // 16, n64, 8, 4), dtype=torch.int64),
+        # an E81B residual (odd bpw) is full-row: axis-0 = m_pad
+        "Qidxs2_e81b": torch.randint(0, 2**31, (m_pad, n64), dtype=torch.int64),
+        "SU": torch.randn(m_pad, dtype=torch.float16),
+        "SV": torch.sign(torch.randn(2816)).to(torch.float16),
+        "Wscale": torch.tensor(0.0091, dtype=torch.float32),
+        "inv_resid_scale": torch.tensor(3.45, dtype=torch.float32),
+        "inv_resid_scale3": torch.tensor(5.0, dtype=torch.float32),  # 6-8bpw scalar -> shared
+    }
+    gate, up = _split_gate_up(arts, inter)
+    for k in ("Qidxs_e8p", "Qidxs2_e8p"):          # tiled: split at inter//16
+        assert gate[k].shape[0] == inter // 16 and up[k].shape[0] == inter // 16
+        assert torch.equal(torch.cat([gate[k], up[k]], 0), arts[k]), f"{k} tiled split not lossless"
+    for k in ("Qidxs2_e81b", "SU"):                # full-row: split at inter
+        assert gate[k].shape[0] == inter and up[k].shape[0] == inter
+        assert torch.equal(torch.cat([gate[k], up[k]], 0), arts[k]), f"{k} row split not lossless"
+    for k in ("SV", "Wscale", "inv_resid_scale", "inv_resid_scale3"):
+        assert torch.equal(gate[k], arts[k]) and torch.equal(up[k], arts[k]), f"{k} not shared"
 
 
 @requires_glq_vllm
@@ -220,6 +264,7 @@ def test_stage3_fullshape_qidxs3_enables_has_s3():
 
 if __name__ == "__main__":
     test_gemma4_expert_gate_up_split_roundtrip()
+    test_gemma4_expert_e8p_gate_up_split_roundtrip()
     test_stage3_sentinel_collapse_disables_has_s3()
     test_stage3_fullshape_qidxs3_enables_has_s3()
     if not _HAS:
