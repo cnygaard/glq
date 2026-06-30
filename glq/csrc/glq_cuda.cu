@@ -4732,16 +4732,24 @@ torch::Tensor glq_fused_moe_grouped_gemm_cuda(
 // E8P grouped matmul launcher — defined in glq_e8p.cu (cross-TU).
 void launch_grouped_matmul_e8p(
     float* scratch, float* y_out, const half* x_grouped,
-    const uint2* qb0, const uint2* qb1, const uint32_t* codebook_abs,
+    const uint2* qb0, const uint2* qb1, const uint2* qb2, const uint2* qb3,
+    const uint32_t* codebook_abs,
     int M_sum_max, int N, int K, long w_estride,
-    const int* m_indices, const float* wscale_dev, const float* inv_rs_dev,
+    const int* m_indices, const float* wscale_dev,
+    const float* inv_rs_dev, const float* inv_rs2_dev, const float* inv_rs3_dev,
     cudaStream_t stream);
+void launch_grouped_lookupmatmul_e81b(
+    const c10::Half* x_grouped, const int64_t* YIs, const c10::Half* CB, float* y_out,
+    const int* m_indices, const float* wscale_dev, const float* inv_rs_dev,
+    long w_estride, int M_sum_max, int M, int N, cudaStream_t stream);
 
 // E8P fused grouped-MoE entry — the shell glq_fused_moe_grouped_gemm_cuda scaffold
 // (stages 1-3/5-7/9-10 verbatim: input/output block-diag RHT, device token grouping,
 // gather, gated activation, deterministic weighted scatter-reduce) with stages 4 & 8
-// (the per-expert matmul) swapped to the e8p TC decode (launch_grouped_matmul_e8p).
-// v1 scope: 4bpw (E8P stage-0 + optional E8P stage-2). Capturable.
+// (the per-expert matmul) swapped to the e8p TC decode. Full N-stage RVQ (bpw 4-8):
+// E8P stages via launch_grouped_matmul_e8p (qb0..qb3, numel-0 = absent); odd-bpw E81B
+// residual via launch_grouped_lookupmatmul_e81b (Qidxs{2,3,4}_e81b + e81b_grid). All
+// stage buffers full-size / numel-0-gated. Capturable.
 torch::Tensor glq_fused_moe_e8p_cuda(
     torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
     torch::Tensor w13_Qidxs_e8p, torch::Tensor w13_Qidxs2_e8p,
@@ -4755,7 +4763,14 @@ torch::Tensor glq_fused_moe_e8p_cuda(
     torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
     torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
     torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
-    int activation_type
+    int activation_type,
+    torch::Tensor w13_Qidxs3_e8p, torch::Tensor w13_Qidxs4_e8p,
+    torch::Tensor w13_inv_rs2, torch::Tensor w13_inv_rs3,
+    torch::Tensor w2_Qidxs3_e8p, torch::Tensor w2_Qidxs4_e8p,
+    torch::Tensor w2_inv_rs2, torch::Tensor w2_inv_rs3,
+    torch::Tensor w13_Qidxs2_e81b, torch::Tensor w13_Qidxs3_e81b, torch::Tensor w13_Qidxs4_e81b,
+    torch::Tensor w2_Qidxs2_e81b, torch::Tensor w2_Qidxs3_e81b, torch::Tensor w2_Qidxs4_e81b,
+    torch::Tensor e81b_grid
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(w13_Qidxs_e8p);
@@ -4793,21 +4808,48 @@ torch::Tensor glq_fused_moe_e8p_cuda(
     const float* topk_w_dev = topk_weights.data_ptr<float>();
     const float* w13_ws_dev = w13_Wscale.data_ptr<float>();
     const float* w2_ws_dev = w2_Wscale.data_ptr<float>();
-    const float* w13_irs_dev = w13_has_s2 ? w13_inv_rs.data_ptr<float>() : nullptr;
-    const float* w2_irs_dev = w2_has_s2 ? w2_inv_rs.data_ptr<float>() : nullptr;
+    // Cumulative per-stage inv_resid_scale ptrs are always valid (numel-E, registered);
+    // the E8P launcher / E81B launch each gate on their stage's Qidxs presence, so an
+    // unconditional ptr here is correct for both E8P and E81B residual stages.
+    const float* w13_irs_dev = w13_inv_rs.data_ptr<float>();
+    const float* w2_irs_dev = w2_inv_rs.data_ptr<float>();
     const uint2* w13_q0 = (const uint2*)w13_Qidxs_e8p.data_ptr<int64_t>();
     const uint2* w13_q1 = w13_has_s2 ? (const uint2*)w13_Qidxs2_e8p.data_ptr<int64_t>() : nullptr;
     const uint2* w2_q0 = (const uint2*)w2_Qidxs_e8p.data_ptr<int64_t>();
     const uint2* w2_q1 = w2_has_s2 ? (const uint2*)w2_Qidxs2_e8p.data_ptr<int64_t>() : nullptr;
     const long w13_estride = w13_Qidxs_e8p.stride(0);   // uint2/expert = mp16*nb64*32
     const long w2_estride = w2_Qidxs_e8p.stride(0);
+    // E8P residual stages 2-3 (even bpw 6/8): Qidxs numel-0 -> nullptr (launcher skips);
+    // tie each stage's inv_rs scale ptr to its Qidxs presence.
+    bool w13_has_s3e = w13_Qidxs3_e8p.numel() > 0, w13_has_s4e = w13_Qidxs4_e8p.numel() > 0;
+    bool w2_has_s3e = w2_Qidxs3_e8p.numel() > 0, w2_has_s4e = w2_Qidxs4_e8p.numel() > 0;
+    const uint2* w13_q2 = w13_has_s3e ? (const uint2*)w13_Qidxs3_e8p.data_ptr<int64_t>() : nullptr;
+    const uint2* w13_q3 = w13_has_s4e ? (const uint2*)w13_Qidxs4_e8p.data_ptr<int64_t>() : nullptr;
+    const uint2* w2_q2 = w2_has_s3e ? (const uint2*)w2_Qidxs3_e8p.data_ptr<int64_t>() : nullptr;
+    const uint2* w2_q3 = w2_has_s4e ? (const uint2*)w2_Qidxs4_e8p.data_ptr<int64_t>() : nullptr;
+    const float* w13_irs2_dev = w13_inv_rs2.data_ptr<float>();
+    const float* w13_irs3_dev = w13_inv_rs3.data_ptr<float>();
+    const float* w2_irs2_dev = w2_inv_rs2.data_ptr<float>();
+    const float* w2_irs3_dev = w2_inv_rs3.data_ptr<float>();
+    // E81B residual stages (odd bpw 5/7): shared 256x8 grid; per-stage Qidxs_e81b
+    // (numel-0 -> skip). E81B WMMA needs m_pad % 32 == 0 (E8P needs only 16).
+    const c10::Half* e81b_cb = (e81b_grid.numel() > 0) ? (const c10::Half*)e81b_grid.data_ptr<c10::Half>() : nullptr;
+    bool any_e81b = w13_Qidxs2_e81b.numel() > 0 || w13_Qidxs3_e81b.numel() > 0 || w13_Qidxs4_e81b.numel() > 0
+                 || w2_Qidxs2_e81b.numel() > 0 || w2_Qidxs3_e81b.numel() > 0 || w2_Qidxs4_e81b.numel() > 0;
+    TORCH_CHECK(!any_e81b || (m_pad_w13 % 32 == 0 && m_pad_w2 % 32 == 0),
+                "e8p MoE E81B stage needs m_pad % 32 == 0 (w13=", m_pad_w13, " w2=", m_pad_w2, ")");
+    TORCH_CHECK(!any_e81b || e81b_cb != nullptr, "e8p MoE E81B stage present but e81b_grid empty");
     const uint32_t* cb_abs = (const uint32_t*)codebook_abs.data_ptr<int32_t>();
     const half* w13_su_base = (const half*)w13_SU.data_ptr<c10::Half>();
     const half* w2_su_base = (const half*)w2_SU.data_ptr<c10::Half>();
 
     const int TILE = GLQ_MOE_GROUP_TILE;
     int R = num_tokens * top_k;
-    long M_sum_max = (long)R + (long)E * TILE;
+    // Round up to a multiple of 8 so the E81B grouped WMMA (8-token tiles) covers
+    // x_grouped/y_out exactly with no OOB on the last tile. The extra pad slots are
+    // harmless: m_indices stays -1 there (every grouped kernel skips eidx<0) and the
+    // E8P kernels also guard per-token. No effect on the even-bpw (E8P-only) path.
+    long M_sum_max = (((long)R + (long)E * TILE) + 7) / 8 * 8;
 
     // 1. shared input RHT for w13.
     auto x_rht = torch::empty({num_tokens, n_pad_w13}, opts_f32);
@@ -4846,8 +4888,22 @@ torch::Tensor glq_fused_moe_e8p_cuda(
     // 4. w13 e8p grouped matmul (stage-0 + optional E8P stage-2).
     auto y_rht_w13 = torch::empty({M_sum_max, M_w13}, opts_f32);
     launch_grouped_matmul_e8p(scratch_w13.data_ptr<float>(), y_rht_w13.data_ptr<float>(),
-        (const half*)x_grouped.data_ptr<c10::Half>(), w13_q0, w13_q1, cb_abs,
-        (int)M_sum_max, M_w13, n_pad_w13, w13_estride, mi, w13_ws_dev, w13_irs_dev, stream);
+        (const half*)x_grouped.data_ptr<c10::Half>(), w13_q0, w13_q1, w13_q2, w13_q3, cb_abs,
+        (int)M_sum_max, M_w13, n_pad_w13, w13_estride, mi, w13_ws_dev,
+        w13_irs_dev, w13_irs2_dev, w13_irs3_dev, stream);
+
+    // 4b. w13 E81B residual stage (odd bpw 5/7): accumulate onto the E8P sum.
+    if (any_e81b) {
+        torch::Tensor w13_e81b_q[3] = {w13_Qidxs2_e81b, w13_Qidxs3_e81b, w13_Qidxs4_e81b};
+        const float* w13_e81b_irs[3] = {w13_irs_dev, w13_irs2_dev, w13_irs3_dev};
+        for (int s = 0; s < 3; ++s) {
+            if (w13_e81b_q[s].numel() == 0) continue;
+            launch_grouped_lookupmatmul_e81b(
+                (const c10::Half*)x_grouped.data_ptr<c10::Half>(), w13_e81b_q[s].data_ptr<int64_t>(),
+                e81b_cb, y_rht_w13.data_ptr<float>(), mi, w13_ws_dev, w13_e81b_irs[s],
+                w13_e81b_q[s].stride(0), (int)M_sum_max, M_w13, n_pad_w13, stream);
+        }
+    }
 
     // 5. w13 output RHT (grouped, per-expert SU).
     auto h_w13 = torch::empty({M_sum_max, w13_out_features}, opts_f16);
@@ -4875,8 +4931,22 @@ torch::Tensor glq_fused_moe_e8p_cuda(
     // 8. w2 e8p grouped matmul.
     auto y_rht_w2 = torch::empty({M_sum_max, M_w2}, opts_f32);
     launch_grouped_matmul_e8p(scratch_w2.data_ptr<float>(), y_rht_w2.data_ptr<float>(),
-        (const half*)h_rht_half.data_ptr<c10::Half>(), w2_q0, w2_q1, cb_abs,
-        (int)M_sum_max, M_w2, n_pad_w2, w2_estride, mi, w2_ws_dev, w2_irs_dev, stream);
+        (const half*)h_rht_half.data_ptr<c10::Half>(), w2_q0, w2_q1, w2_q2, w2_q3, cb_abs,
+        (int)M_sum_max, M_w2, n_pad_w2, w2_estride, mi, w2_ws_dev,
+        w2_irs_dev, w2_irs2_dev, w2_irs3_dev, stream);
+
+    // 8b. w2 E81B residual stage (odd bpw 5/7): accumulate onto the E8P sum.
+    if (any_e81b) {
+        torch::Tensor w2_e81b_q[3] = {w2_Qidxs2_e81b, w2_Qidxs3_e81b, w2_Qidxs4_e81b};
+        const float* w2_e81b_irs[3] = {w2_irs_dev, w2_irs2_dev, w2_irs3_dev};
+        for (int s = 0; s < 3; ++s) {
+            if (w2_e81b_q[s].numel() == 0) continue;
+            launch_grouped_lookupmatmul_e81b(
+                (const c10::Half*)h_rht_half.data_ptr<c10::Half>(), w2_e81b_q[s].data_ptr<int64_t>(),
+                e81b_cb, y_rht_w2.data_ptr<float>(), mi, w2_ws_dev, w2_e81b_irs[s],
+                w2_e81b_q[s].stride(0), (int)M_sum_max, M_w2, n_pad_w2, stream);
+        }
+    }
 
     // 9. w2 output RHT (grouped, per-expert SU) -> per-slot expert output.
     auto expert_out = torch::empty({M_sum_max, hidden_size}, opts_f16);

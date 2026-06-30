@@ -319,14 +319,15 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         # an E81B stage or a stage-2/3 E8P residual (odd / 5-8 bpw) fall back to the
         # per-expert loop. Computed once at load (the sentinels are already collapsed).
         def _fused_ok(pfx):
-            for k in (2, 3, 4):                      # no E81B residual at any stage
-                t = getattr(layer, f"{pfx}_Qidxs{k}_e81b", None)
-                if t is not None and t.numel() > 0:
-                    return False
-            for k in (3, 4):                          # no E8P stage-2/3 residual
-                t = getattr(layer, f"{pfx}_Qidxs{k}_e8p", None)
-                if t is not None and t.numel() > 0:
-                    return False
+            # Full N-stage (E8P stages 0-3 + an optional E81B residual) is fused.
+            # The E81B grouped WMMA needs m_pad % 32 == 0 (E8P needs only 16); a layer
+            # with an E81B stage whose m_pad isn't a multiple of 32 falls back to the
+            # per-expert loop (correct, eager).
+            has_e81b = any((getattr(layer, f"{pfx}_Qidxs{k}_e81b", None) is not None
+                            and getattr(layer, f"{pfx}_Qidxs{k}_e81b").numel() > 0)
+                           for k in (2, 3, 4))
+            if has_e81b and getattr(layer, f"glq_m_pad_{pfx}") % 32 != 0:
+                return False
             return True
         layer.glq_e8p_fused_ok = _fused_ok("w13") and _fused_ok("w2")
 
@@ -534,6 +535,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 dtype = x.dtype
                 blk13 = layer._glq_e8p_blocks_w13
                 blk2 = layer._glq_e8p_blocks_w2
+                e81b_grid = layer._glq_e8p_grid.new_empty(0) \
+                    if getattr(layer, '_glq_e81b_grid', None) is None else layer._glq_e81b_grid
                 output = torch.ops.glq.fused_moe_e8p(
                     x.half().contiguous(),
                     topk_ids.to(torch.int64),
@@ -549,6 +552,17 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                     blk13['_bn'], blk13['_bm'], blk13['_bnm'], blk13['_bmm'],
                     blk2['_bn'], blk2['_bm'], blk2['_bnm'], blk2['_bmm'],
                     self._activation_type(activation),
+                    # E8P residual stages 2-3 (even bpw 6/8): numel-0 Qidxs / zero
+                    # inv_rs for absent stages (4bpw); the op gates per-Qidxs-numel.
+                    layer.w13_Qidxs3_e8p, layer.w13_Qidxs4_e8p,
+                    layer.w13_inv_resid_scale2, layer.w13_inv_resid_scale3,
+                    layer.w2_Qidxs3_e8p, layer.w2_Qidxs4_e8p,
+                    layer.w2_inv_resid_scale2, layer.w2_inv_resid_scale3,
+                    # E81B residual stage (odd bpw 5/7): per-stage Qidxs_e81b (numel-0
+                    # if absent) + shared 256x8 grid (numel-0 placeholder if pure-E8P).
+                    layer.w13_Qidxs2_e81b, layer.w13_Qidxs3_e81b, layer.w13_Qidxs4_e81b,
+                    layer.w2_Qidxs2_e81b, layer.w2_Qidxs3_e81b, layer.w2_Qidxs4_e81b,
+                    e81b_grid,
                 )
                 if dtype != torch.float16:
                     output = output.to(dtype)
