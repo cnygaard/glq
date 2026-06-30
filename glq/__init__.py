@@ -4,7 +4,7 @@ E8 lattice shell codebook + Randomized Hadamard Transform (RHT)
 for 2-bit post-training quantization of LLM weights.
 """
 
-__version__ = "0.6.6"
+__version__ = "0.6.8"
 
 from .codebook import E8ShellCodebook
 from .hadamard import fast_hadamard_transform
