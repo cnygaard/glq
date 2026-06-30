@@ -568,13 +568,20 @@ __global__ static void __launch_bounds__(256) glq_reduce_splits_2d_e8p_accum_ker
 
 // Grouped E8P matmul over a PRE-GROUPED input (no gather), for the fused MoE
 // host entry in glq_cuda.cu. Non-static (cross-TU). RVQ stages compose by
-// linearity: stage-0 (qb0, wscale) overwrites y_out; stage-1 (qb1, wscale*inv_rs)
-// accumulates. Caller passes pre-allocated scratch (capture-safe).
+// linearity: stage-0 (qb0, wscale) overwrites y_out; E8P residual stages 1-3
+// (qb1..qb3, wscale*cumulative-inv_rs) accumulate. Each qb{k}/inv_rs{k} pair is
+// null for an absent stage (bpw 4 = qb0+qb1; bpw 6 = +qb2; bpw 8 = +qb3). The
+// decode kernel is stage-agnostic, so higher even-bpw is just more accumulate
+// passes. (Odd-bpw E81B residual stages are handled separately by the host
+// entry via launch_grouped_lookupmatmul_e81b.) Caller passes pre-allocated
+// scratch (capture-safe).
 void launch_grouped_matmul_e8p(
     float *scratch, float *y_out, const half *x_grouped,
-    const uint2 *qb0, const uint2 *qb1, const uint32_t *codebook_abs,
+    const uint2 *qb0, const uint2 *qb1, const uint2 *qb2, const uint2 *qb3,
+    const uint32_t *codebook_abs,
     int M_sum_max, int N, int K, long w_estride,
-    const int *m_indices, const float *wscale_dev, const float *inv_rs_dev,
+    const int *m_indices, const float *wscale_dev,
+    const float *inv_rs_dev, const float *inv_rs2_dev, const float *inv_rs3_dev,
     cudaStream_t stream
 ) {
     dim3 grid((N + 15) / 16, (M_sum_max + 7) / 8);
@@ -589,11 +596,14 @@ void launch_grouped_matmul_e8p(
     glq_reduce_splits_2d_e8p_kernel<<<rblocks, 256, 0, stream>>>(
         y_out, scratch, (int)BN, E8P_MM_WARPS);
 
-    // stage 1 (E8P residual): wscale * inv_resid_scale, accumulate.
-    if (qb1 != nullptr) {
+    // E8P residual stages 1-3: wscale * cumulative inv_resid_scale, accumulate.
+    const uint2 *qb[3] = {qb1, qb2, qb3};
+    const float *irs[3] = {inv_rs_dev, inv_rs2_dev, inv_rs3_dev};
+    for (int s = 0; s < 3; ++s) {
+        if (qb[s] == nullptr) continue;
         glq_decode_matmul_e8p_grouped_kernel<<<grid, block, 0, stream>>>(
-            scratch, (const uint32_t *)x_grouped, qb1, codebook_abs, m_indices,
-            wscale_dev, inv_rs_dev, w_estride, N, K, M_sum_max);
+            scratch, (const uint32_t *)x_grouped, qb[s], codebook_abs, m_indices,
+            wscale_dev, irs[s], w_estride, N, K, M_sum_max);
         glq_reduce_splits_2d_e8p_accum_kernel<<<rblocks, 256, 0, stream>>>(
             y_out, scratch, (int)BN, E8P_MM_WARPS);
     }
@@ -795,4 +805,86 @@ void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tens
                                         dim3(E8P_DECOMPRESS_E81B_BLOCK_SIZE), 0, stream>>>(
         YIs.data_ptr<int64_t>(), CB.data_ptr<c10::Half>(), Y.data_ptr<c10::Half>());
     E8P_ERRCHK(cudaPeekAtLastError());
+}
+
+
+// ---- Grouped E81B residual stage for the fused MoE (odd bpw 5/7) ----
+// Graft of glq_lookupmatmul_e81b_k8_kernel with device-side per-expert dispatch
+// (m_indices, like the E8P grouped kernel) + per-expert wscale*cumulative-inv_rs
+// folded in, ACCUMULATING into y_out. No K-split: one block computes the full-N
+// dot product for its (8-token tile m1? no: 32-row tile, 8-token tile), so each
+// (token,row) output is owned by exactly one block -> plain load+FMA+store, no
+// atomics, deterministic. Requires M (out features) % 32 == 0 and M_sum_max % 8
+// == 0 (host rounds M_sum_max up to a multiple of 8 when an E81B stage is used).
+__global__ static void glq_lookupmatmul_e81b_grouped_kernel(
+    const c10::Half *__restrict__ x_grouped,   // (M_sum_max, N) fp16, grouped tokens
+    const int64_t *__restrict__ YIs,           // (E, M, N/64) int64 -> per-expert via w_estride
+    const c10::Half *__restrict__ CB,          // 256 x 8 E81B codebook
+    float *__restrict__ y_out,                 // (M_sum_max, M) fp32 -- ACCUMULATE
+    const int *__restrict__ m_indices,         // (M_sum_max,) expert per slot, -1 = pad
+    const float *__restrict__ wscale_dev,      // (E,)
+    const float *__restrict__ inv_rs_dev,      // (E,) cumulative residual scale (or null)
+    long w_estride,                            // int64 / expert = M * (N/64)
+    int M_sum_max, int M, int N
+) {
+    long m1 = blockIdx.x;                       // m-tile (32 output rows)
+    long k1 = blockIdx.y;                       // token-tile (8 grouped tokens)
+    int base = (int)(k1 << 3);
+    int eidx = (base < M_sum_max) ? m_indices[base] : -1;
+    if (eidx < 0) return;                       // fully-pad tile -> skip (output discarded)
+    const int64_t *YIe = YIs + (size_t)eidx * w_estride;
+    float scale = wscale_dev[eidx] * (inv_rs_dev != nullptr ? inv_rs_dev[eidx] : 1.0f);
+
+    __shared__ c10::Half Y_cache0[32 * 16];
+    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a0;
+    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b0;
+    __shared__ c10::Half Y_cache1[32 * 16];
+    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a1;
+    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b1;
+    wmma::fragment<wmma::accumulator, 8, 32, 16, float> c;
+    fill_fragment(c, 0.0f);
+#pragma unroll
+    for (long jn = 0; jn < N / 32; jn++) {
+        uint32_t packed = ((const uint32_t *)YIe)[(m1 * 32 + threadIdx.x) * (N / 32) + jn];
+#pragma unroll
+        for (long r = 0; r < 2; r++) {
+            uint32_t yidx = packed & 255;
+            ((uint64_t *)Y_cache0)[(threadIdx.x * 2 + r) * 2] = ((const uint64_t *)CB)[yidx * 2];
+            ((uint64_t *)Y_cache0)[(threadIdx.x * 2 + r) * 2 + 1] = ((const uint64_t *)CB)[yidx * 2 + 1];
+            packed = packed >> 8;
+        }
+#pragma unroll
+        for (long r = 0; r < 2; r++) {
+            uint32_t yidx = packed & 255;
+            ((uint64_t *)Y_cache1)[(threadIdx.x * 2 + r) * 2] = ((const uint64_t *)CB)[yidx * 2];
+            ((uint64_t *)Y_cache1)[(threadIdx.x * 2 + r) * 2 + 1] = ((const uint64_t *)CB)[yidx * 2 + 1];
+            packed = packed >> 8;
+        }
+        load_matrix_sync(a0, (const __half *)(x_grouped + (size_t)8 * N * k1 + 32 * jn), N);
+        load_matrix_sync(b0, (const __half *)Y_cache0, 16);
+        mma_sync(c, a0, b0, c);
+        load_matrix_sync(a1, (const __half *)(x_grouped + (size_t)8 * N * k1 + 32 * jn + 16), N);
+        load_matrix_sync(b1, (const __half *)Y_cache1, 16);
+        mma_sync(c, a1, b1, c);
+    }
+    // accumulate c*scale into the (8-token, 32-row) y_out tile; single owner -> no atomics.
+    wmma::fragment<wmma::accumulator, 8, 32, 16, float> y_frag;
+    load_matrix_sync(y_frag, &y_out[(size_t)8 * M * k1 + 32 * m1], M, wmma::mem_row_major);
+#pragma unroll
+    for (int i = 0; i < c.num_elements; i++) c.x[i] = c.x[i] * scale + y_frag.x[i];
+    store_matrix_sync(&y_out[(size_t)8 * M * k1 + 32 * m1], c, M, wmma::mem_row_major);
+}
+
+
+// Launch one grouped E81B residual stage, accumulating wscale*cum_inv_rs * (W_e81b @ x)
+// into y_out (which must already hold the lower-stage E8P sum). NON-static (cross-TU).
+void launch_grouped_lookupmatmul_e81b(
+    const c10::Half *x_grouped, const int64_t *YIs, const c10::Half *CB, float *y_out,
+    const int *m_indices, const float *wscale_dev, const float *inv_rs_dev,
+    long w_estride, int M_sum_max, int M, int N, cudaStream_t stream
+) {
+    dim3 grid(M / 32, M_sum_max / 8);
+    glq_lookupmatmul_e81b_grouped_kernel<<<grid, dim3(32), 0, stream>>>(
+        x_grouped, YIs, CB, y_out, m_indices, wscale_dev, inv_rs_dev,
+        w_estride, M_sum_max, M, N);
 }

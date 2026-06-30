@@ -143,7 +143,14 @@ torch::Tensor glq_fused_moe_e8p_cuda(
     torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
     torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
     torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
-    int activation_type);
+    int activation_type,
+    torch::Tensor w13_Qidxs3_e8p, torch::Tensor w13_Qidxs4_e8p,
+    torch::Tensor w13_inv_rs2, torch::Tensor w13_inv_rs3,
+    torch::Tensor w2_Qidxs3_e8p, torch::Tensor w2_Qidxs4_e8p,
+    torch::Tensor w2_inv_rs2, torch::Tensor w2_inv_rs3,
+    torch::Tensor w13_Qidxs2_e81b, torch::Tensor w13_Qidxs3_e81b, torch::Tensor w13_Qidxs4_e81b,
+    torch::Tensor w2_Qidxs2_e81b, torch::Tensor w2_Qidxs3_e81b, torch::Tensor w2_Qidxs4_e81b,
+    torch::Tensor e81b_grid);
 
 std::vector<torch::Tensor> glq_moe_build_grouping(
     torch::Tensor topk_ids, int64_t num_experts, int64_t top_k, int64_t tile);
@@ -324,7 +331,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("blocks_n_w13_meta"), py::arg("blocks_m_w13_meta"),
           py::arg("blocks_n_w2"), py::arg("blocks_m_w2"),
           py::arg("blocks_n_w2_meta"), py::arg("blocks_m_w2_meta"),
-          py::arg("activation_type"));
+          py::arg("activation_type"),
+          py::arg("w13_Qidxs3_e8p") = torch::Tensor(),
+          py::arg("w13_Qidxs4_e8p") = torch::Tensor(),
+          py::arg("w13_inv_rs2") = torch::Tensor(),
+          py::arg("w13_inv_rs3") = torch::Tensor(),
+          py::arg("w2_Qidxs3_e8p") = torch::Tensor(),
+          py::arg("w2_Qidxs4_e8p") = torch::Tensor(),
+          py::arg("w2_inv_rs2") = torch::Tensor(),
+          py::arg("w2_inv_rs3") = torch::Tensor(),
+          py::arg("w13_Qidxs2_e81b") = torch::Tensor(),
+          py::arg("w13_Qidxs3_e81b") = torch::Tensor(),
+          py::arg("w13_Qidxs4_e81b") = torch::Tensor(),
+          py::arg("w2_Qidxs2_e81b") = torch::Tensor(),
+          py::arg("w2_Qidxs3_e81b") = torch::Tensor(),
+          py::arg("w2_Qidxs4_e81b") = torch::Tensor(),
+          py::arg("e81b_grid") = torch::Tensor());
     m.def("glq_moe_build_grouping", &glq_moe_build_grouping,
           "GLQ MoE token grouping: count+padded-cumsum+scatter -> "
           "(expert_offset, m_indices, sorted_tk), capturable",

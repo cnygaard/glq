@@ -245,7 +245,14 @@ def _ensure_registered():
             "Tensor blocks_n_w13_meta, Tensor blocks_m_w13_meta, "
             "Tensor blocks_n_w2, Tensor blocks_m_w2, "
             "Tensor blocks_n_w2_meta, Tensor blocks_m_w2_meta, "
-            "int activation_type) -> Tensor")
+            "int activation_type, "
+            "Tensor w13_Qidxs3_e8p, Tensor w13_Qidxs4_e8p, "
+            "Tensor w13_inv_rs2, Tensor w13_inv_rs3, "
+            "Tensor w2_Qidxs3_e8p, Tensor w2_Qidxs4_e8p, "
+            "Tensor w2_inv_rs2, Tensor w2_inv_rs3, "
+            "Tensor w13_Qidxs2_e81b, Tensor w13_Qidxs3_e81b, Tensor w13_Qidxs4_e81b, "
+            "Tensor w2_Qidxs2_e81b, Tensor w2_Qidxs3_e81b, Tensor w2_Qidxs4_e81b, "
+            "Tensor e81b_grid) -> Tensor")
         _glq_lib.impl("fused_moe_e8p", cuda.glq_fused_moe_e8p_cuda, dispatch_key)
         _glq_lib._register_fake("fused_moe_e8p", _fused_moe_e8p_fake)
 
@@ -524,7 +531,11 @@ def _fused_moe_e8p_fake(x, topk_ids, topk_weights,
                         blocks_n_w13_meta, blocks_m_w13_meta,
                         blocks_n_w2, blocks_m_w2,
                         blocks_n_w2_meta, blocks_m_w2_meta,
-                        activation_type):
+                        activation_type,
+                        w13_Qidxs3_e8p, w13_Qidxs4_e8p, w13_inv_rs2, w13_inv_rs3,
+                        w2_Qidxs3_e8p, w2_Qidxs4_e8p, w2_inv_rs2, w2_inv_rs3,
+                        w13_Qidxs2_e81b, w13_Qidxs3_e81b, w13_Qidxs4_e81b,
+                        w2_Qidxs2_e81b, w2_Qidxs3_e81b, w2_Qidxs4_e81b, e81b_grid):
     # Same output contract as the shell grouped MoE op: (num_tokens, hidden) fp16.
     return torch.empty((*x.shape[:-1], hidden_size),
                        dtype=torch.float16, device=x.device)
