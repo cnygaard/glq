@@ -2752,6 +2752,10 @@ torch::Tensor glq_decompress_packed_e8p(
 void glq_lookupmatmul_e81b_k8(
     torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z);
 void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y);
+// Fast SM-saturating E81B decode (replaces the low-occupancy k8 lookup-matmul in
+// the odd-bpw decode path). GEMV: (N,) -> (M,); GEMM: (B,N) -> (B,M). Defined in glq_e8p.cu.
+torch::Tensor glq_decode_matvec_e81b(torch::Tensor x, torch::Tensor YIs, torch::Tensor CB);
+torch::Tensor glq_decode_matmul_e81b(torch::Tensor x, torch::Tensor YIs, torch::Tensor CB);
 
 // ── Block-diagonal RHT host helpers (shared by the shell block-diag fused op and the
 // thin e8p fused op). A single block (legacy pow2 / already-pow2 dim) falls back to the
@@ -2920,15 +2924,12 @@ torch::Tensor glq_fused_linear_e8p_cuda(
                 auto yk = glq_decode_matvec_e8p(xh, res_e8p[s], codebook_abs);
                 y_rht = y_rht + (float)res_scale[s] * yk;
             } else if (res_e81b[s].numel() > 0) {
-                // E81B residual: WMMA lookup-matmul needs k≤8 — row 0 of an (8,n_pad)
-                // input carries xh, Z[0] is this stage's contribution.
-                auto X8 = torch::zeros({8, (long)n_pad},
-                                       torch::dtype(torch::kFloat16).device(x.device()));
-                X8.select(0, 0).copy_(xh);
-                auto Z = torch::zeros({8, (long)m_pad},
-                                      torch::dtype(torch::kFloat32).device(x.device()));
-                glq_lookupmatmul_e81b_k8(X8, res_e81b[s], e81b_codebook, Z);
-                y_rht = y_rht + (float)res_scale[s] * Z.select(0, 0);
+                // E81B residual: route B=1 through the SM-saturating split-K GEMM — its
+                // padded-to-8 tensor-core WMMA measured faster than a scalar per-row GEMV
+                // for these shapes (and far faster than the old per-call-alloc k8 path).
+                auto yk = glq_decode_matmul_e81b(xh.view({1, (long)n_pad}),
+                                                 res_e81b[s], e81b_codebook);  // (1, m_pad)
+                y_rht = y_rht + (float)res_scale[s] * yk.view({(long)m_pad});
             }
         }
         y_rht = (y_rht * (float)wscale).view({1, (long)m_pad}).contiguous();
@@ -2961,17 +2962,10 @@ torch::Tensor glq_fused_linear_e8p_cuda(
                 y_rht = y_rht + (float)res_scale[s] *
                         glq_matmul_e8p(xh, res_e8p[s], codebook_abs);
             } else if (res_e81b[s].numel() > 0) {
-                // E81B residual: the WMMA lookup-matmul takes k<=8, so tile the batch by 8.
-                for (int b0 = 0; b0 < B; b0 += 8) {
-                    int nb = (B - b0) < 8 ? (B - b0) : 8;
-                    auto X8 = torch::zeros({8, (long)n_pad},
-                                           torch::dtype(torch::kFloat16).device(x.device()));
-                    X8.narrow(0, 0, nb).copy_(xh.narrow(0, b0, nb));
-                    auto Z = torch::zeros({8, (long)m_pad},
-                                          torch::dtype(torch::kFloat32).device(x.device()));
-                    glq_lookupmatmul_e81b_k8(X8, res_e81b[s], e81b_codebook, Z);
-                    y_rht.narrow(0, b0, nb).add_((float)res_scale[s] * Z.narrow(0, 0, nb));
-                }
+                // E81B residual: SM-saturating split-K GEMM (was a host loop of
+                // low-occupancy k8 lookup-matmul launches over 8-token tiles).
+                y_rht = y_rht + (float)res_scale[s] *
+                        glq_decode_matmul_e81b(xh, res_e81b[s], e81b_codebook);
             }
         }
         y_rht = (y_rht * (float)wscale).contiguous();           // (B, m_pad) fp32

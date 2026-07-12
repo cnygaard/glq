@@ -134,10 +134,19 @@ class GLQvLLMConfig(QuantizationConfig):
                 return UnquantizedEmbeddingMethod()
             return GLQEmbeddingMethod(self, bpw=bpw)
 
-        # FusedMoE layers — lazy import to avoid circular deps
+        # FusedMoE layers — lazy import to avoid circular deps. vLLM 0.25 split the
+        # 0.23 `FusedMoE` nn.Module into a factory *function* (returns a MoERunner)
+        # plus the weight-holding `RoutedExperts` layer that get_quant_method now
+        # receives; `isinstance(layer, FusedMoE)` throws TypeError there. Detect
+        # RoutedExperts on 0.25+, falling back to the FusedMoE class on <=0.23.
         try:
-            from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-            if isinstance(layer, FusedMoE):
+            try:
+                from vllm.model_executor.layers.fused_moe.routed_experts import (
+                    RoutedExperts as _MoELayer)  # vLLM 0.25+
+            except ImportError:
+                from vllm.model_executor.layers.fused_moe.layer import (
+                    FusedMoE as _MoELayer)       # vLLM <= 0.23
+            if isinstance(layer, _MoELayer):
                 from .fused_moe_method import GLQFusedMoEMethod
                 return GLQFusedMoEMethod(self, moe=layer.moe_config)
         except (ImportError, AttributeError):

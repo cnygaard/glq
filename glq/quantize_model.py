@@ -1644,9 +1644,11 @@ def quantize(
         from .sensitivity import allocate_bpw, print_allocation_summary
         layer_sizes = {}
         for prefix, arts in all_artifacts.items():
-            qidxs = arts['Qidxs']
-            m, n_blocks = qidxs.shape
-            layer_sizes[prefix] = m * n_blocks * 8  # n_weights
+            # Codebook-aware padded weight count (shell ``Qidxs`` vs e8p
+            # ``Qidxs_e8p``) — same helper the effective-bpw reporting uses,
+            # so the sensitivity allocator no longer KeyErrors on an e8p
+            # profiling pass (which has no shell ``Qidxs`` buffer).
+            layer_sizes[prefix] = _artifact_padded_weights(arts)
         bpw_map = allocate_bpw(all_proxy_losses, layer_sizes, avg_target,
                               min_bpw=min_bpw, max_bpw=max_bpw)
         print_allocation_summary(bpw_map, layer_sizes, all_proxy_losses)

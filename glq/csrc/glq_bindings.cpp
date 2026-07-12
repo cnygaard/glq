@@ -218,6 +218,9 @@ torch::Tensor glq_decompress_packed_e8p(
 void glq_lookupmatmul_e81b_k8(
     torch::Tensor X, torch::Tensor YIs, torch::Tensor CB, torch::Tensor Z);
 void glq_decompress_e81b_packed(torch::Tensor YIs, torch::Tensor CB, torch::Tensor Y);
+// Fast SM-saturating E81B decode (odd-bpw): GEMV (N,)->(M,) and GEMM (B,N)->(B,M).
+torch::Tensor glq_decode_matvec_e81b(torch::Tensor x, torch::Tensor YIs, torch::Tensor CB);
+torch::Tensor glq_decode_matmul_e81b(torch::Tensor x, torch::Tensor YIs, torch::Tensor CB);
 
 // Fused E8P linear (defined in glq_cuda.cu): input_rht + N-stage decode/matmul + output_rht.
 // blocks_n/blocks_m + *_meta carry the block-diagonal RHT structure (single-block = full pow2 RHT).
@@ -245,6 +248,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "E81B residual lookup-matmul B=1/k<=8 (CUDA, accumulates into Z)");
     m.def("glq_decompress_e81b_packed", &glq_decompress_e81b_packed,
           "E81B residual dense decompress (CUDA)");
+    m.def("glq_decode_matvec_e81b", &glq_decode_matvec_e81b,
+          "E81B fast SM-saturating GEMV B=1 decode (CUDA)");
+    m.def("glq_decode_matmul_e81b", &glq_decode_matmul_e81b,
+          "E81B fast SM-saturating split-K GEMM B>1 decode (CUDA)");
     m.def("glq_fused_linear_cuda", &glq_fused_linear_cuda,
           "GLQ fused input_rht + dequant_matmul + output_rht (CUDA)");
     m.def("glq_fused_linear_block_diag_cuda", &glq_fused_linear_block_diag_cuda,
