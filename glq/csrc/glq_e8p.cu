@@ -71,6 +71,10 @@ __device__ static inline uint32_t e8p_mask_lop3(uint32_t x, uint32_t m0, uint32_
 // floats, so fewer warps = less scratch traffic at the cost of K parallelism. 8
 // matches the shell TC matmul's WARPS and bounds B=32 scratch below the weight traffic.
 #define E8P_MM_WARPS 8
+// Warps per block for the fast E81B decode kernels (single-linear GEMM: k-split;
+// grouped MoE: one warp per m-tile). 8 fills the SM warp slots and keeps per-warp
+// Ycache smem (NW * 2KB) + the 4KB shared codebook well under 48KB.
+#define E81B_MM_WARPS 8
 
 
 // Fixed-order reduction over the k-split planes -> deterministic output. One thread per
@@ -827,45 +831,57 @@ __global__ static void glq_lookupmatmul_e81b_grouped_kernel(
     long w_estride,                            // int64 / expert = M * (N/64)
     int M_sum_max, int M, int N
 ) {
-    long m1 = blockIdx.x;                       // m-tile (32 output rows)
-    long k1 = blockIdx.y;                       // token-tile (8 grouped tokens)
-    int base = (int)(k1 << 3);
-    int eidx = (base < M_sum_max) ? m_indices[base] : -1;
+    // E81B_MM_WARPS warps per block, each owning a DISTINCT m-tile (M-parallel).
+    // Every (token-tile, m-tile) output is still written by exactly one warp, so
+    // the in-place accumulate stays atomic-free/deterministic; the extra warps +
+    // the shared codebook lift occupancy off the old 1-warp-per-block launch.
+    const int warpId = threadIdx.y;
+    const int laneId = threadIdx.x;
+    const long k1 = blockIdx.y;                 // token-tile (8 grouped tokens)
+    __shared__ __half smem_CB[256 * 8];
+    __shared__ c10::Half Ycache[E81B_MM_WARPS][2][32 * 16];
+    for (int i = warpId * 32 + laneId; i < 256 * 8; i += E81B_MM_WARPS * 32)
+        smem_CB[i] = ((const __half *)CB)[i];
+    __syncthreads();
+
+    const long m1 = (long)blockIdx.x * E81B_MM_WARPS + warpId;  // this warp's m-tile
+    if (m1 >= M / 32) return;                   // extra warps (M/32 not a multiple of NW)
+    const int base = (int)(k1 << 3);
+    const int eidx = (base < M_sum_max) ? m_indices[base] : -1;
     if (eidx < 0) return;                       // fully-pad tile -> skip (output discarded)
     const int64_t *YIe = YIs + (size_t)eidx * w_estride;
-    float scale = wscale_dev[eidx] * (inv_rs_dev != nullptr ? inv_rs_dev[eidx] : 1.0f);
+    const float scale = wscale_dev[eidx] * (inv_rs_dev != nullptr ? inv_rs_dev[eidx] : 1.0f);
+    c10::Half *Y_cache0 = Ycache[warpId][0];
+    c10::Half *Y_cache1 = Ycache[warpId][1];
 
-    __shared__ c10::Half Y_cache0[32 * 16];
-    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a0;
-    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b0;
-    __shared__ c10::Half Y_cache1[32 * 16];
-    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a1;
-    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b1;
+    wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a0, a1;
+    wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b0, b1;
     wmma::fragment<wmma::accumulator, 8, 32, 16, float> c;
     fill_fragment(c, 0.0f);
-#pragma unroll
     for (long jn = 0; jn < N / 32; jn++) {
-        uint32_t packed = ((const uint32_t *)YIe)[(m1 * 32 + threadIdx.x) * (N / 32) + jn];
+        uint32_t packed = ((const uint32_t *)YIe)[(m1 * 32 + laneId) * (N / 32) + jn];
 #pragma unroll
         for (long r = 0; r < 2; r++) {
             uint32_t yidx = packed & 255;
-            ((uint64_t *)Y_cache0)[(threadIdx.x * 2 + r) * 2] = ((const uint64_t *)CB)[yidx * 2];
-            ((uint64_t *)Y_cache0)[(threadIdx.x * 2 + r) * 2 + 1] = ((const uint64_t *)CB)[yidx * 2 + 1];
+            ((uint64_t *)Y_cache0)[(laneId * 2 + r) * 2]     = ((uint64_t *)smem_CB)[yidx * 2];
+            ((uint64_t *)Y_cache0)[(laneId * 2 + r) * 2 + 1] = ((uint64_t *)smem_CB)[yidx * 2 + 1];
             packed = packed >> 8;
         }
 #pragma unroll
         for (long r = 0; r < 2; r++) {
             uint32_t yidx = packed & 255;
-            ((uint64_t *)Y_cache1)[(threadIdx.x * 2 + r) * 2] = ((const uint64_t *)CB)[yidx * 2];
-            ((uint64_t *)Y_cache1)[(threadIdx.x * 2 + r) * 2 + 1] = ((const uint64_t *)CB)[yidx * 2 + 1];
+            ((uint64_t *)Y_cache1)[(laneId * 2 + r) * 2]     = ((uint64_t *)smem_CB)[yidx * 2];
+            ((uint64_t *)Y_cache1)[(laneId * 2 + r) * 2 + 1] = ((uint64_t *)smem_CB)[yidx * 2 + 1];
             packed = packed >> 8;
         }
+        __syncwarp();
         load_matrix_sync(a0, (const __half *)(x_grouped + (size_t)8 * N * k1 + 32 * jn), N);
         load_matrix_sync(b0, (const __half *)Y_cache0, 16);
         mma_sync(c, a0, b0, c);
         load_matrix_sync(a1, (const __half *)(x_grouped + (size_t)8 * N * k1 + 32 * jn + 16), N);
         load_matrix_sync(b1, (const __half *)Y_cache1, 16);
         mma_sync(c, a1, b1, c);
+        __syncwarp();
     }
     // accumulate c*scale into the (8-token, 32-row) y_out tile; single owner -> no atomics.
     wmma::fragment<wmma::accumulator, 8, 32, 16, float> y_frag;
@@ -883,8 +899,191 @@ void launch_grouped_lookupmatmul_e81b(
     const int *m_indices, const float *wscale_dev, const float *inv_rs_dev,
     long w_estride, int M_sum_max, int M, int N, cudaStream_t stream
 ) {
-    dim3 grid(M / 32, M_sum_max / 8);
-    glq_lookupmatmul_e81b_grouped_kernel<<<grid, dim3(32), 0, stream>>>(
+    dim3 grid((M / 32 + E81B_MM_WARPS - 1) / E81B_MM_WARPS, M_sum_max / 8);
+    glq_lookupmatmul_e81b_grouped_kernel<<<grid, dim3(32, E81B_MM_WARPS), 0, stream>>>(
         x_grouped, YIs, CB, y_out, m_indices, wscale_dev, inv_rs_dev,
         w_estride, M_sum_max, M, N);
+}
+
+
+// ============================================================================
+// Fast E81B decode (odd-bpw 3/5/7). The stages above (glq_lookupmatmul_e81b_k8,
+// grid (m/32, k/8), one warp per block, no K-split, batch padded to 8) decode
+// the whole weight matrix at a fraction of the E8P GEMV/GEMM occupancy, so any
+// odd-bpw layer is ~7-8x slower than even-bpw. These two kernels mirror the E8P
+// SM-saturating design: a 4 KB shared-memory-resident 256x8 codebook gather in
+// place of the E8P in-register lattice expand; direct fp32 accumulate; no host
+// allocations. Same int64 (m_pad, n_pad/64) pack_e81b layout -> full checkpoint
+// back-compat, no re-quant. Determinism: GEMV = one warp per output row + fixed
+// shfl reduce; GEMM = disjoint k-split scratch planes + fixed-order reduce.
+// NOTE on axes (differs from E8P): here N = reduction dim, M = output features.
+// ============================================================================
+
+
+// B=1 E81B decode GEMV. Warp-per-output-row FMA dot; the 32 lanes split the
+// reduction (each int64 word packs 8 groups = 64 reduction dims). smem CB shared
+// by all warps in the block. One warp owns a row -> deterministic, no scratch.
+__global__ static void glq_decode_matvec_e81b_kernel(
+    const c10::Half *__restrict__ x,     // (N,) fp16
+    const int64_t *__restrict__ YIs,     // (M, N/64) int64
+    const c10::Half *__restrict__ CB,    // (256, 8) fp16
+    float *__restrict__ out,             // (M,) fp32
+    int M, int N
+) {
+    const int warpId = threadIdx.y;
+    const int laneId = threadIdx.x;
+    const int NW = blockDim.y;
+    __shared__ __half smem_CB[256 * 8];
+    for (int i = warpId * 32 + laneId; i < 256 * 8; i += NW * 32)
+        smem_CB[i] = ((const __half *)CB)[i];
+    __syncthreads();
+
+    const int words = N >> 6;                       // int64 per output row
+    for (int row = blockIdx.x * NW + warpId; row < M; row += gridDim.x * NW) {
+        const int64_t *rowp = YIs + (size_t)row * words;
+        float acc = 0.0f;
+        for (int w = laneId; w < words; w += 32) {
+            uint64_t packed = (uint64_t)rowp[w];
+            const __half *xw = (const __half *)x + (size_t)w * 64;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {           // 8 groups (8 reduction dims each)
+                uint32_t yidx = (uint32_t)(packed & 255);
+                packed >>= 8;
+                const __half *cbrow = smem_CB + yidx * 8;
+                const __half *xg = xw + i * 8;
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    acc += __half2float(xg[j]) * __half2float(cbrow[j]);
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(FULL_MASK, acc, off);
+        if (laneId == 0) out[row] = acc;
+    }
+}
+
+
+torch::Tensor glq_decode_matvec_e81b(torch::Tensor x, torch::Tensor YIs, torch::Tensor CB) {
+    E8P_CHECK_INPUT(x); E8P_CHECK_INPUT(YIs); E8P_CHECK_INPUT(CB);
+    TORCH_CHECK(x.dim() == 1 && x.scalar_type() == torch::kFloat16);
+    TORCH_CHECK(YIs.scalar_type() == torch::kInt64 && CB.scalar_type() == torch::kFloat16);
+    TORCH_CHECK(CB.size(0) == 256 && CB.size(1) == 8);
+    int64_t M = YIs.size(0), N = x.size(0);
+    TORCH_CHECK(YIs.size(1) * 64 == N && N % 64 == 0);
+    at::DeviceGuard guard(x.device());
+    auto opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    torch::Tensor output = torch::empty({M}, opt);
+    static int64_t grid_size = 0;
+    if (grid_size == 0) {
+        cudaDeviceProp p; cudaGetDeviceProperties(&p, x.get_device());
+        grid_size = p.multiProcessorCount;
+    }
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    glq_decode_matvec_e81b_kernel<<<grid_size, dim3(32, E81B_MM_WARPS), 0, stream>>>(
+        x.data_ptr<c10::Half>(), YIs.data_ptr<int64_t>(), CB.data_ptr<c10::Half>(),
+        output.data_ptr<float>(), (int)M, (int)N);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    return output;
+}
+
+
+// B>1 E81B decode GEMM. Reuses the WMMA gather+mma body of the k8 kernel but
+// wraps it in the E8P GEMM scaffolding: persistent blocks stride output-row
+// tiles (blockIdx.x), grid.y = 8-token tiles, E81B_MM_WARPS warps split the
+// reduction (jn = warpId; += NW), each writes its own scratch plane, then
+// glq_reduce_splits_2d_e8p_kernel sums the planes in fixed order.
+__global__ static void glq_decode_matmul_e81b_kernel(
+    float *__restrict__ scratch,         // (E81B_MM_WARPS, Bpad, M) fp32 k-split planes
+    const c10::Half *__restrict__ X,     // (Bpad, N) fp16
+    const int64_t *__restrict__ YIs,     // (M, N/64) int64
+    const c10::Half *__restrict__ CB,    // (256, 8) fp16
+    int M, int N, int Bpad
+) {
+    const int warpId = threadIdx.y;
+    const int laneId = threadIdx.x;
+    const long k1 = blockIdx.y;                     // 8-token tile
+    __shared__ __half smem_CB[256 * 8];
+    __shared__ c10::Half Ycache[E81B_MM_WARPS][2][32 * 16];
+    for (int i = warpId * 32 + laneId; i < 256 * 8; i += E81B_MM_WARPS * 32)
+        smem_CB[i] = ((const __half *)CB)[i];
+    __syncthreads();
+
+    c10::Half *Y_cache0 = Ycache[warpId][0];
+    c10::Half *Y_cache1 = Ycache[warpId][1];
+    const size_t kplane = (size_t)warpId * Bpad * M;
+
+    for (long m1 = blockIdx.x; m1 < M / 32; m1 += gridDim.x) {
+        wmma::fragment<wmma::matrix_a, 8, 32, 16, __half, wmma::row_major> a0, a1;
+        wmma::fragment<wmma::matrix_b, 8, 32, 16, __half, wmma::col_major> b0, b1;
+        wmma::fragment<wmma::accumulator, 8, 32, 16, float> c;
+        fill_fragment(c, 0.0f);
+        for (long jn = warpId; jn < N / 32; jn += E81B_MM_WARPS) {
+            uint32_t packed = ((const uint32_t *)YIs)[(m1 * 32 + laneId) * (N / 32) + jn];
+#pragma unroll
+            for (long r = 0; r < 2; r++) {
+                uint32_t yidx = packed & 255;
+                ((uint64_t *)Y_cache0)[(laneId * 2 + r) * 2]     = ((uint64_t *)smem_CB)[yidx * 2];
+                ((uint64_t *)Y_cache0)[(laneId * 2 + r) * 2 + 1] = ((uint64_t *)smem_CB)[yidx * 2 + 1];
+                packed = packed >> 8;
+            }
+#pragma unroll
+            for (long r = 0; r < 2; r++) {
+                uint32_t yidx = packed & 255;
+                ((uint64_t *)Y_cache1)[(laneId * 2 + r) * 2]     = ((uint64_t *)smem_CB)[yidx * 2];
+                ((uint64_t *)Y_cache1)[(laneId * 2 + r) * 2 + 1] = ((uint64_t *)smem_CB)[yidx * 2 + 1];
+                packed = packed >> 8;
+            }
+            __syncwarp();                           // ensure Y_cache writes visible to wmma load
+            load_matrix_sync(a0, (const __half *)(X + (size_t)8 * N * k1 + 32 * jn), N);
+            load_matrix_sync(b0, (const __half *)Y_cache0, 16);
+            mma_sync(c, a0, b0, c);
+            load_matrix_sync(a1, (const __half *)(X + (size_t)8 * N * k1 + 32 * jn + 16), N);
+            load_matrix_sync(b1, (const __half *)Y_cache1, 16);
+            mma_sync(c, a1, b1, c);
+            __syncwarp();                           // Y_cache reused next iter
+        }
+        store_matrix_sync(&scratch[kplane + (size_t)8 * M * k1 + 32 * m1], c, M, wmma::mem_row_major);
+    }
+}
+
+
+torch::Tensor glq_decode_matmul_e81b(torch::Tensor x, torch::Tensor YIs, torch::Tensor CB) {
+    E8P_CHECK_INPUT(x); E8P_CHECK_INPUT(YIs); E8P_CHECK_INPUT(CB);
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == torch::kFloat16);
+    TORCH_CHECK(YIs.scalar_type() == torch::kInt64 && CB.scalar_type() == torch::kFloat16);
+    TORCH_CHECK(CB.size(0) == 256 && CB.size(1) == 8);
+    int64_t B = x.size(0), N = x.size(-1), M = YIs.size(0);
+    TORCH_CHECK(YIs.size(1) * 64 == N && N % 64 == 0 && M % 32 == 0 && N % 32 == 0);
+    x = x.contiguous();
+    at::DeviceGuard guard(x.device());
+    auto opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    int64_t Bpad = (B + 7) & ~7L;                   // WMMA matrix_a tile is 8 rows
+    torch::Tensor xp = x;
+    if (Bpad != B) {
+        xp = torch::zeros({Bpad, N}, x.options());
+        xp.narrow(0, 0, B).copy_(x);
+    }
+    torch::Tensor output = torch::empty({Bpad, M}, opt);  // reduce overwrites every elem
+    static int64_t grid_size = 0;
+    if (grid_size == 0) {
+        cudaDeviceProp p; cudaGetDeviceProperties(&p, x.get_device());
+        grid_size = p.multiProcessorCount;
+    }
+    dim3 grid(grid_size, Bpad / 8);
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    size_t scratch_bytes = (size_t)E81B_MM_WARPS * Bpad * M * sizeof(float);
+    float *scratch = (float *)c10::cuda::CUDACachingAllocator::raw_alloc(scratch_bytes);
+    glq_decode_matmul_e81b_kernel<<<grid, dim3(32, E81B_MM_WARPS), 0, stream>>>(
+        scratch, xp.data_ptr<c10::Half>(), YIs.data_ptr<int64_t>(), CB.data_ptr<c10::Half>(),
+        (int)M, (int)N, (int)Bpad);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    int64_t BM = Bpad * M;
+    int reduce_threads = 256;
+    int reduce_blocks = (int)((BM + reduce_threads - 1) / reduce_threads);
+    glq_reduce_splits_2d_e8p_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+        output.data_ptr<float>(), scratch, (int)BM, E81B_MM_WARPS);
+    E8P_ERRCHK(cudaPeekAtLastError());
+    c10::cuda::CUDACachingAllocator::raw_delete(scratch);
+    return (Bpad != B) ? output.narrow(0, 0, B).contiguous() : output;
 }
