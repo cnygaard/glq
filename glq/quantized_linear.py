@@ -18,6 +18,10 @@ except ImportError:
 # bit-exact A/B test and as a production escape hatch).
 _GLQ_FUSED_E8P_ENABLED = True
 
+# Kill-switch for the fused QTIP-trellis linear op (glq_fused_linear_trellis_cuda). Default
+# on; flip to False to force the pure-torch decode reference (used by the A/B parity test).
+_GLQ_FUSED_TRELLIS_ENABLED = True
+
 
 def _pack_block_meta(block_sizes):
     """Pack (col_offset, bs, log_bs, _) per sub-block as CPU int32 (N, 4).
@@ -153,6 +157,12 @@ class E8RHTLinear(nn.Module):
         # m_pad÷16). Detected here so the right buffers get registered; the
         # forward early-returns into _forward_e8p, leaving the shell path intact.
         self._is_e8p = (codebook_type == "e8p")
+        # QTIP-trellis (glq/trellis.py): block-diagonal RHT, NO pow2 padding →
+        # m_pad==out_features, n_pad==in_features. Detected here so _init_trellis_buffers
+        # registers the compressed buffers and forward dispatches to _forward_trellis.
+        self._is_trellis = (codebook_type == "trellis")
+        if self._is_trellis:
+            block_diagonal = True
         if self._is_e8p:
             # e8p is block-diagonal too, but its qidxs tile layout needs n_pad a
             # multiple of 64 / m_pad a multiple of 16, so floor the smallest block.
@@ -181,6 +191,9 @@ class E8RHTLinear(nn.Module):
 
         if self._is_e8p:
             self._init_e8p_buffers(bias)
+            return
+        if self._is_trellis:
+            self._init_trellis_buffers(bias)
             return
 
         # Quantized weight storage
@@ -292,6 +305,38 @@ class E8RHTLinear(nn.Module):
         self._blocks_n_meta_gpu = None
         self._blocks_m_meta_gpu = None
 
+    def _init_trellis_buffers(self, bias):
+        """Register compressed QTIP-trellis buffers (glq/trellis.py storage format).
+
+        ``trellis_packed`` is the kernel-layout packed int16 codes; ``tlut`` the fitted
+        HYB lookup table (empty for lookup-free 3inst). Both are registered 0-size and
+        resized to the checkpoint shape on load (K/bpw is checkpoint-authoritative). The
+        decoded weight is materialized+cached lazily in _forward_trellis (pure-torch S0
+        reference; the S1 CUDA kernel fuses decode into the matvec)."""
+        self.register_buffer('trellis_packed', torch.zeros(0, dtype=torch.int16))
+        self.register_buffer('tlut', torch.zeros(0, dtype=torch.float16))
+        self.register_buffer('SU', torch.ones(self.m_pad, dtype=torch.float16))
+        self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
+        self.register_buffer('Wscale', torch.ones((), dtype=torch.float32))
+        if bias:
+            self.register_buffer('bias', torch.zeros(self.out_features, dtype=torch.float16))
+        else:
+            self.bias = None
+        self.codebook = None
+        self.codebook2 = None
+        self._wscale_float = 1.0
+        self._trellis_has_kernel = True
+        self._trellis_W_rht = None       # dense fallback cache (NOT used on the CUDA path)
+        self._trellis_op = None          # resolved fused CUDA op (False = unavailable)
+        # Block-diagonal RHT metadata for the fused trellis op (trellis never pads, so these
+        # sum to in_features / out_features exactly).
+        self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
+        self._blocks_m_tensor = torch.tensor(self.blocks_m, dtype=torch.int64, device="cpu")
+        self._blocks_n_meta_cpu = _pack_block_meta(self.blocks_n)
+        self._blocks_m_meta_cpu = _pack_block_meta(self.blocks_m)
+        self._blocks_n_meta_gpu = None
+        self._blocks_m_meta_gpu = None
+
     @property
     def weight(self):
         """Proxy so code checking weight.device works (e.g. Mamba).
@@ -299,7 +344,7 @@ class E8RHTLinear(nn.Module):
         Returns a zero-element tensor on the same device as the quantized
         weights, without allocating any real memory.
         """
-        dev = self.SV.device if self._is_e8p else self.Qidxs.device
+        dev = self.SV.device if (self._is_e8p or self._is_trellis) else self.Qidxs.device
         return torch.empty(0, dtype=torch.float16, device=dev)
 
     def set_codebook(self, codebook, codebook2=None):
@@ -318,6 +363,17 @@ class E8RHTLinear(nn.Module):
                 return
             self._wscale_float = self.Wscale.item()
             self._inv_rs_float = self.inv_resid_scale.item()
+            return
+        if self._is_trellis:
+            # Shared TrellisCodebook (reconstructed from the stored tlut); the storage
+            # layout (kernel/for_kernel vs natural) travels with the codebook.
+            self._trellis_has_kernel = getattr(codebook, 'has_kernel', True)
+            self._trellis_W_rht = None
+            self._trellis_op = None      # re-resolve (has_kernel gates the CUDA path)
+            if self.Wscale.device.type != "meta":
+                self._wscale_float = self.Wscale.item()
+            else:
+                self._wscale_float = None
             return
         # Skip scalar caching for meta tensors (offloaded layers);
         # values will be resolved lazily in forward() if needed.
@@ -353,6 +409,20 @@ class E8RHTLinear(nn.Module):
         checkpoints by resizing buffers to match the checkpoint's actual shapes.
         Also handles 2bpw models that omit Qidxs2/inv_resid_scale.
         """
+        if self._is_trellis:
+            # Resize the 0-size compressed placeholders to the checkpoint's exact shapes
+            # so super()'s copy matches (non-meta path); meta-assign replaces wholesale.
+            for suffix in ('trellis_packed', 'tlut'):
+                key = prefix + suffix
+                if key in state_dict:
+                    buf = getattr(self, suffix)
+                    t = state_dict[key]
+                    if buf.device.type != 'meta' and buf.shape != t.shape:
+                        buf.resize_(t.shape)
+            super()._load_from_state_dict(
+                state_dict, prefix, local_metadata,
+                strict, missing_keys, unexpected_keys, error_msgs)
+            return
         if self._is_e8p:
             # E8P buffers are stored at their exact pow2-padded shape — no runtime
             # padding. Register whichever stage-2 buffer the recipe used (present in
@@ -698,6 +768,90 @@ class E8RHTLinear(nn.Module):
             y = y + bias.unsqueeze(0).to(out_dtype)
         return y
 
+    def _ensure_trellis_codebook_device(self, device):
+        """Move the shared TrellisCodebook's lut/state buffers to the compute device once."""
+        cb = self.codebook
+        if cb is not None and cb.cb.lut.device != device:
+            cb.cb = cb.cb.to(device)
+            cb.cb.fakeinf = cb.cb.fakeinf.to(device)
+            cb.device = device
+
+    def _resolve_trellis_op(self, x2d):
+        """Resolve the fused trellis CUDA op once (None if unusable for this layer).
+
+        Requires: CUDA input, the built extension, the kernel storage layout (HYB — a 3inst
+        checkpoint is packed in the natural layout the kernel can't read), and a shape the
+        kernel supports (m % 32, k % 64). Anything else falls back to the pure-torch decode.
+        """
+        if self._trellis_op is not None:
+            return self._trellis_op or None
+        if not (x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel):
+            self._trellis_op = False
+            return None
+        from . import inference_kernel as _ik
+        op = None
+        if _ik._try_load_cuda_ext() and hasattr(_ik._glq_cuda, "glq_fused_linear_trellis_cuda"):
+            if _ik._glq_cuda.glq_trellis_kernel_supported(self.m_pad, self.n_pad):
+                # Prefer the registered torch.op when present (traceable → vLLM cudagraph
+                # sees one node); the raw pybind binding calls the same C++ entry.
+                if (hasattr(torch.ops, "glq")
+                        and hasattr(torch.ops.glq, "fused_linear_trellis")):
+                    op = torch.ops.glq.fused_linear_trellis
+                else:
+                    op = _ik._glq_cuda.glq_fused_linear_trellis_cuda
+        self._trellis_op = op if op is not None else False
+        return op
+
+    def _forward_trellis(self, x: torch.Tensor) -> torch.Tensor:
+        """QTIP-trellis forward.
+
+        Fast path: ONE fused CUDA op (input RHT → trellis decode+matmul → ×Wscale → output
+        RHT), mirroring ``glq_fused_linear_e8p_cuda``. At B=1 the weights are decoded from
+        ``trellis_packed`` **inside** the kernel — nothing dense is ever materialized, so VRAM
+        tracks the 2-bpw storage and the decode escapes GLQ's L2 codebook-gather ceiling.
+
+        Fallback (no CUDA ext / unsupported shape / 3inst layout): decode to a dense weight
+        once and run the block-diag RHT in torch. This is the S0 correctness reference —
+        identical math, just slow and dense.
+        """
+        shape = x.shape
+        x2d = x.reshape(-1, self.in_features)
+        if self._wscale_float is None:
+            self._wscale_float = self.Wscale.item()
+
+        op = self._resolve_trellis_op(x2d)
+        if op is not None:
+            if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
+                self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
+                self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
+            y = op(x2d.half().contiguous(), self.SV, self.SU,
+                   self.trellis_packed, self.tlut,
+                   self._blocks_n_tensor, self._blocks_m_tensor,
+                   self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
+                   float(self._wscale_float),
+                   self.in_features, self.out_features,
+                   self.n_pad, self.m_pad).to(x.dtype)
+            if self.bias is not None:
+                y = y + self.bias.unsqueeze(0).to(x.dtype)
+            return y.reshape(*shape[:-1], self.out_features)
+
+        # ---- pure-torch reference / fallback (dense) ----
+        from .hadamard import block_diagonal_fht
+        from .trellis import decode_layer
+        if self._trellis_W_rht is None or self._trellis_W_rht.device != x.device:
+            self._ensure_trellis_codebook_device(x.device)
+            hatWr = decode_layer(self.codebook, self.trellis_packed,
+                                 self.m_pad, self.n_pad, self._trellis_has_kernel)
+            self._trellis_W_rht = (hatWr.float() * self._wscale_float).to(x.device)
+        x2df = x2d.float()
+        x_rht = block_diagonal_fht(x2df * self.SV.float().unsqueeze(0), self.blocks_n)
+        y_rht = x_rht @ self._trellis_W_rht.T
+        y = block_diagonal_fht(y_rht, self.blocks_m) * self.SU.float().unsqueeze(0)
+        y = y[:, :self.out_features]
+        if self.bias is not None:
+            y = y + self.bias.float().unsqueeze(0)
+        return y.to(x.dtype).reshape(*shape[:-1], self.out_features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with RHT-domain matmul.
@@ -706,6 +860,8 @@ class E8RHTLinear(nn.Module):
         2. Fused dequant+matmul in RHT domain (Triton) or decode+matmul (fallback)
         3. FHT on y_rht, apply SU signs, unpad → inverse RHT on output
         """
+        if self._is_trellis:
+            return self._forward_trellis(x)
         if self._is_e8p:
             return self._forward_e8p(x)
         self._pad_if_needed()

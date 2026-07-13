@@ -111,6 +111,11 @@ def _artifact_padded_weights(arts: dict) -> int:
     mix of shell + e8p layers — e.g. a mixed-bpw e8p run whose PLE embedding is
     shell — without assuming a single codebook.
     """
+    qt = arts.get('trellis_packed')
+    if qt is not None:
+        # packed [(m//16)*(n//16), ceil(256*K/16)==16K]; padded weights m*n == numel*16/K.
+        K = max(qt.shape[1] // 16, 1)
+        return int(qt.numel() * 16 // K)
     qe = arts.get('Qidxs_e8p')
     if qe is not None:
         return qe.shape[0] * 16 * qe.shape[1] * 64
@@ -377,6 +382,23 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
         artifacts: dict with Qidxs, SU, SV, Wscale (for saving)
         metrics: dict with sqnr, bpw
     """
+    if getattr(codebook, 'is_trellis', False):
+        # QTIP trellis: block-diagonal RHT + tile-trellis LDLQ (glq/trellis.py). Returns
+        # the SAME (W_hat, artifacts, metrics) contract; artifacts carry trellis_packed +
+        # SU/SV/Wscale/tlut, which the driver stores generically. H is the RAW captured
+        # Hessian (quantize_layer_trellis_rht damps internally, like the validated scratch).
+        import math as _math
+        from .trellis import quantize_layer_trellis_rht as _qtr
+        W_hat, artifacts = _qtr(W, H, codebook, block_diagonal=block_diagonal)
+        d = W.float().to(W_hat.device) - W_hat.float()
+        mse = d.pow(2).mean().item()
+        sig = W.float().pow(2).mean().item()
+        sqnr = 10 * _math.log10(sig / mse) if mse > 0 else 99.0
+        # Hessian-weighted proxy tr(ΔW·H·ΔWᵀ)/m — same metric the shell path reports, so
+        # sensitivity/mixed-bpw allocation stays consistent across codebooks.
+        proxy = ((d @ H.float().to(d.device)) * d).sum().item() / W.shape[0]
+        return W_hat, artifacts, {"sqnr": sqnr, "bpw": codebook.K,
+                                  "Wscale": float(artifacts["Wscale"]), "proxy_loss": proxy}
     dev = codebook.device
     m, n = W.shape
     W_f = W.float().to(dev)
@@ -931,6 +953,11 @@ def quantize(
     elif codebook_type == "e8p":
         from .codebook_e8p import E8PCodebook
         codebook = E8PCodebook(device=device)         # QuIP# padded-D̂8, TC-GEMV decode (2-8 bpw RVQ)
+    elif codebook_type == "trellis":
+        from .trellis import TrellisCodebook           # QTIP TCQ — dim-256 trellis, beats e8p at low bpw
+        _variant = os.environ.get("GLQ_TRELLIS_VARIANT", "hyb")
+        _K = int(bpw) if isinstance(bpw, (int, float)) else 2
+        codebook = TrellisCodebook(variant=_variant, K=_K, device=device)
     else:
         codebook = E8ShellCodebook(device=device, target_size=codebook_size)
 
@@ -1833,8 +1860,10 @@ def quantize(
 
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
-    # 2. Save codebook
-    codebook.save(os.path.join(output_dir, "e8_codebook.pt"))
+    # 2. Save codebook. Trellis has no separate .pt — its tlut is stored per-layer in the
+    # safetensors and the loader rebuilds the shared codebook from it (+ config variant).
+    if hasattr(codebook, "save"):
+        codebook.save(os.path.join(output_dir, "e8_codebook.pt"))
 
     # 3. Save config.json with quantization_config
     if not streaming:
@@ -1900,14 +1929,19 @@ def quantize(
     # and relaxed are always block-diagonal. block_diagonal=False tells the vLLM
     # loader to size the e8p buffers to pow2 instead of the block-diagonal dims.
     block_diagonal = not (codebook_type == "e8p" and bool(os.environ.get("GLQ_E8P_POW2")))
+    # Trellis groups 16×16=256-element tiles → codesz 16 (shell/e8p use 8).
+    _codesz = 16 if codebook_type == "trellis" else 8
     config_dict["quantization_config"] = {
         "quant_method": "glq",
         "codebook": codebook_type,
         "block_diagonal": block_diagonal,
-        "codesz": 8,
+        "codesz": _codesz,
         "bpw": effective_bpw,
         "layer_bpw": layer_bpw_out,
     }
+    if codebook_type == "trellis":
+        # HYB vs 3inst variant round-trips so the loader rebuilds the right codebook.
+        config_dict["quantization_config"]["variant"] = getattr(codebook, "variant", "hyb")
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:
@@ -1918,7 +1952,7 @@ def quantize(
         "quant_method": "glq",
         "codebook": codebook_type,
         "block_diagonal": block_diagonal,
-        "codesz": 8,
+        "codesz": _codesz,
         "bpw": effective_bpw,
         "tune_iters": tune_iters,
         "nsamples": nsamples,
@@ -2039,10 +2073,11 @@ def main():
                         help="Parallel workers for CPU quantization "
                              "(0=auto, 1=sequential, ignored on GPU)")
     parser.add_argument("--codebook", type=str, default="e8_shell",
-                        choices=["e8_shell", "e8_relaxed", "e8p"],
+                        choices=["e8_shell", "e8_relaxed", "e8p", "trellis"],
                         help="Codebook variant: e8_shell (default, optimal ball), "
                              "e8_relaxed (D~8 for KV), e8p (QuIP# padded-D̂8 + RVQ, "
-                             "tensor-core decode, bpw 2-8).")
+                             "tensor-core decode, bpw 2-8), trellis (QTIP TCQ — dim-256 "
+                             "trellis, best low-bpw quality; GLQ_TRELLIS_VARIANT=hyb|3inst).")
     parser.add_argument("--codebook-size", type=int, default=None,
                         help="E8 codebook entry count. Default 65 536 "
                              "(shells 0-5 in full + 8 655 from shell 6). "
