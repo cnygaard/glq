@@ -151,6 +151,82 @@ def test_fused_linear_e8p_fake_shape():
 
 
 @requires_vllm
+def test_fused_linear_trellis_fake_shape():
+    """Pins the trellis schema⇆fake arg count/order (14 args). An off-by-one between the
+    ``define`` string and ``_fused_linear_trellis_fake`` would raise here rather than at
+    serve time. Meta-device, so it runs without the CUDA ext."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear_trellis"):
+        pytest.skip("fused_linear_trellis not registered (no CUDA ext loaded)")
+
+    B, in_features, out_features = 2, 1024, 768
+    n_pad, m_pad = in_features, out_features        # trellis never pads
+    meta = torch.device("meta")
+    x = torch.empty(B, in_features, dtype=torch.float16, device=meta)
+    sv = torch.empty(n_pad, dtype=torch.float16, device=meta)
+    su = torch.empty(m_pad, dtype=torch.float16, device=meta)
+    packed = torch.empty((m_pad // 16) * (n_pad // 16), 32, dtype=torch.int16, device=meta)
+    tlut = torch.empty(512, 2, dtype=torch.float16, device=meta)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    blk_n = torch.tensor([n_pad], dtype=torch.int64, device=meta)
+    blk_m = torch.tensor([m_pad], dtype=torch.int64, device=meta)
+
+    fy = torch.ops.glq.fused_linear_trellis(
+        x, sv, su, packed, tlut,
+        blk_n, blk_m, empty_i32, empty_i32,
+        1.0, in_features, out_features, n_pad, m_pad,
+    )
+    assert fy.shape == (B, out_features), f"got {tuple(fy.shape)}"
+    assert fy.dtype == torch.float16
+    assert fy.device.type == "meta"
+
+
+@requires_vllm
+def test_trellis_create_weights_sizing():
+    """Trellis create_weights registers the compressed buffers at FULL checkpoint size, so
+    vLLM's loader takes the in-place copy_ branch — a shape mismatch sends it down
+    ``param.data = empty_like(loaded)``, stranding .data on CPU and aborting the kernel at
+    cudagraph capture. Trellis never pads: m_pad == out, n_pad == in. CPU-only."""
+    from glq_vllm.linear_method import GLQLinearMethod
+
+    in_sz, out_sz, bpw = 2048, 3072, 2
+    m = GLQLinearMethod(None, bpw=bpw, codebook_type="trellis")
+    layer = torch.nn.Module()
+    m.create_weights(layer, in_sz, [out_sz], in_sz, out_sz, torch.float16)
+
+    assert layer.glq_is_trellis is True
+    assert layer.glq_n_pad == in_sz and layer.glq_m_pad == out_sz          # no padding
+    assert tuple(layer.trellis_packed.shape) == ((out_sz // 16) * (in_sz // 16), 16 * bpw)
+    assert layer.trellis_packed.dtype == torch.int16
+    assert tuple(layer.tlut.shape) == (512, 2) and layer.tlut.dtype == torch.float16
+    assert tuple(layer.SU.shape) == (out_sz,) and tuple(layer.SV.shape) == (in_sz,)
+
+
+@requires_vllm
+def test_trellis_rejects_unservable_shape():
+    """Trellis never pads, so the kernel's m%32 / k%64 requirement cannot be hidden — a TP
+    split that violates it must fail loudly at load rather than serve garbage."""
+    from glq_vllm.linear_method import GLQLinearMethod
+    m = GLQLinearMethod(None, bpw=2, codebook_type="trellis")
+    with pytest.raises(ValueError, match="never pads"):
+        m.create_weights(torch.nn.Module(), 2048, [48], 2048, 48, torch.float16)  # 48 % 32 != 0
+
+
+@requires_vllm
+def test_glq_config_trellis_variant():
+    """`variant` round-trips; a 3inst checkpoint (no CUDA kernel, and vLLM has no pure-torch
+    fallback) is refused up front rather than served as garbage."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config(
+        {"bpw": 2, "codebook": "trellis", "variant": "hyb", "block_diagonal": True})
+    assert cfg.codebook == "trellis" and cfg.variant == "hyb"
+    assert GLQvLLMConfig.from_config({"bpw": 2, "codebook": "e8p"}).variant == "hyb"  # default
+    with pytest.raises(ValueError, match="no CUDA kernel"):
+        GLQvLLMConfig.from_config({"bpw": 2, "codebook": "trellis", "variant": "3inst"})
+
+
+@requires_vllm
 def test_glq_config_from_config():
     """GLQvLLMConfig should parse bpw and layer_bpw from dict."""
     from glq_vllm.config import GLQvLLMConfig

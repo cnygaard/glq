@@ -88,6 +88,53 @@ def test_cuda_matvec_is_deterministic():
 
 
 # ---------------------------------------------------------------------------
+# GATE 2b: the BATCHED GEMM (B>1) — weights stay compressed (no dense W).
+# m16n8k16 computes a 16x8 tile; the GEMV fills only column 0 and discards 7/8.
+# The batched kernel puts one token per N-column, so B<=8 costs the same decode
+# and the same tensor-core work as B=1. Ragged B is predicated, not padded.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("B", [1, 2, 7, 8, 9, 63, 64, 65])
+def test_cuda_matmul_batched_matches_reference(B):
+    m, n = 256, 512
+    cb, packed, tlut16 = _quantized(m, n, seed=21)
+    W = gt.decode_layer(cb, packed, m, n, has_kernel=True)        # (m,n) fp32
+    torch.manual_seed(B)
+    x = (torch.randn(B, n, device="cuda") * 0.5).to(torch.float16)
+    ref = x.float() @ W.t()                                      # (B,m) fp32
+    out = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
+    assert out.shape == (B, m) and out.dtype == torch.float32
+    assert _sqnr(ref, out) > 40.0, f"B={B} SQNR {_sqnr(ref, out):.1f} dB"
+
+
+def test_cuda_matmul_row_parity_with_gemv():
+    """Row b of the batched GEMM must be BIT-EXACT vs the B=1 GEMV on x[b].
+
+    Each mma N-column accumulates independently, both kernels issue the same mma
+    sequence over the same k-split (32 warps, fixed-order smem reduce), and the A
+    (weight) fragment is identical — so the only thing that changed is which column
+    the token sits in. Anything less than bit-exact means the B-fragment indexing or
+    the C-fragment harvest is wrong.
+    """
+    m, n = 256, 512
+    cb, packed, tlut16 = _quantized(m, n, seed=22)
+    torch.manual_seed(5)
+    x = (torch.randn(9, n, device="cuda") * 0.5).to(torch.float16)   # 9 → crosses a tile
+    batched = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
+    for b in range(9):
+        gemv = _ext().glq_decode_matvec_trellis_cuda(x[b].contiguous(), packed, tlut16, m, n)
+        assert torch.equal(batched[b], gemv), f"row {b} != GEMV"
+
+
+def test_cuda_matmul_is_deterministic():
+    m, n = 256, 512
+    cb, packed, tlut16 = _quantized(m, n, seed=23)
+    x = (torch.randn(16, n, device="cuda") * 0.5).to(torch.float16)
+    a = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
+    b = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
+    assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
 # GATE 3: the fused linear op == the pure-torch S0 reference (RHT in/out bracket)
 # ---------------------------------------------------------------------------
 def _trellis_layer(in_f=512, out_f=256, seed=11):

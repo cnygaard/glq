@@ -776,31 +776,51 @@ class E8RHTLinear(nn.Module):
             cb.cb.fakeinf = cb.cb.fakeinf.to(device)
             cb.device = device
 
-    def _resolve_trellis_op(self, x2d):
-        """Resolve the fused trellis CUDA op once (None if unusable for this layer).
+    @staticmethod
+    def _trellis_linear_apply(x2d, SV, SU, trellis_packed, tlut,
+                              blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                              wscale, in_features, out_features, n_pad, m_pad,
+                              bias=None, out_dtype=torch.float16):
+        """Capture-safe trellis linear core: input_rht → trellis decode/matmul → ×Wscale →
+        output_rht, as ONE op.
+
+        x2d: (B, in_features) → (B, out_features) in out_dtype. Prefers the registered
+        torch.op (traceable, so vLLM's cudagraph capture sees a single node) over the pybind
+        binding — both call the same C++ entry. Shared by E8RHTLinear._forward_trellis (HF)
+        and glq_vllm's _glq_apply_trellis (serving) so both run one validated path, exactly
+        as _e8p_linear_apply does. The B=1 / B≤64 / prefill dispatch lives inside the C++ op.
+        """
+        from . import inference_kernel as _ik
+        _ik._try_load_cuda_ext()
+        if hasattr(torch.ops, "glq") and hasattr(torch.ops.glq, "fused_linear_trellis"):
+            _fused = torch.ops.glq.fused_linear_trellis
+        else:
+            _fused = _ik._glq_cuda.glq_fused_linear_trellis_cuda
+        y = _fused(x2d.half().contiguous(), SV, SU, trellis_packed, tlut,
+                   blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                   float(wscale), in_features, out_features, n_pad, m_pad).to(out_dtype)
+        if bias is not None:
+            y = y + bias.unsqueeze(0).to(out_dtype)
+        return y
+
+    def _trellis_op_usable(self, x2d):
+        """Can this layer take the fused CUDA path? (cached; None → pure-torch fallback)
 
         Requires: CUDA input, the built extension, the kernel storage layout (HYB — a 3inst
         checkpoint is packed in the natural layout the kernel can't read), and a shape the
         kernel supports (m % 32, k % 64). Anything else falls back to the pure-torch decode.
         """
         if self._trellis_op is not None:
-            return self._trellis_op or None
-        if not (x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel):
-            self._trellis_op = False
-            return None
-        from . import inference_kernel as _ik
-        op = None
-        if _ik._try_load_cuda_ext() and hasattr(_ik._glq_cuda, "glq_fused_linear_trellis_cuda"):
-            if _ik._glq_cuda.glq_trellis_kernel_supported(self.m_pad, self.n_pad):
-                # Prefer the registered torch.op when present (traceable → vLLM cudagraph
-                # sees one node); the raw pybind binding calls the same C++ entry.
-                if (hasattr(torch.ops, "glq")
-                        and hasattr(torch.ops.glq, "fused_linear_trellis")):
-                    op = torch.ops.glq.fused_linear_trellis
-                else:
-                    op = _ik._glq_cuda.glq_fused_linear_trellis_cuda
-        self._trellis_op = op if op is not None else False
-        return op
+            return bool(self._trellis_op)
+        ok = False
+        if x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel:
+            from . import inference_kernel as _ik
+            if (_ik._try_load_cuda_ext()
+                    and hasattr(_ik._glq_cuda, "glq_fused_linear_trellis_cuda")
+                    and _ik._glq_cuda.glq_trellis_kernel_supported(self.m_pad, self.n_pad)):
+                ok = True
+        self._trellis_op = ok
+        return ok
 
     def _forward_trellis(self, x: torch.Tensor) -> torch.Tensor:
         """QTIP-trellis forward.
@@ -819,20 +839,16 @@ class E8RHTLinear(nn.Module):
         if self._wscale_float is None:
             self._wscale_float = self.Wscale.item()
 
-        op = self._resolve_trellis_op(x2d)
-        if op is not None:
+        if self._trellis_op_usable(x2d):
             if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
                 self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
                 self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
-            y = op(x2d.half().contiguous(), self.SV, self.SU,
-                   self.trellis_packed, self.tlut,
-                   self._blocks_n_tensor, self._blocks_m_tensor,
-                   self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
-                   float(self._wscale_float),
-                   self.in_features, self.out_features,
-                   self.n_pad, self.m_pad).to(x.dtype)
-            if self.bias is not None:
-                y = y + self.bias.unsqueeze(0).to(x.dtype)
+            y = E8RHTLinear._trellis_linear_apply(
+                x2d, self.SV, self.SU, self.trellis_packed, self.tlut,
+                self._blocks_n_tensor, self._blocks_m_tensor,
+                self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
+                self._wscale_float, self.in_features, self.out_features,
+                self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype)
             return y.reshape(*shape[:-1], self.out_features)
 
         # ---- pure-torch reference / fallback (dense) ----

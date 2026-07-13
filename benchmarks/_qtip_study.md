@@ -113,6 +113,62 @@ GEMM. (2) HF-eager 48 tok/s is Python-dispatch bound, and bf16 is still faster (
 Blackwell — GLQ's speed win lives on 24/32 GB cards and under vLLM cudagraphs (S2).
 (3) Kernel needs `m % 32`, `k % 64`; other shapes fall back to the pure-torch decode.
 
-## Remaining (S2-S4)
-S2 vLLM under FULL cudagraph · S3 sequential requant + MMLU-Pro/AIME + release · S4 3inst-inline
-kernel (drops the 64 KB smem LUT, reclaims ~0.1 PPL).
+---
+
+# Productization S2 — **DONE**: vLLM serving + batched GEMM. **Speed gate FAILED.**
+
+Two things shipped: a **batched trellis GEMM** (the B=1 GEMV filled only column 0 of the
+`m16n8k16` tile and discarded 7/8 — the batched fork puts one token per N-column, so B≤8 costs
+the same decode and the same tensor-core work; ragged tail predicated, not padded) with a
+hybrid dispatch (`B=1` GEMV → `B≤64` batched → `B>64` decompress-fp16 + cuBLAS, so no dense
+weight exists on any *decode* step while prefill keeps the fast cuBLAS path); and the full vLLM
+wiring (op triple + fake, `config.variant`, full-size `create_weights`, `_setup_trellis_weights`,
+`_glq_apply_trellis`).
+
+Deliberately **not** copied from e8p: its split-K scratch uses a per-call
+`raw_alloc`/`raw_delete`, which `glq_cuda.cu:3405-3412` itself flags as illegal during graph
+capture. Our in-block reduce (each block owns a disjoint m-range; no atomics, no scratch) is
+deterministic *and* capture-safe by construction.
+
+## Gates
+
+| Gate | Result |
+| :-- | :-- |
+| batched GEMM vs `x @ decompress(packed).T` (B=1,2,7,8,9,63,64,65) | SQNR > 40 dB |
+| **batched row `b` vs the B=1 GEMV on `x[b]`** | **BIT-EXACT** (`torch.equal`) |
+| determinism, cudagraph capture/replay | pass |
+| vLLM serve, **FULL cudagraph** (no `enforce_eager`) | coherent |
+| PPL (3B) | 11.7448 (unchanged) |
+| **peak VRAM** | **1315 → 1186 MiB** — the dense-materialization wart is gone (e8p: 1187) |
+| **decode tok/s > e8p** | ❌ **FAILED** |
+
+## SmolLM3-3B @ 2 bpw — vLLM, FULL cudagraph
+
+| | PPL | weights | peak VRAM | B=1 | B=32 total |
+| :-- | --: | --: | --: | --: | --: |
+| e8p | 13.21 | 1176 MiB | 1187 MiB | **150.9 tok/s** | **3173 tok/s** |
+| **trellis** | **11.74** | 1176 MiB | **1186 MiB** | 147.9 | 2366 |
+
+## ⚠️ Correction to S1
+
+**The S1 claim that trellis decodes "1.31× faster than e8p" was WRONG** — an artifact of
+HF-eager being Python-dispatch-bound. Under cudagraph, e8p gained 4.1× (36.8→150.9) while
+trellis gained 3.0× (48.8→144.5): e8p was simply penalised *more* by Python overhead. Once both
+are freed by graph capture — the setting that actually matters for serving — **e8p's kernel is
+the faster one.** *Never generalise an eager-mode tok/s number.*
+
+**The real proposition: trellis buys better quality (−1.47 PPL) at IDENTICAL footprint, for a
+~2% (B=1) / ~25% (B=32) decode-throughput cost.** Not "better and faster".
+
+The cost is intrinsic, not a tuning miss: trellis decode is a smem LUT gather + `idx*(idx+1)` +
+sign-flip per 2 weights, vs e8p's cheaper packed-int32 bit-expand; and the 64 KB LUT + 1024
+threads caps occupancy at 1 block/SM (67%). We *did* find a real defect — QTIP hardcodes
+`grid.x=128` (a ~108-SM A100), leaving 60 of this card's 188 SMs idle — and made it SM-adaptive,
+but it bought only +2%/+1%, which **disproves** the under-subscription theory rather than
+confirming it.
+
+## Remaining (S3, S4)
+**S4 (3inst-inline kernel) is now the high-value lever, not a nicety:** 3inst is **lookup-free**
+(3 integer ops, no tlut) → deletes the 64 KB smem, lifts occupancy, *and* reclaims ~0.1 PPL. It
+is the one change that could plausibly close the speed gap. · S3 sequential requant +
+MMLU-Pro/AIME + release.

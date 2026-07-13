@@ -57,7 +57,22 @@ namespace {
 
 constexpr uint32_t TR_WARP_SIZE   = 32;
 constexpr uint32_t TR_BLOCK_SIZE  = 1024;
-constexpr uint32_t TR_BLOCK_COUNT = 128;
+constexpr uint32_t TR_BLOCK_COUNT = 128;   // upstream default; overridden by tr_grid_x()
+
+/* Blocks along the m axis. Upstream QTIP hardcodes 128 (a ~108-SM A100); GLQ runs on cards
+ * from 24 GB consumer parts to a 188-SM RTX PRO 6000, where a fixed 128 leaves 60 SMs idle at
+ * decode batch sizes. Query once and cache (the kernels read gridDim.x, so nothing else has to
+ * change). Mirrors the `static int num_sms` caching in glq_e8p.cu / glq_cuda.cu. */
+uint32_t tr_grid_x() {
+    static uint32_t g = 0;
+    if (g == 0) {
+        int dev = 0, sms = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        g = (sms > 0) ? (uint32_t)sms : TR_BLOCK_COUNT;
+    }
+    return g;
+}
 constexpr uint32_t TR_WARPS       = TR_BLOCK_SIZE / TR_WARP_SIZE;   // 32
 constexpr uint32_t TR_MMA_M       = 16;
 constexpr uint32_t TR_MMA_K       = 16;
@@ -181,7 +196,10 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
 
     const uint32_t tileCountM = m / TR_MMA_M;
     const uint32_t tileCountK = k / TR_MMA_K;
-    const uint32_t m_per_block = (tileCountM + (2 * TR_BLOCK_COUNT) - 1) / (2 * TR_BLOCK_COUNT);
+    // Partition the m-tile-pairs across however many blocks the host launched. Upstream
+    // hardcodes BLOCK_COUNT=128 (tuned for a ~108-SM A100); read gridDim.x instead so the
+    // kernel self-adapts — on a 188-SM card a fixed 128 leaves a third of the GPU idle.
+    const uint32_t m_per_block = (tileCountM + (2 * gridDim.x) - 1) / (2 * gridDim.x);
     const uint32_t k_per_block = tileCountK / (TR_WARPS * 4) * 2;
     const uint32_t this_warp_k =
         (warpId < (tileCountK % (TR_WARPS * 4)) / 4) ? k_per_block + 2 : k_per_block;
@@ -294,6 +312,160 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
     }
 }
 
+/* ── Batched GEMM (B>1): out (B,m) fp32 = x (B,k) @ W(m,k).T, weights stay COMPRESSED ──
+ *
+ * The GEMV above fills only column 0 of the m16n8k16 B-fragment and discards the other 7
+ * columns the tensor core already computed. Here each N-column carries a DIFFERENT token, so
+ * up to 8 tokens ride along for free: identical weight-decode work, identical mma count as
+ * B=1. (Same trick as glq_decode_matmul_e8p, glq_e8p.cu:247-255.)
+ *
+ * Three changes vs the GEMV, everything else — the weight walk, the bit-unpack, the decode —
+ * is byte-identical, which is what makes row-parity with the GEMV bit-exact:
+ *   1. B-fragment straight from global (no x_buf staging): lane l → g = l>>2 picks the TOKEN,
+ *      t = l&3 picks the k-pair. Every lane wants a different token, so smem staging buys
+ *      nothing, and dropping it frees 4 KB (we're already at 64 KB dynamic for the LUT).
+ *   2. Ragged tail by PREDICATION (active = tok < B), not padding — we're on raw mma.sync.
+ *   3. C-harvest: g/t swap roles between the B and C fragments (in C, g is the row and t the
+ *      column pair), so all four accumulators are live. We loop the 8 columns through the
+ *      existing 4 KB reduce_gather rather than widening it 8x to 32 KB (64+32 KB would crush
+ *      occupancy); the reduce runs once per m-tile-pair, so 8 passes are free vs the k-loop.
+ *
+ * Grid (tr_grid_x()=#SMs, ceil(B/8)): each (blockIdx.x → m-range, blockIdx.y → token-tile) owns
+ * disjoint output, so the in-block fixed-order reduce stays deterministic with NO global
+ * scratch and NO allocation → capture-safe by construction. (e8p's split-K scratch uses a
+ * per-call raw_alloc/raw_delete, which glq_cuda.cu:3405-3412 itself flags as illegal during
+ * capture — we deliberately do not copy that.) */
+template <uint32_t R>
+__global__ static void __launch_bounds__(TR_BLOCK_SIZE, 1)
+glq_trellis_matmul_kernel(float *__restrict__ out,
+                          const uint32_t *__restrict__ compressed,
+                          const half2 *__restrict__ x,
+                          const half2 *__restrict__ codebook,
+                          uint32_t m, uint32_t k, uint32_t B) {
+    extern __shared__ __align__(16) half2 smem_codebook[];
+
+    const uint32_t laneId = threadIdx.x % TR_WARP_SIZE;
+    const uint32_t warpId = threadIdx.x / TR_WARP_SIZE;
+    const uint32_t g = laneId >> 2;     // B-frag: token within the 8-token tile · C-frag: row
+    const uint32_t t = laneId & 3;      // B-frag: k-pair               · C-frag: column pair
+
+    const uint32_t tileCountM = m / TR_MMA_M;
+    const uint32_t tileCountK = k / TR_MMA_K;
+    // Partition the m-tile-pairs across however many blocks the host launched. Upstream
+    // hardcodes BLOCK_COUNT=128 (tuned for a ~108-SM A100); read gridDim.x instead so the
+    // kernel self-adapts — on a 188-SM card a fixed 128 leaves a third of the GPU idle.
+    const uint32_t m_per_block = (tileCountM + (2 * gridDim.x) - 1) / (2 * gridDim.x);
+    const uint32_t k_per_block = tileCountK / (TR_WARPS * 4) * 2;
+    const uint32_t this_warp_k =
+        (warpId < (tileCountK % (TR_WARPS * 4)) / 4) ? k_per_block + 2 : k_per_block;
+
+    const uint32_t u16_per_tile       = TR_MMA_M * TR_MMA_K * R / 16;
+    const uint32_t u16_per_tile_block = u16_per_tile * 4;
+    const uint32_t weight_step        = TR_WARPS * u16_per_tile_block;
+    const uint32_t weight_row_step    = tileCountK * u16_per_tile * 2;
+    const uint32_t x_row_half2        = k / 2;                 // half2 per token row
+
+    const uint32_t tok      = blockIdx.y * 8 + g;              // this lane's token
+    const bool     active   = (tok < B);
+    const uint32_t *x_u32   = reinterpret_cast<const uint32_t *>(x) + (size_t)tok * x_row_half2;
+
+    uint32_t tileIdM = m_per_block * blockIdx.x;
+
+    {
+        uint32_t my_cb_idx = threadIdx.x & 0x1ff;
+        half2 my_cb = codebook[my_cb_idx];
+        for (uint32_t i = 0; i < 32; i += 2)
+            smem_codebook[(my_cb_idx << 5) | (i ^ (threadIdx.x & 0x1f) ^ (threadIdx.x >> 9))] = my_cb;
+        __syncthreads();
+    }
+
+    __shared__ float reduce_gather[TR_WARPS][2][16];
+
+    for (uint32_t mi = 0; mi < m_per_block; mi += 1) {
+        if (tileIdM * 2 >= tileCountM) return;   // block-uniform → no __syncthreads deadlock
+
+        int weight_idx = tileIdM * weight_row_step + warpId * u16_per_tile_block * 2
+                       + laneId * (u16_per_tile_block / TR_WARP_SIZE);
+        uint4 reg_cs_next = {}, reg_cs2_next = {};
+        tr_load_reg_cs<R>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
+        uint4 reg_cs, reg_cs2;
+        float4 reg_p[2] = {};
+
+#pragma unroll 4
+        for (uint32_t ki = 0; ki < this_warp_k; ki += 1) {
+            if (ki + 1 != this_warp_k && ki % 2 == 1) weight_idx += weight_step * 2;
+            reg_cs = reg_cs_next; reg_cs2 = reg_cs2_next;
+            tr_load_reg_cs<R>((const uint16_t *)compressed,
+                              weight_idx + (1 - ki % 2) * u16_per_tile_block,
+                              laneId, reg_cs_next, reg_cs2_next);
+
+#pragma unroll 2
+            for (uint32_t subki = 0; subki < 2; subki += 1) {
+                // Absolute k-tile this (warp, ki, subki) covers — the same mapping the
+                // decompress kernel uses, and algebraically identical to the GEMV's x_buf
+                // indexing at B=1. L1::evict_last: x is re-read for every m-tile.
+                const uint32_t k_tile = 4 * warpId + 2 * (ki % 2) + subki + (4 * TR_WARPS) * (ki / 2);
+                const uint32_t xo = k_tile * 8 + t;
+                ditto2 reg_a; reg_a.u32[0] = 0u; reg_a.u32[1] = 0u;
+                if (active) {
+                    reg_a.u32[0] = tr_ld_x(x_u32 + xo);
+                    reg_a.u32[1] = tr_ld_x(x_u32 + xo + 4);
+                }
+
+#pragma unroll 2
+                for (uint32_t submi = 0; submi < 2; submi += 1) {
+                    uint32_t reg_c, reg_c2;
+                    if      (submi == 0 && subki == 0) { reg_c = reg_cs.x; reg_c2 = reg_cs2.x; }
+                    else if (submi == 1 && subki == 0) { reg_c = reg_cs.y; reg_c2 = reg_cs2.y; }
+                    else if (submi == 0 && subki == 1) { reg_c = reg_cs.z; reg_c2 = reg_cs2.z; }
+                    else                               { reg_c = reg_cs.w; reg_c2 = reg_cs2.w; }
+
+                    ditto4 reg_w;
+                    tr_decode_regw<R>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
+
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                        " {%0, %1, %2, %3},"
+                        " {%4, %5, %6, %7},"
+                        " {%8, %9},"
+                        " {%0, %1, %2, %3};"
+                        : "+f"(reg_p[submi].x), "+f"(reg_p[submi].y),
+                          "+f"(reg_p[submi].z), "+f"(reg_p[submi].w)
+                        : "r"(reg_w.u32[0]), "r"(reg_w.u32[1]),
+                          "r"(reg_w.u32[2]), "r"(reg_w.u32[3]),
+                          "r"(reg_a.u32[0]), "r"(reg_a.u32[1]));
+                }
+            }
+        }
+
+        // C-fragment: lane l holds c0→(row g, col 2t)  c1→(row g, col 2t+1)
+        //                          c2→(row g+8, col 2t) c3→(row g+8, col 2t+1)
+        // One column (= one token) per pass, reusing the 4 KB reduce_gather.
+        for (uint32_t c = 0; c < 8; c += 1) {
+            if (t == (c >> 1)) {
+                const bool even = ((c & 1) == 0);
+                for (int pi = 0; pi < 2; pi++) {
+                    reduce_gather[warpId][pi][g]     = even ? reg_p[pi].x : reg_p[pi].y;
+                    reduce_gather[warpId][pi][g + 8] = even ? reg_p[pi].z : reg_p[pi].w;
+                }
+            }
+            __syncthreads();
+            if (warpId < 1) {
+                const uint32_t out_tok = blockIdx.y * 8 + c;
+                if (out_tok < B) {
+                    int pi = laneId / 16;
+                    float reduced = 0.0f;
+                    for (uint32_t warpi = 0; warpi < TR_WARPS; warpi++)
+                        reduced += reduce_gather[warpi][pi][laneId % 16];
+                    out[(size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId] = reduced;
+                }
+            }
+            __syncthreads();
+        }
+        tileIdM += 1;
+    }
+}
+
 /* ── Decompress: identical weight walk + identical decode, but scatter W instead of mma ──
  * Shares tr_load_reg_cs + tr_decode_regw with the matvec kernel, so a bit-exact test of THIS
  * kernel against glq/trellis.py:decode_layer also pins the matvec's decode. Used for B>1
@@ -317,7 +489,10 @@ glq_trellis_decompress_kernel(half *__restrict__ W,
 
     const uint32_t tileCountM = m / TR_MMA_M;
     const uint32_t tileCountK = k / TR_MMA_K;
-    const uint32_t m_per_block = (tileCountM + (2 * TR_BLOCK_COUNT) - 1) / (2 * TR_BLOCK_COUNT);
+    // Partition the m-tile-pairs across however many blocks the host launched. Upstream
+    // hardcodes BLOCK_COUNT=128 (tuned for a ~108-SM A100); read gridDim.x instead so the
+    // kernel self-adapts — on a 188-SM card a fixed 128 leaves a third of the GPU idle.
+    const uint32_t m_per_block = (tileCountM + (2 * gridDim.x) - 1) / (2 * gridDim.x);
     const uint32_t k_per_block = tileCountK / (TR_WARPS * 4) * 2;
     const uint32_t this_warp_k =
         (warpId < (tileCountK % (TR_WARPS * 4)) / 4) ? k_per_block + 2 : k_per_block;
@@ -399,6 +574,12 @@ void tr_init_once() {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
         cudaFuncSetAttribute(glq_trellis_matvec_kernel<4>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
+        cudaFuncSetAttribute(glq_trellis_matmul_kernel<2>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
+        cudaFuncSetAttribute(glq_trellis_matmul_kernel<3>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
+        cudaFuncSetAttribute(glq_trellis_matmul_kernel<4>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
         cudaFuncSetAttribute(glq_trellis_decompress_kernel<2>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
         cudaFuncSetAttribute(glq_trellis_decompress_kernel<3>,
@@ -446,7 +627,7 @@ torch::Tensor glq_decompress_trellis_cuda(torch::Tensor trellis_packed, torch::T
     half *wp = (half *)W.data_ptr<c10::Half>();
 
 #define TR_LAUNCH_DECOMP(RBITS)                                                        \
-    glq_trellis_decompress_kernel<RBITS><<<TR_BLOCK_COUNT, TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>( \
+    glq_trellis_decompress_kernel<RBITS><<<tr_grid_x(), TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>( \
         wp, cp, cb, (uint32_t)m, (uint32_t)k)
     if (R == 2)      { TR_LAUNCH_DECOMP(2); }
     else if (R == 3) { TR_LAUNCH_DECOMP(3); }
@@ -477,12 +658,47 @@ torch::Tensor glq_decode_matvec_trellis_cuda(torch::Tensor x, torch::Tensor trel
     float *op = out.data_ptr<float>();
 
 #define TR_LAUNCH_MATVEC(RBITS)                                                        \
-    glq_trellis_matvec_kernel<RBITS><<<TR_BLOCK_COUNT, TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>( \
+    glq_trellis_matvec_kernel<RBITS><<<tr_grid_x(), TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>( \
         op, cp, xp, cb, (uint32_t)m, (uint32_t)k)
     if (R == 2)      { TR_LAUNCH_MATVEC(2); }
     else if (R == 3) { TR_LAUNCH_MATVEC(3); }
     else             { TR_LAUNCH_MATVEC(4); }
 #undef TR_LAUNCH_MATVEC
+    return out;
+}
+
+/* Batched GEMM: out (B, m) fp32 = x (B, k) @ W(m,k).T, weights never materialized. */
+torch::Tensor glq_decode_matmul_trellis_cuda(torch::Tensor x, torch::Tensor trellis_packed,
+                                             torch::Tensor tlut, int64_t m, int64_t k) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    CHECK_INPUT(tlut);
+    TORCH_CHECK(x.dim() == 2, "x must be (B, k)");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
+    TORCH_CHECK(x.size(1) == k, "x must have k columns, got ", x.size(1));
+    TORCH_CHECK(tlut.scalar_type() == torch::kFloat16, "tlut must be fp16");
+    TORCH_CHECK(tlut.numel() == (1 << TR_S) * 2, "tlut must be (512, 2) fp16");
+    int R = tr_bits_from_packed(trellis_packed);
+    tr_check_shape(m, k, trellis_packed, R);
+    at::DeviceGuard guard(x.device());
+    tr_init_once();
+
+    const int64_t B = x.size(0);
+    auto out = torch::empty({B, m}, torch::dtype(torch::kFloat32).device(x.device()));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
+    const half2 *xp = (const half2 *)x.data_ptr<c10::Half>();
+    const half2 *cb = (const half2 *)tlut.data_ptr<c10::Half>();
+    float *op = out.data_ptr<float>();
+    dim3 grid(tr_grid_x(), (unsigned)((B + 7) / 8));   // 8 tokens per mma N-tile
+
+#define TR_LAUNCH_MATMUL(RBITS)                                                        \
+    glq_trellis_matmul_kernel<RBITS><<<grid, TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>(  \
+        op, cp, xp, cb, (uint32_t)m, (uint32_t)k, (uint32_t)B)
+    if (R == 2)      { TR_LAUNCH_MATMUL(2); }
+    else if (R == 3) { TR_LAUNCH_MATMUL(3); }
+    else             { TR_LAUNCH_MATMUL(4); }
+#undef TR_LAUNCH_MATMUL
     return out;
 }
 
@@ -523,18 +739,39 @@ torch::Tensor glq_fused_linear_trellis_cuda(
                                  (int)in_features, (int)n_pad, blocks_n, blocks_n_meta);
 
     // ---- Step 2: decode + matmul in the RHT domain → y_rht (B, m_pad) fp32 ----
+    //
+    // Hybrid dispatch. The compressed kernels re-read/re-decode the whole weight per 8-token
+    // tile (traffic ∝ ceil(B/8)) — ideal for decode, wasteful for a multi-thousand-token
+    // prefill against a single cuBLAS GEMM. So:
+    //   B == 1        → GEMV                          compressed
+    //   B ≤ BATCH_MAX → batched GEMM                  compressed  ← every captured decode batch
+    //   B >  BATCH_MAX → decompress fp16 + one GEMM   ← prefill only (eager, not captured)
+    // Net: no dense weight on ANY decode step, and TTFT stays on the cuBLAS path.
+    // GLQ_TRELLIS_DENSE forces the dense path everywhere (bit-exact A/B reference, mirrors
+    // GLQ_E8P_DENSE_B1). GLQ_TRELLIS_BATCH_MAX tunes the threshold.
+    static const int64_t batch_max = [] {
+        const char *e = std::getenv("GLQ_TRELLIS_BATCH_MAX");
+        return e ? std::max<int64_t>(1, atoll(e)) : 64;
+    }();
+    static const bool force_dense = (std::getenv("GLQ_TRELLIS_DENSE") != nullptr);
+
     torch::Tensor y_rht;
-    if (B == 1) {
+    if (B == 1 && !force_dense) {
         auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
         auto yv = glq_decode_matvec_trellis_cuda(xh, trellis_packed, tlut, m_pad, n_pad);
         y_rht = (yv * (float)wscale).view({1, (long)m_pad}).contiguous();
+    } else if (B <= batch_max && !force_dense) {
+        auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
+        auto yb = glq_decode_matmul_trellis_cuda(xh, trellis_packed, tlut, m_pad, n_pad);
+        y_rht = (yb * (float)wscale).contiguous();                       // (B, m_pad) fp32
     } else {
-        // Prefill: decompress once, then one dense fp32 GEMM (matches the S0 reference and
-        // the e8p dense fallback). The compressed weight is what lives in VRAM; W here is a
-        // transient per-layer buffer from the caching allocator.
-        auto W = glq_decompress_trellis_cuda(trellis_packed, tlut, m_pad, n_pad)
-                     .to(torch::kFloat32);
-        y_rht = (at::matmul(x_rht, W.t()) * (float)wscale).contiguous();
+        // Prefill: decompress ONCE to fp16 (not fp32 — halves the transient) and let cuBLAS
+        // do the GEMM. W is a transient per-layer buffer from the caching allocator; the
+        // weight that actually LIVES in VRAM is the compressed one. fp16 accumulation error
+        // here (~1e-3 relative) is negligible against 2-bpw quantization noise (~28%).
+        auto W = glq_decompress_trellis_cuda(trellis_packed, tlut, m_pad, n_pad);   // fp16
+        auto xh = x_rht.to(torch::kFloat16);
+        y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
     }
 
     // ---- Step 3: output RHT → y (B, out_features) fp16 ----

@@ -317,8 +317,29 @@ def _ensure_registered():
             _glq_lib.impl("fused_linear_e8p", cuda.glq_fused_linear_e8p_cuda, dispatch_key)
             _glq_lib._register_fake("fused_linear_e8p", _fused_linear_e8p_fake)
 
+    # Fused QTIP-trellis linear: input_rht + trellis decode/matmul + ×wscale + output_rht as
+    # ONE opaque op, so FULL cudagraph capture sees a single node per linear (a multi-op chain
+    # regresses ~2x). Guarded independently of the e8p ops above — a trellis-only build need
+    # not carry them.
+    if hasattr(cuda, "glq_fused_linear_trellis_cuda"):
+        _glq_lib.define(
+            "fused_linear_trellis(Tensor x, Tensor sv, Tensor su, "
+            "Tensor trellis_packed, Tensor tlut, "
+            "Tensor blocks_n, Tensor blocks_m, Tensor blocks_n_meta, Tensor blocks_m_meta, "
+            "float wscale, int in_features, int out_features, "
+            "int n_pad, int m_pad) -> Tensor")
+        _glq_lib.impl("fused_linear_trellis", cuda.glq_fused_linear_trellis_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_linear_trellis", _fused_linear_trellis_fake)
+
 
 # --- Fake implementations for torch.compile tracing ---
+
+def _fused_linear_trellis_fake(x, sv, su, trellis_packed, tlut,
+                               blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                               wscale, in_features, out_features, n_pad, m_pad):
+    # (B, in_features) → (B, out_features) fp16. Args MUST positionally mirror the `define`
+    # string above; test_fused_linear_trellis_fake_shape pins that.
+    return torch.empty((x.shape[0], out_features), dtype=torch.float16, device=x.device)
 
 def _dequant_matvec_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resid_scale, codebook_abs):
     M = qidxs.shape[0]

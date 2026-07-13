@@ -243,6 +243,8 @@ torch::Tensor glq_decompress_trellis_cuda(
     torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k);
 torch::Tensor glq_decode_matvec_trellis_cuda(
     torch::Tensor x, torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k);
+torch::Tensor glq_decode_matmul_trellis_cuda(
+    torch::Tensor x, torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k);
 bool glq_trellis_kernel_supported(int64_t m, int64_t k);
 torch::Tensor glq_fused_linear_trellis_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
@@ -257,6 +259,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "QTIP trellis dense decompress to fp16 weight (CUDA)");
     m.def("glq_decode_matvec_trellis_cuda", &glq_decode_matvec_trellis_cuda,
           "QTIP trellis fused B=1 tensor-core GEMV, weights stay compressed (CUDA)");
+    m.def("glq_decode_matmul_trellis_cuda", &glq_decode_matmul_trellis_cuda,
+          "QTIP trellis batched B>1 tensor-core GEMM, weights stay compressed (CUDA)");
     m.def("glq_trellis_kernel_supported", &glq_trellis_kernel_supported,
           "Whether the trellis kernel supports this (m, k) — m%32, k%64");
     m.def("glq_fused_linear_trellis_cuda", &glq_fused_linear_trellis_cuda,

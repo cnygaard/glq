@@ -18,11 +18,21 @@ class GLQvLLMConfig(QuantizationConfig):
     """vLLM quantization config for GLQ (E8 lattice codebook + RHT)."""
 
     def __init__(self, bpw: int = 2, layer_bpw: dict | None = None,
-                 codebook: str = "e8_shell", block_diagonal: bool = True):
+                 codebook: str = "e8_shell", block_diagonal: bool = True,
+                 variant: str = "hyb"):
         super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
         self.codebook = codebook
+        # Trellis codebook variant. Only "hyb" has a CUDA kernel: a "3inst" checkpoint is
+        # packed in the natural (non-MMA-fragment) layout the kernel cannot read, and vLLM
+        # has no pure-torch decode fallback, so refuse it up front rather than serve garbage.
+        self.variant = variant
+        if codebook == "trellis" and variant != "hyb":
+            raise ValueError(
+                f"GLQ trellis variant {variant!r} has no CUDA kernel and cannot be served on "
+                f"vLLM (only 'hyb' can). Re-quantize with GLQ_TRELLIS_VARIANT=hyb, or run this "
+                f"checkpoint through HF transformers, which has a pure-torch decode fallback.")
         # RHT layout from the checkpoint: True (default) = block-diagonal padding,
         # False = legacy full pow2 Hadamard. Controls how the e8p weight buffers
         # are sized so the loader can copy in place. Absent in pre-0.6.7
@@ -50,6 +60,7 @@ class GLQvLLMConfig(QuantizationConfig):
             layer_bpw=config.get("layer_bpw", None),
             codebook=config.get("codebook", "e8_shell"),
             block_diagonal=config.get("block_diagonal", True),
+            variant=config.get("variant", "hyb"),
         )
 
     def _lookup_bpw(self, prefix: str) -> int | None:
