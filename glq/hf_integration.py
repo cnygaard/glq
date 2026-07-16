@@ -533,7 +533,14 @@ class GLQQuantizer(HfQuantizer):
             max_bpw = int(global_bpw) if isinstance(global_bpw, (int, float)) else 2
 
         codebook2 = None
-        if cb_type == "e8p":
+        if cb_type == "trellis":
+            # The trellis is SINGLE-STAGE at every rate — bpw is the trellis rate K,
+            # not a stage count — so there is no residual grid to supply. It must be
+            # branched out explicitly: the shell arms below reach for shell-only RVQ
+            # machinery (`make_small`, which TrellisCodebook has no business owning)
+            # the moment K >= 3.
+            pass
+        elif cb_type == "e8p":
             # E8P RVQ: the E8P residual stages decode against the stage-0 grid
             # (`codebook`); `codebook2` only supplies the E81B grid for the E81B
             # residual stage — the final stage of any ODD bpw (3/5/7). Even bpw

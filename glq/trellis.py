@@ -22,6 +22,10 @@ QTIP is GPL-3.0, same license as GLQ; the Viterbi/pack/permute logic is ported f
 ``~/.claude/plans/hazy-churning-shannon.md``.
 """
 import math
+import os
+import threading
+import warnings
+from collections import namedtuple
 
 import numpy as np
 import torch
@@ -31,6 +35,26 @@ from glq.ldlq import block_LDL
 from glq.rht import RHT
 
 TD = 16  # QTIP tile dim td_x == td_y == 16 → 256-element tiles
+
+# ---------------------------------------------------------------------------
+# Encoder-side CUDA-graph capture of the Viterbi (offline quant speedup).
+# The 127-step Viterbi loop (`bitshift_codebook.viterbi`) is launch-bound: nsys shows ~96%
+# of CUDA-API time is kernel-launch + memcpy DISPATCH, GPU busy only ~17%. Capturing the
+# whole `viterbi` as one CUDA graph per (T, B, has_overlap) collapses that dispatch. It is
+# ENCODE-ONLY (decode uses `decode_layer`, never the Viterbi), deterministic (min/argmin/
+# gather, no atomics), and a pure speed change → replay is `torch.equal` to eager, which is
+# the gate. CPU / kill-switch fall back to the unchanged eager `viterbi`.
+_GLQ_TRELLIS_CUDAGRAPH_ENABLED = True   # module kill-switch (mirrors _GLQ_FUSED_TRELLIS_ENABLED)
+# Layers with B above this fall back to eager: they hold a large `from_state`/`cost` graph
+# pool (4 MB·B at K=2) and are more GPU-bound, so they lose the least from staying eager.
+_GLQ_TRELLIS_CUDAGRAPH_MAX_B = int(os.environ.get("GLQ_TRELLIS_CUDAGRAPH_MAX_B", "256"))
+_VitGraph = namedtuple("_VitGraph", "graph x_buf overlap_buf out_buf")
+
+
+def _trellis_cudagraph_on():
+    return (_GLQ_TRELLIS_CUDAGRAPH_ENABLED
+            and not os.environ.get("GLQ_TRELLIS_NO_CUDAGRAPH")
+            and torch.cuda.is_available())
 
 # MMA-fragment intra-tile reorder (QTIP lib/algo/ldlq.py:10-13). Applied to the 256-element
 # tile BEFORE trellis-quantizing (for_kernel) so decoded lanes land in tensor-core fragment
@@ -138,6 +162,19 @@ class bitshift_codebook(nn.Module):
             "state_cand",
             (self.state >> (K * V))[0, ::2 ** (K * V)].unsqueeze(-1) + self.sumdelta)
         self.register_buffer("recons_state", self.recons(self.state))
+        # arange(2^KV) for the overlap tail-biting mask, as a device BUFFER — the original
+        # `torch.arange(...).to(X.device)` is a CPU→CUDA copy, which is ILLEGAL during CUDA-graph
+        # capture and silently forced the overlap pass onto the eager fallback.
+        self.register_buffer("_kv_arange", torch.arange(2 ** (K * V)).view(1, 1, -1))
+
+        # Viterbi CUDA-graph cache: (T, B, has_overlap) -> _VitGraph. Plain attrs (NOT buffers)
+        # so `.to(device)` never touches them. Lazily populated on first CUDA `quantize_seq`.
+        # The lock is REQUIRED: MoE experts quantize on a ThreadPoolExecutor sharing this one
+        # codebook instance, and CUDA-graph capture is process-global/exclusive — concurrent
+        # captures (or replays racing on the shared static buffers) would corrupt/abort.
+        self._vit_graphs = {}
+        self._vit_graph_pool = None
+        self._vit_lock = threading.Lock()
 
     def recons(self, encoded):
         return self.lut[:, encoded.int().to(self.lut.device)].to(encoded.device)
@@ -161,8 +198,7 @@ class bitshift_codebook(nn.Module):
         cost = (self.recons_state - X[:self.V].unsqueeze(-1)).square().sum(dim=0)
         if overlap is not None:
             mask = torch.ones(B, 2 ** self.L, device=X.device) * self.fakeinf
-            allow = (overlap << (self.K * self.V)).unsqueeze(-1) + \
-                torch.arange(2 ** (self.K * self.V)).to(X.device).view(1, 1, -1)
+            allow = (overlap << (self.K * self.V)).unsqueeze(-1) + self._kv_arange
             mask.scatter_(1, allow[0], 0)
             cost = torch.min(cost + mask, self.fakeinf)
         from_state = torch.zeros(T // self.V, B, 2 ** (self.L - self.K * self.V),
@@ -182,6 +218,68 @@ class bitshift_codebook(nn.Module):
                 (final_state[i].to(torch.int64).unsqueeze(-1)) >> (self.K * self.V))[..., 0]
         return final_state
 
+    # -- CUDA-graph capture of `viterbi` (see module header) ------------------
+    @torch.no_grad()
+    def _capture_viterbi(self, X, overlap, warmup_iters=3):
+        """Warm (compile `update` + prime allocator) on a side stream, then capture the whole
+        `viterbi` into the shared graph pool. Returns a _VitGraph with the static I/O buffers."""
+        if self._vit_graph_pool is None:
+            self._vit_graph_pool = torch.cuda.graph_pool_handle()
+        x_buf = torch.empty_like(X)
+        overlap_buf = torch.empty_like(overlap) if overlap is not None else None
+        x_buf.copy_(X)
+        if overlap_buf is not None:
+            overlap_buf.copy_(overlap)
+        # Side-stream warmup: the FIRST call compiles @torch.compile(update) for this B and
+        # primes the caching allocator; capture-during-compile would be illegal.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(warmup_iters):
+                self.viterbi(x_buf, overlap_buf)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._vit_graph_pool):
+            out_buf = self.viterbi(x_buf, overlap_buf)
+        return _VitGraph(graph, x_buf, overlap_buf, out_buf)
+
+    @torch.no_grad()
+    def _viterbi_graphed(self, X, overlap=None):
+        """Replay a cached CUDA graph of `viterbi` (lazy-capture on miss). Bit-exact to eager.
+
+        The whole capture + copy-in → replay → clone-out is under `_vit_lock`: capture is
+        process-global/exclusive (a sibling MoE-expert thread launching any kernel mid-capture
+        would corrupt it), and the static x_buf/out_buf are shared across chunks/threads. The
+        `.clone()` (enqueued inside the lock) reads this replay's result before the next
+        copy-in can overwrite `out_buf`. The lock cost is ~nil — the ThreadPool only existed to
+        overlap host dispatch, which the graph has already collapsed to one launch."""
+        key = (int(X.shape[0]), int(X.shape[1]), overlap is not None)  # (T, B, has_overlap)
+        with self._vit_lock:
+            if key not in self._vit_graphs:
+                try:
+                    self._vit_graphs[key] = self._capture_viterbi(X, overlap)
+                except Exception as e:
+                    # Fall back to eager for THIS shape only (a None sentinel, not a retry) and
+                    # WARN — a silent global disable previously hid a real capture bug.
+                    warnings.warn(
+                        f"trellis Viterbi CUDA-graph capture failed for {key}; using eager for "
+                        f"this shape. {type(e).__name__}: {e}", RuntimeWarning, stacklevel=2)
+                    self._vit_graphs[key] = None
+            entry = self._vit_graphs[key]
+            if entry is None:                      # capture failed for this shape → eager
+                return self.viterbi(X, overlap)
+            entry.x_buf.copy_(X)
+            if entry.overlap_buf is not None:
+                entry.overlap_buf.copy_(overlap)
+            entry.graph.replay()
+            return entry.out_buf.clone()
+
+    def free_viterbi_graphs(self):
+        """Release captured Viterbi graphs + their pool (call after quantization to reclaim VRAM)."""
+        self._vit_graphs.clear()
+        self._vit_graph_pool = None
+
     def quantize_seq(self, X, overlap=None):
         T, NO = X.shape
         bs = min(2 ** (24 - self.L), NO)
@@ -192,8 +290,11 @@ class bitshift_codebook(nn.Module):
         if overlap is not None:
             overlap = torch.nn.functional.pad(overlap, (0, pad_amt)).reshape(N // bs, bs)
         Qidxs = torch.zeros(N // bs, T // self.V, bs, dtype=self.idx_dtype, device=X.device)
+        # CUDA-graph the per-chunk Viterbi when on-device; CPU/kill-switch/oversize B use eager.
+        use_graph = (X.is_cuda and _trellis_cudagraph_on() and bs <= _GLQ_TRELLIS_CUDAGRAPH_MAX_B)
+        _vit = self._viterbi_graphed if use_graph else self.viterbi
         for i in range(len(X)):
-            Qidxs[i] = self.viterbi(X[i], overlap=None if overlap is None else overlap[i])
+            Qidxs[i] = _vit(X[i], overlap=None if overlap is None else overlap[i])
         return Qidxs.transpose(0, 1).reshape(T // self.V, N)[:, :NO]
 
     def quantize(self, X):

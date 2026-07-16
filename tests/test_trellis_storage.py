@@ -9,16 +9,26 @@ pure-torch oracle to match. They cover the three storage transforms that must ro
   2. `_PERMUTE`/`_INV_PERMUTE` — the 256-element MMA-fragment tile reorder.
   3. the `for_kernel` byte tile-flip — the MMA-fragment byte shuffle.
 
+Everything is parameterized over the native trellis rate **K in {2,3,4}** — the three rates
+the CUDA kernel templates on (`tr_bits_from_packed` hard-checks `2 <= R <= 4`). K is *not*
+a codebook property: the HYB tlut is K-independent (kmeans on 2-D Gaussians, no K), and the
+rate is recoverable from the packed shape alone (cols == 16*K), which is exactly what the
+kernel, the HF factory and the vLLM loader each rely on.
+
 HYB is tested with an explicit (non-kmeans) tlut so the suite needs no scipy.
 """
 import math
 import os
 import sys
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import glq.trellis as gt  # noqa: E402
+
+# The rates the shipped CUDA kernel templates on (R == K).
+KS = [2, 3, 4]
 
 
 def _sqnr(x, xh):
@@ -46,8 +56,9 @@ def test_permute_is_true_inverse_permutation():
 # ---------------------------------------------------------------------------
 # 2. pack_trellis / unpack_trellis round-trip on REAL encoder state
 # ---------------------------------------------------------------------------
-def test_pack_unpack_trellis_roundtrip_hyb():
-    cb = _hyb_cb()
+@pytest.mark.parametrize("K", KS)
+def test_pack_unpack_trellis_roundtrip_hyb(K):
+    cb = _hyb_cb(K=K)
     torch.manual_seed(1)
     tiles = torch.randn(6, 256)                             # 6 independent tiles
     _, state = cb.quantize_tiles(tiles)                    # (6, 256//V=128)
@@ -57,12 +68,27 @@ def test_pack_unpack_trellis_roundtrip_hyb():
     assert torch.equal(un.to(torch.int32), state.to(torch.int32))
 
 
+@pytest.mark.parametrize("K", KS)
+def test_packed_rate_is_self_describing(K):
+    """cols == 16*K (32/48/64) is the ONLY record of the rate in a checkpoint —
+    `tr_bits_from_packed` (CUDA), `hf_integration` and the vLLM loader all recover
+    K from it. Pin the shape, or a rate mismatch becomes a silent load failure."""
+    cb = _hyb_cb(K=K)
+    torch.manual_seed(1)
+    _, state = cb.quantize_tiles(torch.randn(6, 256))
+    packed = cb.pack_trellis(state)
+    assert packed.shape == (6, 16 * K)
+    # ...and it really is K bits/weight: 6 tiles x 256 weights, 2 bytes/int16.
+    assert packed.numel() * 16 == 6 * 256 * K
+
+
 # ---------------------------------------------------------------------------
 # 3. the for_kernel byte tile-flip is exactly invertible
 # ---------------------------------------------------------------------------
-def test_kernel_byte_flip_is_invertible():
+@pytest.mark.parametrize("K", KS)
+def test_kernel_byte_flip_is_invertible(K):
     torch.manual_seed(2)
-    m, n, K = 64, 96, 2
+    m, n = 64, 96
     num_tiles = (m // 16) * (n // 16)
     packed = torch.randint(-(2 ** 15), 2 ** 15, (num_tiles, 16 * K), dtype=torch.int16)
     flipped = gt.kernel_tile_flip(packed, m, n, K, forward=True)
@@ -75,8 +101,9 @@ def test_kernel_byte_flip_is_invertible():
 # 4. THE S0 GATE: full-layer quantize -> pack(kernel layout) -> pure-torch decode
 #    reproduces the in-memory normalized hatW bit-exactly.
 # ---------------------------------------------------------------------------
-def test_layer_storage_roundtrip_kernel_layout_bitexact():
-    cb = _hyb_cb()
+@pytest.mark.parametrize("K", KS)
+def test_layer_storage_roundtrip_kernel_layout_bitexact(K):
+    cb = _hyb_cb(K=K)
     torch.manual_seed(3)
     m, n = 96, 128
     W = (torch.randn(m, n) * 0.05).float()
@@ -88,8 +115,9 @@ def test_layer_storage_roundtrip_kernel_layout_bitexact():
     assert torch.equal(hatWr_dec, hatWr_norm)              # bit-exact round-trip
 
 
-def test_layer_storage_roundtrip_natural_layout_bitexact():
-    cb = _hyb_cb()
+@pytest.mark.parametrize("K", KS)
+def test_layer_storage_roundtrip_natural_layout_bitexact(K):
+    cb = _hyb_cb(K=K)
     torch.manual_seed(4)
     m, n = 64, 96
     W = (torch.randn(m, n) * 0.05).float()
@@ -114,11 +142,22 @@ def test_hyb_codebook_reconstructs_from_stored_tlut():
     assert torch.equal(s1, s2) and torch.equal(h1, h2)
 
 
+def test_tlut_is_rate_independent():
+    """One shared tlut serves every K — the HYB tlut is kmeans on 2-D Gaussians and
+    never sees K. This is why a checkpoint stores ONE tlut regardless of rate (and
+    why a future mixed-K trellis is architecturally cheap)."""
+    luts = [_hyb_cb(K=K).tlut for K in KS]
+    for lut in luts[1:]:
+        assert torch.equal(lut, luts[0])
+
+
 # ---------------------------------------------------------------------------
-# 6. quality sanity: kernel-layout quant still clears e8p's 2-bit MSE bar
+# 6. quality sanity: kernel-layout quant still clears e8p's 2-bit MSE bar,
+#    and a higher native rate is strictly better (this is the point of K=3/4).
 # ---------------------------------------------------------------------------
-def test_kernel_layout_quality_matches_natural():
-    cb = _hyb_cb()
+@pytest.mark.parametrize("K", KS)
+def test_kernel_layout_quality_matches_natural(K):
+    cb = _hyb_cb(K=K)
     torch.manual_seed(6)
     m, n = 256, 256
     W = torch.randn(m, n)
@@ -128,3 +167,20 @@ def test_kernel_layout_quality_matches_natural():
     assert _sqnr(W / sk, hk) > 11.0
     assert _sqnr(W / sn, hn) > 11.0
     assert abs(_sqnr(W / sk, hk) - _sqnr(W / sn, hn)) < 0.5
+
+
+def test_sqnr_strictly_improves_with_rate():
+    """A native rate-K trellis must beat rate-(K-1) — the whole case for K=3/4 over
+    stacking e8p RVQ stages. ~6 dB/bit is the rate-distortion slope."""
+    torch.manual_seed(6)
+    W = torch.randn(256, 256)
+    sqnr = {}
+    for K in KS:
+        cb = _hyb_cb(K=K)
+        hk, _, sk = gt.trellis_ldlq(W, torch.eye(256), cb, for_kernel=True)
+        sqnr[K] = _sqnr(W / sk, hk)
+    assert sqnr[4] > sqnr[3] > sqnr[2], sqnr
+    # each added bit should buy several dB (RD slope ~6 dB/bit); a flat step would
+    # mean the extra bits are not reaching the Viterbi.
+    assert sqnr[3] - sqnr[2] > 3.0, sqnr
+    assert sqnr[4] - sqnr[3] > 3.0, sqnr

@@ -9,6 +9,7 @@ CPU-only, seeded.
 import os
 import sys
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -41,12 +42,12 @@ torch.manual_seed(100)
 _SHARED_TLUT = (torch.randn(2 ** 9, 2) * 0.9682458365518543).to(torch.float16)
 
 
-def _make_trellis_layer(in_f, out_f, seed):
+def _make_trellis_layer(in_f, out_f, seed, K=2):
     torch.manual_seed(seed)
     W = (torch.randn(out_f, in_f) * 0.05).float()
     X = torch.randn(512, in_f)
     H = (X.T @ X) / 512
-    cb = gt.TrellisCodebook(variant="hyb", K=2, tlut=_SHARED_TLUT.clone())
+    cb = gt.TrellisCodebook(variant="hyb", K=K, tlut=_SHARED_TLUT.clone())
     W_hat, art = gt.quantize_layer_trellis_rht(W, H, cb)
     layer = E8RHTLinear(in_f, out_f, codebook_type="trellis")
     layer.load_state_dict({
@@ -66,11 +67,15 @@ def test_glqconfig_roundtrips_trellis_variant():
     assert "variant" not in GLQConfig(codebook="e8_shell").to_dict()
 
 
-def test_trellis_factory_builds_one_shared_codebook_and_forwards():
-    l1, wh1 = _make_trellis_layer(128, 96, seed=0)
-    l2, wh2 = _make_trellis_layer(96, 64, seed=1)
+@pytest.mark.parametrize("K", [2, 3, 4])
+def test_trellis_factory_builds_one_shared_codebook_and_forwards(K):
+    """The factory recovers K from ``trellis_packed.shape[1] // 16`` — the config's ``bpw``
+    is NOT what sizes the codebook. Run every native rate: a K it can't recover would
+    rebuild the wrong trellis and decode to garbage, silently."""
+    l1, wh1 = _make_trellis_layer(128, 96, seed=0, K=K)
+    l2, wh2 = _make_trellis_layer(96, 64, seed=1, K=K)
     model = _Model(l1, l2)
-    q = GLQQuantizer(GLQConfig(codebook="trellis", variant="hyb", codesz=16, bpw=2))
+    q = GLQQuantizer(GLQConfig(codebook="trellis", variant="hyb", codesz=16, bpw=K))
 
     q._process_model_after_weight_loading(model)
 
@@ -78,7 +83,7 @@ def test_trellis_factory_builds_one_shared_codebook_and_forwards():
     assert l1.codebook is not None
     assert l1.codebook is l2.codebook
     assert getattr(l1.codebook, "is_trellis", False)
-    assert l1.codebook.K == 2 and l1.codebook.variant == "hyb"
+    assert l1.codebook.K == K and l1.codebook.variant == "hyb"
 
     torch.manual_seed(7)
     x = torch.randn(3, 128)

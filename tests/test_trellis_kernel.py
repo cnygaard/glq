@@ -1,4 +1,4 @@
-"""S1 CUDA trellis-kernel gates (GPU-only).
+"""S1/S3 CUDA trellis-kernel gates (GPU-only).
 
 The highest-risk item in the whole port is the **encoder-pack ⇔ kernel-unpack pairing**:
 `pack_layer` writes QTIP's kernel byte layout (tail-biting bit-pack + `_PERMUTE` + tile-flip)
@@ -10,7 +10,15 @@ Because the tlut is stored fp16, the kernel's fp16 LUT values are bit-identical 
 fp32-holding-fp16 values torch produces — so the decompress gate is a true `torch.equal`,
 not a tolerance. The decompress kernel shares its decode path with the matvec kernel, so
 this one test pins both.
+
+**Every gate runs at the native rate K in {2,3,4}** — the three rates the kernel templates
+on (`tr_load_reg_cs<R>` reads uint2/uint3/uint4; `tr_decode_regw<R>` extracts indices at a
+4/6/8-bit stride). Through S2 only K=2 was ever executed: R=3 and R=4 were compiled and
+smem-configured but never launched. The pairing is the risk, and it is R-specific — the
+lane load width (2R u16) has to line up with the packed width (16R) or the kernel silently
+reads a neighbour's bits.
 """
+import functools
 import math
 import os
 import sys
@@ -24,6 +32,9 @@ from glq import inference_kernel as ik  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
+# The rates the shipped CUDA kernel templates on (R == K).
+KS = [2, 3, 4]
+
 
 def _sqnr(ref, got):
     return 10 * math.log10(ref.float().pow(2).mean().item()
@@ -35,39 +46,45 @@ def _ext():
     return ik._glq_cuda
 
 
-def _quantized(m, n, seed=0):
-    """Quantize a random layer in the KERNEL storage layout; return (cb, packed, tlut16)."""
+@functools.lru_cache(maxsize=None)
+def _quantized(m, n, seed=0, K=2):
+    """Quantize a random layer in the KERNEL storage layout; return (cb, packed, tlut16).
+
+    Cached: the Viterbi is the expensive part and every consumer here is read-only."""
     dev = "cuda"
     torch.manual_seed(seed)
     W = (torch.randn(m, n, device=dev) * 0.05).float()
     X = torch.randn(512, n, device=dev)
     H = (X.T @ X) / 512
     tlut = (torch.randn(2 ** 9, 2) * 0.9682458365518543).to(torch.float16)
-    cb = gt.TrellisCodebook(variant="hyb", K=2, tlut=tlut, device=dev)
+    cb = gt.TrellisCodebook(variant="hyb", K=K, tlut=tlut, device=dev)
     _, Qidxs, _ = gt.trellis_ldlq(W, H, cb, for_kernel=True)
     packed = gt.pack_layer(cb, Qidxs, m, n, has_kernel=True).to(dev)
+    assert packed.shape[1] == 16 * K          # the kernel re-derives R from this
     return cb, packed, tlut.to(dev)
 
 
 # ---------------------------------------------------------------------------
 # GATE 1 (the crux): CUDA decompress is BIT-EXACT vs the pure-torch decode_layer
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("K", KS)
 @pytest.mark.parametrize("m,n", [(128, 256), (256, 512), (64, 128)])
-def test_cuda_decompress_bitexact_vs_decode_layer(m, n):
-    cb, packed, tlut16 = _quantized(m, n, seed=m)
+def test_cuda_decompress_bitexact_vs_decode_layer(m, n, K):
+    cb, packed, tlut16 = _quantized(m, n, seed=m, K=K)
     ref = gt.decode_layer(cb, packed, m, n, has_kernel=True)          # (m,n) fp32 oracle
     W = _ext().glq_decompress_trellis_cuda(packed, tlut16, m, n)     # (m,n) fp16
     assert W.shape == (m, n) and W.dtype == torch.float16
     assert torch.equal(W.float(), ref.float()), \
-        f"max|Δ|={(W.float() - ref).abs().max().item()}"
+        f"K={K} max|Δ|={(W.float() - ref).abs().max().item()}"
 
 
 # ---------------------------------------------------------------------------
 # GATE 2: the fused B=1 GEMV matches x @ W_decoded.T
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("K", KS)
 @pytest.mark.parametrize("m,n", [(256, 512), (512, 2048)])
-def test_cuda_matvec_matches_reference_gemv(m, n):
-    cb, packed, tlut16 = _quantized(m, n, seed=m + 1)
+def test_cuda_matvec_matches_reference_gemv(m, n, K):
+    cb, packed, tlut16 = _quantized(m, n, seed=m + 1, K=K)
     W = gt.decode_layer(cb, packed, m, n, has_kernel=True)            # (m,n) fp32
     torch.manual_seed(7)
     x = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
@@ -75,12 +92,13 @@ def test_cuda_matvec_matches_reference_gemv(m, n):
     out = _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n)
     assert out.shape == (m,) and out.dtype == torch.float32
     # fp16 tensor-core products w/ fp32 accum vs an fp32 reference
-    assert _sqnr(ref, out) > 40.0, f"SQNR {_sqnr(ref, out):.1f} dB"
+    assert _sqnr(ref, out) > 40.0, f"K={K} SQNR {_sqnr(ref, out):.1f} dB"
 
 
-def test_cuda_matvec_is_deterministic():
+@pytest.mark.parametrize("K", KS)
+def test_cuda_matvec_is_deterministic(K):
     m, n = 256, 512
-    cb, packed, tlut16 = _quantized(m, n, seed=3)
+    cb, packed, tlut16 = _quantized(m, n, seed=3, K=K)
     x = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
     a = _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n)
     b = _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n)
@@ -93,20 +111,22 @@ def test_cuda_matvec_is_deterministic():
 # The batched kernel puts one token per N-column, so B<=8 costs the same decode
 # and the same tensor-core work as B=1. Ragged B is predicated, not padded.
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("K", KS)
 @pytest.mark.parametrize("B", [1, 2, 7, 8, 9, 63, 64, 65])
-def test_cuda_matmul_batched_matches_reference(B):
+def test_cuda_matmul_batched_matches_reference(B, K):
     m, n = 256, 512
-    cb, packed, tlut16 = _quantized(m, n, seed=21)
+    cb, packed, tlut16 = _quantized(m, n, seed=21, K=K)
     W = gt.decode_layer(cb, packed, m, n, has_kernel=True)        # (m,n) fp32
     torch.manual_seed(B)
     x = (torch.randn(B, n, device="cuda") * 0.5).to(torch.float16)
     ref = x.float() @ W.t()                                      # (B,m) fp32
     out = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
     assert out.shape == (B, m) and out.dtype == torch.float32
-    assert _sqnr(ref, out) > 40.0, f"B={B} SQNR {_sqnr(ref, out):.1f} dB"
+    assert _sqnr(ref, out) > 40.0, f"K={K} B={B} SQNR {_sqnr(ref, out):.1f} dB"
 
 
-def test_cuda_matmul_row_parity_with_gemv():
+@pytest.mark.parametrize("K", KS)
+def test_cuda_matmul_row_parity_with_gemv(K):
     """Row b of the batched GEMM must be BIT-EXACT vs the B=1 GEMV on x[b].
 
     Each mma N-column accumulates independently, both kernels issue the same mma
@@ -116,18 +136,19 @@ def test_cuda_matmul_row_parity_with_gemv():
     the C-fragment harvest is wrong.
     """
     m, n = 256, 512
-    cb, packed, tlut16 = _quantized(m, n, seed=22)
+    cb, packed, tlut16 = _quantized(m, n, seed=22, K=K)
     torch.manual_seed(5)
     x = (torch.randn(9, n, device="cuda") * 0.5).to(torch.float16)   # 9 → crosses a tile
     batched = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
     for b in range(9):
         gemv = _ext().glq_decode_matvec_trellis_cuda(x[b].contiguous(), packed, tlut16, m, n)
-        assert torch.equal(batched[b], gemv), f"row {b} != GEMV"
+        assert torch.equal(batched[b], gemv), f"K={K} row {b} != GEMV"
 
 
-def test_cuda_matmul_is_deterministic():
+@pytest.mark.parametrize("K", KS)
+def test_cuda_matmul_is_deterministic(K):
     m, n = 256, 512
-    cb, packed, tlut16 = _quantized(m, n, seed=23)
+    cb, packed, tlut16 = _quantized(m, n, seed=23, K=K)
     x = (torch.randn(16, n, device="cuda") * 0.5).to(torch.float16)
     a = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
     b = _ext().glq_decode_matmul_trellis_cuda(x, packed, tlut16, m, n)
@@ -137,7 +158,7 @@ def test_cuda_matmul_is_deterministic():
 # ---------------------------------------------------------------------------
 # GATE 3: the fused linear op == the pure-torch S0 reference (RHT in/out bracket)
 # ---------------------------------------------------------------------------
-def _trellis_layer(in_f=512, out_f=256, seed=11):
+def _trellis_layer(in_f=512, out_f=256, seed=11, K=2):
     from glq.quantized_linear import E8RHTLinear
     dev = "cuda"
     torch.manual_seed(seed)
@@ -145,7 +166,7 @@ def _trellis_layer(in_f=512, out_f=256, seed=11):
     X = torch.randn(512, in_f, device=dev)
     H = (X.T @ X) / 512
     tlut = (torch.randn(2 ** 9, 2) * 0.9682458365518543).to(torch.float16)
-    cb = gt.TrellisCodebook(variant="hyb", K=2, tlut=tlut, device=dev)
+    cb = gt.TrellisCodebook(variant="hyb", K=K, tlut=tlut, device=dev)
     W_hat, art = gt.quantize_layer_trellis_rht(W, H, cb)
     layer = E8RHTLinear(in_f, out_f, codebook_type="trellis").to(dev)
     layer.load_state_dict({k: v.to(dev) for k, v in {
@@ -157,15 +178,16 @@ def _trellis_layer(in_f=512, out_f=256, seed=11):
     return layer, W_hat
 
 
+@pytest.mark.parametrize("K", KS)
 @pytest.mark.parametrize("B", [1, 4])
-def test_fused_linear_trellis_matches_s0_reference(B):
+def test_fused_linear_trellis_matches_s0_reference(B, K):
     in_f, out_f = 512, 256
-    layer, W_hat = _trellis_layer(in_f, out_f)
+    layer, W_hat = _trellis_layer(in_f, out_f, K=K)
     x = torch.randn(B, in_f, device="cuda", dtype=torch.float16)
     ref = x.float() @ W_hat.float().t()          # the S0 dense reference
     y = layer(x)
     assert y.shape == (B, out_f)
-    assert _sqnr(ref, y) > 35.0, f"SQNR {_sqnr(ref, y):.1f} dB"
+    assert _sqnr(ref, y) > 35.0, f"K={K} SQNR {_sqnr(ref, y):.1f} dB"
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +195,10 @@ def test_fused_linear_trellis_matches_s0_reference(B):
 # and cudaGetDeviceProperties were hoisted out of the launch path. Without this the
 # decode win never materializes under vLLM/HF graph capture.
 # ---------------------------------------------------------------------------
-def test_fused_linear_trellis_is_cudagraph_capturable():
+@pytest.mark.parametrize("K", KS)
+def test_fused_linear_trellis_is_cudagraph_capturable(K):
     in_f, out_f = 512, 256
-    layer, _ = _trellis_layer(in_f, out_f, seed=13)
+    layer, _ = _trellis_layer(in_f, out_f, seed=13, K=K)
     x = torch.randn(1, in_f, device="cuda", dtype=torch.float16)
 
     # warm up on a side stream (required before capture; also resolves the lazy op + smem attr)
@@ -196,4 +219,38 @@ def test_fused_linear_trellis_is_cudagraph_capturable():
     g.replay()
     torch.cuda.synchronize()
     assert torch.allclose(static_y.float(), y_eager.float(), atol=2e-2, rtol=2e-2), \
-        f"graph replay != eager, max|Δ|={(static_y.float() - y_eager.float()).abs().max().item()}"
+        f"K={K} graph replay != eager, max|Δ|={(static_y.float() - y_eager.float()).abs().max().item()}"
+
+
+# ---------------------------------------------------------------------------
+# GATE 5 (S3): decode cost is RATE-INDEPENDENT — the structural claim behind K=3/4.
+#
+# `tr_decode_regw<R>` loops j=0..3 for EVERY R: always 4 half2 (8 weights) from 4
+# trellis states. LUT gathers, sign-flips and mma count are identical at K=2 and K=4;
+# only the compressed bytes read per lane double (uint2 -> uint4). So one K=4 pass
+# should cost far less than e8p's TWO 2-bpw RVQ passes at the same 4 bpw.
+#
+# Pinned as a ratio, not an absolute: a K=4 GEMV must not cost ~2x a K=2 GEMV. If this
+# ever regresses, the "one pass beats two" case for trellis at 4 bpw collapses with it.
+# ---------------------------------------------------------------------------
+def test_decode_cost_is_rate_independent():
+    m, n = 4096, 4096
+    x = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
+
+    def _time(K, iters=50):
+        _, packed, tlut16 = _quantized(m, n, seed=31, K=K)
+        for _ in range(10):                                       # warm
+            _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n)
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters                    # ms
+
+    t2, t4 = _time(2), _time(4)
+    # 2x the bits, but the same decode work: weight DRAM traffic doubles, everything
+    # else is flat. Generous bound — the claim is "sub-linear in K", not a precise ratio.
+    assert t4 < 1.8 * t2, f"K=4 GEMV {t4:.4f} ms vs K=2 {t2:.4f} ms — decode is NOT rate-flat"

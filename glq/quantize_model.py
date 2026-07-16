@@ -805,6 +805,40 @@ def quantize(
         avg_target = None
         print(f"GLQ Quantization: {model_name} -> {output_dir}")
         print(f"  bpw={bpw}, tune_iters={tune_iters}, nsamples={nsamples}")
+
+    # The trellis carries its rate in the codebook object (``TrellisCodebook.K``),
+    # and the trellis branch of ``quantize_layer_e8_shell_rht`` encodes every layer
+    # at that single K — it ignores the per-layer ``sub_bpw`` the mixed-precision
+    # driver hands it. ``layer_bpw`` in config.json, however, is written from the
+    # *map*. The checkpoint would therefore advertise per-layer rates its packing
+    # does not have, and vLLM (which sizes ``trellis_packed`` at ``16*layer_bpw[p]``)
+    # would mismatch on load and strand ``param.data`` on CPU. Refuse instead.
+    #
+    # Per-layer K is architecturally cheap — the rate is self-describing from the
+    # packed shape (cols == 16*K) and the tlut is K-independent, so layers of
+    # different K can share one codebook's tlut. It needs the allocator to emit
+    # integer K and the layer dispatch to thread ``sub_bpw`` through. Until then,
+    # a refusal beats a checkpoint that decodes to garbage.
+    if codebook_type == "trellis":
+        if mixed_precision:
+            raise ValueError(
+                "--codebook trellis requires a uniform integer bpw (2, 3 or 4); got "
+                f"{'bpw_map' if bpw_map is not None else repr(bpw)}"
+                f"{' with min/max range' if has_range else ''}. Mixed-bpw trellis is "
+                "not implemented: every layer would be encoded at a single K while "
+                "config.json advertised the per-layer map, which fails to load."
+            )
+        # The trellis rate K *is* the bpw, and the CUDA kernel templates on
+        # R in {2,3,4} (``tr_bits_from_packed`` hard-checks it). 5-8 bpw needs RVQ
+        # stacking (5=3+2, 6=4+2, 7=4+3, 8=4+4), which is not implemented. Catch it
+        # here: a K=5 run would otherwise Viterbi-encode for GPU-hours, write a
+        # checkpoint, and only fail at serve time.
+        if not 2 <= bpw <= 4:
+            raise ValueError(
+                f"trellis codebook supports bpw 2-4, got {bpw}. Higher rates need "
+                "RVQ stacking (not implemented); use --codebook e8p for 5-8 bpw."
+            )
+
     if nsamples < 64:
         import warnings
         warnings.warn(
@@ -956,7 +990,10 @@ def quantize(
     elif codebook_type == "trellis":
         from .trellis import TrellisCodebook           # QTIP TCQ — dim-256 trellis, beats e8p at low bpw
         _variant = os.environ.get("GLQ_TRELLIS_VARIANT", "hyb")
-        _K = int(bpw) if isinstance(bpw, (int, float)) else 2
+        # The mixed-precision guard above pins bpw to a uniform int here, so the
+        # trellis rate K == bpw exactly. (A silent `else 2` fallback used to hide
+        # the mixed-bpw mismatch behind a wrong-but-loadable K=2 checkpoint.)
+        _K = int(bpw)
         codebook = TrellisCodebook(variant=_variant, K=_K, device=device)
     else:
         codebook = E8ShellCodebook(device=device, target_size=codebook_size)

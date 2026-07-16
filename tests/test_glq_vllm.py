@@ -183,14 +183,19 @@ def test_fused_linear_trellis_fake_shape():
 
 
 @requires_vllm
-def test_trellis_create_weights_sizing():
+@pytest.mark.parametrize("bpw", [2, 3, 4])
+def test_trellis_create_weights_sizing(bpw):
     """Trellis create_weights registers the compressed buffers at FULL checkpoint size, so
     vLLM's loader takes the in-place copy_ branch — a shape mismatch sends it down
     ``param.data = empty_like(loaded)``, stranding .data on CPU and aborting the kernel at
-    cudagraph capture. Trellis never pads: m_pad == out, n_pad == in. CPU-only."""
+    cudagraph capture. Trellis never pads: m_pad == out, n_pad == in. CPU-only.
+
+    Parameterized over the native rate: the packed width is the ONLY record of K in a
+    checkpoint (cols == 16*K == 32/48/64), so sizing it from ``bpw`` is what makes a
+    K=3/4 checkpoint load in-place instead of being reallocated onto CPU."""
     from glq_vllm.linear_method import GLQLinearMethod
 
-    in_sz, out_sz, bpw = 2048, 3072, 2
+    in_sz, out_sz = 2048, 3072
     m = GLQLinearMethod(None, bpw=bpw, codebook_type="trellis")
     layer = torch.nn.Module()
     m.create_weights(layer, in_sz, [out_sz], in_sz, out_sz, torch.float16)
@@ -199,6 +204,7 @@ def test_trellis_create_weights_sizing():
     assert layer.glq_n_pad == in_sz and layer.glq_m_pad == out_sz          # no padding
     assert tuple(layer.trellis_packed.shape) == ((out_sz // 16) * (in_sz // 16), 16 * bpw)
     assert layer.trellis_packed.dtype == torch.int16
+    # the tlut is rate-INdependent (kmeans on 2-D Gaussians; never sees K)
     assert tuple(layer.tlut.shape) == (512, 2) and layer.tlut.dtype == torch.float16
     assert tuple(layer.SU.shape) == (out_sz,) and tuple(layer.SV.shape) == (in_sz,)
 

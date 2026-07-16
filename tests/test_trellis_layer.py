@@ -4,25 +4,31 @@ Proves a *compressed* trellis layer (packed int16 + SU/SV/Wscale/tlut, loaded vi
 state_dict) forwards to the SAME output as the quantizer's dense W_hat — i.e. the stored
 bytes + the layer's decode + inverse-RHT reproduce the quantized weight. This is the
 per-layer half of the S0 round-trip gate (the model-level PPL gate runs on the box).
-CPU-only, seeded.
+
+Parameterized over the native rate **K in {2,3,4}**: the layer never stores K anywhere,
+it recovers it from `trellis_packed.shape[1] // 16`, so a rate the buffers can't round-trip
+would surface here as a shape or forward mismatch. CPU-only, seeded.
 """
 import os
 import sys
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import glq.trellis as gt  # noqa: E402
 from glq.quantized_linear import E8RHTLinear  # noqa: E402
 
+KS = [2, 3, 4]
 
-def _quantized_layer(in_f, out_f, seed=0):
+
+def _quantized_layer(in_f, out_f, seed=0, K=2):
     torch.manual_seed(seed)
     W = (torch.randn(out_f, in_f) * 0.05).float()
     X = torch.randn(512, in_f)
     H = (X.T @ X) / 512
     tlut = (torch.randn(2 ** 9, 2) * 0.9682458365518543).to(torch.float16)
-    cb = gt.TrellisCodebook(variant="hyb", K=2, tlut=tlut, device="cpu")
+    cb = gt.TrellisCodebook(variant="hyb", K=K, tlut=tlut, device="cpu")
     W_hat, art = gt.quantize_layer_trellis_rht(W, H, cb)
     return cb, W_hat, art
 
@@ -46,9 +52,10 @@ def test_trellis_layer_is_flagged_and_unpadded():
     assert layer.m_pad == 96 and layer.n_pad == 128     # block-diag, no padding
 
 
-def test_trellis_layer_forward_matches_dense_dequant():
+@pytest.mark.parametrize("K", KS)
+def test_trellis_layer_forward_matches_dense_dequant(K):
     in_f, out_f = 128, 96
-    cb, W_hat, art = _quantized_layer(in_f, out_f)
+    cb, W_hat, art = _quantized_layer(in_f, out_f, K=K)
     layer = _load_layer(in_f, out_f, cb, art)
 
     torch.manual_seed(9)
@@ -58,20 +65,25 @@ def test_trellis_layer_forward_matches_dense_dequant():
     assert torch.allclose(y, y_ref, atol=2e-3, rtol=2e-3), (y - y_ref).abs().max().item()
 
 
-def test_trellis_layer_load_resizes_compressed_buffers():
+@pytest.mark.parametrize("K", KS)
+def test_trellis_layer_load_resizes_compressed_buffers(K):
     # 0-size trellis_packed/tlut placeholders must resize to the checkpoint shapes.
     in_f, out_f = 256, 128
-    cb, _, art = _quantized_layer(in_f, out_f, seed=3)
+    cb, _, art = _quantized_layer(in_f, out_f, seed=3, K=K)
     layer = _load_layer(in_f, out_f, cb, art)
     assert layer.trellis_packed.shape == art["trellis_packed"].shape
     assert layer.trellis_packed.dtype == torch.int16
     assert layer.tlut.shape == art["tlut"].shape
+    # rate is carried ONLY by the packed width — this is what the kernel, the HF
+    # factory and the vLLM loader each re-derive K from.
+    assert layer.trellis_packed.shape[1] == 16 * K
 
 
-def test_trellis_layer_state_dict_roundtrips_through_save_load():
+@pytest.mark.parametrize("K", KS)
+def test_trellis_layer_state_dict_roundtrips_through_save_load(K):
     # save_pretrained/from_pretrained-style: state_dict out → fresh layer in → same forward.
     in_f, out_f = 128, 96
-    cb, W_hat, art = _quantized_layer(in_f, out_f, seed=5)
+    cb, W_hat, art = _quantized_layer(in_f, out_f, seed=5, K=K)
     layer = _load_layer(in_f, out_f, cb, art)
     sd = layer.state_dict()
 
