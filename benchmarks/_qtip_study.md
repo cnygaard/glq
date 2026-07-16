@@ -326,7 +326,10 @@ The 480 = exactly the Viterbi-call count (72+72+72+72+192 over the 5 shapes) —
 | **1 layer (7 linears)** | **7160** | **1659** | **4.32×** |
 
 **Projected full SmolLM2-135M Viterbi-quant: 214.8 s → 52.2 s = 4.1×** (incl. 2.4 s one-time
-capture). End-to-end quant A/B (byte-identical checkpoint) pending. All 25 GPU parity tests green
+capture). **End-to-end confirmed: real SmolLM2-135M trellis-4bpw quant 4.2 min → 1.3 min = 3.2×
+(210 sublayers), and the two checkpoints are BYTE-IDENTICAL (sha256 `5a1bc5d2…`)** — the CUDA
+graph produces a bit-identical quant, just faster (3.2× e2e < 4.1× Viterbi-only because RHT /
+block_LDL / embedding stay eager). All 25 GPU parity tests green
 (`tests/test_trellis_cudagraph.py`), bit-exact `torch.equal` graphed-vs-eager across K∈{2,3,4} ×
 B∈{12,36,256} × overlap∈{None,tensor} and full-layer `trellis_ldlq`.
 
