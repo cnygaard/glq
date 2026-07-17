@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+pytest.importorskip("transformers")  # glq.hf_integration imports transformers at module top
 import glq.trellis as gt  # noqa: E402
 from glq.hf_integration import GLQConfig, GLQQuantizer  # noqa: E402
 from glq.quantized_linear import E8RHTLinear  # noqa: E402
