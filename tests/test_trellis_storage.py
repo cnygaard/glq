@@ -42,6 +42,11 @@ def _hyb_cb(seed=0, K=2):
     return gt.TrellisCodebook(variant="hyb", K=K, tlut=tlut, device="cpu")
 
 
+def _3inst_cb(K=2):
+    """Lookup-free 3INST codebook (computed, V=1, no tlut, no kmeans)."""
+    return gt.TrellisCodebook(variant="3inst", K=K, device="cpu")
+
+
 # ---------------------------------------------------------------------------
 # 1. the MMA-fragment 256-tile permutation is a true inverse permutation
 # ---------------------------------------------------------------------------
@@ -125,6 +130,67 @@ def test_layer_storage_roundtrip_natural_layout_bitexact(K):
     packed = gt.pack_layer(cb, Qidxs, m, n, has_kernel=False)
     hatWr_dec = gt.decode_layer(cb, packed, m, n, has_kernel=False)
     assert torch.equal(hatWr_dec, hatWr_norm)
+
+
+# ---------------------------------------------------------------------------
+# 4b. 3INST (lookup-free, V=1) storage: the layout that travels with the codebook.
+#     A 3inst codebook has no CUDA kernel (has_kernel=False) → its pure-torch decoder uses
+#     the NATURAL tile layout, so the quantizer must STORE natural too. The driver
+#     (quantize_model.py) calls quantize_layer_trellis_rht WITHOUT for_kernel, so its
+#     DEFAULT must follow cb.has_kernel — else a 3inst checkpoint is packed kernel-layout
+#     but decoded natural-layout → scrambled weights.
+# ---------------------------------------------------------------------------
+def test_3inst_codebook_is_lookup_free():
+    cb = _3inst_cb(K=2)
+    assert cb.has_kernel is False          # no CUDA kernel yet → natural storage layout
+    assert cb.tlut is None                 # computed codebook, nothing to store
+    assert cb.V == 1                       # one weight per trellis state
+
+
+@pytest.mark.parametrize("K", KS)
+def test_3inst_natural_layout_roundtrip_bitexact(K):
+    """The 3inst codebook + pure-torch decode round-trip bit-exactly in natural layout."""
+    cb = _3inst_cb(K=K)
+    torch.manual_seed(20)
+    m, n = 64, 96
+    W = (torch.randn(m, n) * 0.05).float()
+    hatWr_norm, Qidxs, _ = gt.trellis_ldlq(W, torch.eye(n), cb, for_kernel=False)
+    packed = gt.pack_layer(cb, Qidxs, m, n, has_kernel=False)
+    hatWr_dec = gt.decode_layer(cb, packed, m, n, has_kernel=False)
+    assert torch.equal(hatWr_dec, hatWr_norm)
+
+
+@pytest.mark.parametrize("K", KS)
+def test_quantize_layer_default_layout_follows_codebook_3inst(K):
+    """THE driver bug (Phase 0a): quantize_layer_trellis_rht's default `for_kernel` must
+    equal the codebook's native layout. For a 3inst codebook (has_kernel=False) the default
+    call MUST store the SAME natural layout as an explicit for_kernel=False call — otherwise
+    the stored packing is MMA-permuted but decode_layer(has_kernel=False) never un-permutes."""
+    cb = _3inst_cb(K=K)
+    assert cb.has_kernel is False
+    torch.manual_seed(21)
+    m, n = 64, 128
+    W = (torch.randn(m, n) * 0.05).float()
+    X = torch.randn(256, n)
+    H = (X.T @ X) / 256
+    _, art_default = gt.quantize_layer_trellis_rht(W, H, cb)                       # driver path
+    _, art_correct = gt.quantize_layer_trellis_rht(W, H, cb, for_kernel=cb.has_kernel)
+    assert torch.equal(art_default["trellis_packed"], art_correct["trellis_packed"])
+    assert "tlut" not in art_default                                              # 3inst stores no tlut
+
+
+@pytest.mark.parametrize("K", KS)
+def test_quantize_layer_default_layout_unchanged_for_hyb(K):
+    """Regression: HYB (has_kernel=True) keeps storing the kernel layout by default."""
+    cb = _hyb_cb(K=K)
+    torch.manual_seed(22)
+    m, n = 64, 128
+    W = (torch.randn(m, n) * 0.05).float()
+    X = torch.randn(256, n)
+    H = (X.T @ X) / 256
+    _, art_default = gt.quantize_layer_trellis_rht(W, H, cb)
+    _, art_kernel = gt.quantize_layer_trellis_rht(W, H, cb, for_kernel=True)
+    assert torch.equal(art_default["trellis_packed"], art_kernel["trellis_packed"])
 
 
 # ---------------------------------------------------------------------------

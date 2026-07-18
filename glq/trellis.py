@@ -508,12 +508,21 @@ def trellis_ldlq(W, H, cb, Wscale=None, for_kernel=True):
     return hatWr, Qidxs, Wscale
 
 
-def quantize_layer_trellis_rht(W, H, cb, block_diagonal=True, for_kernel=True):
+def quantize_layer_trellis_rht(W, H, cb, block_diagonal=True, for_kernel=None):
     """RHT + trellis-LDLQ, mirroring ``quantize_layer_e8_shell_rht``.
 
     Returns (W_hat (m,n) in original weight space, artifacts dict with the compressed
     trellis + per-codebook metadata needed to reconstruct at inference).
+
+    ``for_kernel`` selects the stored tile layout (the MMA-fragment ``_PERMUTE`` + byte
+    flip). It MUST match the layout the decoder uses — i.e. the codebook's ``has_kernel``
+    (True only for variants with a shipped CUDA kernel: HYB). It therefore DEFAULTS to
+    ``cb.has_kernel`` so store-layout == decode-layout for every variant automatically; the
+    driver relies on this. A 3inst checkpoint (has_kernel=False) is stored in the natural
+    layout so its pure-torch decoder round-trips. Pass explicitly only in tests.
     """
+    if for_kernel is None:
+        for_kernel = cb.has_kernel
     dev = cb.device
     m, n = W.shape
     Wf, Hf = W.float().to(dev), H.float().to(dev)
