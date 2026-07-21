@@ -183,6 +183,37 @@ def test_fused_linear_trellis_fake_shape():
 
 
 @requires_vllm
+def test_fused_linear_trellis_3inst_fake_shape():
+    """Pins the 3INST (no-tlut) schema⇆fake arg count/order (13 args — the HYB schema minus
+    tlut). An off-by-one between the ``define`` string and
+    ``_fused_linear_trellis_3inst_fake`` would raise here rather than at serve time."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear_trellis_3inst"):
+        pytest.skip("fused_linear_trellis_3inst not registered (no CUDA ext loaded)")
+
+    B, in_features, out_features = 2, 1024, 768
+    n_pad, m_pad = in_features, out_features        # trellis never pads
+    meta = torch.device("meta")
+    x = torch.empty(B, in_features, dtype=torch.float16, device=meta)
+    sv = torch.empty(n_pad, dtype=torch.float16, device=meta)
+    su = torch.empty(m_pad, dtype=torch.float16, device=meta)
+    packed = torch.empty((m_pad // 16) * (n_pad // 16), 32, dtype=torch.int16, device=meta)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    blk_n = torch.tensor([n_pad], dtype=torch.int64, device=meta)
+    blk_m = torch.tensor([m_pad], dtype=torch.int64, device=meta)
+
+    fy = torch.ops.glq.fused_linear_trellis_3inst(
+        x, sv, su, packed,
+        blk_n, blk_m, empty_i32, empty_i32,
+        1.0, in_features, out_features, n_pad, m_pad,
+    )
+    assert fy.shape == (B, out_features), f"got {tuple(fy.shape)}"
+    assert fy.dtype == torch.float16
+    assert fy.device.type == "meta"
+
+
+@requires_vllm
 @pytest.mark.parametrize("bpw", [2, 3, 4])
 def test_trellis_create_weights_sizing(bpw):
     """Trellis create_weights registers the compressed buffers at FULL checkpoint size, so
@@ -221,15 +252,25 @@ def test_trellis_rejects_unservable_shape():
 
 @requires_vllm
 def test_glq_config_trellis_variant():
-    """`variant` round-trips; a 3inst checkpoint (no CUDA kernel, and vLLM has no pure-torch
-    fallback) is refused up front rather than served as garbage."""
+    """`variant` round-trips. Both shipped variants (hyb, 3inst-kernel-layout) are accepted;
+    a pre-kernel NATURAL-layout 3inst checkpoint (no trellis_layout marker) and unknown
+    variants are refused up front rather than served as garbage."""
     from glq_vllm.config import GLQvLLMConfig
     cfg = GLQvLLMConfig.from_config(
         {"bpw": 2, "codebook": "trellis", "variant": "hyb", "block_diagonal": True})
     assert cfg.codebook == "trellis" and cfg.variant == "hyb"
     assert GLQvLLMConfig.from_config({"bpw": 2, "codebook": "e8p"}).variant == "hyb"  # default
-    with pytest.raises(ValueError, match="no CUDA kernel"):
+    # 3inst with the kernel-layout marker serves
+    cfg3 = GLQvLLMConfig.from_config(
+        {"bpw": 2, "codebook": "trellis", "variant": "3inst", "trellis_layout": "kernel"})
+    assert cfg3.variant == "3inst" and cfg3.trellis_layout == "kernel"
+    # legacy natural-layout 3inst (pre-kernel, no marker) → refused
+    with pytest.raises(ValueError, match="NATURAL layout"):
         GLQvLLMConfig.from_config({"bpw": 2, "codebook": "trellis", "variant": "3inst"})
+    # unknown variant → refused
+    with pytest.raises(ValueError, match="no CUDA kernel"):
+        GLQvLLMConfig.from_config(
+            {"bpw": 2, "codebook": "trellis", "variant": "1mad", "trellis_layout": "kernel"})
 
 
 @requires_vllm

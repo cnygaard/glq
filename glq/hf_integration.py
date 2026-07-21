@@ -37,12 +37,16 @@ class GLQConfig(QuantizationConfigMixin):
         kv_n_stages: int = 1,
         trust_remote_code: bool = False,
         variant: str = "hyb",
+        trellis_layout: str = None,
         **kwargs,
     ):
         self.quant_method = "glq"
         self.codebook = codebook
         # Trellis codebook variant (hyb/3inst); only meaningful when codebook=="trellis".
         self.variant = variant
+        # Trellis storage-layout marker ("kernel"); absent on checkpoints from before the
+        # 3inst CUDA kernel (which stored 3inst in the natural layout) — the loader guards.
+        self.trellis_layout = trellis_layout
         self.codesz = codesz
         self.bpw = bpw
         self.layer_bpw = layer_bpw
@@ -65,6 +69,8 @@ class GLQConfig(QuantizationConfigMixin):
         }
         if self.codebook == "trellis":
             d["variant"] = self.variant
+            if self.trellis_layout is not None:
+                d["trellis_layout"] = self.trellis_layout
         if self.layer_bpw:
             d["layer_bpw"] = self.layer_bpw
         if self.kv_cache_bits != 16:
@@ -507,6 +513,17 @@ class GLQQuantizer(HfQuantizer):
             # layer's shape (authoritative), tlut from its stored buffer, variant from cfg.
             from .trellis import TrellisCodebook
             variant = getattr(self.quantization_config, "variant", "hyb")
+            # Layout guard: 3inst decodes with has_kernel=True (the <R, IS_3INST> CUDA
+            # kernel's MMA-fragment layout). Checkpoints from before that kernel stored
+            # 3inst in the NATURAL layout (no `trellis_layout` marker) — decoding them
+            # in the kernel layout would silently scramble every weight, so refuse.
+            layout = getattr(self.quantization_config, "trellis_layout", None)
+            if variant == "3inst" and layout != "kernel":
+                raise ValueError(
+                    "This 3inst trellis checkpoint is stored in the pre-kernel NATURAL "
+                    "layout (config.json lacks trellis_layout: \"kernel\") and cannot be "
+                    "decoded by this glq version. Re-quantize with glq >= 0.7 "
+                    "(--codebook trellis, variant 3inst).")
             tlut, K = None, 2
             for _m in model.modules():
                 if (isinstance(_m, E8RHTLinear) and getattr(_m, "_is_trellis", False)

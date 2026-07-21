@@ -1979,6 +1979,11 @@ def quantize(
     if codebook_type == "trellis":
         # HYB vs 3inst variant round-trips so the loader rebuilds the right codebook.
         config_dict["quantization_config"]["variant"] = getattr(codebook, "variant", "hyb")
+        # Storage-layout marker. Both variants now store the kernel (MMA-fragment) layout;
+        # 3inst checkpoints from before the <R, IS_3INST> CUDA kernel were natural-layout and
+        # would silently scramble under a kernel-layout decoder — the loader guards on this.
+        config_dict["quantization_config"]["trellis_layout"] = (
+            "kernel" if getattr(codebook, "has_kernel", True) else "natural")
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:

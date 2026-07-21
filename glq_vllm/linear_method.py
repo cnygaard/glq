@@ -656,10 +656,15 @@ class GLQLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False,
-                 codebook_type: str = "e8_shell", block_diagonal: bool = True):
+                 codebook_type: str = "e8_shell", block_diagonal: bool = True,
+                 variant: str = "hyb"):
         self.quant_config = quant_config
         self.bpw = bpw
         self.codebook_type = codebook_type
+        # Trellis variant (hyb/3inst). Decides whether a tlut buffer exists: hyb loads a
+        # (512, 2) tlut; 3inst is lookup-free — its tlut is registered ZERO-SIZE, which is
+        # ALSO what routes _trellis_linear_apply to the no-tlut fused op (tlut.numel()==0).
+        self.variant = variant
         # RHT layout for the e8p managed-param buffers. True (default) =
         # block-diagonal padding (mult-of-64 cols / mult-of-16 rows); False =
         # legacy full pow2 Hadamard (one block spanning the next pow2). The
@@ -839,7 +844,13 @@ class GLQLinearMethod(LinearMethodBase):
                 _R = int(self.bpw)                               # packed cols == 16*R
                 layer.trellis_packed = _make_glq_param(torch.zeros(
                     (m_pad // 16) * (n_pad // 16), 16 * _R, dtype=torch.int16))
-                layer.tlut = _make_glq_param(torch.zeros(512, 2, dtype=torch.float16))
+                # hyb: full-size (512, 2) tlut, loaded from the checkpoint. 3inst: ZERO-SIZE —
+                # no checkpoint key exists, and numel()==0 is what routes the apply to the
+                # no-tlut lookup-free op. (A full-size zeros tlut here would silently take
+                # the HYB path with a garbage table.)
+                layer.tlut = _make_glq_param(
+                    torch.zeros(512, 2, dtype=torch.float16) if self.variant == "hyb"
+                    else torch.zeros(0, dtype=torch.float16))
                 layer.SU = _make_glq_param(torch.ones(m_pad, dtype=torch.float16))
                 layer.SV = _make_glq_param(torch.ones(n_pad, dtype=torch.float16))
                 layer.Wscale = _make_glq_param(torch.ones((), dtype=torch.float32))

@@ -68,6 +68,19 @@ def test_glqconfig_roundtrips_trellis_variant():
     assert "variant" not in GLQConfig(codebook="e8_shell").to_dict()
 
 
+def test_glqconfig_roundtrips_trellis_layout():
+    """`trellis_layout` ("kernel") round-trips — the marker the loader guard keys on to
+    refuse pre-kernel natural-layout 3inst checkpoints (which would silently scramble)."""
+    cfg = GLQConfig(codebook="trellis", variant="3inst", codesz=16, bpw=2,
+                    trellis_layout="kernel")
+    d = cfg.to_dict()
+    assert d["trellis_layout"] == "kernel"
+    assert GLQConfig(**d).trellis_layout == "kernel"
+    # legacy configs (no marker) parse to None → the guard fires for 3inst
+    assert GLQConfig(codebook="trellis", variant="3inst").trellis_layout is None
+    assert "trellis_layout" not in GLQConfig(codebook="trellis", variant="hyb").to_dict()
+
+
 @pytest.mark.parametrize("K", [2, 3, 4])
 def test_trellis_factory_builds_one_shared_codebook_and_forwards(K):
     """The factory recovers K from ``trellis_packed.shape[1] // 16`` — the config's ``bpw``

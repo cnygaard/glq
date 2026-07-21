@@ -789,16 +789,29 @@ class E8RHTLinear(nn.Module):
         binding — both call the same C++ entry. Shared by E8RHTLinear._forward_trellis (HF)
         and glq_vllm's _glq_apply_trellis (serving) so both run one validated path, exactly
         as _e8p_linear_apply does. The B=1 / B≤64 / prefill dispatch lives inside the C++ op.
+
+        The variant is carried by ``tlut``: non-empty → HYB (tlut kernels); empty → 3INST,
+        which routes to the no-tlut lookup-free entry (`<R, IS_3INST>` instantiations).
         """
         from . import inference_kernel as _ik
         _ik._try_load_cuda_ext()
-        if hasattr(torch.ops, "glq") and hasattr(torch.ops.glq, "fused_linear_trellis"):
-            _fused = torch.ops.glq.fused_linear_trellis
-        else:
-            _fused = _ik._glq_cuda.glq_fused_linear_trellis_cuda
-        y = _fused(x2d.half().contiguous(), SV, SU, trellis_packed, tlut,
-                   blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
-                   float(wscale), in_features, out_features, n_pad, m_pad).to(out_dtype)
+        _has_glq_ops = hasattr(torch.ops, "glq")
+        if tlut is not None and tlut.numel() > 0:                    # HYB
+            if _has_glq_ops and hasattr(torch.ops.glq, "fused_linear_trellis"):
+                _fused = torch.ops.glq.fused_linear_trellis
+            else:
+                _fused = _ik._glq_cuda.glq_fused_linear_trellis_cuda
+            y = _fused(x2d.half().contiguous(), SV, SU, trellis_packed, tlut,
+                       blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                       float(wscale), in_features, out_features, n_pad, m_pad).to(out_dtype)
+        else:                                                        # 3INST (lookup-free)
+            if _has_glq_ops and hasattr(torch.ops.glq, "fused_linear_trellis_3inst"):
+                _fused = torch.ops.glq.fused_linear_trellis_3inst
+            else:
+                _fused = _ik._glq_cuda.glq_fused_linear_trellis_3inst_cuda
+            y = _fused(x2d.half().contiguous(), SV, SU, trellis_packed,
+                       blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                       float(wscale), in_features, out_features, n_pad, m_pad).to(out_dtype)
         if bias is not None:
             y = y + bias.unsqueeze(0).to(out_dtype)
         return y
@@ -806,8 +819,9 @@ class E8RHTLinear(nn.Module):
     def _trellis_op_usable(self, x2d):
         """Can this layer take the fused CUDA path? (cached; None → pure-torch fallback)
 
-        Requires: CUDA input, the built extension, the kernel storage layout (HYB — a 3inst
-        checkpoint is packed in the natural layout the kernel can't read), and a shape the
+        Requires: CUDA input, the built extension carrying this VARIANT's entry (HYB → tlut
+        kernels, 3INST → the no-tlut lookup-free entry), the kernel storage layout
+        (has_kernel — a pre-kernel natural-layout checkpoint can't be read), and a shape the
         kernel supports (m % 32, k % 64). Anything else falls back to the pure-torch decode.
         """
         if self._trellis_op is not None:
@@ -815,8 +829,10 @@ class E8RHTLinear(nn.Module):
         ok = False
         if x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel:
             from . import inference_kernel as _ik
+            entry = ("glq_fused_linear_trellis_cuda" if self.tlut.numel() > 0
+                     else "glq_fused_linear_trellis_3inst_cuda")
             if (_ik._try_load_cuda_ext()
-                    and hasattr(_ik._glq_cuda, "glq_fused_linear_trellis_cuda")
+                    and hasattr(_ik._glq_cuda, entry)
                     and _ik._glq_cuda.glq_trellis_kernel_supported(self.m_pad, self.n_pad)):
                 ok = True
         self._trellis_op = ok
@@ -830,9 +846,9 @@ class E8RHTLinear(nn.Module):
         ``trellis_packed`` **inside** the kernel — nothing dense is ever materialized, so VRAM
         tracks the 2-bpw storage and the decode escapes GLQ's L2 codebook-gather ceiling.
 
-        Fallback (no CUDA ext / unsupported shape / 3inst layout): decode to a dense weight
-        once and run the block-diag RHT in torch. This is the S0 correctness reference —
-        identical math, just slow and dense.
+        Fallback (no CUDA ext / unsupported shape): decode to a dense weight once and run
+        the block-diag RHT in torch. This is the S0 correctness reference — identical math,
+        just slow and dense.
         """
         shape = x.shape
         x2d = x.reshape(-1, self.in_features)

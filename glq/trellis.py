@@ -12,10 +12,12 @@ package and adds the **shippable compressed storage** — the exact byte layout 
 error-feedback verbatim (GLQ's `block_LDL` is provably identical to QTIP's BlockLDLQ); only
 the codebook changes.
 
-Variants:
-  * ``"hyb"``   — ``quantlut_sym`` V=2 tlut_bits=9: the ONLY variant with a shipped QTIP
-                  CUDA kernel (``has_kernel``). ~1.1 dB over e8p at 2 bpw. **This is what ships.**
-  * ``"3inst"`` — lookup-free V=1: ~1.2 dB over e8p, no LUT, but no kernel yet (S4 follow-up).
+Variants (both ship with CUDA kernels, glq/csrc/glq_trellis.cu):
+  * ``"hyb"``   — ``quantlut_sym`` V=2 tlut_bits=9: decodes via a 512-entry tlut replicated in
+                  shared memory. ~1.1 dB over e8p at 2 bpw.
+  * ``"3inst"`` — lookup-free V=1 (``decode_3inst``): quality ≈ HYB at 2 & 4 bpw, decodes
+                  ARITHMETICALLY (no tlut, zero dynamic smem) on the ``<R, IS_3INST>`` kernel
+                  instantiations — removes the smem codebook-gather from the B=1 decode path.
 
 QTIP is GPL-3.0, same license as GLQ; the Viterbi/pack/permute logic is ported from its
 ``lib/codebook/bitshift.py``, ``lib/algo/{ldlq,finetune}.py``. See
@@ -373,8 +375,12 @@ class TrellisCodebook:
         self.K, self.V, self.L = K, self.cb.V, self.cb.L
         self.tlut_bits = self.cb.tlut_bits
         self.tlut = self.cb.tlut                        # (2**tlut_bits, V) fp32, or None
-        # HYB ships in the kernel (for_kernel) storage layout; 3inst has no kernel yet.
-        self.has_kernel = (variant == "hyb")
+        # Both variants ship in the kernel (for_kernel/MMA-fragment) storage layout: HYB decodes
+        # on the tlut CUDA kernels, 3inst on the lookup-free <R, IS_3INST=true> kernels
+        # (glq_trellis.cu). Checkpoints stamp `trellis_layout: "kernel"` in config.json; the
+        # loader refuses natural-layout 3inst checkpoints from before this flip (they must be
+        # re-quantized — a kernel-layout decoder would silently scramble them).
+        self.has_kernel = variant in ("hyb", "3inst")
         self.codesz = TD
         self.device = device
         # QTIP scale: Wr /= rms(Wr)/(rms(lut)*0.9)  ⇔  GLQ Wscale = rms(W)*opt_scale
@@ -515,11 +521,10 @@ def quantize_layer_trellis_rht(W, H, cb, block_diagonal=True, for_kernel=None):
     trellis + per-codebook metadata needed to reconstruct at inference).
 
     ``for_kernel`` selects the stored tile layout (the MMA-fragment ``_PERMUTE`` + byte
-    flip). It MUST match the layout the decoder uses — i.e. the codebook's ``has_kernel``
-    (True only for variants with a shipped CUDA kernel: HYB). It therefore DEFAULTS to
-    ``cb.has_kernel`` so store-layout == decode-layout for every variant automatically; the
-    driver relies on this. A 3inst checkpoint (has_kernel=False) is stored in the natural
-    layout so its pure-torch decoder round-trips. Pass explicitly only in tests.
+    flip). It MUST match the layout the decoder uses — i.e. the codebook's ``has_kernel``.
+    It therefore DEFAULTS to ``cb.has_kernel`` so store-layout == decode-layout for every
+    variant automatically; the driver relies on this. Both shipped variants (HYB + 3inst)
+    are has_kernel=True → kernel layout. Pass explicitly only in tests.
     """
     if for_kernel is None:
         for_kernel = cb.has_kernel

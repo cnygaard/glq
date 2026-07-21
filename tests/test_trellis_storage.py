@@ -134,22 +134,24 @@ def test_layer_storage_roundtrip_natural_layout_bitexact(K):
 
 # ---------------------------------------------------------------------------
 # 4b. 3INST (lookup-free, V=1) storage: the layout that travels with the codebook.
-#     A 3inst codebook has no CUDA kernel (has_kernel=False) → its pure-torch decoder uses
-#     the NATURAL tile layout, so the quantizer must STORE natural too. The driver
+#     3inst ships CUDA kernels (the <R, IS_3INST> instantiations in glq_trellis.cu) →
+#     has_kernel=True → the KERNEL (MMA-fragment) layout, exactly like HYB. The driver
 #     (quantize_model.py) calls quantize_layer_trellis_rht WITHOUT for_kernel, so its
-#     DEFAULT must follow cb.has_kernel — else a 3inst checkpoint is packed kernel-layout
-#     but decoded natural-layout → scrambled weights.
+#     DEFAULT must follow cb.has_kernel — the Phase-0a invariant that store-layout ==
+#     decode-layout for every variant (a mismatch silently scrambles every weight).
 # ---------------------------------------------------------------------------
 def test_3inst_codebook_is_lookup_free():
     cb = _3inst_cb(K=2)
-    assert cb.has_kernel is False          # no CUDA kernel yet → natural storage layout
+    assert cb.has_kernel is True           # ships the lookup-free CUDA kernel → kernel layout
     assert cb.tlut is None                 # computed codebook, nothing to store
     assert cb.V == 1                       # one weight per trellis state
 
 
 @pytest.mark.parametrize("K", KS)
 def test_3inst_natural_layout_roundtrip_bitexact(K):
-    """The 3inst codebook + pure-torch decode round-trip bit-exactly in natural layout."""
+    """The 3inst codebook + pure-torch decode round-trip bit-exactly in the natural layout
+    too (explicit has_kernel=False on both sides) — the layouts are equivalent as long as
+    pack and decode agree; only the DEFAULT is kernel now."""
     cb = _3inst_cb(K=K)
     torch.manual_seed(20)
     m, n = 64, 96
@@ -162,19 +164,19 @@ def test_3inst_natural_layout_roundtrip_bitexact(K):
 
 @pytest.mark.parametrize("K", KS)
 def test_quantize_layer_default_layout_follows_codebook_3inst(K):
-    """THE driver bug (Phase 0a): quantize_layer_trellis_rht's default `for_kernel` must
-    equal the codebook's native layout. For a 3inst codebook (has_kernel=False) the default
-    call MUST store the SAME natural layout as an explicit for_kernel=False call — otherwise
-    the stored packing is MMA-permuted but decode_layer(has_kernel=False) never un-permutes."""
+    """THE driver invariant (Phase 0a): quantize_layer_trellis_rht's default `for_kernel`
+    must equal the codebook's native layout. For 3inst (has_kernel=True since the lookup-free
+    kernel shipped) the default call MUST store the SAME kernel layout as an explicit
+    for_kernel=True call — the layout the <R, IS_3INST> CUDA kernels consume."""
     cb = _3inst_cb(K=K)
-    assert cb.has_kernel is False
+    assert cb.has_kernel is True
     torch.manual_seed(21)
     m, n = 64, 128
     W = (torch.randn(m, n) * 0.05).float()
     X = torch.randn(256, n)
     H = (X.T @ X) / 256
     _, art_default = gt.quantize_layer_trellis_rht(W, H, cb)                       # driver path
-    _, art_correct = gt.quantize_layer_trellis_rht(W, H, cb, for_kernel=cb.has_kernel)
+    _, art_correct = gt.quantize_layer_trellis_rht(W, H, cb, for_kernel=True)
     assert torch.equal(art_default["trellis_packed"], art_correct["trellis_packed"])
     assert "tlut" not in art_default                                              # 3inst stores no tlut
 
