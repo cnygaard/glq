@@ -20,9 +20,19 @@
  * Storage layout is QTIP's exactly (see glq/trellis.py: `pack_layer` + `kernel_tile_flip` +
  * `_PERMUTE`), so `decode_layer` in that module is this kernel's bit-exact oracle.
  *
- * Fixed HYB codebook params (the only variant with a shipped kernel):
+ * Fixed HYB codebook params:
  *   L=16 (shift-register width) · S=9 (tlut index bits) · V=1 (log2 of the VQ dim, i.e. 2
  *   weights per trellis step). R = bits/weight = K in the Python API (2, 3 or 4).
+ *
+ * The kernels additionally template on IS_3INST for the **3INST** variant (QTIP's lookup-free
+ * codebook, Python V=1): each 16-bit state decodes by ARITHMETIC (`tr_decode_3inst_half`, a
+ * uint32 hash + fp16 two-half sum) instead of the smem tlut gather, and states sit at a K-bit
+ * (not 2K-bit) stride — 8 states per A-fragment instead of 4. No tlut → **zero dynamic smem**,
+ * which removes the L2/smem codebook-gather bottleneck (~35% of matvec stalls under ncu) and
+ * lifts occupancy. The packed storage layout is IDENTICAL to HYB (256·K bits per 16×16 tile),
+ * so the tile walk, mma, reduce and scatter are shared verbatim; only `tr_load_reg_cs` /
+ * `tr_decode_regw` fork. Bit-flow proven bit-exact against `decode_layer` by the CPU mirrors
+ * in tests/test_trellis_3inst_kernel.py BEFORE this port (see that file's module docstring).
  */
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
@@ -110,13 +120,61 @@ __inline__ __device__ uint32_t tr_ld_x(const uint32_t *p) {
     return out;
 }
 
+/* 3INST lookup-free state decode (glq/trellis.py:decode_3inst, bit-exact):
+ *   h = s*89226354 + 64248484 (uint32 WRAP) → r = (h & 0x8FFF8FFF) ^ 0x3B603B60 → the two
+ *   16-bit halves BIT-CAST to fp16 and summed IN fp16. The bit-cast (__ushort_as_half, not a
+ *   convert) and the fp16 add (__hadd, not fp32) are both load-bearing for torch.equal vs the
+ *   Python oracle; every output is an exactly-representable fp16. */
+__device__ inline half tr_decode_3inst_half(uint32_t s) {
+    const uint32_t h = s * 89226354u + 64248484u;
+    const uint32_t r = (h & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    return __hadd(__ushort_as_half((unsigned short)(r >> 16)),
+                  __ushort_as_half((unsigned short)(r & 0xFFFFu)));
+}
+
 /* Warp-shuffle bit-unpack: lane l holds its 16-bit chunks and pulls lane l+1's (tail-biting
  * wraps at lane 31 → lane 0), reconstructing the OVERLAPPING 32-bit windows from which four
- * successive L=16 trellis states are extracted at 4-bit strides. QTIP-verbatim. */
-template <uint32_t R>
+ * successive L=16 trellis states are extracted at 4-bit strides. QTIP-verbatim.
+ *
+ * IS_3INST (V=1) departs from HYB only in WHAT is kept per window: instead of HYB's
+ * byte-perm'd 32-bit view, keep the RAW 8R-bit chunk of the tail-biting stream (R=2: this
+ * lane's u16 · R=3: reg_24_i · R=4: r_i) in reg_cs, and the 16-bit CONTINUATION (the top 16
+ * bits of the NEXT lane's chunk — the stream bits immediately below this chunk's bit 0) in
+ * reg_cs2. That uniform {chunk, continuation} form sidesteps the per-R overflow special-casing
+ * entirely; the CPU mirror (tests/test_trellis_3inst_kernel.py::_load_chunks) is bit-exact. */
+template <uint32_t R, bool IS_3INST = false>
 __device__ inline void tr_load_reg_cs(const uint16_t *__restrict__ compressed, int weight_idx,
                                       uint32_t laneId, uint4 &reg_cs_next, uint4 &reg_cs2_next) {
-    if constexpr (R == 2) {
+    if constexpr (IS_3INST && R == 2) {
+        ditto2 reg_load; reg_load.u32x2 = tr_ld_cs((const uint2 *)&compressed[weight_idx]);
+        reg_cs_next.x = reg_load.u32x2.x & 0xFFFFu;      // chunk = one u16 of stream (width 16)
+        reg_cs_next.y = reg_load.u32x2.x >> 16;
+        reg_cs_next.z = reg_load.u32x2.y & 0xFFFFu;
+        reg_cs_next.w = reg_load.u32x2.y >> 16;
+        // width 16 → continuation is the next lane's ENTIRE chunk
+        reg_cs2_next.x = __shfl_sync(TR_FULL_MASK, reg_cs_next.x, laneId + 1);
+        reg_cs2_next.y = __shfl_sync(TR_FULL_MASK, reg_cs_next.y, laneId + 1);
+        reg_cs2_next.z = __shfl_sync(TR_FULL_MASK, reg_cs_next.z, laneId + 1);
+        reg_cs2_next.w = __shfl_sync(TR_FULL_MASK, reg_cs_next.w, laneId + 1);
+    } else if constexpr (IS_3INST && R == 3) {
+        uint3 reg_load = tr_ld_cs((const uint3 *)&compressed[weight_idx]);
+        uint32_t r1 = reg_load.x, r2 = reg_load.y, r3 = reg_load.z;
+        reg_cs_next.x = r1 & 0xffffff;                            // reg_24_i (width 24)
+        reg_cs_next.y = ((r1 >> 24) | (r2 << 8)) & 0xffffff;
+        reg_cs_next.z = ((r2 >> 16) | (r3 << 16)) & 0xffffff;
+        reg_cs_next.w = (r3 >> 8) & 0xffffff;
+        reg_cs2_next.x = (__shfl_sync(TR_FULL_MASK, reg_cs_next.x, laneId + 1) >> 8) & 0xFFFFu;
+        reg_cs2_next.y = (__shfl_sync(TR_FULL_MASK, reg_cs_next.y, laneId + 1) >> 8) & 0xFFFFu;
+        reg_cs2_next.z = (__shfl_sync(TR_FULL_MASK, reg_cs_next.z, laneId + 1) >> 8) & 0xFFFFu;
+        reg_cs2_next.w = (__shfl_sync(TR_FULL_MASK, reg_cs_next.w, laneId + 1) >> 8) & 0xFFFFu;
+    } else if constexpr (IS_3INST && R == 4) {
+        uint4 reg_load = tr_ld_cs((const uint4 *)&compressed[weight_idx]);
+        reg_cs_next = reg_load;                                   // chunk = r_i (width 32)
+        reg_cs2_next.x = __shfl_sync(TR_FULL_MASK, reg_load.x, laneId + 1) >> 16;
+        reg_cs2_next.y = __shfl_sync(TR_FULL_MASK, reg_load.y, laneId + 1) >> 16;
+        reg_cs2_next.z = __shfl_sync(TR_FULL_MASK, reg_load.z, laneId + 1) >> 16;
+        reg_cs2_next.w = __shfl_sync(TR_FULL_MASK, reg_load.w, laneId + 1) >> 16;
+    } else if constexpr (R == 2) {
         ditto2 reg_load; reg_load.u32x2 = tr_ld_cs((const uint2 *)&compressed[weight_idx]);
         uint32_t next1 = __shfl_sync(TR_FULL_MASK, reg_load.u32x2.x, laneId + 1);
         uint32_t next2 = __shfl_sync(TR_FULL_MASK, reg_load.u32x2.y, laneId + 1);
@@ -159,12 +217,28 @@ __device__ inline void tr_load_reg_cs(const uint16_t *__restrict__ compressed, i
 }
 
 /* Decode one MMA A-fragment (4 half2 = 8 weights) from a 32-bit code window.
- * Mirrors glq/trellis.py `quantlut_sym`: state → idx*(idx+1) → tlut[(idx>>6) & 0x1ff] →
+ * HYB — mirrors glq/trellis.py `quantlut_sym`: state → idx*(idx+1) → tlut[(idx>>6) & 0x1ff] →
  * flip the sign of component 0 when bit 15 is set. The (laneId<<1) in `masked_idx` selects
- * this lane's private replica of the tlut entry (the ×32 replication in smem). */
-template <uint32_t R>
+ * this lane's private replica of the tlut entry (the ×32 replication in smem).
+ * IS_3INST — V=1: EIGHT states at a K-bit stride from the extended window
+ * Ext = chunk‖continuation (reg_c‖reg_c2): state_j = (Ext >> (8R − R·j)) & 0xFFFF, each state
+ * decodes arithmetically (`tr_decode_3inst_half`, no smem), consecutive states (s_2j, s_2j+1)
+ * pair into f16x2[j] — the same two adjacent columns HYB's V=2 half2 fills. No tlut, no
+ * sign-flip, no laneId replica. Bit-exact per the CPU mirror (`_v1_states`). */
+template <uint32_t R, bool IS_3INST = false>
 __device__ inline void tr_decode_regw(uint32_t reg_c, uint32_t reg_c2, uint32_t laneId,
                                       const half2 *__restrict__ smem_codebook, ditto4 &reg_w) {
+    if constexpr (IS_3INST) {
+        constexpr uint32_t WIDTH = 8 * R;                        // chunk bit-width
+        const uint64_t ext = ((uint64_t)reg_c << 16) | (uint64_t)reg_c2;
+#pragma unroll
+        for (uint32_t j = 0; j < 4; j += 1) {
+            const uint32_t s0 = (uint32_t)(ext >> (WIDTH - R * (2 * j)))     & 0xFFFFu;
+            const uint32_t s1 = (uint32_t)(ext >> (WIDTH - R * (2 * j + 1))) & 0xFFFFu;
+            reg_w.f16x2[j] = __halves2half2(tr_decode_3inst_half(s0), tr_decode_3inst_half(s1));
+        }
+        return;
+    }
 #pragma unroll
     for (uint32_t j = 0; j < 4; j += 1) {
         uint32_t idx;
@@ -182,14 +256,14 @@ __device__ inline void tr_decode_regw(uint32_t reg_c, uint32_t reg_c2, uint32_t 
 /* ── Fused B=1 GEMV: bit-unpack → trellis decode → tensor-core mma → block reduce ──
  * out (m,) fp32 = W (m,k) @ x (k,). Each block owns a disjoint m-range and reduces across
  * its 32 warps in smem — no atomics, no cross-block split-K → bit-stable output. */
-template <uint32_t R>
+template <uint32_t R, bool IS_3INST = false>
 __global__ static void __launch_bounds__(TR_BLOCK_SIZE, 1)
 glq_trellis_matvec_kernel(float *__restrict__ out,
                           const uint32_t *__restrict__ compressed,
                           const half2 *__restrict__ x,
                           const half2 *__restrict__ codebook,
                           uint32_t m, uint32_t k) {
-    extern __shared__ __align__(16) half2 smem_codebook[];
+    extern __shared__ __align__(16) half2 smem_codebook[];   // unused (0 bytes) when IS_3INST
 
     const uint32_t laneId = threadIdx.x % TR_WARP_SIZE;
     const uint32_t warpId = threadIdx.x / TR_WARP_SIZE;
@@ -215,7 +289,8 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
 
     // tlut → smem, replicated ×32 (one private copy per lane, so the LUT gather is
     // bank-conflict free). Threads t and t+512 cooperate to fill all 32 replicas.
-    {
+    // 3INST decodes arithmetically — no tlut, no smem fill, no barrier.
+    if constexpr (!IS_3INST) {
         uint32_t my_cb_idx = threadIdx.x & 0x1ff;
         half2 my_cb = codebook[my_cb_idx];
         for (uint32_t i = 0; i < 32; i += 2)
@@ -232,7 +307,14 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
         int weight_idx = tileIdM * weight_row_step + warpId * u16_per_tile_block * 2
                        + laneId * (u16_per_tile_block / TR_WARP_SIZE);
         uint4 reg_cs_next = {}, reg_cs2_next = {};
-        tr_load_reg_cs<R>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
+        // Idle warps (this_warp_k == 0 — small k relative to 32 warps × 4 tiles) must NOT run
+        // this speculative preload: their weight_idx points past the packed tensor (upstream
+        // QTIP loads unconditionally — a latent OOB read that MMU-faults (Xid 31) when the
+        // caching allocator maps nothing after the tensor; surfaced on Blackwell/sm_120 as an
+        // allocation-layout-dependent cudaErrorIllegalAddress). The predicate is warp-uniform,
+        // so the __shfl_syncs inside stay converged; the skipped value was never consumed.
+        if (this_warp_k > 0)
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
         uint4 reg_cs, reg_cs2;
         float4 reg_p[2] = {};
 
@@ -243,9 +325,9 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
         for (uint32_t ki = 0; ki < this_warp_k; ki += 1) {
             if (ki + 1 != this_warp_k && ki % 2 == 1) weight_idx += weight_step * 2;
             reg_cs = reg_cs_next; reg_cs2 = reg_cs2_next;
-            tr_load_reg_cs<R>((const uint16_t *)compressed,
-                              weight_idx + (1 - ki % 2) * u16_per_tile_block,
-                              laneId, reg_cs_next, reg_cs2_next);
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed,
+                                        weight_idx + (1 - ki % 2) * u16_per_tile_block,
+                                        laneId, reg_cs_next, reg_cs2_next);
 
             if (ki % 2 == 0) {
                 __syncwarp();
@@ -272,7 +354,7 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
                     else                               { reg_c = reg_cs.w; reg_c2 = reg_cs2.w; }
 
                     ditto4 reg_w;
-                    tr_decode_regw<R>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
+                    tr_decode_regw<R, IS_3INST>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
 
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
@@ -335,7 +417,7 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
  * scratch and NO allocation → capture-safe by construction. (e8p's split-K scratch uses a
  * per-call raw_alloc/raw_delete, which glq_cuda.cu:3405-3412 itself flags as illegal during
  * capture — we deliberately do not copy that.) */
-template <uint32_t R>
+template <uint32_t R, bool IS_3INST = false>
 __global__ static void __launch_bounds__(TR_BLOCK_SIZE, 1)
 glq_trellis_matmul_kernel(float *__restrict__ out,
                           const uint32_t *__restrict__ compressed,
@@ -371,7 +453,7 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
 
     uint32_t tileIdM = m_per_block * blockIdx.x;
 
-    {
+    if constexpr (!IS_3INST) {   // 3INST: arithmetic decode — no tlut smem fill, no barrier
         uint32_t my_cb_idx = threadIdx.x & 0x1ff;
         half2 my_cb = codebook[my_cb_idx];
         for (uint32_t i = 0; i < 32; i += 2)
@@ -387,7 +469,14 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
         int weight_idx = tileIdM * weight_row_step + warpId * u16_per_tile_block * 2
                        + laneId * (u16_per_tile_block / TR_WARP_SIZE);
         uint4 reg_cs_next = {}, reg_cs2_next = {};
-        tr_load_reg_cs<R>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
+        // Idle warps (this_warp_k == 0 — small k relative to 32 warps × 4 tiles) must NOT run
+        // this speculative preload: their weight_idx points past the packed tensor (upstream
+        // QTIP loads unconditionally — a latent OOB read that MMU-faults (Xid 31) when the
+        // caching allocator maps nothing after the tensor; surfaced on Blackwell/sm_120 as an
+        // allocation-layout-dependent cudaErrorIllegalAddress). The predicate is warp-uniform,
+        // so the __shfl_syncs inside stay converged; the skipped value was never consumed.
+        if (this_warp_k > 0)
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
         uint4 reg_cs, reg_cs2;
         float4 reg_p[2] = {};
 
@@ -395,9 +484,9 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
         for (uint32_t ki = 0; ki < this_warp_k; ki += 1) {
             if (ki + 1 != this_warp_k && ki % 2 == 1) weight_idx += weight_step * 2;
             reg_cs = reg_cs_next; reg_cs2 = reg_cs2_next;
-            tr_load_reg_cs<R>((const uint16_t *)compressed,
-                              weight_idx + (1 - ki % 2) * u16_per_tile_block,
-                              laneId, reg_cs_next, reg_cs2_next);
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed,
+                                        weight_idx + (1 - ki % 2) * u16_per_tile_block,
+                                        laneId, reg_cs_next, reg_cs2_next);
 
 #pragma unroll 2
             for (uint32_t subki = 0; subki < 2; subki += 1) {
@@ -421,7 +510,7 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
                     else                               { reg_c = reg_cs.w; reg_c2 = reg_cs2.w; }
 
                     ditto4 reg_w;
-                    tr_decode_regw<R>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
+                    tr_decode_regw<R, IS_3INST>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
 
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
@@ -476,7 +565,7 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
  *   m_tile = tileIdM*2 + submi
  *   k_tile = 4*warpId + 2*(ki%2) + subki + (4*TR_WARPS)*(ki/2)
  * Fragment→(row,col) is the standard m16n8k16 A layout. */
-template <uint32_t R>
+template <uint32_t R, bool IS_3INST = false>
 __global__ static void __launch_bounds__(TR_BLOCK_SIZE, 1)
 glq_trellis_decompress_kernel(half *__restrict__ W,
                               const uint32_t *__restrict__ compressed,
@@ -504,7 +593,7 @@ glq_trellis_decompress_kernel(half *__restrict__ W,
 
     uint32_t tileIdM = m_per_block * blockIdx.x;
 
-    {
+    if constexpr (!IS_3INST) {   // 3INST: arithmetic decode — no tlut smem fill, no barrier
         uint32_t my_cb_idx = threadIdx.x & 0x1ff;
         half2 my_cb = codebook[my_cb_idx];
         for (uint32_t i = 0; i < 32; i += 2)
@@ -521,15 +610,22 @@ glq_trellis_decompress_kernel(half *__restrict__ W,
         int weight_idx = tileIdM * weight_row_step + warpId * u16_per_tile_block * 2
                        + laneId * (u16_per_tile_block / TR_WARP_SIZE);
         uint4 reg_cs_next = {}, reg_cs2_next = {};
-        tr_load_reg_cs<R>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
+        // Idle warps (this_warp_k == 0 — small k relative to 32 warps × 4 tiles) must NOT run
+        // this speculative preload: their weight_idx points past the packed tensor (upstream
+        // QTIP loads unconditionally — a latent OOB read that MMU-faults (Xid 31) when the
+        // caching allocator maps nothing after the tensor; surfaced on Blackwell/sm_120 as an
+        // allocation-layout-dependent cudaErrorIllegalAddress). The predicate is warp-uniform,
+        // so the __shfl_syncs inside stay converged; the skipped value was never consumed.
+        if (this_warp_k > 0)
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
         uint4 reg_cs, reg_cs2;
 
         for (uint32_t ki = 0; ki < this_warp_k; ki += 1) {
             if (ki + 1 != this_warp_k && ki % 2 == 1) weight_idx += weight_step * 2;
             reg_cs = reg_cs_next; reg_cs2 = reg_cs2_next;
-            tr_load_reg_cs<R>((const uint16_t *)compressed,
-                              weight_idx + (1 - ki % 2) * u16_per_tile_block,
-                              laneId, reg_cs_next, reg_cs2_next);
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed,
+                                        weight_idx + (1 - ki % 2) * u16_per_tile_block,
+                                        laneId, reg_cs_next, reg_cs2_next);
 
             for (uint32_t subki = 0; subki < 2; subki += 1) {
                 const uint32_t k_tile = 4 * warpId + 2 * (ki % 2) + subki + (4 * TR_WARPS) * (ki / 2);
@@ -541,7 +637,7 @@ glq_trellis_decompress_kernel(half *__restrict__ W,
                     else                               { reg_c = reg_cs.w; reg_c2 = reg_cs2.w; }
 
                     ditto4 reg_w;
-                    tr_decode_regw<R>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
+                    tr_decode_regw<R, IS_3INST>(reg_c, reg_c2, laneId, smem_codebook, reg_w);
 
                     const uint32_t m_tile = tileIdM * 2 + submi;
                     const uint32_t r0 = m_tile * TR_MMA_M + groupID;
@@ -770,6 +866,146 @@ torch::Tensor glq_fused_linear_trellis_cuda(
         // weight that actually LIVES in VRAM is the compressed one. fp16 accumulation error
         // here (~1e-3 relative) is negligible against 2-bpw quantization noise (~28%).
         auto W = glq_decompress_trellis_cuda(trellis_packed, tlut, m_pad, n_pad);   // fp16
+        auto xh = x_rht.to(torch::kFloat16);
+        y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
+    }
+
+    // ---- Step 3: output RHT → y (B, out_features) fp16 ----
+    auto y = torch::empty({B, (long)out_features},
+                          torch::dtype(torch::kFloat16).device(x.device()));
+    glq_output_rht_blockdiag_cuda(y_rht, su, y, (int)out_features, (int)m_pad,
+                                  blocks_m, blocks_m_meta);
+    return y;
+}
+
+/* ══ 3INST (lookup-free V=1) host entries — no tlut, ZERO dynamic smem ══
+ * Same packed storage and grid geometry as HYB; the <R, true> instantiations decode
+ * arithmetically, so the codebook pointer is null and the launches pass smem=0 (no
+ * cudaFuncSetAttribute needed — 0 ≤ the default opt-in limit; skipping the 64 KB
+ * carve-out is precisely the occupancy win). */
+
+torch::Tensor glq_decompress_trellis_3inst_cuda(torch::Tensor trellis_packed,
+                                                int64_t m, int64_t k) {
+    CHECK_INPUT(trellis_packed);
+    int R = tr_bits_from_packed(trellis_packed);
+    tr_check_shape(m, k, trellis_packed, R);
+    at::DeviceGuard guard(trellis_packed.device());
+
+    auto W = torch::empty({m, k}, torch::dtype(torch::kFloat16).device(trellis_packed.device()));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
+    half *wp = (half *)W.data_ptr<c10::Half>();
+
+#define TR_LAUNCH_DECOMP3(RBITS)                                                       \
+    glq_trellis_decompress_kernel<RBITS, true><<<tr_grid_x(), TR_BLOCK_SIZE, 0, stream>>>( \
+        wp, cp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k)
+    if (R == 2)      { TR_LAUNCH_DECOMP3(2); }
+    else if (R == 3) { TR_LAUNCH_DECOMP3(3); }
+    else             { TR_LAUNCH_DECOMP3(4); }
+#undef TR_LAUNCH_DECOMP3
+    return W;
+}
+
+torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
+                                                   int64_t m, int64_t k) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
+    TORCH_CHECK(x.numel() == k, "x must have k elements, got ", x.numel());
+    int R = tr_bits_from_packed(trellis_packed);
+    tr_check_shape(m, k, trellis_packed, R);
+    at::DeviceGuard guard(x.device());
+
+    auto out = torch::empty({m}, torch::dtype(torch::kFloat32).device(x.device()));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
+    const half2 *xp = (const half2 *)x.data_ptr<c10::Half>();
+    float *op = out.data_ptr<float>();
+
+#define TR_LAUNCH_MATVEC3(RBITS)                                                       \
+    glq_trellis_matvec_kernel<RBITS, true><<<tr_grid_x(), TR_BLOCK_SIZE, 0, stream>>>( \
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k)
+    if (R == 2)      { TR_LAUNCH_MATVEC3(2); }
+    else if (R == 3) { TR_LAUNCH_MATVEC3(3); }
+    else             { TR_LAUNCH_MATVEC3(4); }
+#undef TR_LAUNCH_MATVEC3
+    return out;
+}
+
+torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
+                                                   int64_t m, int64_t k) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    TORCH_CHECK(x.dim() == 2, "x must be (B, k)");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
+    TORCH_CHECK(x.size(1) == k, "x must have k columns, got ", x.size(1));
+    int R = tr_bits_from_packed(trellis_packed);
+    tr_check_shape(m, k, trellis_packed, R);
+    at::DeviceGuard guard(x.device());
+
+    const int64_t B = x.size(0);
+    auto out = torch::empty({B, m}, torch::dtype(torch::kFloat32).device(x.device()));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
+    const half2 *xp = (const half2 *)x.data_ptr<c10::Half>();
+    float *op = out.data_ptr<float>();
+    dim3 grid(tr_grid_x(), (unsigned)((B + 7) / 8));   // 8 tokens per mma N-tile
+
+#define TR_LAUNCH_MATMUL3(RBITS)                                                       \
+    glq_trellis_matmul_kernel<RBITS, true><<<grid, TR_BLOCK_SIZE, 0, stream>>>(        \
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (uint32_t)B)
+    if (R == 2)      { TR_LAUNCH_MATMUL3(2); }
+    else if (R == 3) { TR_LAUNCH_MATMUL3(3); }
+    else             { TR_LAUNCH_MATMUL3(4); }
+#undef TR_LAUNCH_MATMUL3
+    return out;
+}
+
+/* Fused 3INST linear: identical bracket + hybrid B-dispatch as the HYB fused op, minus the
+ * tlut. Same env knobs (GLQ_TRELLIS_BATCH_MAX / GLQ_TRELLIS_DENSE). One host call →
+ * cudagraph-capturable as a single node. */
+torch::Tensor glq_fused_linear_trellis_3inst_cuda(
+    torch::Tensor x,               // (B, in_features) fp16, contiguous
+    torch::Tensor sv,              // (n_pad,) fp16
+    torch::Tensor su,              // (m_pad,) fp16
+    torch::Tensor trellis_packed,  // ((m_pad/16)*(n_pad/16), 16*R) int16
+    torch::Tensor blocks_n,        // (num_n_blocks,) int64 CPU
+    torch::Tensor blocks_m,        // (num_m_blocks,) int64 CPU
+    torch::Tensor blocks_n_meta,   // (num_n_blocks, 4) int32 GPU (or empty)
+    torch::Tensor blocks_m_meta,   // (num_m_blocks, 4) int32 GPU (or empty)
+    double wscale,
+    int64_t in_features, int64_t out_features,
+    int64_t n_pad, int64_t m_pad
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    int B = x.size(0);
+    at::DeviceGuard guard(x.device());
+
+    // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
+    auto x_rht = torch::empty({B, (long)n_pad},
+                              torch::dtype(torch::kFloat32).device(x.device()));
+    glq_input_rht_blockdiag_cuda(x.contiguous(), sv, x_rht,
+                                 (int)in_features, (int)n_pad, blocks_n, blocks_n_meta);
+
+    // ---- Step 2: decode + matmul in the RHT domain → y_rht (B, m_pad) fp32 ----
+    static const int64_t batch_max = [] {
+        const char *e = std::getenv("GLQ_TRELLIS_BATCH_MAX");
+        return e ? std::max<int64_t>(1, atoll(e)) : 64;
+    }();
+    static const bool force_dense = (std::getenv("GLQ_TRELLIS_DENSE") != nullptr);
+
+    torch::Tensor y_rht;
+    if (B == 1 && !force_dense) {
+        auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
+        auto yv = glq_decode_matvec_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad);
+        y_rht = (yv * (float)wscale).view({1, (long)m_pad}).contiguous();
+    } else if (B <= batch_max && !force_dense) {
+        auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
+        auto yb = glq_decode_matmul_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad);
+        y_rht = (yb * (float)wscale).contiguous();                       // (B, m_pad) fp32
+    } else {
+        auto W = glq_decompress_trellis_3inst_cuda(trellis_packed, m_pad, n_pad);   // fp16
         auto xh = x_rht.to(torch::kFloat16);
         y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
     }

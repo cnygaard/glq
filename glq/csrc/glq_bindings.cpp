@@ -253,6 +253,20 @@ torch::Tensor glq_fused_linear_trellis_cuda(
     torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
     double wscale, int64_t in_features, int64_t out_features,
     int64_t n_pad, int64_t m_pad);
+// 3INST (lookup-free V=1) trellis variants — no tlut, zero dynamic smem.
+torch::Tensor glq_decompress_trellis_3inst_cuda(
+    torch::Tensor trellis_packed, int64_t m, int64_t k);
+torch::Tensor glq_decode_matvec_trellis_3inst_cuda(
+    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k);
+torch::Tensor glq_decode_matmul_trellis_3inst_cuda(
+    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k);
+torch::Tensor glq_fused_linear_trellis_3inst_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor su,
+    torch::Tensor trellis_packed,
+    torch::Tensor blocks_n, torch::Tensor blocks_m,
+    torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
+    double wscale, int64_t in_features, int64_t out_features,
+    int64_t n_pad, int64_t m_pad);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decompress_trellis_cuda", &glq_decompress_trellis_cuda,
@@ -265,6 +279,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Whether the trellis kernel supports this (m, k) — m%32, k%64");
     m.def("glq_fused_linear_trellis_cuda", &glq_fused_linear_trellis_cuda,
           "GLQ fused trellis input_rht + decode/matmul + output_rht, one host call (CUDA)");
+    m.def("glq_decompress_trellis_3inst_cuda", &glq_decompress_trellis_3inst_cuda,
+          "QTIP 3INST (lookup-free) trellis dense decompress to fp16 weight (CUDA)");
+    m.def("glq_decode_matvec_trellis_3inst_cuda", &glq_decode_matvec_trellis_3inst_cuda,
+          "QTIP 3INST trellis fused B=1 tensor-core GEMV, no tlut, zero smem (CUDA)");
+    m.def("glq_decode_matmul_trellis_3inst_cuda", &glq_decode_matmul_trellis_3inst_cuda,
+          "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA)");
+    m.def("glq_fused_linear_trellis_3inst_cuda", &glq_fused_linear_trellis_3inst_cuda,
+          "GLQ fused 3INST trellis input_rht + decode/matmul + output_rht, one host call (CUDA)");
     m.def("glq_decode_matvec_e8p", &glq_decode_matvec_e8p,
           "E8P tensor-core GEMV B=1 decode (CUDA)");
     m.def("glq_matmul_e8p", &glq_matmul_e8p,
