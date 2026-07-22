@@ -43,9 +43,12 @@ MASK32 = (1 << 32) - 1
 @functools.lru_cache(maxsize=None)
 def _make(variant, K, m, n, seed=0):
     """Quantize a random layer in KERNEL layout (for_kernel=True). Cached so the (slow CPU-Viterbi)
-    quant is shared across the decode_compressed gate and the mirror gate."""
+    quant is shared across the decode_compressed gate and the mirror gate. HYB gets an explicit
+    random tlut (decoder-style construction) — the default kmeans fit needs scipy, an encode-only
+    dep absent on CI, and the bit-mirror only needs *a* tlut, not a fitted one."""
     torch.manual_seed(seed)
-    cb = gt.TrellisCodebook(variant=variant, K=K, device="cpu")
+    tlut = (torch.randn(2 ** 9, 2) * 0.9682458365518543) if variant == "hyb" else None
+    cb = gt.TrellisCodebook(variant=variant, K=K, tlut=tlut, device="cpu")
     W = (torch.randn(m, n) * 0.05).float()
     _, Qidxs, _ = gt.trellis_ldlq(W, torch.eye(n), cb, for_kernel=True)
     packed = gt.pack_layer(cb, Qidxs, m, n, has_kernel=True)
