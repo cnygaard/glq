@@ -45,10 +45,13 @@ def _try_load_cuda_ext():
         cu_file = os.path.join(_csrc, 'glq_cuda.cu')
         cpp_file = os.path.join(_csrc, 'glq_bindings.cpp')
         e8p_file = os.path.join(_csrc, 'glq_e8p.cu')          # E8P TC-GEMV decode (--codebook e8p)
+        trellis_file = os.path.join(_csrc, 'glq_trellis.cu')  # QTIP TCQ decode (--codebook trellis)
         if not os.path.exists(cu_file):
             _cuda_ext_available = False
             return False
-        sources = [cu_file, cpp_file] + ([e8p_file] if os.path.exists(e8p_file) else [])
+        sources = ([cu_file, cpp_file]
+                   + ([e8p_file] if os.path.exists(e8p_file) else [])
+                   + ([trellis_file] if os.path.exists(trellis_file) else []))
         _glq_cuda = _load_ext(
             'glq_cuda',
             sources=sources,

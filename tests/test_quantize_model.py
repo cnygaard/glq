@@ -24,6 +24,7 @@ from glq.quantize_model import (
     _build_forward_kwargs,
     _load_layer_state,
     _load_tensor_from_shards,
+    quantize,
     main,
 )
 
@@ -669,3 +670,65 @@ class TestE8PNStageRecipe:
         assert sqnr[8] > sqnr[6] > sqnr[4]            # full E8P stages strictly help
         assert sqnr[4] <= sqnr[5] <= sqnr[6] + 1e-6   # odd bpw's E81B lands between
         assert sqnr[6] <= sqnr[7] <= sqnr[8] + 1e-6
+
+
+# ---- trellis: uniform integer bpw only (mixed-bpw is silently wrong, so refuse it) ----
+
+class TestTrellisMixedBpwGuard:
+    """The trellis codebook carries its rate in the codebook object (``K``), and
+    ``quantize_layer_e8_shell_rht``'s trellis branch ignores the per-layer
+    ``bpw=sub_bpw`` it is handed — every layer is encoded at ``codebook.K``.
+    But ``layer_bpw`` in config.json is written from the *map*. So a mixed-bpw
+    trellis run produces a checkpoint whose config claims per-layer 2/3/4 that
+    the packing does not have; vLLM then sizes ``trellis_packed`` at
+    ``16*layer_bpw[p]``, mismatches, and strands ``param.data`` on CPU.
+
+    Until per-layer K is threaded through, ``quantize()`` must refuse rather
+    than emit a checkpoint that decodes to garbage."""
+
+    def test_dict_bpw_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="uniform integer bpw"):
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw={"model.layers.0.self_attn.q_proj": 3}, codebook_type="trellis")
+
+    def test_fractional_bpw_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="uniform integer bpw"):
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw=3.5, codebook_type="trellis")
+
+    def test_min_max_range_rejected(self, tmp_path):
+        # --bpw 3 --min-bpw 2 --max-bpw 4 also routes into the mixed-precision
+        # profiling pass (has_range), with the same silent-K failure.
+        with pytest.raises(ValueError, match="uniform integer bpw"):
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw=3, min_bpw=2, max_bpw=4, codebook_type="trellis")
+
+    def test_other_codebooks_unaffected(self, tmp_path):
+        # The guard must be trellis-only: e8p/shell mixed-bpw is a shipped path.
+        # Getting *past* the guard means failing later, on the model load.
+        with pytest.raises(ValueError, match="uniform integer bpw"):
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw=3.5, codebook_type="trellis")
+        with pytest.raises(Exception) as exc:  # noqa: PT011 — HF raises OSError/etc
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw=3.5, codebook_type="e8p")
+        assert "uniform integer bpw" not in str(exc.value)
+
+    @pytest.mark.parametrize("bpw", [1, 5, 8])
+    def test_bpw_outside_2_4_rejected(self, bpw, tmp_path):
+        """The trellis rate K *is* the bpw, and the CUDA kernel templates on
+        R in {2,3,4} (``tr_bits_from_packed`` hard-checks it). Reaching 5-8 bpw
+        needs RVQ stacking, which is not implemented. Refuse up front — a K=5
+        run would otherwise Viterbi-encode for GPU-hours and only fail at serve."""
+        with pytest.raises(ValueError, match="trellis codebook supports bpw 2-4"):
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw=bpw, codebook_type="trellis")
+
+    @pytest.mark.parametrize("bpw", [2, 3, 4])
+    def test_bpw_2_3_4_accepted(self, bpw, tmp_path):
+        """K=2/3/4 must get *past* the guards (and then fail on the model load)."""
+        with pytest.raises(Exception) as exc:  # noqa: PT011
+            quantize(model_name="x/y", output_dir=str(tmp_path),
+                     bpw=bpw, codebook_type="trellis")
+        assert "trellis codebook supports" not in str(exc.value)
+        assert "uniform integer bpw" not in str(exc.value)

@@ -18,11 +18,29 @@ class GLQvLLMConfig(QuantizationConfig):
     """vLLM quantization config for GLQ (E8 lattice codebook + RHT)."""
 
     def __init__(self, bpw: int = 2, layer_bpw: dict | None = None,
-                 codebook: str = "e8_shell", block_diagonal: bool = True):
+                 codebook: str = "e8_shell", block_diagonal: bool = True,
+                 variant: str = "hyb", trellis_layout: str | None = None):
         super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
         self.codebook = codebook
+        # Trellis codebook variant. Both "hyb" (tlut kernels) and "3inst" (lookup-free
+        # <R, IS_3INST> kernels) serve; anything else has no CUDA kernel and vLLM has no
+        # pure-torch decode fallback, so refuse up front rather than serve garbage.
+        self.variant = variant
+        self.trellis_layout = trellis_layout
+        if codebook == "trellis" and variant not in ("hyb", "3inst"):
+            raise ValueError(
+                f"GLQ trellis variant {variant!r} has no CUDA kernel and cannot be served on "
+                f"vLLM (only 'hyb' and '3inst' can). Re-quantize with GLQ_TRELLIS_VARIANT=hyb "
+                f"or 3inst.")
+        # 3inst checkpoints from before the lookup-free kernel are stored in the NATURAL
+        # layout (no trellis_layout marker) — the kernel would silently scramble them.
+        if codebook == "trellis" and variant == "3inst" and trellis_layout != "kernel":
+            raise ValueError(
+                "This 3inst trellis checkpoint is stored in the pre-kernel NATURAL layout "
+                "(config lacks trellis_layout: \"kernel\") and cannot be served. Re-quantize "
+                "with glq >= 0.7 (GLQ_TRELLIS_VARIANT=3inst).")
         # RHT layout from the checkpoint: True (default) = block-diagonal padding,
         # False = legacy full pow2 Hadamard. Controls how the e8p weight buffers
         # are sized so the loader can copy in place. Absent in pre-0.6.7
@@ -50,6 +68,8 @@ class GLQvLLMConfig(QuantizationConfig):
             layer_bpw=config.get("layer_bpw", None),
             codebook=config.get("codebook", "e8_shell"),
             block_diagonal=config.get("block_diagonal", True),
+            variant=config.get("variant", "hyb"),
+            trellis_layout=config.get("trellis_layout", None),
         )
 
     def _lookup_bpw(self, prefix: str) -> int | None:
@@ -120,7 +140,8 @@ class GLQvLLMConfig(QuantizationConfig):
                 self, bpw=bpw if bpw is not None else self.bpw,
                 pre_fused=self._is_prefused(prefix),
                 codebook_type=self.codebook,
-                block_diagonal=self.block_diagonal)
+                block_diagonal=self.block_diagonal,
+                variant=self.variant)
 
         # VocabParallelEmbedding (and subclasses, e.g. ParallelLMHead).
         # Quantized embeddings — currently only Gemma-4's PLE — appear in

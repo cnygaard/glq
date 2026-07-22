@@ -1,11 +1,19 @@
 # {{ title }} — GLQ {{ bpw_label }}
 
+{% if is_trellis %}
+**GLQ ({{ "%.1f"|format(avg_bpw) }} bits/weight)** quantization of [`{{ base_model }}`](https://huggingface.co/{{ base_model }}) using a **trellis-coded codebook (QTIP TCQ) + randomized Hadamard transform (RHT) + LDLQ**. Weights stay compressed in memory and are decoded on the fly by a fused CUDA kernel.
+{% else %}
 **GLQ ({{ "%.1f"|format(avg_bpw) }} bits/weight)** quantization of [`{{ base_model }}`](https://huggingface.co/{{ base_model }}) using an **E8-lattice codebook + randomized Hadamard transform (RHT) + LDLQ**. Weights stay compressed in memory and are dequantized on the fly by fused CUDA kernels.
+{% endif %}
 
 > **Where GLQ shines:** the size-vs-accuracy win is strongest at **2–4 bits/weight**. {% if avg_bpw > 4.05 %}At {{ "%.1f"|format(avg_bpw) }} bpw the weight savings are modest — the bigger win at this precision is pairing it with the **E8 KV cache** (≈4× smaller KV cache → much longer context / more concurrency in the same VRAM).{% else %}For even more headroom, combine it with the **E8 KV cache** (≈4× smaller KV cache → longer context in the same VRAM).{% endif +%}
 
 - **Base model:** [`{{ base_model }}`](https://huggingface.co/{{ base_model }})
-- **Method:** E8 shell codebook + RHT + LDLQ{% if is_mixed %} — mixed precision (per-layer {{ min_bpw }}–{{ max_bpw }} bpw, avg {{ "%.1f"|format(avg_bpw) }}){% else %} — {{ "%.1f"|format(avg_bpw) }} bpw uniform{% endif +%}
+{% if is_trellis %}
+- **Method:** trellis-coded quantization (QTIP TCQ, `{{ variant }}` variant) + RHT + LDLQ — {{ "%.1f"|format(avg_bpw) }} bpw uniform (native trellis rate — one decode pass, no residual stacking)
+{% else %}
+- **Method:** E8 shell codebook + RHT + LDLQ{% if is_mixed %} — mixed precision (per-layer {{ min_bpw }}–{{ max_bpw }} bpw, avg {{ "%.1f"|format(avg_bpw) }}){% else %} — {{ "%.1f"|format(avg_bpw) }} bpw uniform{% endif %}
+{% endif %}
 {% if avg_sqnr_db %}
 - **Avg weight SQNR:** {{ "%.2f"|format(avg_sqnr_db) }} dB{% if n_quantized_layers %} over {{ n_quantized_layers }} quantized layers{% endif +%}
 {% endif %}
@@ -105,10 +113,17 @@ vllm serve {{ repo_id }}
 {% endif %}
 
 ## How GLQ works
+{% if is_trellis %}
+
+A **randomized Hadamard transform** (a fixed random sign-flip + Hadamard rotation on each side) makes the weights and the calibration Hessian *incoherent* — spreading outliers so they quantize well. **LDLQ** then rounds the weights with error feedback across the remaining input dimensions via the Hessian's LDL factorization. Instead of a per-group lattice codebook, GLQ here uses **trellis-coded quantization** (TCQ, from [QTIP](https://arxiv.org/abs/2406.11235)): each 16×16 weight tile is encoded as a **tail-biting Viterbi sequence over a dimension-256 trellis code**, reaching a higher effective quantization dimension than an 8-D lattice at the same bit-rate. Decoding is a small look-up plus a few arithmetic ops per weight; a fused CUDA kernel keeps the weights compressed in VRAM and decodes them inline.
+
+The "Golay/Leech" in the project name refers to the lattice codebooks GLQ also ships (E8 and its higher-dimensional cousins). Code, kernels and quantizer: **[GLQ on GitHub]({{ glq_repo }})**.
+{% else %}
 
 GLQ compresses weights in groups of 8. A **randomized Hadamard transform** (a fixed random sign-flip + Hadamard rotation on each side) makes the weights and the calibration Hessian *incoherent* — spreading outliers so an 8-dimensional lattice quantizes them well. **LDLQ** then rounds each group to the nearest entry of an **E8 shell codebook** (a 65,536-point subset of the E8 lattice), feeding each group's rounding error forward across the remaining input dimensions via the Hessian's LDL factorization. {{ stages_blurb }}
 
 E8 is the 8-dimensional root lattice; the "Golay/Leech" in the project name refers to its higher-dimensional lattice cousins. Code, kernels and quantizer: **[GLQ on GitHub]({{ glq_repo }})**.
+{% endif %}
 
 ---
 {% if orig_body %}

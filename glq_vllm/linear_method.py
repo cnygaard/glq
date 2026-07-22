@@ -613,6 +613,41 @@ def _glq_apply_e8p(x, layer):
         bias=None, out_dtype=x.dtype)
 
 
+def _glq_apply_trellis(x, layer):
+    """Trellis apply: one fused torch.ops call per shard, reusing the SAME staticmethod the
+    HF path runs (E8RHTLinear._trellis_linear_apply) so serving and eager share one validated
+    code path. Single layer → one call; fused QKV/gate_up → one call per shard, concatenated
+    (mirrors _glq_apply_e8p). Bias is applied once by apply(), not per shard."""
+    from glq.quantized_linear import E8RHTLinear
+    _apply = E8RHTLinear._trellis_linear_apply
+
+    # Block-diagonal RHT tensors are precomputed once in _setup_trellis_weights (before
+    # compile/capture) and held on each meta dict, so dynamo lifts them as frozen constants
+    # instead of tracing a per-forward torch.tensor CPU alloc (which aborts graph capture).
+    def _blocks(meta):
+        return meta['_bn'], meta['_bm'], meta['_bnm'], meta['_bmm']
+
+    if getattr(layer, 'glq_is_fused', False):
+        outs = []
+        for i, meta in enumerate(layer._glq_trellis_meta):
+            bn, bm, bnm, bmm = _blocks(meta)
+            outs.append(_apply(
+                x, layer.SV.get_shard(i), layer.SU.get_shard(i),
+                layer.trellis_packed.get_shard(i), layer.tlut.get_shard(i),
+                bn, bm, bnm, bmm, meta['wscale'],
+                meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
+                bias=None, out_dtype=x.dtype))
+        return torch.cat(outs, dim=-1)
+
+    meta = layer._glq_trellis_meta[0]
+    bn, bm, bnm, bmm = _blocks(meta)
+    return _apply(
+        x, layer.SV, layer.SU, layer.trellis_packed, layer.tlut,
+        bn, bm, bnm, bmm, meta['wscale'],
+        meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
+        bias=None, out_dtype=x.dtype)
+
+
 class GLQLinearMethod(LinearMethodBase):
     """GLQ fused dequant+matmul linear method for vLLM.
 
@@ -621,10 +656,15 @@ class GLQLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False,
-                 codebook_type: str = "e8_shell", block_diagonal: bool = True):
+                 codebook_type: str = "e8_shell", block_diagonal: bool = True,
+                 variant: str = "hyb"):
         self.quant_config = quant_config
         self.bpw = bpw
         self.codebook_type = codebook_type
+        # Trellis variant (hyb/3inst). Decides whether a tlut buffer exists: hyb loads a
+        # (512, 2) tlut; 3inst is lookup-free — its tlut is registered ZERO-SIZE, which is
+        # ALSO what routes _trellis_linear_apply to the no-tlut fused op (tlut.numel()==0).
+        self.variant = variant
         # RHT layout for the e8p managed-param buffers. True (default) =
         # block-diagonal padding (mult-of-64 cols / mult-of-16 rows); False =
         # legacy full pow2 Hadamard (one block spanning the next pow2). The
@@ -659,10 +699,46 @@ class GLQLinearMethod(LinearMethodBase):
         layer.glq_bpw = self.bpw
         is_e8p = (self.codebook_type == "e8p")
         layer.glq_is_e8p = is_e8p
+        is_trellis = (self.codebook_type == "trellis")
+        layer.glq_is_trellis = is_trellis
+        # Trellis NEVER pads (m_pad == out_features, n_pad == in_features), so unlike e8p
+        # there is no padding to hide an awkward shape behind: the kernel hard-requires
+        # out % 32 and in % 64. A tensor-parallel split can make a shard violate that, so
+        # refuse up front rather than serve garbage.
+        if is_trellis:
+            for _osz in output_partition_sizes:
+                if _osz % 32 != 0 or input_size_per_partition % 64 != 0:
+                    raise ValueError(
+                        f"GLQ trellis needs out%32==0 and in%64==0 per shard, got out={_osz}, "
+                        f"in={input_size_per_partition} (trellis never pads). Reduce the "
+                        f"tensor-parallel size, or use --codebook e8p for this model.")
 
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        if is_fused and is_e8p:
+        if is_fused and is_trellis:
+            # Fused QKV / gate_up for trellis: per-shard compressed buffers. trellis_packed's
+            # 2-D shape [(m/16)*(n/16), 16R] does not fit GLQShardedParameter's
+            # (m_pad, inner_dim) convention, so use the sentinel escape hatch — empty(0), which
+            # the loader's empty_like() replaces with the checkpoint's exact tensor. That is
+            # safe here (and ONLY here): GLQShardedParameter keeps its buffers in a private
+            # _shard_data list vLLM doesn't manage, unlike a plain nn.Parameter.
+            # SV is PER-SHARD: q/k/v get independent random Hadamards despite sharing the
+            # input dim, so each shard carries a full n_pad-length SV.
+            layer.glq_shard_sizes = output_partition_sizes
+            layer.glq_num_shards = len(output_partition_sizes)
+            n_pad = input_size_per_partition            # trellis never pads
+            ops = output_partition_sizes
+            layer.trellis_packed = GLQShardedParameter(
+                ops, 1, torch.int16, weight_loader=weight_loader, sentinel=True)
+            layer.tlut = GLQShardedParameter(
+                ops, 1, torch.float16, weight_loader=weight_loader, sentinel=True)
+            layer.SU = GLQShardedParameter(ops, -1, torch.float16, weight_loader=weight_loader)
+            layer.SV = GLQShardedParameter([n_pad] * len(ops), -1, torch.float16,
+                                           weight_loader=weight_loader)
+            layer.Wscale = GLQShardedParameter([1] * len(ops), 0, torch.float32,
+                                               weight_loader=weight_loader)
+            layer.glq_n_pad = n_pad
+        elif is_fused and is_e8p:
             # Fused QKV/gate_up for e8p: per-shard int64 TC-packed buffers. The
             # GLQShardedParameter loaders use empty_like, so sentinel=True placeholders
             # are replaced by the loaded q/k/v (or gate/up) Qidxs_e8p on load.
@@ -756,7 +832,29 @@ class GLQLinearMethod(LinearMethodBase):
             # Standard: single set of GLQ buffers (no suffix)
             out_sz = sum(output_partition_sizes)
             layer.glq_out_features = out_sz
-            if is_e8p:
+            if is_trellis:
+                # FULL-SIZE registration (same invariant as the e8p stage-2 note below): a
+                # plain nn.Parameter must be allocated at the checkpoint's exact shape so the
+                # loader takes the in-place ``copy_`` branch and keeps the CUDA storage from
+                # create_weights. A shape mismatch sends it down ``param.data =
+                # empty_like(loaded)``, which strands .data on CPU — vLLM then restores its
+                # registered param after process_weights, reverting the move, and the kernel
+                # aborts on a CPU tensor at cudagraph capture.
+                m_pad, n_pad = out_sz, input_size_per_partition   # trellis never pads
+                _R = int(self.bpw)                               # packed cols == 16*R
+                layer.trellis_packed = _make_glq_param(torch.zeros(
+                    (m_pad // 16) * (n_pad // 16), 16 * _R, dtype=torch.int16))
+                # hyb: full-size (512, 2) tlut, loaded from the checkpoint. 3inst: ZERO-SIZE —
+                # no checkpoint key exists, and numel()==0 is what routes the apply to the
+                # no-tlut lookup-free op. (A full-size zeros tlut here would silently take
+                # the HYB path with a garbage table.)
+                layer.tlut = _make_glq_param(
+                    torch.zeros(512, 2, dtype=torch.float16) if self.variant == "hyb"
+                    else torch.zeros(0, dtype=torch.float16))
+                layer.SU = _make_glq_param(torch.ones(m_pad, dtype=torch.float16))
+                layer.SV = _make_glq_param(torch.ones(n_pad, dtype=torch.float16))
+                layer.Wscale = _make_glq_param(torch.ones((), dtype=torch.float32))
+            elif is_e8p:
                 # Block-diagonal dims (= the checkpoint shape; equals _glq_pad for pow2 dims).
                 # Legacy pow2 checkpoints (block_diagonal=False) sized every dim to
                 # the next power of two, so size the buffers the same way to load them.
@@ -809,6 +907,10 @@ class GLQLinearMethod(LinearMethodBase):
         """Set up codebook and cache scalars. Dequant Mamba layers to dense."""
         device = next(layer.parameters()).device
         bpw = getattr(layer, 'glq_bpw', 2)
+
+        if getattr(layer, 'glq_is_trellis', False):
+            self._setup_trellis_weights(layer, device)
+            return
 
         if getattr(layer, 'glq_is_e8p', False):
             self._setup_e8p_weights(layer, device)
@@ -1078,6 +1180,80 @@ class GLQLinearMethod(LinearMethodBase):
             except (AttributeError, TypeError):
                 pass
 
+    def _setup_trellis_weights(self, layer, device):
+        """Post-load setup for the QTIP-trellis path (mirrors _setup_e8p_weights).
+
+        Simpler than e8p in two ways: there is no codebook OBJECT to cache (the fused op takes
+        only the ``tlut`` tensor), and there is exactly one scalar (Wscale) and zero stage
+        flags. Everything that could sync or allocate on the host is hoisted here, so apply()
+        is pure tensor work and captures cleanly.
+        """
+        fused = getattr(layer, 'glq_is_fused', False)
+        n_shards = layer.glq_num_shards if fused else 1
+
+        # (1) Move data to the device IN PLACE. Re-binding ``layer.attr = nn.Parameter(...)``
+        # would create a NEW object; vLLM still holds the CPU param it registered at build
+        # time and effectively restores it after process_weights, so the move is lost and the
+        # kernel aborts on a CPU tensor at capture. Mutating .data (or GLQShardedParameter's
+        # private _shard_data list) preserves object identity, so the move sticks.
+        for attr in ('trellis_packed', 'tlut', 'SU', 'SV', 'Wscale'):
+            t = getattr(layer, attr, None)
+            if t is None:
+                continue
+            if isinstance(t, GLQShardedParameter):
+                for i, sd in enumerate(t._shard_data):
+                    if sd.device != device:
+                        t._shard_data[i] = sd.to(device)
+            elif hasattr(t, 'device') and t.device != device:
+                t.data = t.data.to(device)
+
+        # (2) Hoist every host-sync scalar into per-shard metadata. The ONLY .item() in the
+        # trellis path happens here, once — never in apply().
+        in_f = layer.glq_in_features
+        if fused:
+            layer._glq_trellis_meta = [{
+                'wscale': float(layer.Wscale.get_shard(i).item()),
+                'in': in_f,
+                'out': int(layer.glq_shard_sizes[i]),
+                'n_pad': int(layer.glq_n_pad),
+                'm_pad': int(layer.glq_shard_sizes[i]),   # trellis never pads
+            } for i in range(n_shards)]
+        else:
+            layer._glq_trellis_meta = [{
+                'wscale': float(layer.Wscale.item()),
+                'in': in_f,
+                'out': int(layer.glq_out_features),
+                'n_pad': int(layer.glq_n_pad),
+                'm_pad': int(layer.glq_m_pad),
+            }]
+
+        # (3) Precompute the block-diagonal RHT tensors ONCE, here — *before*
+        # torch.compile/cudagraph capture. Building them lazily inside apply() would make
+        # dynamo trace the ``torch.tensor(...)`` CPU allocation into the captured graph, and
+        # the resulting CPU tensor triggers "Cannot copy between CPU and CUDA tensors during
+        # CUDA graph capture". As stable layer-held constants inductor lifts them as frozen
+        # graph inputs instead. _bn/_bm stay on CPU (the C++ op reads block sizes host-side
+        # via data_ptr, purely to pick grid/threads/smem — no H2D, no sync); the packed
+        # _bnm/_bmm are GPU int32 for the multiblock FHT kernel.
+        from glq.hadamard import _block_decompose as _bd
+        from glq.quantized_linear import _pack_block_meta as _pbm
+        for meta in layer._glq_trellis_meta:
+            bn = _bd(meta['n_pad'])
+            bm = _bd(meta['m_pad'])
+            meta['_bn'] = torch.tensor(bn, dtype=torch.int64, device='cpu')
+            meta['_bm'] = torch.tensor(bm, dtype=torch.int64, device='cpu')
+            meta['_bnm'] = _pbm(bn).to(device)
+            meta['_bmm'] = _pbm(bm).to(device)
+
+        # (4) Drop weight_loaders (function refs break vLLM v1 msgpack serialization).
+        for _name, param in layer.named_parameters():
+            try:
+                if hasattr(param, 'weight_loader') and not isinstance(
+                        type(param).__dict__.get('weight_loader'), property):
+                    del param.weight_loader
+            except (AttributeError, TypeError):
+                pass
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1093,7 +1269,12 @@ class GLQLinearMethod(LinearMethodBase):
         device = x.device
         cb, cb2 = _codebook, _codebook2_small
 
-        if getattr(layer, 'glq_is_e8p', False):
+        if getattr(layer, 'glq_is_trellis', False):
+            y = _glq_apply_trellis(x, layer)
+            out_features = (sum(layer.glq_shard_sizes)
+                            if getattr(layer, 'glq_is_fused', False)
+                            else layer.glq_out_features)
+        elif getattr(layer, 'glq_is_e8p', False):
             y = _glq_apply_e8p(x, layer)
             out_features = (sum(layer.glq_shard_sizes)
                             if getattr(layer, 'glq_is_fused', False)

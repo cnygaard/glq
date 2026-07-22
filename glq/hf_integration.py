@@ -36,10 +36,17 @@ class GLQConfig(QuantizationConfigMixin):
         kv_quant_method: str = "int8",
         kv_n_stages: int = 1,
         trust_remote_code: bool = False,
+        variant: str = "hyb",
+        trellis_layout: str = None,
         **kwargs,
     ):
         self.quant_method = "glq"
         self.codebook = codebook
+        # Trellis codebook variant (hyb/3inst); only meaningful when codebook=="trellis".
+        self.variant = variant
+        # Trellis storage-layout marker ("kernel"); absent on checkpoints from before the
+        # 3inst CUDA kernel (which stored 3inst in the natural layout) — the loader guards.
+        self.trellis_layout = trellis_layout
         self.codesz = codesz
         self.bpw = bpw
         self.layer_bpw = layer_bpw
@@ -60,6 +67,10 @@ class GLQConfig(QuantizationConfigMixin):
             "codesz": self.codesz,
             "bpw": self.bpw,
         }
+        if self.codebook == "trellis":
+            d["variant"] = self.variant
+            if self.trellis_layout is not None:
+                d["trellis_layout"] = self.trellis_layout
         if self.layer_bpw:
             d["layer_bpw"] = self.layer_bpw
         if self.kv_cache_bits != 16:
@@ -102,7 +113,7 @@ def _peek_qidxs_keys(pretrained_path):
                 idx = json.load(f)
             seen_files = set()
             for k, fname in idx.get("weight_map", {}).items():
-                if k.endswith(".Qidxs") or k.endswith(".Qidxs_e8p"):
+                if k.endswith(".Qidxs") or k.endswith(".Qidxs_e8p") or k.endswith(".trellis_packed"):
                     keys.append(k)
                     if sample_shape is None and fname not in seen_files:
                         seen_files.add(fname)
@@ -128,7 +139,7 @@ def _peek_qidxs_keys(pretrained_path):
             return [], None
         with safe_open(st_path, framework="pt") as st:
             for k in st.keys():
-                if k.endswith(".Qidxs") or k.endswith(".Qidxs_e8p"):
+                if k.endswith(".Qidxs") or k.endswith(".Qidxs_e8p") or k.endswith(".trellis_packed"):
                     keys.append(k)
                     if sample_shape is None:
                         sample_shape = st.get_tensor(k).shape
@@ -164,7 +175,12 @@ def _collect_quantized_layer_names(pretrained_path):
         return None
     out = set()
     for k in keys:
-        suffix = ".Qidxs_e8p" if k.endswith(".Qidxs_e8p") else ".Qidxs"
+        if k.endswith(".Qidxs_e8p"):
+            suffix = ".Qidxs_e8p"
+        elif k.endswith(".trellis_packed"):
+            suffix = ".trellis_packed"
+        else:
+            suffix = ".Qidxs"
         out.add(k[:-len(suffix)])
     return out
 
@@ -492,6 +508,32 @@ class GLQQuantizer(HfQuantizer):
         elif cb_type == "e8p":
             from .codebook_e8p import E8PCodebook
             codebook = E8PCodebook(device='cpu', verbose=False)
+        elif cb_type == "trellis":
+            # One shared TrellisCodebook rebuilt from the checkpoint: K from a packed
+            # layer's shape (authoritative), tlut from its stored buffer, variant from cfg.
+            from .trellis import TrellisCodebook
+            variant = getattr(self.quantization_config, "variant", "hyb")
+            # Layout guard: 3inst decodes with has_kernel=True (the <R, IS_3INST> CUDA
+            # kernel's MMA-fragment layout). Checkpoints from before that kernel stored
+            # 3inst in the NATURAL layout (no `trellis_layout` marker) — decoding them
+            # in the kernel layout would silently scramble every weight, so refuse.
+            layout = getattr(self.quantization_config, "trellis_layout", None)
+            if variant == "3inst" and layout != "kernel":
+                raise ValueError(
+                    "This 3inst trellis checkpoint is stored in the pre-kernel NATURAL "
+                    "layout (config.json lacks trellis_layout: \"kernel\") and cannot be "
+                    "decoded by this glq version. Re-quantize with glq >= 0.7 "
+                    "(--codebook trellis, variant 3inst).")
+            tlut, K = None, 2
+            for _m in model.modules():
+                if (isinstance(_m, E8RHTLinear) and getattr(_m, "_is_trellis", False)
+                        and _m.trellis_packed.numel() > 0
+                        and _m.trellis_packed.device.type != 'meta'):
+                    K = max(_m.trellis_packed.shape[1] // 16, 1)
+                    if _m.tlut.numel() > 0:
+                        tlut = _m.tlut.detach().to(torch.float32)
+                    break
+            codebook = TrellisCodebook(variant=variant, K=K, tlut=tlut, device='cpu')
         pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
         if codebook is None:
             codebook = _resolve_shell_codebook(pretrained_path)
@@ -508,7 +550,14 @@ class GLQQuantizer(HfQuantizer):
             max_bpw = int(global_bpw) if isinstance(global_bpw, (int, float)) else 2
 
         codebook2 = None
-        if cb_type == "e8p":
+        if cb_type == "trellis":
+            # The trellis is SINGLE-STAGE at every rate — bpw is the trellis rate K,
+            # not a stage count — so there is no residual grid to supply. It must be
+            # branched out explicitly: the shell arms below reach for shell-only RVQ
+            # machinery (`make_small`, which TrellisCodebook has no business owning)
+            # the moment K >= 3.
+            pass
+        elif cb_type == "e8p":
             # E8P RVQ: the E8P residual stages decode against the stage-0 grid
             # (`codebook`); `codebook2` only supplies the E81B grid for the E81B
             # residual stage — the final stage of any ODD bpw (3/5/7). Even bpw
