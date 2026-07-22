@@ -24,6 +24,12 @@
 ```bash
 pip install glq
 ```
+{% if is_trellis and variant == "3inst" %}
+
+> **Requires `glq >= 0.7.0`.** This checkpoint stores the trellis in the kernel
+> (MMA-fragment) layout that the lookup-free 3INST CUDA kernels consume
+> (`trellis_layout: "kernel"` in `config.json`); older glq versions cannot decode it.
+{% endif %}
 
 ## Use with vLLM (recommended)
 
@@ -109,7 +115,7 @@ vllm serve {{ repo_id }}
 | {{ b.task }} | {{ b.metric }}{% if b.n %} (n={{ b.n }}){% endif %} | {{ b.value }} |
 {% endfor %}
 
-*Measured with lm-evaluation-harness on vLLM. Small-n results are noisy estimates.*
+*Single-run measurements; small-n results are noisy estimates. Setup details per row.*
 {% endif %}
 
 ## How GLQ works
