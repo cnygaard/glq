@@ -62,7 +62,8 @@ def _fetch_original_readme(base_model_id: str, token: str | None) -> tuple[dict,
         return {}, ""
 
 
-def _merged_frontmatter(orig_fm: dict, base_model_id: str) -> dict:
+def _merged_frontmatter(orig_fm: dict, base_model_id: str,
+                        codebook: str = "e8_shell") -> dict:
     fm: dict = {}
     for k in _INHERIT_KEYS:
         if k in orig_fm and orig_fm[k] is not None:
@@ -73,7 +74,10 @@ def _merged_frontmatter(orig_fm: dict, base_model_id: str) -> dict:
     fm["base_model"] = base_model_id
     fm["base_model_relation"] = "quantized"
     tags = list(fm.get("tags") or [])
-    for t in ("glq", "quantization", "e8-lattice"):
+    # codebook-aware tag: trellis models are NOT an E8 lattice.
+    extra = (("glq", "quantization", "trellis", "tcq") if codebook == "trellis"
+             else ("glq", "quantization", "e8-lattice"))
+    for t in extra:
         if t not in tags:
             tags.append(t)
     fm["tags"] = tags
@@ -153,6 +157,13 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
 
     repo_id = repo_id or f"xv0y5ncu/{out.name}"
     avg_bpw = float(qcfg.get("bpw", cfg.get("quantization_config", {}).get("bpw", 4)))
+    # Codebook family drives the method prose: trellis (QTIP TCQ) vs the E8 lattice
+    # (e8_shell / e8p / e8_relaxed). Legacy checkpoints have no key → default e8_shell.
+    codebook = (qcfg.get("codebook")
+                or (cfg.get("quantization_config") or {}).get("codebook")
+                or "e8_shell")
+    variant = (qcfg.get("variant")
+               or (cfg.get("quantization_config") or {}).get("variant") or "hyb")
 
     # Mixed-precision detection from the per-layer bpw map (config.json).
     layer_bpw = (cfg.get("quantization_config") or {}).get("layer_bpw") or {}
@@ -169,7 +180,7 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
     trust_remote_code = bool(cfg.get("auto_map"))
 
     orig_fm, orig_body = _fetch_original_readme(base_model_id, hf_token)
-    fm = _merged_frontmatter(orig_fm, base_model_id)
+    fm = _merged_frontmatter(orig_fm, base_model_id, codebook=codebook)
 
     if isinstance(benchmarks, dict):  # accept {"MMLU-Pro": "65.2%"} convenience form
         benchmarks = [{"task": k, "metric": "score", "value": v}
@@ -190,6 +201,9 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
         "multimodal": multimodal,
         "auto_cls": "AutoModelForImageTextToText" if multimodal else "AutoModelForCausalLM",
         "benchmarks": benchmarks,
+        "codebook": codebook,
+        "is_trellis": codebook == "trellis",
+        "variant": variant,
         "stages_blurb": _stages_blurb(avg_bpw),
         "pi_config": _pi_config(repo_id),
         "opencode_config": _opencode_config(repo_id),

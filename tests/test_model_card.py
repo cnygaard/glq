@@ -22,19 +22,24 @@ from glq.model_card import (  # noqa: E402
 
 
 def _write_quant_dir(tmp_path, *, bpw=4, layer_bpw=None, arch="LlamaForCausalLM",
-                     auto_map=None, extra_cfg=None):
+                     auto_map=None, extra_cfg=None, codebook=None, variant=None):
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "quantize_config.json").write_text(json.dumps({
-        "bpw": bpw, "avg_sqnr_db": 21.5, "n_quantized_layers": 224,
-        "nsamples": 128, "seqlen": 2048,
-    }))
+    qmeta = {"bpw": bpw, "avg_sqnr_db": 21.5, "n_quantized_layers": 224,
+             "nsamples": 128, "seqlen": 2048}
+    if codebook:
+        qmeta["codebook"] = codebook
+    if variant:
+        qmeta["variant"] = variant
+    (tmp_path / "quantize_config.json").write_text(json.dumps(qmeta))
     cfg = {"architectures": [arch]}
     if auto_map:
         cfg["auto_map"] = auto_map
     qc = {"bpw": bpw}
     if layer_bpw:
         qc["layer_bpw"] = layer_bpw
+    if codebook:
+        qc["codebook"] = codebook
     cfg["quantization_config"] = qc
     if extra_cfg:
         cfg.update(extra_cfg)
@@ -133,6 +138,33 @@ def test_build_card_multimodal_flags(tmp_path):
     assert "AutoModelForImageTextToText" in card    # multimodal auto class
     assert "trust_remote_code=True" in card         # auto_map -> trust remote
     assert "limit_mm_per_prompt" in card            # text-only serving note
+
+
+def test_build_card_trellis(tmp_path):
+    # A trellis (TCQ) checkpoint must describe the trellis method, NOT the E8-shell one.
+    out = _write_quant_dir(tmp_path, bpw=4, codebook="trellis", variant="hyb")
+    card = build_card(out, "google/gemma-4-12B-it",
+                      repo_id="xv0y5ncu/gemma-4-12B-it-trellis-4bpw", write=False)
+    fm, body = _split_frontmatter(card)
+    # trellis-correct method prose
+    low = body.lower()
+    assert "trellis" in low and ("tcq" in low or "trellis-coded" in low)
+    # must NOT claim the E8-shell weight codebook (the KV-cache section legitimately says E8)
+    assert "65,536-point subset" not in body
+    assert "E8 shell codebook" not in body
+    # codebook-aware tags
+    assert "trellis" in fm["tags"] and "e8-lattice" not in fm["tags"]
+    # shared GLQ scaffolding still present
+    assert "pip install glq" in body and "GLQ on GitHub" in body
+
+
+def test_build_card_shell_unchanged_default(tmp_path):
+    # no `codebook` key (legacy checkpoints) → E8-shell prose + e8-lattice tag, unchanged.
+    out = _write_quant_dir(tmp_path, bpw=4)
+    card = build_card(out, "x/y", write=False)
+    fm, _ = _split_frontmatter(card)
+    assert "e8-lattice" in fm["tags"] and "trellis" not in fm["tags"]
+    assert "E8" in card  # the E8-shell method prose
 
 
 def test_build_card_sweet_spot_callout(tmp_path):
