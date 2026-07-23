@@ -393,6 +393,152 @@ def test_cuda_3inst_matmul_is_deterministic(K):
     assert torch.equal(a, b)
 
 
+# ===========================================================================
+# RS2a — CPU mirror of the FUSE_IN input-FHT prologue (de-risk BEFORE nvcc).
+#   The planned fusion computes, inside every matvec/matmul block:
+#     buf[i] = (i < in_features ? x[i] : 0) * sv[i]        (fp32)
+#     ascending-distance butterfly, log2(n_pad) stages      (fp32, ping-pong)
+#     out[i] = buf[i] * (1.0f / sqrtf(n_pad))               (fp32)  -> __float2half
+#   and then feeds the mma x-fragments FROM that smem buffer with the UNCHANGED
+#   x_idx/fill/consume indexing. Two mirrors pin both halves:
+#     #1 value mirror  — the fp32 pipeline above, validated bit-exactly against the
+#        REAL, already-built glq_input_rht_cuda kernel (no new nvcc needed);
+#        the fp16 cast point is then an RN-rounding of identical fp32 values.
+#     #2 index algebra — the x_buf fill/consume map reads, for fragment
+#        (warpId, refresh r, slot s, lane l), exactly the fp16 quad
+#        x[k_tile*16 + {2l, 2l+1, 8+2l, 9+2l}] with k_tile = 4*warpId + s + 128*r —
+#        i.e. a linear buffer (global OR smem) serves the fragments unchanged.
+# ===========================================================================
+def _mirror_input_fht(x16, sv16, n_pad):
+    """fp32-exact CPU transliteration of glq_input_rht_kernel (single-block path):
+    pad + SV sign -> ascending butterfly -> * (1.0f/sqrtf(n_pad)). Returns fp32."""
+    in_features = x16.numel()
+    buf = torch.zeros(n_pad, dtype=torch.float32)
+    buf[:in_features] = x16.float() * sv16[:in_features].float()
+    if in_features < n_pad:                       # padded region: 0 * sv == 0
+        buf[in_features:] = 0.0
+    log_n = n_pad.bit_length() - 1
+    for k in range(log_n):
+        h = 1 << k
+        partner = buf[torch.arange(n_pad) ^ h]
+        lo = (torch.arange(n_pad) & h) == 0
+        buf = torch.where(lo, buf + partner, partner - buf)
+    rsqrt_n = np.float32(1.0) / np.float32(np.sqrt(np.float32(n_pad)))
+    return buf * torch.tensor(float(rsqrt_n), dtype=torch.float32)
+
+
+@needs_cuda
+def test_rs2a_mirror_matches_cuda_input_rht_kernel():
+    """Value mirror: the CPU transliteration equals the REAL CUDA glq_input_rht_cuda
+    output bit-for-bit at n=2048 (the single-block shape RS2b fuses first), so the
+    in-kernel FUSE_IN butterfly implementing the same loop is pinned before any nvcc."""
+    from glq import inference_kernel as ik
+    assert ik._try_load_cuda_ext()
+    n_pad = 2048
+    torch.manual_seed(41)
+    x = (torch.randn(n_pad) * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n_pad) < 0.5, -1.0, 1.0).to(torch.float16)
+    out = torch.empty(1, n_pad, dtype=torch.float32, device="cuda")
+    rsqrt_n = float(np.float32(1.0) / np.float32(np.sqrt(np.float32(n_pad))))
+    ik._glq_cuda.glq_input_rht_cuda(x.cuda().unsqueeze(0), sv.cuda(), out,
+                                    n_pad, n_pad, rsqrt_n, n_pad,
+                                    n_pad.bit_length() - 1)
+    ref = _mirror_input_fht(x, sv, n_pad)
+    assert torch.equal(out.cpu().view(-1), ref), \
+        f"mirror != CUDA kernel: max|Δ|={(out.cpu().view(-1) - ref).abs().max().item():.3e}"
+    # the fused kernel's __float2half of these fp32 values == the pipeline's .to(fp16)
+    assert torch.equal(out.cpu().view(-1).half(), ref.half())
+
+
+def test_rs2a_xbuf_fragment_map_reads_linear_buffer():
+    """Index algebra: simulate the matvec's x_buf fill (x_idx = warpId*32 + laneId + r*1024,
+    slot=laneId//8, col=laneId%4, u32=(laneId%8)//4) and consume (slot ki%2*2+subki, lanes
+    0-3, both u32s) against a linear ramp — every consumed fp16 quad must be
+    x[k_tile*16 + {2l,2l+1,8+2l,9+2l}], k_tile = 4*warpId + s + 128*r. This is what lets
+    RS2b swap the global x pointer for the in-block smem FHT buffer with no index changes."""
+    n = 2048
+    x = torch.arange(n, dtype=torch.float32)                 # fp16-exact ramp values < 2048
+    x_half2 = x.view(-1, 2)                                  # u32 j -> halves (x[2j], x[2j+1])
+    for warpId in range(32):
+        for r in range(2):                                   # n=2048 -> 128 k-tiles -> r in {0,1}
+            xbuf = torch.zeros(4, 4, 2, 2)                   # [slot][col][u32][half]
+            for lane in range(32):                           # fill (one refresh)
+                x_idx = warpId * 32 + lane + r * 1024
+                if x_idx < n // 2:
+                    xbuf[lane // 8][lane % 4][(lane % 8) // 4] = x_half2[x_idx]
+            for s in range(4):                               # consume: ki%2*2+subki == slot s
+                k_tile = 4 * warpId + s + 128 * r
+                if k_tile >= n // 16:
+                    continue
+                for l in range(4):                           # lanes 0-3 feed mma column 0
+                    got = torch.cat([xbuf[s][l][0], xbuf[s][l][1]])
+                    want = x[[k_tile * 16 + 2 * l, k_tile * 16 + 2 * l + 1,
+                              k_tile * 16 + 8 + 2 * l, k_tile * 16 + 9 + 2 * l]]
+                    assert torch.equal(got, want), (warpId, r, s, l)
+
+
+# ---- RS2b: FUSE_IN — input RHT computed inside every matvec block -----------------------
+@needs_cuda
+@pytest.mark.parametrize("K", KS)
+@pytest.mark.parametrize("in_features", [2048, 2000])   # exact fit + padded tail
+def test_rs2b_fusein_matvec_bitexact_vs_unfused_pipeline(K, in_features):
+    """The FUSE_IN GEMV (raw x + sv in, RHT in-block) must be BIT-EXACT vs the unfused
+    3-kernel pipeline it replaces: glq_input_rht_cuda -> .to(fp16) -> matvec(wscale).
+    Achievable because the in-block butterfly is op-order-identical (test_rs2a_*) and the
+    fragment reads come from the same values via the same indexing."""
+    from glq import inference_kernel as ik
+    m, n = 64, 2048
+    cb, packed = _quantized_3inst_cuda(m, n, K, seed=51)
+    torch.manual_seed(52)
+    x_raw = (torch.randn(in_features, device="cuda") * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    w = 0.01371
+    # unfused reference pipeline (the exact kernels the fused path replaces)
+    x_rht = torch.empty(1, n, dtype=torch.float32, device="cuda")
+    rsqrt_n = float(np.float32(1.0) / np.float32(np.sqrt(np.float32(n))))
+    ik._glq_cuda.glq_input_rht_cuda(x_raw.unsqueeze(0), sv, x_rht, in_features, in_features,
+                                    rsqrt_n, n, n.bit_length() - 1)
+    ref = _ext().glq_decode_matvec_trellis_3inst_cuda(
+        x_rht.view(-1).to(torch.float16), packed, m, n, w)
+    got = _ext().glq_decode_matvec_trellis_3inst_fusein_cuda(
+        x_raw, sv, packed, m, n, in_features, w)
+    assert torch.equal(got, ref), \
+        f"K={K} in={in_features} max|Δ|={(got - ref).abs().max().item():.3e}"
+
+
+@needs_cuda
+@pytest.mark.parametrize("K", KS)
+def test_rs2b_fusein_matvec_is_deterministic(K):
+    m, n = 64, 2048
+    cb, packed = _quantized_3inst_cuda(m, n, K, seed=51)
+    x_raw = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    a = _ext().glq_decode_matvec_trellis_3inst_fusein_cuda(x_raw, sv, packed, m, n, n, 1.0)
+    b = _ext().glq_decode_matvec_trellis_3inst_fusein_cuda(x_raw, sv, packed, m, n, n, 1.0)
+    assert torch.equal(a, b)
+
+
+# ---- RS1: ×wscale folded into the kernel store ------------------------------------------
+@needs_cuda
+@pytest.mark.parametrize("K", KS)
+def test_cuda_3inst_store_folds_wscale_bitexact(K):
+    """The in-store `reduced * wscale` must be BIT-EXACT vs scaling the unscaled output in
+    torch — same two fp32 operands, same multiply — so folding the elementwise scale kernel
+    into the decode store changes nothing numerically. Default wscale=1.0 keeps old calls."""
+    m, n = 256, 512
+    cb, packed = _quantized_3inst_cuda(m, n, K, seed=31)
+    torch.manual_seed(9)
+    x = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
+    w = 0.01371
+    a = _ext().glq_decode_matvec_trellis_3inst_cuda(x, packed, m, n, w)
+    b = _ext().glq_decode_matvec_trellis_3inst_cuda(x, packed, m, n) * w
+    assert torch.equal(a, b)
+    xb = (torch.randn(5, n, device="cuda") * 0.5).to(torch.float16)
+    am = _ext().glq_decode_matmul_trellis_3inst_cuda(xb, packed, m, n, w)
+    bm = _ext().glq_decode_matmul_trellis_3inst_cuda(xb, packed, m, n) * w
+    assert torch.equal(am, bm)
+
+
 # ---- S5+S6: fused no-tlut host entry via the E8RHTLinear eager path -----------------------
 def _trellis_3inst_layer(in_f=512, out_f=256, seed=11, K=2):
     """Quantize + load an E8RHTLinear with a 3inst layer (kernel layout via the has_kernel

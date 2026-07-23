@@ -238,13 +238,16 @@ torch::Tensor glq_fused_linear_e8p_cuda(
     int64_t n_pad, int64_t m_pad, int64_t log_n, int64_t log_m);
 
 // QTIP trellis (TCQ) decode kernels (defined in glq_trellis.cu) for the --codebook trellis path.
-// Runtime-generic in (m, k); R (bits/weight) is derived from the packed shape.
+// Runtime-generic in (m, k); R (bits/weight) is derived from the packed shape. `wscale` is
+// folded into the kernel store (RS1) — default 1.0 keeps old call sites unchanged.
 torch::Tensor glq_decompress_trellis_cuda(
     torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k);
 torch::Tensor glq_decode_matvec_trellis_cuda(
-    torch::Tensor x, torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k);
+    torch::Tensor x, torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k,
+    double wscale);
 torch::Tensor glq_decode_matmul_trellis_cuda(
-    torch::Tensor x, torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k);
+    torch::Tensor x, torch::Tensor trellis_packed, torch::Tensor tlut, int64_t m, int64_t k,
+    double wscale);
 bool glq_trellis_kernel_supported(int64_t m, int64_t k);
 torch::Tensor glq_fused_linear_trellis_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
@@ -257,9 +260,12 @@ torch::Tensor glq_fused_linear_trellis_cuda(
 torch::Tensor glq_decompress_trellis_3inst_cuda(
     torch::Tensor trellis_packed, int64_t m, int64_t k);
 torch::Tensor glq_decode_matvec_trellis_3inst_cuda(
-    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k);
+    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
+torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
+    torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
+    int64_t m, int64_t k, int64_t in_features, double wscale);
 torch::Tensor glq_decode_matmul_trellis_3inst_cuda(
-    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k);
+    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
 torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
     torch::Tensor trellis_packed,
@@ -272,9 +278,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decompress_trellis_cuda", &glq_decompress_trellis_cuda,
           "QTIP trellis dense decompress to fp16 weight (CUDA)");
     m.def("glq_decode_matvec_trellis_cuda", &glq_decode_matvec_trellis_cuda,
-          "QTIP trellis fused B=1 tensor-core GEMV, weights stay compressed (CUDA)");
+          "QTIP trellis fused B=1 tensor-core GEMV, weights stay compressed (CUDA)",
+          py::arg("x"), py::arg("trellis_packed"), py::arg("tlut"),
+          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
     m.def("glq_decode_matmul_trellis_cuda", &glq_decode_matmul_trellis_cuda,
-          "QTIP trellis batched B>1 tensor-core GEMM, weights stay compressed (CUDA)");
+          "QTIP trellis batched B>1 tensor-core GEMM, weights stay compressed (CUDA)",
+          py::arg("x"), py::arg("trellis_packed"), py::arg("tlut"),
+          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
     m.def("glq_trellis_kernel_supported", &glq_trellis_kernel_supported,
           "Whether the trellis kernel supports this (m, k) — m%32, k%64");
     m.def("glq_fused_linear_trellis_cuda", &glq_fused_linear_trellis_cuda,
@@ -282,9 +292,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decompress_trellis_3inst_cuda", &glq_decompress_trellis_3inst_cuda,
           "QTIP 3INST (lookup-free) trellis dense decompress to fp16 weight (CUDA)");
     m.def("glq_decode_matvec_trellis_3inst_cuda", &glq_decode_matvec_trellis_3inst_cuda,
-          "QTIP 3INST trellis fused B=1 tensor-core GEMV, no tlut, zero smem (CUDA)");
+          "QTIP 3INST trellis fused B=1 tensor-core GEMV, no tlut, zero smem (CUDA)",
+          py::arg("x"), py::arg("trellis_packed"),
+          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
+    m.def("glq_decode_matvec_trellis_3inst_fusein_cuda",
+          &glq_decode_matvec_trellis_3inst_fusein_cuda,
+          "3INST B=1 GEMV with the input RHT fused into every block (raw fp16 x + sv in)",
+          py::arg("x_raw"), py::arg("sv"), py::arg("trellis_packed"),
+          py::arg("m"), py::arg("k"), py::arg("in_features"), py::arg("wscale") = 1.0);
     m.def("glq_decode_matmul_trellis_3inst_cuda", &glq_decode_matmul_trellis_3inst_cuda,
-          "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA)");
+          "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA)",
+          py::arg("x"), py::arg("trellis_packed"),
+          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
     m.def("glq_fused_linear_trellis_3inst_cuda", &glq_fused_linear_trellis_3inst_cuda,
           "GLQ fused 3INST trellis input_rht + decode/matmul + output_rht, one host call (CUDA)");
     m.def("glq_decode_matvec_e8p", &glq_decode_matvec_e8p,
