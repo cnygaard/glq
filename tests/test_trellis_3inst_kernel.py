@@ -518,6 +518,58 @@ def test_rs2b_fusein_matvec_is_deterministic(K):
     assert torch.equal(a, b)
 
 
+# ---- RS3: FUSE_IN for block-diagonal (non-pow2) input shapes ----------------------------
+@needs_cuda
+@pytest.mark.parametrize("K", [2, 4])
+@pytest.mark.parametrize("n", [768, 1088])     # [512,256] and [1024,64] decompositions
+def test_rs3_fusein_blockdiag_bitexact_vs_unfused_pipeline(K, n):
+    """Block-diag FUSE_IN must be BIT-EXACT vs the unfused pipeline it replaces:
+    glq_input_rht_blockdiag_cuda (multiblock kernel, per-sub-block rsqrtf) -> .to(fp16)
+    -> matvec(wscale). The in-block prologue mirrors the same per-sub-block butterfly +
+    rsqrtf(bs) normalization, so torch.equal holds."""
+    from glq import inference_kernel as ik
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_block_meta
+    m = 64
+    cb, packed = _quantized_3inst_cuda(m, n, K, seed=61)
+    blocks = _block_decompose(n)
+    assert len(blocks) > 1
+    bn = torch.tensor(blocks, dtype=torch.int64)
+    bnm = _pack_block_meta(blocks).cuda()
+    torch.manual_seed(62)
+    x_raw = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    w = 0.01371
+    x_rht = torch.empty(1, n, dtype=torch.float32, device="cuda")
+    ik._glq_cuda.glq_input_rht_blockdiag_cuda(x_raw.unsqueeze(0), sv, x_rht, n, n, bn, bnm)
+    ref = _ext().glq_decode_matvec_trellis_3inst_cuda(
+        x_rht.view(-1).to(torch.float16), packed, m, n, w)
+    got = _ext().glq_decode_matvec_trellis_3inst_fusein_cuda(
+        x_raw, sv, packed, m, n, n, w,
+        blocks_n_meta=bnm, num_blocks=len(blocks), max_bs=max(blocks))
+    assert torch.equal(got, ref), \
+        f"K={K} n={n} max|Δ|={(got - ref).abs().max().item():.3e}"
+
+
+@needs_cuda
+def test_rs3_fusein_blockdiag_is_deterministic():
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_block_meta
+    m, n = 64, 768
+    cb, packed = _quantized_3inst_cuda(m, n, 2, seed=61)
+    blocks = _block_decompose(n)
+    bnm = _pack_block_meta(blocks).cuda()
+    x_raw = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    a = _ext().glq_decode_matvec_trellis_3inst_fusein_cuda(
+        x_raw, sv, packed, m, n, n, 1.0,
+        blocks_n_meta=bnm, num_blocks=len(blocks), max_bs=max(blocks))
+    b = _ext().glq_decode_matvec_trellis_3inst_fusein_cuda(
+        x_raw, sv, packed, m, n, n, 1.0,
+        blocks_n_meta=bnm, num_blocks=len(blocks), max_bs=max(blocks))
+    assert torch.equal(a, b)
+
+
 # ---- RS1: ×wscale folded into the kernel store ------------------------------------------
 @needs_cuda
 @pytest.mark.parametrize("K", KS)

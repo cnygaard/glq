@@ -263,7 +263,12 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(
     torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
 torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
-    int64_t m, int64_t k, int64_t in_features, double wscale);
+    int64_t m, int64_t k, int64_t in_features, double wscale,
+    c10::optional<torch::Tensor> blocks_n_meta, int64_t num_blocks, int64_t max_bs);
+// Block-diagonal input RHT host entry (glq_cuda.cu) — bound for RS3 test references.
+void glq_input_rht_blockdiag_cuda(torch::Tensor x, torch::Tensor sv, torch::Tensor x_rht,
+                                  int in_features, int n_pad,
+                                  torch::Tensor blocks_n, torch::Tensor blocks_n_meta);
 torch::Tensor glq_decode_matmul_trellis_3inst_cuda(
     torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
 torch::Tensor glq_fused_linear_trellis_3inst_cuda(
@@ -297,9 +302,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
     m.def("glq_decode_matvec_trellis_3inst_fusein_cuda",
           &glq_decode_matvec_trellis_3inst_fusein_cuda,
-          "3INST B=1 GEMV with the input RHT fused into every block (raw fp16 x + sv in)",
+          "3INST B=1 GEMV with the input RHT fused into every block (raw fp16 x + sv in); "
+          "block-diagonal shapes pass blocks_n_meta/num_blocks/max_bs",
           py::arg("x_raw"), py::arg("sv"), py::arg("trellis_packed"),
-          py::arg("m"), py::arg("k"), py::arg("in_features"), py::arg("wscale") = 1.0);
+          py::arg("m"), py::arg("k"), py::arg("in_features"), py::arg("wscale") = 1.0,
+          py::arg("blocks_n_meta") = py::none(),
+          py::arg("num_blocks") = 1, py::arg("max_bs") = 0);
+    m.def("glq_input_rht_blockdiag_cuda", &glq_input_rht_blockdiag_cuda,
+          "GLQ block-diagonal input RHT (pad+SV+per-block FHT) host entry (CUDA)");
     m.def("glq_decode_matmul_trellis_3inst_cuda", &glq_decode_matmul_trellis_3inst_cuda,
           "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA)",
           py::arg("x"), py::arg("trellis_packed"),

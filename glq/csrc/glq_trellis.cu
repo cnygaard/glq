@@ -274,32 +274,59 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
                           const half2 *__restrict__ codebook,
                           uint32_t m, uint32_t k, float wscale,
                           const half *__restrict__ sv = nullptr,
-                          float rsqrt_n = 0.0f, uint32_t in_features = 0) {
+                          float rsqrt_n = 0.0f, uint32_t in_features = 0,
+                          const int4 *__restrict__ block_meta = nullptr,
+                          uint32_t num_blocks = 1) {
     extern __shared__ __align__(16) half2 smem_codebook[];   // unused (0 bytes) when IS_3INST
 
     const half2 *xsrc = x;                  // fragment source (global x, or smem under FUSE_IN)
     if constexpr (FUSE_IN) {
         static_assert(IS_3INST, "FUSE_IN is only instantiated for the 3inst (no-tlut) variant");
+        // Unified single-/multi-block layout: [persist: k fp32 | scratch: max_bs fp32].
+        // Each (sub-)block ping-pongs persist<->scratch through its butterfly; the fp16
+        // result then reuses SCRATCH as half2 (k*2 B <= max_bs*4 B always, because the
+        // leading pow2 of a binary decomposition is >= k/2). RS3 sub-blocks come from
+        // block_meta (int4 {offset, bs, log_bs, 0}, same as the multiblock RHT kernel).
         const half *x_raw = reinterpret_cast<const half *>(x);
-        float *b0 = reinterpret_cast<float *>(smem_codebook);
-        float *b1 = b0 + k;
-        half2 *xh = reinterpret_cast<half2 *>(b1 + k);
+        float *persist = reinterpret_cast<float *>(smem_codebook);
+        float *scratch = persist + k;                       // host sizes smem to k + max_bs
+        half2 *xh = reinterpret_cast<half2 *>(scratch);
         for (uint32_t i = threadIdx.x; i < k; i += TR_BLOCK_SIZE) {
             float xv = (i < in_features) ? __half2float(x_raw[i]) : 0.0f;
-            b0[i] = xv * __half2float(sv[i]);
+            persist[i] = xv * __half2float(sv[i]);
         }
         __syncthreads();
-        float *src = b0, *dst = b1;
-        for (uint32_t h = 1; h < k; h <<= 1) {
-            for (uint32_t i = threadIdx.x; i < k; i += TR_BLOCK_SIZE) {
-                float a = src[i], b = src[i ^ h];
-                dst[i] = ((i & h) == 0) ? (a + b) : (b - a);
+        const uint32_t nb = (num_blocks == 0) ? 1u : num_blocks;
+        for (uint32_t blk = 0; blk < nb; ++blk) {
+            const uint32_t off = (nb == 1) ? 0u : (uint32_t)block_meta[blk].x;
+            const uint32_t bs  = (nb == 1) ? k  : (uint32_t)block_meta[blk].y;
+            float *src = persist + off, *dst = scratch;
+            for (uint32_t h = 1; h < bs; h <<= 1) {
+                for (uint32_t i = threadIdx.x; i < bs; i += TR_BLOCK_SIZE) {
+                    float a = src[i], b = src[i ^ h];
+                    dst[i] = ((i & h) == 0) ? (a + b) : (b - a);
+                }
+                __syncthreads();
+                float *t = src; src = dst; dst = t;
             }
-            __syncthreads();
-            float *t = src; src = dst; dst = t;
+            if (src != persist + off) {       // odd stage count: result ended in scratch
+                for (uint32_t i = threadIdx.x; i < bs; i += TR_BLOCK_SIZE)
+                    (persist + off)[i] = src[i];
+                __syncthreads();
+            }
         }
-        for (uint32_t i = threadIdx.x; i < k / 2; i += TR_BLOCK_SIZE)
-            xh[i] = __floats2half2_rn(src[2 * i] * rsqrt_n, src[2 * i + 1] * rsqrt_n);
+        // Normalize + RN-cast per (sub-)block. Single-block multiplies the HOST
+        // 1.0f/sqrtf(k) (bit-matches glq_input_rht_kernel); sub-blocks multiply the
+        // in-kernel rsqrtf(bs) (bit-matches glq_input_rht_multiblock_kernel). half2
+        // pairs never straddle sub-blocks (bs >= 256, offsets even).
+        for (uint32_t blk = 0; blk < nb; ++blk) {
+            const uint32_t off = (nb == 1) ? 0u : (uint32_t)block_meta[blk].x;
+            const uint32_t bs  = (nb == 1) ? k  : (uint32_t)block_meta[blk].y;
+            const float r = (nb == 1) ? rsqrt_n : rsqrtf((float)bs);
+            for (uint32_t i = threadIdx.x; i < bs / 2; i += TR_BLOCK_SIZE)
+                xh[off / 2 + i] = __floats2half2_rn(persist[off + 2 * i] * r,
+                                                    persist[off + 2 * i + 1] * r);
+        }
         __syncthreads();
         xsrc = xh;
     }
@@ -988,20 +1015,36 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
     return out;
 }
 
-/* RS2b — fused-input B=1 GEMV: takes the RAW (pre-RHT) fp16 x and performs the input RHT
- * inside every matvec block (see the FUSE_IN kernel note). out (m,) fp32 =
- * wscale * (W(m,k) @ RHT(x·sv)/√k). Requires a single-block pow2 RHT shape (k ≤ 8192). */
+/* RS2b/RS3 — fused-input B=1 GEMV: takes the RAW (pre-RHT) fp16 x and performs the input
+ * RHT inside every matvec block (see the FUSE_IN kernel note). out (m,) fp32 =
+ * wscale * (W(m,k) @ blockRHT(x·sv)). Single-block pow2 shapes use the host 1/sqrtf(k);
+ * block-diagonal shapes pass blocks_n_meta (int4 {offset,bs,log_bs,0}, GPU) + num_blocks +
+ * max_bs and normalize per sub-block with rsqrtf(bs), matching the multiblock RHT kernel. */
 torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
-    int64_t m, int64_t k, int64_t in_features, double wscale) {
+    int64_t m, int64_t k, int64_t in_features, double wscale,
+    c10::optional<torch::Tensor> blocks_n_meta_opt, int64_t num_blocks, int64_t max_bs) {
+    // optional (not a default-constructed Tensor): pybind cannot round-trip an undefined
+    // at::Tensor as a py::arg default — single-block callers simply omit it.
+    torch::Tensor blocks_n_meta =
+        blocks_n_meta_opt.has_value() ? *blocks_n_meta_opt : torch::Tensor();
     CHECK_INPUT(x_raw);
     CHECK_INPUT(sv);
     CHECK_INPUT(trellis_packed);
     TORCH_CHECK(x_raw.scalar_type() == torch::kFloat16, "x_raw must be fp16");
     TORCH_CHECK(x_raw.numel() == in_features, "x_raw must have in_features elements");
     TORCH_CHECK(sv.scalar_type() == torch::kFloat16 && sv.numel() == k, "sv must be (k,) fp16");
-    TORCH_CHECK((k & (k - 1)) == 0 && k <= 8192,
-                "FUSE_IN needs a single-block pow2 RHT dim <= 8192, got ", k);
+    const bool multiblock = num_blocks > 1;
+    if (multiblock) {
+        TORCH_CHECK(blocks_n_meta.is_cuda() && blocks_n_meta.numel() >= num_blocks * 4,
+                    "block-diag FUSE_IN needs GPU blocks_n_meta");
+        TORCH_CHECK(max_bs > 0 && max_bs <= 8192 && (max_bs & (max_bs - 1)) == 0,
+                    "block-diag FUSE_IN needs pow2 max_bs <= 8192, got ", max_bs);
+    } else {
+        TORCH_CHECK((k & (k - 1)) == 0 && k <= 8192,
+                    "FUSE_IN needs a single-block pow2 RHT dim <= 8192, got ", k);
+        max_bs = k;
+    }
     int R = tr_bits_from_packed(trellis_packed);
     tr_check_shape(m, k, trellis_packed, R);
     at::DeviceGuard guard(x_raw.device());
@@ -1012,14 +1055,16 @@ torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
     const half2 *xp = (const half2 *)x_raw.data_ptr<c10::Half>();   // RAW fp16 under FUSE_IN
     const half *svp = (const half *)sv.data_ptr<c10::Half>();
+    const int4 *bm = multiblock ? (const int4 *)blocks_n_meta.data_ptr<int32_t>() : nullptr;
     float *op = out.data_ptr<float>();
     const float rsqrt_n = 1.0f / sqrtf((float)k);                   // matches single-block RHT
-    const size_t smem = (size_t)2 * k * 4 + (size_t)k * 2;          // fp32 ping/pong + half2 out
+    const size_t smem = (size_t)k * 4 + (size_t)max_bs * 4;         // persist + scratch/half2
+    TORCH_CHECK(smem <= 81920, "FUSE_IN smem ", smem, " exceeds the 81920 B opt-in");
 
 #define TR_LAUNCH_MATVEC3F(RBITS)                                                          \
     glq_trellis_matvec_kernel<RBITS, true, true><<<tr_grid_x(), TR_BLOCK_SIZE, smem, stream>>>( \
         op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (float)wscale,       \
-        svp, rsqrt_n, (uint32_t)in_features)
+        svp, rsqrt_n, (uint32_t)in_features, bm, (uint32_t)(multiblock ? num_blocks : 1))
     if (R == 2)      { TR_LAUNCH_MATVEC3F(2); }
     else if (R == 3) { TR_LAUNCH_MATVEC3F(3); }
     else             { TR_LAUNCH_MATVEC3F(4); }
@@ -1088,12 +1133,21 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
         return !(e && e[0] == '0');
     }();
 
+    // FUSE_IN eligibility: single-block pow2 (RS2b) or block-diagonal with GPU meta (RS3).
+    const int64_t fnb = blocks_n.numel() > 0 ? blocks_n.size(0) : 1;
+    int64_t fmax_bs = n_pad;
+    if (fnb > 1) fmax_bs = blocks_n.max().item<int64_t>();
+    const bool fusein_sb = fnb <= 1 && n_pad <= 8192 && ((n_pad & (n_pad - 1)) == 0);
+    const bool fusein_bd = fnb > 1 && fmax_bs <= 8192
+                           && blocks_n_meta.numel() > 0 && blocks_n_meta.is_cuda()
+                           && ((size_t)n_pad * 4 + (size_t)fmax_bs * 4) <= 81920;
+
     torch::Tensor y_rht;
-    if (fuse_in && B == 1 && !force_dense && blocks_n.size(0) <= 1
-        && n_pad <= 8192 && ((n_pad & (n_pad - 1)) == 0)) {
-        // ---- RS2b fused path: input RHT + cast + decode + ×wscale in ONE kernel ----
+    if (fuse_in && B == 1 && !force_dense && (fusein_sb || fusein_bd)) {
+        // ---- RS2b/RS3 fused path: input RHT + cast + decode + ×wscale in ONE kernel ----
         auto yv = glq_decode_matvec_trellis_3inst_fusein_cuda(
-            x.contiguous().view({-1}), sv, trellis_packed, m_pad, n_pad, in_features, wscale);
+            x.contiguous().view({-1}), sv, trellis_packed, m_pad, n_pad, in_features, wscale,
+            blocks_n_meta, fnb, fmax_bs);
         y_rht = yv.view({1, (long)m_pad});
     } else {
         // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
