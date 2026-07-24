@@ -572,15 +572,24 @@ def test_glq_vllm_gpu():
     )
 
     # --- 4. Weights stay compressed ---
-    found_qidxs = [False]
+    # check_layers runs in the engine-core subprocess (vLLM >= 0.25): it must RETURN
+    # its result — mutating a closed-over object only changes the subprocess copy.
     def check_layers(model):
+        found = False
         for name, mod in model.named_modules():
             if hasattr(mod, "Qidxs"):
                 assert mod.Qidxs.dtype == torch.int16, f"{name}.Qidxs is {mod.Qidxs.dtype}"
-                assert not hasattr(mod, "weight"), f"{name} has dense weight"
-                found_qidxs[0] = True
-    llm.apply_model(check_layers)
-    assert found_qidxs[0], "No GLQ layers found with Qidxs"
+                # vLLM >= 0.25 registers a numel-1 fp16 stub `weight` on every linear
+                # (PluggableLayer); the invariant is no DENSE weight alongside Qidxs.
+                w = getattr(mod, "weight", None)
+                assert w is None or w.numel() <= 1, \
+                    f"{name} has dense weight {tuple(w.shape)}"
+                found = True
+        return found
+
+    res = llm.apply_model(check_layers)
+    flags = res if isinstance(res, list) else [res]
+    assert any(flags), "No GLQ layers found with Qidxs"
 
     # --- 5. Generation correctness ---
     params = SamplingParams(max_tokens=30, temperature=0)
