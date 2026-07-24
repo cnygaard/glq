@@ -41,6 +41,31 @@ def _pack_block_meta(block_sizes):
     return meta
 
 
+def _pack_shard_meta(shard_blocks):
+    """S4b: pack the sub-blocks of MULTIPLE output shards (a fused linear's q/k/v or
+    gate/up) into one (rows, 4) int32 meta with GLOBAL column offsets, so a single
+    ``glq_output_rht_shards_cuda`` launch replaces the per-shard output RHTs.
+
+    Column 3 carries the normalization the sequential path used, keeping the batched
+    launch bit-exact: a SINGLE-block shard historically multiplied the HOST-computed
+    fp32 ``1.0f/sqrtf(bs)`` (stored here bit-cast to int32); multi-block shards used
+    the in-kernel ``rsqrtf(bs)`` (stored as 0 → no override).
+    """
+    rows = []
+    offset = 0
+    for blocks in shard_blocks:
+        single = len(blocks) == 1
+        for bs in blocks:
+            w = 0
+            if single:
+                r = torch.tensor(1.0, dtype=torch.float32) / torch.sqrt(
+                    torch.tensor(float(bs), dtype=torch.float32))
+                w = int(r.view(torch.int32).item())
+            rows.append([offset, bs, int(math.log2(bs)), w])
+            offset += bs
+    return torch.tensor(rows, dtype=torch.int32, device="cpu")
+
+
 # ────────────────────────────────────────────────────────────────
 # Fused RHT kernels: pad+SV+FHT and FHT+SU+unpad in one launch
 # ────────────────────────────────────────────────────────────────

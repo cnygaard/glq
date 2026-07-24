@@ -686,6 +686,118 @@ def test_rs4a_output_rht_matches_mirror(m_pad, out_features):
         f"m={m_pad} max|Δ|={(out.cpu().view(-1) - ref).abs().max().item():.3e}"
 
 
+# ---- S4b: shard-batched output RHT (qkv 3->1, gate/up 2->1 launches) --------------------
+# One grid.y launch spans every sub-block of every shard of a fused linear's output row.
+# Bit-exactness hinges on the meta.w normalization override: single-block shards carry the
+# bit-cast HOST 1.0f/sqrtf(bs) (what glq_output_rht_cuda multiplies), multi-block shards
+# carry 0 -> in-kernel rsqrtf(bs) (what the multiblock kernel computes) — so the batched
+# kernel reproduces BOTH historical paths bit-for-bit.
+
+def _s4b_sequential_reference(y_rht, su, shards):
+    """The pre-S4b path: one glq_output_rht_blockdiag_cuda per shard, concatenated."""
+    from glq import inference_kernel as ik
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_block_meta
+    B = y_rht.shape[0]
+    ref = torch.empty(B, sum(shards), dtype=torch.float16, device="cuda")
+    off = 0
+    for m in shards:
+        blocks = _block_decompose(m)
+        bn = torch.tensor(blocks, dtype=torch.int64)
+        bnm = _pack_block_meta(blocks).cuda()
+        seg = torch.empty(B, m, dtype=torch.float16, device="cuda")
+        ik._glq_cuda.glq_output_rht_blockdiag_cuda(
+            y_rht[:, off:off + m].contiguous(), su[off:off + m].contiguous(),
+            seg, m, m, bn, bnm)
+        ref[:, off:off + m] = seg
+        off += m
+    return ref
+
+
+@needs_cuda
+@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("shards", [[2048, 512, 512], [11008, 11008], [2048, 512, 11008]])
+def test_s4b_output_rht_shards_bitexact_vs_sequential(B, shards):
+    from glq import inference_kernel as ik
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_shard_meta
+    assert ik._try_load_cuda_ext()
+    total = sum(shards)
+    torch.manual_seed(71)
+    y_rht = torch.randn(B, total, dtype=torch.float32, device="cuda")
+    su = torch.where(torch.rand(total, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    ref = _s4b_sequential_reference(y_rht, su, shards)
+    shard_blocks = [_block_decompose(m) for m in shards]
+    meta = _pack_shard_meta(shard_blocks).cuda()
+    max_bs = max(max(b) for b in shard_blocks)
+    y = torch.empty(B, total, dtype=torch.float16, device="cuda")
+    ik._glq_cuda.glq_output_rht_shards_cuda(y_rht, su, y, total, meta, max_bs)
+    assert torch.equal(y, ref), \
+        f"B={B} shards={shards} max|Δ|={(y.float() - ref.float()).abs().max().item():.3e}"
+
+
+@needs_cuda
+@pytest.mark.parametrize("B", [1, 3])
+def test_s4b_yrht_entry_plus_shards_equals_fused(B):
+    """Splitting the fused op at the y_rht seam must reproduce the one-shot fused op
+    bit-for-bit: per-shard yrht entries write into a shared (B, total_m) fp32 buffer
+    (B=1 matvec writes the contiguous row slice directly), then ONE shards-RHT launch."""
+    from glq import inference_kernel as ik
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_shard_meta
+    shards = [(64, 512), (32, 512)]                    # (m, n) per shard, same input x
+    n = 512
+    torch.manual_seed(72)
+    x = (torch.randn(B, n, device="cuda") * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    total = sum(m for m, _ in shards)
+    su = torch.where(torch.rand(total, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    w = 0.01371
+    bn = torch.tensor([n], dtype=torch.int64)
+    empty_meta = torch.empty(0, dtype=torch.int32, device="cuda")
+    ref_parts, packs = [], []
+    off = 0
+    for m, _ in shards:
+        _, packed = _quantized_3inst_cuda(m, n, 2, seed=73 + m)
+        packs.append(packed)
+        bm = torch.tensor([m], dtype=torch.int64)
+        ref_parts.append(_ext().glq_fused_linear_trellis_3inst_cuda(
+            x, sv, su[off:off + m].contiguous(), packed,
+            bn, bm, empty_meta, empty_meta, w, n, m, n, m))
+        off += m
+    ref = torch.cat(ref_parts, dim=-1)
+    y_rht = torch.empty(B, total, dtype=torch.float32, device="cuda")
+    off = 0
+    for (m, _), packed in zip(shards, packs):
+        _ext().glq_fused_linear_trellis_3inst_yrht_cuda(
+            x, sv, packed, bn, empty_meta, w, n, n, m, y_rht, off)
+        off += m
+    meta = _pack_shard_meta([_block_decompose(m) for m, _ in shards]).cuda()
+    y = torch.empty(B, total, dtype=torch.float16, device="cuda")
+    ik._glq_cuda.glq_output_rht_shards_cuda(y_rht, su, y, total, meta,
+                                            max(m for m, _ in shards))
+    assert torch.equal(y, ref), \
+        f"B={B} max|Δ|={(y.float() - ref.float()).abs().max().item():.3e}"
+
+
+@needs_cuda
+def test_s4b_output_rht_shards_is_deterministic():
+    from glq import inference_kernel as ik
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_shard_meta
+    assert ik._try_load_cuda_ext()
+    shards = [2048, 512, 512]
+    total = sum(shards)
+    y_rht = torch.randn(2, total, dtype=torch.float32, device="cuda")
+    su = torch.where(torch.rand(total, device="cuda") < 0.5, -1.0, 1.0).to(torch.float16)
+    meta = _pack_shard_meta([_block_decompose(m) for m in shards]).cuda()
+    a = torch.empty(2, total, dtype=torch.float16, device="cuda")
+    b = torch.empty(2, total, dtype=torch.float16, device="cuda")
+    ik._glq_cuda.glq_output_rht_shards_cuda(y_rht, su, a, total, meta, 2048)
+    ik._glq_cuda.glq_output_rht_shards_cuda(y_rht, su, b, total, meta, 2048)
+    assert torch.equal(a, b)
+
+
 # ---- S5+S6: fused no-tlut host entry via the E8RHTLinear eager path -----------------------
 def _trellis_3inst_layer(in_f=512, out_f=256, seed=11, K=2):
     """Quantize + load an E8RHTLinear with a 3inst layer (kernel layout via the has_kernel

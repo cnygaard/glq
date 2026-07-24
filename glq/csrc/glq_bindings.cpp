@@ -260,15 +260,20 @@ torch::Tensor glq_fused_linear_trellis_cuda(
 torch::Tensor glq_decompress_trellis_3inst_cuda(
     torch::Tensor trellis_packed, int64_t m, int64_t k);
 torch::Tensor glq_decode_matvec_trellis_3inst_cuda(
-    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
+    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale,
+    c10::optional<torch::Tensor> out_opt);
 torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
     int64_t m, int64_t k, int64_t in_features, double wscale,
-    c10::optional<torch::Tensor> blocks_n_meta, int64_t num_blocks, int64_t max_bs);
-// Block-diagonal input RHT host entry (glq_cuda.cu) — bound for RS3 test references.
+    c10::optional<torch::Tensor> blocks_n_meta, int64_t num_blocks, int64_t max_bs,
+    c10::optional<torch::Tensor> out_opt);
+// Block-diagonal input/output RHT host entries (glq_cuda.cu) — bound for test references.
 void glq_input_rht_blockdiag_cuda(torch::Tensor x, torch::Tensor sv, torch::Tensor x_rht,
                                   int in_features, int n_pad,
                                   torch::Tensor blocks_n, torch::Tensor blocks_n_meta);
+void glq_output_rht_blockdiag_cuda(torch::Tensor y_rht, torch::Tensor su, torch::Tensor y,
+                                   int out_features, int m_pad,
+                                   torch::Tensor blocks_m, torch::Tensor blocks_m_meta);
 torch::Tensor glq_decode_matmul_trellis_3inst_cuda(
     torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
 torch::Tensor glq_fused_linear_trellis_3inst_cuda(
@@ -278,6 +283,15 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
     double wscale, int64_t in_features, int64_t out_features,
     int64_t n_pad, int64_t m_pad);
+// S4b: fused 3INST linear stopped at the y_rht seam + the shard-batched output RHT.
+void glq_fused_linear_trellis_3inst_yrht_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
+    torch::Tensor y_rht_out, int64_t col);
+void glq_output_rht_shards_cuda(torch::Tensor y_rht, torch::Tensor su, torch::Tensor y,
+                                int64_t out_features, torch::Tensor shard_meta,
+                                int64_t max_bs);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decompress_trellis_cuda", &glq_decompress_trellis_cuda,
@@ -299,7 +313,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_decode_matvec_trellis_3inst_cuda", &glq_decode_matvec_trellis_3inst_cuda,
           "QTIP 3INST trellis fused B=1 tensor-core GEMV, no tlut, zero smem (CUDA)",
           py::arg("x"), py::arg("trellis_packed"),
-          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
+          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0,
+          py::arg("out") = py::none());
     m.def("glq_decode_matvec_trellis_3inst_fusein_cuda",
           &glq_decode_matvec_trellis_3inst_fusein_cuda,
           "3INST B=1 GEMV with the input RHT fused into every block (raw fp16 x + sv in); "
@@ -307,15 +322,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x_raw"), py::arg("sv"), py::arg("trellis_packed"),
           py::arg("m"), py::arg("k"), py::arg("in_features"), py::arg("wscale") = 1.0,
           py::arg("blocks_n_meta") = py::none(),
-          py::arg("num_blocks") = 1, py::arg("max_bs") = 0);
+          py::arg("num_blocks") = 1, py::arg("max_bs") = 0,
+          py::arg("out") = py::none());
     m.def("glq_input_rht_blockdiag_cuda", &glq_input_rht_blockdiag_cuda,
           "GLQ block-diagonal input RHT (pad+SV+per-block FHT) host entry (CUDA)");
+    m.def("glq_output_rht_blockdiag_cuda", &glq_output_rht_blockdiag_cuda,
+          "GLQ block-diagonal output RHT (per-block FHT+SU+unpad) host entry (CUDA)");
     m.def("glq_decode_matmul_trellis_3inst_cuda", &glq_decode_matmul_trellis_3inst_cuda,
           "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA)",
           py::arg("x"), py::arg("trellis_packed"),
           py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
     m.def("glq_fused_linear_trellis_3inst_cuda", &glq_fused_linear_trellis_3inst_cuda,
           "GLQ fused 3INST trellis input_rht + decode/matmul + output_rht, one host call (CUDA)");
+    m.def("glq_fused_linear_trellis_3inst_yrht_cuda", &glq_fused_linear_trellis_3inst_yrht_cuda,
+          "S4b: fused 3INST linear stopped at the y_rht seam — writes wscale*(W @ RHT(x·sv)) "
+          "fp32 into columns [col, col+m_pad) of the shared y_rht_out buffer");
+    m.def("glq_output_rht_shards_cuda", &glq_output_rht_shards_cuda,
+          "S4b: ONE output-RHT launch spanning every sub-block of every shard "
+          "(shard_meta rows {offset, bs, log_bs, rsqrt_bits})");
     m.def("glq_decode_matvec_e8p", &glq_decode_matvec_e8p,
           "E8P tensor-core GEMV B=1 decode (CUDA)");
     m.def("glq_matmul_e8p", &glq_matmul_e8p,

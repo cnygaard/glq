@@ -998,7 +998,8 @@ torch::Tensor glq_decompress_trellis_3inst_cuda(torch::Tensor trellis_packed,
 }
 
 torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
-                                                   int64_t m, int64_t k, double wscale) {
+                                                   int64_t m, int64_t k, double wscale,
+                                                   c10::optional<torch::Tensor> out_opt) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
@@ -1007,7 +1008,14 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
     tr_check_shape(m, k, trellis_packed, R);
     at::DeviceGuard guard(x.device());
 
-    auto out = torch::empty({m}, torch::dtype(torch::kFloat32).device(x.device()));
+    // S4b: an (m,) fp32 contiguous view (e.g. a shared y_rht row slice) may be supplied
+    // so the store lands in place — no extra copy between decode and the shards RHT.
+    auto out = out_opt.has_value()
+        ? *out_opt
+        : torch::empty({m}, torch::dtype(torch::kFloat32).device(x.device()));
+    TORCH_CHECK(out.is_contiguous() && out.numel() == m
+                    && out.scalar_type() == torch::kFloat32,
+                "out must be a contiguous (m,) fp32 tensor");
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
     const half2 *xp = (const half2 *)x.data_ptr<c10::Half>();
@@ -1031,7 +1039,8 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
     int64_t m, int64_t k, int64_t in_features, double wscale,
-    c10::optional<torch::Tensor> blocks_n_meta_opt, int64_t num_blocks, int64_t max_bs) {
+    c10::optional<torch::Tensor> blocks_n_meta_opt, int64_t num_blocks, int64_t max_bs,
+    c10::optional<torch::Tensor> out_opt) {
     // optional (not a default-constructed Tensor): pybind cannot round-trip an undefined
     // at::Tensor as a py::arg default — single-block callers simply omit it.
     torch::Tensor blocks_n_meta =
@@ -1058,7 +1067,13 @@ torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     at::DeviceGuard guard(x_raw.device());
     tr_init_once();
 
-    auto out = torch::empty({m}, torch::dtype(torch::kFloat32).device(x_raw.device()));
+    // S4b: optional caller-provided (m,) fp32 contiguous destination (shared y_rht slice).
+    auto out = out_opt.has_value()
+        ? *out_opt
+        : torch::empty({m}, torch::dtype(torch::kFloat32).device(x_raw.device()));
+    TORCH_CHECK(out.is_contiguous() && out.numel() == m
+                    && out.scalar_type() == torch::kFloat32,
+                "out must be a contiguous (m,) fp32 tensor");
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
     const half2 *xp = (const half2 *)x_raw.data_ptr<c10::Half>();   // RAW fp16 under FUSE_IN
@@ -1112,23 +1127,18 @@ torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 /* Fused 3INST linear: identical bracket + hybrid B-dispatch as the HYB fused op, minus the
  * tlut. Same env knobs (GLQ_TRELLIS_BATCH_MAX / GLQ_TRELLIS_DENSE). One host call →
  * cudagraph-capturable as a single node. */
-torch::Tensor glq_fused_linear_trellis_3inst_cuda(
-    torch::Tensor x,               // (B, in_features) fp16, contiguous
-    torch::Tensor sv,              // (n_pad,) fp16
-    torch::Tensor su,              // (m_pad,) fp16
-    torch::Tensor trellis_packed,  // ((m_pad/16)*(n_pad/16), 16*R) int16
-    torch::Tensor blocks_n,        // (num_n_blocks,) int64 CPU
-    torch::Tensor blocks_m,        // (num_m_blocks,) int64 CPU
-    torch::Tensor blocks_n_meta,   // (num_n_blocks, 4) int32 GPU (or empty)
-    torch::Tensor blocks_m_meta,   // (num_m_blocks, 4) int32 GPU (or empty)
-    double wscale,
-    int64_t in_features, int64_t out_features,
-    int64_t n_pad, int64_t m_pad
+/* Steps 1-2 of the fused 3INST linear (input RHT + decode/matmul + ×wscale) →
+ * y_rht (B, m_pad) fp32. `y_out_slice`: optional contiguous (m_pad,) destination the B=1
+ * matvec branches store into DIRECTLY (S4b writes a shared shard buffer row with no copy);
+ * batched/dense branches ignore it and return a fresh tensor — the caller compares data
+ * pointers to decide whether a copy is still needed. */
+static torch::Tensor tr3_forward_yrht(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
+    c10::optional<torch::Tensor> y_out_slice
 ) {
-    CHECK_INPUT(x);
-    CHECK_INPUT(trellis_packed);
     int B = x.size(0);
-    at::DeviceGuard guard(x.device());
 
     static const int64_t batch_max = [] {
         const char *e = std::getenv("GLQ_TRELLIS_BATCH_MAX");
@@ -1155,7 +1165,7 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
         // ---- RS2b/RS3 fused path: input RHT + cast + decode + ×wscale in ONE kernel ----
         auto yv = glq_decode_matvec_trellis_3inst_fusein_cuda(
             x.contiguous().view({-1}), sv, trellis_packed, m_pad, n_pad, in_features, wscale,
-            blocks_n_meta, fnb, fmax_bs);
+            blocks_n_meta, fnb, fmax_bs, y_out_slice);
         y_rht = yv.view({1, (long)m_pad});
     } else {
         // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
@@ -1169,7 +1179,7 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
             auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
             // RS1: ×wscale happens in the kernel store — no separate elementwise launch.
             auto yv = glq_decode_matvec_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad,
-                                                           wscale);
+                                                           wscale, y_out_slice);
             y_rht = yv.view({1, (long)m_pad});
         } else if (B <= batch_max && !force_dense) {
             auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
@@ -1181,6 +1191,29 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
             y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
         }
     }
+    return y_rht;
+}
+
+torch::Tensor glq_fused_linear_trellis_3inst_cuda(
+    torch::Tensor x,               // (B, in_features) fp16, contiguous
+    torch::Tensor sv,              // (n_pad,) fp16
+    torch::Tensor su,              // (m_pad,) fp16
+    torch::Tensor trellis_packed,  // ((m_pad/16)*(n_pad/16), 16*R) int16
+    torch::Tensor blocks_n,        // (num_n_blocks,) int64 CPU
+    torch::Tensor blocks_m,        // (num_m_blocks,) int64 CPU
+    torch::Tensor blocks_n_meta,   // (num_n_blocks, 4) int32 GPU (or empty)
+    torch::Tensor blocks_m_meta,   // (num_m_blocks, 4) int32 GPU (or empty)
+    double wscale,
+    int64_t in_features, int64_t out_features,
+    int64_t n_pad, int64_t m_pad
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    int B = x.size(0);
+    at::DeviceGuard guard(x.device());
+
+    auto y_rht = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                                  wscale, in_features, n_pad, m_pad, c10::nullopt);
 
     // ---- Step 3: output RHT → y (B, out_features) fp16 ----
     auto y = torch::empty({B, (long)out_features},
@@ -1188,4 +1221,35 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     glq_output_rht_blockdiag_cuda(y_rht, su, y, (int)out_features, (int)m_pad,
                                   blocks_m, blocks_m_meta);
     return y;
+}
+
+/* S4b: the fused 3INST linear STOPPED at the y_rht seam — per-shard calls of a fused
+ * QKV/gate_up linear each deposit their (B, m_pad) fp32 result into columns
+ * [col, col+m_pad) of the SHARED y_rht_out buffer, and ONE glq_output_rht_shards_cuda
+ * launch then replaces the per-shard output RHTs. B=1 matvec branches store the row
+ * slice in place (zero copy); batched/dense branches copy their fresh result in. */
+void glq_fused_linear_trellis_3inst_yrht_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
+    torch::Tensor y_rht_out,       // (B, total_m) fp32, contiguous
+    int64_t col                    // this shard's column offset in y_rht_out
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    CHECK_INPUT(y_rht_out);
+    TORCH_CHECK(y_rht_out.scalar_type() == torch::kFloat32
+                    && y_rht_out.dim() == 2 && y_rht_out.size(0) == x.size(0)
+                    && col + m_pad <= y_rht_out.size(1),
+                "y_rht_out must be (B, >= col+m_pad) fp32");
+    int64_t B = x.size(0);
+    at::DeviceGuard guard(x.device());
+
+    c10::optional<torch::Tensor> slice;
+    if (B == 1)
+        slice = y_rht_out.select(0, 0).narrow(0, col, m_pad);   // contiguous row slice
+    auto y = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                              wscale, in_features, n_pad, m_pad, slice);
+    if (!slice.has_value() || y.data_ptr() != slice->data_ptr())
+        y_rht_out.narrow(1, col, m_pad).copy_(y.view({B, (long)m_pad}));
 }
