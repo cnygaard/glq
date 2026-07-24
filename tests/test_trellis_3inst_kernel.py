@@ -591,6 +591,101 @@ def test_cuda_3inst_store_folds_wscale_bitexact(K):
     assert torch.equal(am, bm)
 
 
+# ---- RS4a: warp-shuffle low-5 butterfly stages — independent CPU anchors ----------------
+# The shuffle phase must be BIT-EXACT (same ascending stage order, same fp32 lo?a+b:b−a),
+# so every pre-RS4a equality gate keeps holding. These anchors cover the paths whose only
+# other cross-check is ANOTHER RS4a-modified kernel (consistent-wrong risk): the
+# single-buffer variant (n=16384, 16 elems/thread through the shuffle), the <32 fallback,
+# the multiblock kernel (anchored bit-exactly by harvesting the GPU's rsqrtf(bs): the
+# butterfly of a one-hot at the block start is Hadamard row 0 == all-ones, so the kernel's
+# output there IS rsqrtf(bs)), and the output kernel (host-side rsqrt_m -> full mirror).
+
+@needs_cuda
+@pytest.mark.parametrize("n_pad", [16, 2048, 16384])   # <32 fallback / double-buf / single-buf
+def test_rs4a_input_rht_matches_mirror_all_variants(n_pad):
+    from glq import inference_kernel as ik
+    assert ik._try_load_cuda_ext()
+    torch.manual_seed(43)
+    x = (torch.randn(n_pad) * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n_pad) < 0.5, -1.0, 1.0).to(torch.float16)
+    out = torch.empty(1, n_pad, dtype=torch.float32, device="cuda")
+    rsqrt_n = float(np.float32(1.0) / np.float32(np.sqrt(np.float32(n_pad))))
+    ik._glq_cuda.glq_input_rht_cuda(x.cuda().unsqueeze(0), sv.cuda(), out,
+                                    n_pad, n_pad, rsqrt_n, n_pad,
+                                    n_pad.bit_length() - 1)
+    ref = _mirror_input_fht(x, sv, n_pad)
+    assert torch.equal(out.cpu().view(-1), ref), \
+        f"n={n_pad} max|Δ|={(out.cpu().view(-1) - ref).abs().max().item():.3e}"
+
+
+def _mirror_fht_raw(v32):
+    """Unnormalized ascending-distance fp32 butterfly (adds/subs only — CPU==GPU IEEE)."""
+    n = v32.numel()
+    buf = v32.clone()
+    idx = torch.arange(n)
+    h = 1
+    while h < n:
+        partner = buf[idx ^ h]
+        buf = torch.where((idx & h) == 0, buf + partner, partner - buf)
+        h <<= 1
+    return buf
+
+
+@needs_cuda
+@pytest.mark.parametrize("n", [1088, 1040])    # [1024,64] both shuffled; [1024,16] <32 fallback
+def test_rs4a_multiblock_input_rht_matches_mirror_bitexact(n):
+    from glq import inference_kernel as ik
+    from glq.hadamard import _block_decompose
+    from glq.quantized_linear import _pack_block_meta
+    assert ik._try_load_cuda_ext()
+    blocks = _block_decompose(n)
+    assert len(blocks) > 1
+    bn = torch.tensor(blocks, dtype=torch.int64)
+    bnm = _pack_block_meta(blocks).cuda()
+
+    def run(x16, sv16):
+        out = torch.empty(1, n, dtype=torch.float32, device="cuda")
+        ik._glq_cuda.glq_input_rht_blockdiag_cuda(
+            x16.cuda().unsqueeze(0), sv16.cuda(), out, n, n, bn, bnm)
+        return out.cpu().view(-1)
+
+    # Harvest each block's EXACT rsqrtf(bs) (device intrinsic — not CPU-reproducible):
+    # one-hot at the block start propagates as all-ones, so out[off] == rsqrtf(bs) * 1.0.
+    probe = torch.zeros(n, dtype=torch.float16)
+    offs = np.cumsum([0] + blocks[:-1]).tolist()
+    for off in offs:
+        probe[off] = 1.0
+    rs = run(probe, torch.ones(n, dtype=torch.float16))
+    torch.manual_seed(44)
+    x = (torch.randn(n) * 0.5).to(torch.float16)
+    sv = torch.where(torch.rand(n) < 0.5, -1.0, 1.0).to(torch.float16)
+    got = run(x, sv)
+    ref = torch.empty(n, dtype=torch.float32)
+    for off, bs in zip(offs, blocks):
+        seg = x[off:off + bs].float() * sv[off:off + bs].float()
+        ref[off:off + bs] = _mirror_fht_raw(seg) * rs[off]      # exact harvested rsqrtf(bs)
+    assert torch.equal(got, ref), \
+        f"n={n} blocks={blocks} max|Δ|={(got - ref).abs().max().item():.3e}"
+
+
+@needs_cuda
+@pytest.mark.parametrize("m_pad,out_features", [(2048, 2000), (16384, 16384)])
+def test_rs4a_output_rht_matches_mirror(m_pad, out_features):
+    from glq import inference_kernel as ik
+    assert ik._try_load_cuda_ext()
+    torch.manual_seed(45)
+    y = torch.randn(m_pad, dtype=torch.float32)
+    su = torch.where(torch.rand(m_pad) < 0.5, -1.0, 1.0).to(torch.float16)
+    out = torch.zeros(1, out_features, dtype=torch.float16, device="cuda")
+    rsqrt_m = float(np.float32(1.0) / np.float32(np.sqrt(np.float32(m_pad))))
+    ik._glq_cuda.glq_output_rht_cuda(y.cuda().unsqueeze(0), su.cuda(), out,
+                                     out_features, m_pad, m_pad.bit_length() - 1, rsqrt_m)
+    r = torch.tensor(rsqrt_m, dtype=torch.float32)
+    ref = ((_mirror_fht_raw(y) * r) * su.float())[:out_features].half()
+    assert torch.equal(out.cpu().view(-1), ref), \
+        f"m={m_pad} max|Δ|={(out.cpu().view(-1) - ref).abs().max().item():.3e}"
+
+
 # ---- S5+S6: fused no-tlut host entry via the E8RHTLinear eager path -----------------------
 def _trellis_3inst_layer(in_f=512, out_f=256, seed=11, K=2):
     """Quantize + load an E8RHTLinear with a 3inst layer (kernel layout via the has_kernel

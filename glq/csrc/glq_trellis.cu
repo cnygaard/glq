@@ -44,6 +44,8 @@
 
 #include <mutex>
 
+#include "glq_fht.cuh"
+
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(x)       TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #endif
@@ -300,16 +302,22 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
         for (uint32_t blk = 0; blk < nb; ++blk) {
             const uint32_t off = (nb == 1) ? 0u : (uint32_t)block_meta[blk].x;
             const uint32_t bs  = (nb == 1) ? k  : (uint32_t)block_meta[blk].y;
+            // RS4a: distance 1..16 as warp shuffles in place (bs pow2 ≥ 32 —
+            // trellis sub-blocks are ≥ 256); smem ping-pong resumes at h0.
+            // The pointer-tracked copy-back below is already parity-agnostic.
+            uint32_t h0 = 1;
+            if (bs >= 32) {
+                glq_fht_shuffle_low<8>(persist + off, (int)bs);
+                __syncthreads();
+                h0 = 32;
+            }
             float *src = persist + off, *dst = scratch;
-            for (uint32_t h = 1; h < bs; h <<= 1) {
-                for (uint32_t i = threadIdx.x; i < bs; i += TR_BLOCK_SIZE) {
-                    float a = src[i], b = src[i ^ h];
-                    dst[i] = ((i & h) == 0) ? (a + b) : (b - a);
-                }
+            for (uint32_t h = h0; h < bs; h <<= 1) {
+                glq_fht_stage_smem(src, dst, (int)h, (int)bs);
                 __syncthreads();
                 float *t = src; src = dst; dst = t;
             }
-            if (src != persist + off) {       // odd stage count: result ended in scratch
+            if (src != persist + off) {       // odd smem stage count: result in scratch
                 for (uint32_t i = threadIdx.x; i < bs; i += TR_BLOCK_SIZE)
                     (persist + off)[i] = src[i];
                 __syncthreads();

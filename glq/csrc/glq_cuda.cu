@@ -21,6 +21,8 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/extension.h>
 
+#include "glq_fht.cuh"
+
 #define FULL_MASK 0xffffffff
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -1779,14 +1781,23 @@ __global__ void glq_input_rht_kernel(
     }
     __syncthreads();
 
-    // Step 2: FHT butterfly stages
+    // Step 2: FHT butterfly stages.
+    // RS4a: stages at distance 1..16 run as warp shuffles in place on buf
+    // (needs n_pad pow2 ≥ 32 so active threads form whole warps); smem
+    // stages resume at k0 and the ping-pong parity uses the REMAINING count.
+    int k0 = 0;
+    if (n_pad >= 32) {
+        glq_fht_shuffle_low<16>(buf, n_pad);
+        __syncthreads();
+        k0 = 5;
+    }
     if (use_single_buffer) {
         // Single-buffer: read all elements into registers, sync, write back.
         // n_pad=16384, n_threads=1024 → 16 elements per thread in registers.
         float reg[16];  // max elements per thread
         int elems_per_thread = n_pad / n_threads;
 
-        for (int k = 0; k < log_n; k++) {
+        for (int k = k0; k < log_n; k++) {
             // Phase 1: all threads read and compute into registers
             for (int e = 0; e < elems_per_thread; e++) {
                 int i = tid + e * n_threads;
@@ -1809,19 +1820,13 @@ __global__ void glq_input_rht_kernel(
         float* buf_b = smem + n_pad;
         float* src = buf;
         float* dst = buf_b;
-        for (int k = 0; k < log_n; k++) {
-            for (int i = tid; i < n_pad; i += n_threads) {
-                int partner = i ^ (1 << k);
-                float my_val = src[i];
-                float partner_val = src[partner];
-                bool lo = (i & (1 << k)) == 0;
-                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-            }
+        for (int k = k0; k < log_n; k++) {
+            glq_fht_stage_smem(src, dst, 1 << k, n_pad);
             __syncthreads();
             float* tmp = src; src = dst; dst = tmp;
         }
-        // If odd number of stages, result is in buf_b — copy to buf
-        if (log_n % 2 == 1) {
+        // If odd number of smem stages, result is in buf_b — copy to buf
+        if ((log_n - k0) % 2 == 1) {
             for (int i = tid; i < n_pad; i += n_threads) buf[i] = buf_b[i];
             __syncthreads();
         }
@@ -2023,11 +2028,17 @@ __global__ void glq_output_rht_kernel(
     }
     __syncthreads();
 
-    // Step 2: FHT butterfly stages
+    // Step 2: FHT butterfly stages (RS4a low-stage shuffle, see input kernel)
+    int k0 = 0;
+    if (m_pad >= 32) {
+        glq_fht_shuffle_low<16>(buf, m_pad);
+        __syncthreads();
+        k0 = 5;
+    }
     if (use_single_buffer) {
         float reg[16];
         int elems_per_thread = m_pad / n_threads;
-        for (int k = 0; k < log_m; k++) {
+        for (int k = k0; k < log_m; k++) {
             for (int e = 0; e < elems_per_thread; e++) {
                 int i = tid + e * n_threads;
                 int partner = i ^ (1 << k);
@@ -2046,18 +2057,12 @@ __global__ void glq_output_rht_kernel(
         float* buf_b = smem + m_pad;
         float* src = buf;
         float* dst = buf_b;
-        for (int k = 0; k < log_m; k++) {
-            for (int i = tid; i < m_pad; i += n_threads) {
-                int partner = i ^ (1 << k);
-                float my_val = src[i];
-                float partner_val = src[partner];
-                bool lo = (i & (1 << k)) == 0;
-                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-            }
+        for (int k = k0; k < log_m; k++) {
+            glq_fht_stage_smem(src, dst, 1 << k, m_pad);
             __syncthreads();
             float* tmp = src; src = dst; dst = tmp;
         }
-        if (log_m % 2 == 1) {
+        if ((log_m - k0) % 2 == 1) {
             for (int i = tid; i < m_pad; i += n_threads) buf[i] = buf_b[i];
             __syncthreads();
         }
@@ -2117,21 +2122,22 @@ __global__ void glq_input_rht_multiblock_kernel(
     __syncthreads();
 
     // Step 2: FHT butterfly — double-buffer (buf_b is after buf, max_bs elems apart)
+    // RS4a: low 5 stages as warp shuffles when bs ≥ 32 (sub-blocks can be tiny)
+    int k0 = 0;
+    if (bs >= 32) {
+        glq_fht_shuffle_low<8>(buf, bs);
+        __syncthreads();
+        k0 = 5;
+    }
     float* buf_b = smem + bs;
     float* src = buf;
     float* dst = buf_b;
-    for (int k = 0; k < log_bs; k++) {
-        for (int i = tid; i < bs; i += n_threads) {
-            int partner = i ^ (1 << k);
-            float my_val = src[i];
-            float partner_val = src[partner];
-            bool lo = (i & (1 << k)) == 0;
-            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-        }
+    for (int k = k0; k < log_bs; k++) {
+        glq_fht_stage_smem(src, dst, 1 << k, bs);
         __syncthreads();
         float* tmp = src; src = dst; dst = tmp;
     }
-    if (log_bs % 2 == 1) {
+    if ((log_bs - k0) % 2 == 1) {
         for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
         __syncthreads();
     }
@@ -2170,21 +2176,21 @@ __global__ void glq_output_rht_multiblock_kernel(
     }
     __syncthreads();
 
+    int k0 = 0;
+    if (bs >= 32) {
+        glq_fht_shuffle_low<8>(buf, bs);
+        __syncthreads();
+        k0 = 5;
+    }
     float* buf_b = smem + bs;
     float* src = buf;
     float* dst = buf_b;
-    for (int k = 0; k < log_bs; k++) {
-        for (int i = tid; i < bs; i += n_threads) {
-            int partner = i ^ (1 << k);
-            float my_val = src[i];
-            float partner_val = src[partner];
-            bool lo = (i & (1 << k)) == 0;
-            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-        }
+    for (int k = k0; k < log_bs; k++) {
+        glq_fht_stage_smem(src, dst, 1 << k, bs);
         __syncthreads();
         float* tmp = src; src = dst; dst = tmp;
     }
-    if (log_bs % 2 == 1) {
+    if ((log_bs - k0) % 2 == 1) {
         for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
         __syncthreads();
     }
