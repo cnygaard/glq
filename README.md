@@ -2,15 +2,17 @@
 
 **E8-lattice post-training quantization** for LLM weights: **2–8 bits/weight**,
 served on **vLLM · HuggingFace Transformers**, with **deterministic**
-fused CUDA kernels and opt-in **~4× KV-cache compression**. Validated from a
-24 GB RTX 3090 to a 96 GB RTX PRO 6000 Blackwell.
+fused CUDA kernels and opt-in **KV-cache compression (up to ~4×)**. Validated
+from 24 GB 3090-class GPUs (A10G, sm_86) to a 96 GB RTX PRO 6000 Blackwell
+(sm_120).
 
 GLQ encodes each group of 8 weights as a 16-bit index into a 65,536-entry E8
 lattice codebook; a Randomized Hadamard Transform makes the weights incoherent
 so Euclidean nearest-neighbour rounding is near-optimal under the Hessian-weighted
 proxy loss, and a fused CUDA kernel matmuls **directly against the compressed
-indices** — the dense weight is never materialized, so GPU memory drops with the
-compression ratio.
+indices** — on the GPU serving path the dense weight is never materialized, so
+GPU memory drops with the compression ratio (CPU inference and a few
+architecture fallbacks dequantize instead).
 
 **What you get**
 - **NEW in v0.7 — trellis (TCQ) codebook**: single-stream decode at **bf16 speed**
@@ -20,12 +22,13 @@ compression ratio.
 - **2–8 bpw**, **no group-size constraint**, optional **per-layer mixed precision**.
 - **Serve anywhere** — a vLLM plugin (weight + MoE + embedding + KV cache) and an
   HF Transformers integration. `pip install glq`, load, run.
-- **Smallest-in-class footprint** — a 31B fits ≈16.5 GiB at 5 bpw where bf16 needs
-  ≈58 GiB, with quality within noise of bf16 on reasoning evals.
+- **Small footprint** — smallest of the ~4-bit quantizers we measured (vs AWQ /
+  NVFP4 on a 26B); a 31B fits ≈16.5 GiB at 5 bpw where bf16 needs ≈58 GiB, with
+  quality within noise of bf16 on our paired reasoning evals.
 - **Deterministic kernels** — bit-identical logits across runs (reproducible
   lm-eval scoring / on-policy RL rollouts).
-- **Long context** — opt-in E8 KV-cache compression (~4× smaller KV → more context
-  in the same VRAM).
+- **Long context** — opt-in E8 KV-cache compression (up to ~4× smaller KV → more
+  context in the same VRAM).
 
 **Pick your path** → [run a model](#run-a-pre-quantized-model) ·
 [fit a bigger model on your card](#available-pre-quantized-checkpoints) ·
@@ -51,10 +54,10 @@ import glq.hf_integration  # registers GLQ with transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model = AutoModelForCausalLM.from_pretrained(
-    "xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw",
+    "xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw",
     device_map="auto",
 )
-tok = AutoTokenizer.from_pretrained("xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw")
+tok = AutoTokenizer.from_pretrained("xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw")
 print(tok.decode(model.generate(
     **tok("The capital of France is", return_tensors="pt").to(model.device),
     max_new_tokens=20,
@@ -82,24 +85,29 @@ A few popular checkpoints (all on the [**`xv0y5ncu`** HF org](https://huggingfac
 |---|---|---|--:|--:|---|
 | [`Gemma-4-E4B-it-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw) | Gemma-4-E4B (8B, multimodal) | 4.0 | Apache 2.0 | 5.8 GiB | a capable model on an 8–12 GB card |
 | [`SmolLM3-3B-trellis-3inst-4bpw-kernel`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel) | SmolLM3-3B | 4.0 trellis | Apache 2.0 | 1.9 GiB | **fastest GLQ decode** — single-stream at bf16 parity |
-| [`gemma-4-12B-it-trellis-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-12B-it-trellis-4bpw) | Gemma-4-12B | 4.0 trellis | Apache 2.0 | 7.1 GiB | 12B thinking model, trellis quality at 4 bpw |
-| [`SmolLM3-3B-GLQ-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw) | SmolLM3-3B | 3.5 mix | Apache 2.0 | 2.4 GiB | small + fast, fits anything |
+| [`SmolLM3-3B-GLQ-block-diagonal-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-block-diagonal-3.5bpw) | SmolLM3-3B | 3.5 mix | Apache 2.0 | 1.8 GiB | small + fast, fits anything |
 | [`Gemma-4-12B-it-GLQ-5.0bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-12B-it-GLQ-5.0bpw) | Gemma-4-12B | 5.0 mix | Apache 2.0 | 6.9 GiB | 12B on a 24 GB card |
 | [`gemma-4-26B-A4B-it-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-26B-A4B-it-GLQ-4bpw) | Gemma-4-26B-A4B (MoE) | 4.0 | Apache 2.0 | ~15 GiB | best quality-per-GB (MoE) |
 | [`Gemma-4-31B-it-GLQ-5.0bpw-mix3-8`](https://huggingface.co/xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8) | Gemma-4-31B | 5.0 mix | Apache 2.0 | 16.5 GiB | a 31B on **one** 24–32 GB card |
-| [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0 | Apache 2.0 | ~20.5 GiB | coding / agentic |
-| [`SmolLM2-360M-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw) | SmolLM2-360M | 4.0 | Apache 2.0 | 0.33 GiB | tiny / CI demo |
+| [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic |
+| [`SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-360M | 4.0 | Apache 2.0 | 0.25 GiB | tiny / CI demo |
 
 **24 checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has SmolLM3
-at 6 bpw, the Gemma-4 12B/31B/E4B family across **3–8 bpw** (incl. `e8p` and `trellis`
+at 6 bpw, the Gemma-4 12B/31B/E4B family across **3–8 bpw** (incl. `e8p`
 variants), and Nemotron. Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
 each model card and in [How GLQ compares](#how-glq-compares) and
 [Quality & footprint](#quality--footprint) below.
 
 <sub>¹ **Footprint** = resident weight memory after load (vLLM's `Model loading took … GiB`)
-— the figure that decides whether a model fits a 24/32 GB card; it tracks the bpw budget and
-is what lets a 31B fit one GPU. E8-KV compression doesn't change it; its payoff is a ~4×
-smaller KV cache → more context / concurrency in the same VRAM.</sub>
+— the figure that decides whether a model fits a 24/32 GB card. For current (block-diagonal)
+checkpoints it tracks the bpw budget — that is what lets a 31B fit one GPU. E8-KV compression
+doesn't change it; its payoff is an up-to-~4× smaller KV cache → more context / concurrency in
+the same VRAM.</sub>
+
+<sub>² Quantized before block-diagonal FHT became the quantizer default: power-of-2 FHT padding
+is stored as real bits, so the checkpoint holds more bits per weight than its nominal rate and
+the footprint is correspondingly larger than 4 bpw implies (the Nemotron repos share this). The
+`-block-diagonal-` repos above are true-to-label re-quants.</sub>
 
 ### Quantize your own model
 
@@ -144,8 +152,10 @@ Trellis constraints differ from the shell/e8p paths: **integer bpw only
 than silently rounded — and the fused kernel needs layer dims with
 `out % 32 == 0`, `in % 64 == 0` (standard transformer shapes qualify).
 Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
-automatically — the PLE table quantizes via the shell codebook. Use
-`--streaming` for Gemma-4 family models.
+automatically — the PLE table quantizes via the shell codebook. This PLE
+routing merged after 0.7.1, so for these models install glq from `main`
+(or the next release); with 0.7.1, `--codebook trellis` on E2B/E4B stops
+with an error. Use `--streaming` for Gemma-4 family models.
 See [Trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq)
 for details.
 
@@ -274,15 +284,18 @@ different things; here is the honest layout.
 | Group-size constraint | **none** | g64/g128 | g64/g128 | — | — |
 | Core method | E8 lattice + RHT + LDLQ | activation-aware scale | block error-feedback | FP4 + per-tensor scale | per-layer bit allocation |
 | Footprint at ~4-bit | **smallest** (no per-group scales/zeros) | + group scales/zeros | + group scales/zeros | + FP8 scales | varies |
-| Speed on Blackwell | W4A16; **single-stream at bf16 parity** (trellis 3INST) | W4A16 (Marlin) | W4A16 (Marlin) | **fastest at batch** (native FP4) | n/a (GGUF) |
+| Speed on Blackwell | W4A16; **single-stream at bf16 parity** (trellis 3INST, 3B measured) | W4A16 (Marlin) | W4A16 (Marlin) | **fastest at batch** (native FP4) | n/a (GGUF) |
 | Serving stack | **vLLM · HF** | vLLM · HF · TRT | vLLM · HF · TRT | vLLM · TRT-LLM | **llama.cpp / Ollama** (GGUF) |
 | KV-cache compression | **built-in (~4×)** | — | — | fp8 KV | (llama.cpp KV) |
 | Bit-exact deterministic kernels | **yes** | — | — | — | — |
 | Fine-tuning (QLoRA) | — | — | — | — | **yes** |
 
+<sub>A "—" means the feature is absent or not advertised by that method — we have not
+tested the other methods for those properties.</sub>
+
 **Where each wins** — pick by your constraint, not by a single "best":
 
-- **GLQ** — smallest footprint at a target quality, the widest bit-range (2–8) with
+- **GLQ** — the smallest footprint of the ~4-bit methods we measured, the widest bit-range (2–8) with
   per-layer mixed precision, deterministic kernels, and built-in KV compression. The pick
   when you are **memory-bound** — fit a bigger model or longer context on a 24–32 GB card —
   and serve on vLLM / HF.
@@ -354,9 +367,10 @@ AIME-2026 in thinking mode (32k budget, 8 samples/problem, avg@8).
 **The read**: at 4 bpw trellis, GLQ decodes **single-stream at bf16 parity** in a third of
 the memory, and keeps most of the reasoning quality (−5.8 pts AIME vs bf16) where this
 NVFP4 checkpoint's 4-bit activations cost −15 pts. NVFP4 is decisively faster — but its
-FP4 tensor cores exist **only on Blackwell**; on the 24 GB RTX 3090 (sm_86) / 4090 (sm_89)
-cards GLQ targets, NVFP4 falls back to weight-only emulation while GLQ's fp16-mma kernels
-run natively (validated on sm_86 / sm_89 / sm_120).
+FP4 tensor cores exist **only on Blackwell**; on the 24 GB 3090-class (sm_86) / 4090-class
+(sm_89) cards GLQ targets, NVFP4 cannot use FP4 hardware, while GLQ's fp16-mma kernels have
+no Blackwell dependency (core GLQ kernels validated on sm_86 / sm_89 / sm_120; the trellis
+kernels to date on sm_120).
 
 <sub>¹ [`Firworks/SmolLM3-3B-nvfp4`](https://huggingface.co/Firworks/SmolLM3-3B-nvfp4), a
 community w4a4 checkpoint — results are scoped to it, not to NVFP4 at large. ² The
@@ -398,14 +412,22 @@ GPTQ requires a group-size dividing the hidden dim; SmolLM2-360M's
 hidden=960 is not divisible by 128, forcing `group_size=64` (~4.5 eff
 bpw) and losing quality. GLQ has no group-size constraint.
 
-| Method        | bpw  | 5-task avg | % of bf16 |
+| Method        | bpw stored | 5-task avg | % of bf16 |
 |---------------|------|------------|-----------|
 | bf16          | 16.0 | 0.557      | 100 %     |
-| **GLQ 4-bit** | 4.0  | **0.555**  | **99.6 %** |
+| **GLQ 4-bit block-diagonal** (current) | 4.0 | — | **97.9 %**¹ |
+| GLQ 4-bit legacy (padded) | ~6.4 eff¹ | 0.555 | 99.6 % |
 | GPTQ W4 (g64) | ~4.5 | 0.486      | 87.2 %    |
 
 5-task = ARC-e, HellaSwag, PIQA, WinoGrande, LAMBADA; 128 calibration
 samples; L40S. GPTQ's LAMBADA collapses to 0.346; GLQ preserves 0.508.
+
+<sub>¹ The original "4 bpw" checkpoint predates block-diagonal FHT and stored its
+power-of-2 padding as real bits — effectively ~6.4 bits/weight, so its 99.6 % was
+earned with extra storage. The true-4-bpw re-quant
+([`SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw))
+scores 97.9 % of bf16 on the same 5 tasks (paired GLQ/bf16 runs on the vLLM stack)
+— still well clear of GPTQ. The group-size constraint on GPTQ applies regardless.</sub>
 
 ### Gemma-4 family — GLQ vs bf16, paired (thinking mode)
 
@@ -480,8 +502,8 @@ Requires `transformers >= 4.45`. No external dependencies.
 
 ### E8 lattice cache (vLLM, v0.3.0+)
 
-Drops vLLM's paged KV cache to **~25 % of fp16 footprint** using the
-same E8 lattice quantizer used for weights. Two fused Triton kernels
+Drops vLLM's paged KV cache to **as little as ~25 % of fp16 footprint**
+(recipe-dependent) using the same E8 lattice quantizer used for weights. Two fused Triton kernels
 (read-side dequant-gather, write-side scatter) keep decode within
 ~20 % of un-fused throughput.
 
@@ -493,6 +515,10 @@ Measured on Gemma-4-E4B-it, RTX PRO 6000 Blackwell, vLLM 0.20:
 | mmlu_pro n=240 accuracy | 71.25 % | **71.25 % (bit-identical)** at `e8_relaxed:2` |
 | NIAH passkey @ ctx=16k / 32k / 64k / 130k | — | **40/40** at `e8_relaxed:2` (full 128k window) |
 | `cudaLaunchKernel` per decode | 110,659 | **71,619 (−35 %)** at `e8_relaxed:2` |
+
+Note the capacity row was measured with the `e8_relaxed:1` recipe and the
+quality rows with `e8_relaxed:2` — the recipes trade capacity for fidelity,
+so pick one and measure both for your model.
 
 Activation:
 
@@ -662,9 +688,9 @@ is a single K-bit trellis code with no residual stages — integer
 quantization** (TCQ) over 256-weight sequences, following
 [QTIP](https://github.com/Cornell-RelaxML/qtip) (Tseng et al., 2024): a Viterbi search
 encodes each row against a tail-biting trellis, so neighbouring weights share state and
-the effective codebook is exponentially larger than a flat lookup at the same rate. It is
-GLQ's best format at **2–4 bpw** — at 2 bpw it clearly beats the e8p codebook
-(SmolLM3-3B PPL 11.74 vs 13.21) — and at 4 bpw its decode is GLQ's fastest
+the effective codebook is exponentially larger than a flat lookup at the same rate. In our
+SmolLM3-3B tests it is GLQ's best format at **2–4 bpw** — at 2 bpw it clearly beats the
+e8p codebook (PPL 11.74 vs 13.21) — and at 4 bpw its decode is GLQ's fastest
 (single-stream at bf16 parity, see
 [the measured table](#trellis-3inst-vs-bf16-vs-nvfp4-measured)).
 
@@ -775,8 +801,9 @@ codebook, and accumulates the matmul directly against indices.
 | **Shard-batched output RHT** | trellis, fused QKV / gate-up | per-shard output transforms in one `grid.y` launch (v0.7.1) |
 | **Triton fallback** | no `ninja`, or `n_pad > 32 768` | always available |
 
-**Bit-exact determinism.** Every kernel uses a scratch-buffer + fixed-
-order reduction instead of `atomicAdd` across k-splits, so running the
+**Bit-exact determinism.** Every kernel reduces partial sums in a fixed
+order (scratch-buffer split-K or in-block reduction) instead of
+`atomicAdd` across k-splits, so running the
 same prompt at B=1 decode or B=8 prefill produces identical logits
 across runs — required for reproducible lm-eval scoring and
 on-policy RL rollouts.
