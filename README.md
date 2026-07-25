@@ -152,10 +152,8 @@ Trellis constraints differ from the shell/e8p paths: **integer bpw only
 than silently rounded — and the fused kernel needs layer dims with
 `out % 32 == 0`, `in % 64 == 0` (standard transformer shapes qualify).
 Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
-automatically — the PLE table quantizes via the shell codebook. This PLE
-routing merged after 0.7.1, so for these models install glq from `main`
-(or the next release); with 0.7.1, `--codebook trellis` on E2B/E4B stops
-with an error. Use `--streaming` for Gemma-4 family models.
+automatically — the PLE table quantizes via the shell codebook (requires
+glq ≥ 0.7.2). Use `--streaming` for Gemma-4 family models.
 See [Trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq)
 for details.
 
