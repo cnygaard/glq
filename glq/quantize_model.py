@@ -1766,12 +1766,15 @@ def quantize(
         ple_inv_rs_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
         ple_sqnr_chunks = []
         # E8RHTEmbedding decodes the PLE per-row via the shell E8 lookup (no e8p
-        # tensor-core decode path), so quantize it with a shell codebook even
-        # under --codebook e8p — otherwise the e8p path stores 'Qidxs_e8p' and
-        # the shell-key assembly below KeyErrors. Shell/relaxed runs reuse the
-        # global codebook unchanged (it is already shell-decodable).
+        # tensor-core or trellis decode path), so quantize it with a shell codebook
+        # under --codebook e8p AND trellis — the e8p path stores 'Qidxs_e8p' (the
+        # shell-key assembly below KeyErrors) and the trellis path asserts on the
+        # padded full-Hadamard RHT its no-padding layout forbids. Shell/relaxed
+        # runs reuse the global codebook unchanged (it is already shell-decodable).
         ple_codebook = (E8ShellCodebook(device=device)
-                        if getattr(codebook, 'is_e8p', False) else codebook)
+                        if (getattr(codebook, 'is_e8p', False)
+                            or type(codebook).__name__ == "TrellisCodebook")
+                        else codebook)
         for r0 in range(0, vocab_size_ple, chunk_rows):
             r1 = min(r0 + chunk_rows, vocab_size_ple)
             chunk = ple_w[r0:r1].to(device)

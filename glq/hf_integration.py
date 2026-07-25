@@ -423,11 +423,11 @@ def _resolve_shell_codebook(pretrained_path):
 
 def _embedding_codebooks(cb_type, linear_cb, linear_cb2, shell_cb):
     """Codebooks for E8RHTEmbedding. Embeddings always decode via the shell E8
-    lookup (no e8p tensor-core path), and an e8p model's PLE is shell-quantized
-    (see quantize_model), so under ``e8p`` use the shell codebook here — with a
-    full-shell stage-2, since the PLE is quantized at 4 bpw (two full-shell
-    stages). Shell/relaxed models reuse the same codebook as their linears."""
-    if cb_type == "e8p":
+    lookup (no e8p tensor-core / trellis path), and an e8p or trellis model's
+    PLE is shell-quantized (see quantize_model), so under those use the shell
+    codebook here — with a full-shell stage-2, since the PLE is quantized at
+    4 bpw (two full-shell stages). Shell/relaxed models reuse their linears'."""
+    if cb_type in ("e8p", "trellis"):
         return shell_cb, shell_cb
     return linear_cb, linear_cb2
 
@@ -584,12 +584,12 @@ class GLQQuantizer(HfQuantizer):
         if isinstance(compute_dtype, str):
             compute_dtype = getattr(torch, compute_dtype, torch.bfloat16)
 
-        # E8RHTEmbedding always decodes via the shell E8 lookup; under e8p the
-        # PLE is shell-quantized (see quantize_model), so give embeddings a shell
-        # codebook (full-shell stage-2 for the 4bpw PLE) while the linears keep
-        # the e8p codebook. Shell/relaxed models reuse the same codebook for both.
+        # E8RHTEmbedding always decodes via the shell E8 lookup; under e8p and
+        # trellis the PLE is shell-quantized (see quantize_model), so give
+        # embeddings a shell codebook (full-shell stage-2 for the 4bpw PLE) while
+        # the linears keep their own. Shell/relaxed models reuse one codebook.
         emb_shell_cb = (_resolve_shell_codebook(pretrained_path)
-                        if cb_type == "e8p" else None)
+                        if cb_type in ("e8p", "trellis") else None)
         emb_cb, emb_cb2 = _embedding_codebooks(cb_type, codebook, codebook2, emb_shell_cb)
         for module in model.modules():
             if isinstance(module, E8RHTEmbedding):
