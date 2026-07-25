@@ -21,6 +21,8 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/extension.h>
 
+#include "glq_fht.cuh"
+
 #define FULL_MASK 0xffffffff
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -1779,14 +1781,23 @@ __global__ void glq_input_rht_kernel(
     }
     __syncthreads();
 
-    // Step 2: FHT butterfly stages
+    // Step 2: FHT butterfly stages.
+    // RS4a: stages at distance 1..16 run as warp shuffles in place on buf
+    // (needs n_pad pow2 ≥ 32 so active threads form whole warps); smem
+    // stages resume at k0 and the ping-pong parity uses the REMAINING count.
+    int k0 = 0;
+    if (n_pad >= 32) {
+        glq_fht_shuffle_low<16>(buf, n_pad);
+        __syncthreads();
+        k0 = 5;
+    }
     if (use_single_buffer) {
         // Single-buffer: read all elements into registers, sync, write back.
         // n_pad=16384, n_threads=1024 → 16 elements per thread in registers.
         float reg[16];  // max elements per thread
         int elems_per_thread = n_pad / n_threads;
 
-        for (int k = 0; k < log_n; k++) {
+        for (int k = k0; k < log_n; k++) {
             // Phase 1: all threads read and compute into registers
             for (int e = 0; e < elems_per_thread; e++) {
                 int i = tid + e * n_threads;
@@ -1809,19 +1820,13 @@ __global__ void glq_input_rht_kernel(
         float* buf_b = smem + n_pad;
         float* src = buf;
         float* dst = buf_b;
-        for (int k = 0; k < log_n; k++) {
-            for (int i = tid; i < n_pad; i += n_threads) {
-                int partner = i ^ (1 << k);
-                float my_val = src[i];
-                float partner_val = src[partner];
-                bool lo = (i & (1 << k)) == 0;
-                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-            }
+        for (int k = k0; k < log_n; k++) {
+            glq_fht_stage_smem(src, dst, 1 << k, n_pad);
             __syncthreads();
             float* tmp = src; src = dst; dst = tmp;
         }
-        // If odd number of stages, result is in buf_b — copy to buf
-        if (log_n % 2 == 1) {
+        // If odd number of smem stages, result is in buf_b — copy to buf
+        if ((log_n - k0) % 2 == 1) {
             for (int i = tid; i < n_pad; i += n_threads) buf[i] = buf_b[i];
             __syncthreads();
         }
@@ -2023,11 +2028,17 @@ __global__ void glq_output_rht_kernel(
     }
     __syncthreads();
 
-    // Step 2: FHT butterfly stages
+    // Step 2: FHT butterfly stages (RS4a low-stage shuffle, see input kernel)
+    int k0 = 0;
+    if (m_pad >= 32) {
+        glq_fht_shuffle_low<16>(buf, m_pad);
+        __syncthreads();
+        k0 = 5;
+    }
     if (use_single_buffer) {
         float reg[16];
         int elems_per_thread = m_pad / n_threads;
-        for (int k = 0; k < log_m; k++) {
+        for (int k = k0; k < log_m; k++) {
             for (int e = 0; e < elems_per_thread; e++) {
                 int i = tid + e * n_threads;
                 int partner = i ^ (1 << k);
@@ -2046,18 +2057,12 @@ __global__ void glq_output_rht_kernel(
         float* buf_b = smem + m_pad;
         float* src = buf;
         float* dst = buf_b;
-        for (int k = 0; k < log_m; k++) {
-            for (int i = tid; i < m_pad; i += n_threads) {
-                int partner = i ^ (1 << k);
-                float my_val = src[i];
-                float partner_val = src[partner];
-                bool lo = (i & (1 << k)) == 0;
-                dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-            }
+        for (int k = k0; k < log_m; k++) {
+            glq_fht_stage_smem(src, dst, 1 << k, m_pad);
             __syncthreads();
             float* tmp = src; src = dst; dst = tmp;
         }
-        if (log_m % 2 == 1) {
+        if ((log_m - k0) % 2 == 1) {
             for (int i = tid; i < m_pad; i += n_threads) buf[i] = buf_b[i];
             __syncthreads();
         }
@@ -2117,21 +2122,22 @@ __global__ void glq_input_rht_multiblock_kernel(
     __syncthreads();
 
     // Step 2: FHT butterfly — double-buffer (buf_b is after buf, max_bs elems apart)
+    // RS4a: low 5 stages as warp shuffles when bs ≥ 32 (sub-blocks can be tiny)
+    int k0 = 0;
+    if (bs >= 32) {
+        glq_fht_shuffle_low<8>(buf, bs);
+        __syncthreads();
+        k0 = 5;
+    }
     float* buf_b = smem + bs;
     float* src = buf;
     float* dst = buf_b;
-    for (int k = 0; k < log_bs; k++) {
-        for (int i = tid; i < bs; i += n_threads) {
-            int partner = i ^ (1 << k);
-            float my_val = src[i];
-            float partner_val = src[partner];
-            bool lo = (i & (1 << k)) == 0;
-            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-        }
+    for (int k = k0; k < log_bs; k++) {
+        glq_fht_stage_smem(src, dst, 1 << k, bs);
         __syncthreads();
         float* tmp = src; src = dst; dst = tmp;
     }
-    if (log_bs % 2 == 1) {
+    if ((log_bs - k0) % 2 == 1) {
         for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
         __syncthreads();
     }
@@ -2162,7 +2168,10 @@ __global__ void glq_output_rht_multiblock_kernel(
     int col_offset = meta.x;
     int bs = meta.y;
     int log_bs = meta.z;
-    float rsqrt_bs = rsqrtf((float)bs);
+    // meta.w: optional bit-cast HOST 1.0f/sqrtf(bs) override (S4b shard batching —
+    // single-block shards historically normalize with the host value, multi-block
+    // sub-blocks with in-kernel rsqrtf). 0 = no override; all pre-S4b metas carry 0.
+    float rsqrt_bs = (meta.w != 0) ? __int_as_float(meta.w) : rsqrtf((float)bs);
 
     float* buf = smem;
     for (int i = tid; i < bs; i += n_threads) {
@@ -2170,21 +2179,21 @@ __global__ void glq_output_rht_multiblock_kernel(
     }
     __syncthreads();
 
+    int k0 = 0;
+    if (bs >= 32) {
+        glq_fht_shuffle_low<8>(buf, bs);
+        __syncthreads();
+        k0 = 5;
+    }
     float* buf_b = smem + bs;
     float* src = buf;
     float* dst = buf_b;
-    for (int k = 0; k < log_bs; k++) {
-        for (int i = tid; i < bs; i += n_threads) {
-            int partner = i ^ (1 << k);
-            float my_val = src[i];
-            float partner_val = src[partner];
-            bool lo = (i & (1 << k)) == 0;
-            dst[i] = lo ? (my_val + partner_val) : (partner_val - my_val);
-        }
+    for (int k = k0; k < log_bs; k++) {
+        glq_fht_stage_smem(src, dst, 1 << k, bs);
         __syncthreads();
         float* tmp = src; src = dst; dst = tmp;
     }
-    if (log_bs % 2 == 1) {
+    if ((log_bs - k0) % 2 == 1) {
         for (int i = tid; i < bs; i += n_threads) buf[i] = buf_b[i];
         __syncthreads();
     }
@@ -2862,6 +2871,48 @@ void glq_output_rht_blockdiag_cuda(
             col_offset += bs;
         }
     }
+}
+
+/* S4b: output RHT over the SHARDS of a fused linear (qkv / gate_up) in ONE launch.
+ * shard_meta rows are the concatenation of every shard's sub-block metas with GLOBAL
+ * column offsets (trellis never pads, so y_rht offsets == output offsets); meta.w
+ * carries the bit-cast host 1/sqrtf(bs) for single-block shards (see kernel comment),
+ * which makes this launch bit-exact vs the sequential per-shard path it replaces.
+ * grid = (B, total_sub_blocks) — the per-shard latency lumps run concurrently. */
+void glq_output_rht_shards_cuda(
+    torch::Tensor y_rht,       // (B, total_m) fp32 — per-shard y_rht segments, contiguous
+    torch::Tensor su,          // (total_m,) fp16 — concatenated per-shard sign vectors
+    torch::Tensor y,           // (B, total_out) fp16 — pre-allocated output
+    int64_t out_features,      // total_out (== total_m for trellis)
+    torch::Tensor shard_meta,  // (rows, 4) int32 GPU: {global_offset, bs, log_bs, rsqrt_bits}
+    int64_t max_bs
+) {
+    CHECK_INPUT(y_rht);
+    CHECK_INPUT(su);
+    CHECK_INPUT(y);
+    TORCH_CHECK(y_rht.scalar_type() == torch::kFloat32, "y_rht must be fp32");
+    TORCH_CHECK(y.scalar_type() == torch::kFloat16, "y must be fp16");
+    TORCH_CHECK(shard_meta.is_cuda() && shard_meta.scalar_type() == torch::kInt32
+                    && shard_meta.dim() == 2 && shard_meta.size(1) == 4,
+                "shard_meta must be a (rows, 4) int32 CUDA tensor");
+    TORCH_CHECK(max_bs > 0 && max_bs <= 8192 && (max_bs & (max_bs - 1)) == 0,
+                "shard-batched output RHT needs pow2 max_bs <= 8192, got ", max_bs);
+    int B = y_rht.size(0);
+    int rows = shard_meta.size(0);
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    int threads = min((int)max_bs, 1024);
+    int smem = 2 * (int)max_bs * (int)sizeof(float);
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(glq_output_rht_multiblock_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    dim3 grid(B, rows);
+    glq_output_rht_multiblock_kernel<<<grid, threads, smem, stream>>>(
+        y_rht.data_ptr<float>(),
+        (const half*)su.data_ptr<c10::Half>(),
+        (half*)y.data_ptr<c10::Half>(),
+        (int)out_features, (int)y_rht.size(1), (int)y.size(1),
+        (const int4*)shard_meta.data_ptr<int32_t>());
 }
 
 

@@ -345,6 +345,27 @@ def _ensure_registered():
                       cuda.glq_fused_linear_trellis_3inst_cuda, dispatch_key)
         _glq_lib._register_fake("fused_linear_trellis_3inst", _fused_linear_trellis_3inst_fake)
 
+    # S4b — shard-batched output RHT: per-shard fused calls stop at the y_rht seam and
+    # deposit into a shared (B, total_m) fp32 buffer; ONE output-RHT launch then spans
+    # every sub-block of every shard (qkv 3->1, gate/up 2->1 launches). Mutating ops
+    # (Tensor(a!) ... -> ()) like decompress_e81b_packed above.
+    if hasattr(cuda, "glq_fused_linear_trellis_3inst_yrht_cuda"):
+        _glq_lib.define(
+            "fused_linear_trellis_3inst_yrht(Tensor x, Tensor sv, Tensor trellis_packed, "
+            "Tensor blocks_n, Tensor blocks_n_meta, float wscale, "
+            "int in_features, int n_pad, int m_pad, "
+            "Tensor(a!) y_rht_out, int col) -> ()")
+        _glq_lib.impl("fused_linear_trellis_3inst_yrht",
+                      cuda.glq_fused_linear_trellis_3inst_yrht_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_linear_trellis_3inst_yrht",
+                                _fused_linear_trellis_3inst_yrht_fake)
+    if hasattr(cuda, "glq_output_rht_shards_cuda"):
+        _glq_lib.define(
+            "output_rht_shards(Tensor y_rht, Tensor su, Tensor(a!) y, "
+            "int out_features, Tensor shard_meta, int max_bs) -> ()")
+        _glq_lib.impl("output_rht_shards", cuda.glq_output_rht_shards_cuda, dispatch_key)
+        _glq_lib._register_fake("output_rht_shards", _output_rht_shards_fake)
+
 
 # --- Fake implementations for torch.compile tracing ---
 
@@ -362,6 +383,20 @@ def _fused_linear_trellis_3inst_fake(x, sv, su, trellis_packed,
     # Same contract as _fused_linear_trellis_fake minus the tlut arg (lookup-free variant);
     # test_fused_linear_trellis_3inst_fake_shape pins the positional mirror.
     return torch.empty((x.shape[0], out_features), dtype=torch.float16, device=x.device)
+
+
+def _fused_linear_trellis_3inst_yrht_fake(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                                          wscale, in_features, n_pad, m_pad,
+                                          y_rht_out, col):
+    # Mutating op: writes y_rht_out[:, col:col+m_pad] in place, returns nothing.
+    # test_fused_linear_trellis_3inst_yrht_fake_shape pins the positional mirror.
+    return None
+
+
+def _output_rht_shards_fake(y_rht, su, y, out_features, shard_meta, max_bs):
+    # Mutating op: writes y in place, returns nothing.
+    # test_output_rht_shards_fake_shape pins the positional mirror.
+    return None
 
 def _dequant_matvec_fake(x, qidxs, codebook, wscale, qidxs2, codebook2, inv_resid_scale, codebook_abs):
     M = qidxs.shape[0]

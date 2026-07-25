@@ -155,6 +155,24 @@ def test_cuda_matmul_is_deterministic(K):
     assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("K", KS)
+def test_cuda_store_folds_wscale_bitexact(K):
+    """RS1: in-store `reduced * wscale` == torch-side scale of the unscaled output, bit-exact
+    (same fp32 operands). Default wscale=1.0 keeps every existing call site unchanged."""
+    m, n = 256, 512
+    cb, packed, tlut16 = _quantized(m, n, seed=24, K=K)
+    torch.manual_seed(9)
+    x = (torch.randn(n, device="cuda") * 0.5).to(torch.float16)
+    w = 0.01371
+    a = _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n, w)
+    b = _ext().glq_decode_matvec_trellis_cuda(x, packed, tlut16, m, n) * w
+    assert torch.equal(a, b)
+    xb = (torch.randn(5, n, device="cuda") * 0.5).to(torch.float16)
+    am = _ext().glq_decode_matmul_trellis_cuda(xb, packed, tlut16, m, n, w)
+    bm = _ext().glq_decode_matmul_trellis_cuda(xb, packed, tlut16, m, n) * w
+    assert torch.equal(am, bm)
+
+
 # ---------------------------------------------------------------------------
 # GATE 3: the fused linear op == the pure-torch S0 reference (RHT in/out bracket)
 # ---------------------------------------------------------------------------

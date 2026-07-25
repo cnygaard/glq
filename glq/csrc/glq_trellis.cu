@@ -44,6 +44,8 @@
 
 #include <mutex>
 
+#include "glq_fht.cuh"
+
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(x)       TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #endif
@@ -256,14 +258,86 @@ __device__ inline void tr_decode_regw(uint32_t reg_c, uint32_t reg_c2, uint32_t 
 /* ── Fused B=1 GEMV: bit-unpack → trellis decode → tensor-core mma → block reduce ──
  * out (m,) fp32 = W (m,k) @ x (k,). Each block owns a disjoint m-range and reduces across
  * its 32 warps in smem — no atomics, no cross-block split-K → bit-stable output. */
-template <uint32_t R, bool IS_3INST = false>
+/* FUSE_IN (RS2b): compute the input RHT *inside* every block instead of a separate 1-block
+ * kernel the whole GPU idles behind (Phase-0 ncu: input_rht = grid(1,1,1), SM 0.2%, on 188
+ * SMs). Each block redundantly runs the same fp32 butterfly on x in its own smem — ~µs of
+ * overlapped work replacing a serialized kernel + fp32 global round-trip + fp16-cast launch.
+ * B=1 (matvec) only: a matmul block serves an 8-token tile and would redo 8 FHTs. When
+ * FUSE_IN, `x` points at the RAW fp16 input (in_features), `sv`/`rsqrt_n` drive the
+ * transform, and the smem layout is [fp32 ping | fp32 pong | half2 result] (2·k·4 + k·2 B).
+ * The butterfly is the bit-exact transliteration pinned by test_rs2a_* (ascending distance,
+ * lo ? a+b : b−a, single ×rsqrt_n then RN cast — identical fp32 op order to
+ * glq_input_rht_kernel + torch .to(fp16)). */
+template <uint32_t R, bool IS_3INST = false, bool FUSE_IN = false>
 __global__ static void __launch_bounds__(TR_BLOCK_SIZE, 1)
 glq_trellis_matvec_kernel(float *__restrict__ out,
                           const uint32_t *__restrict__ compressed,
                           const half2 *__restrict__ x,
                           const half2 *__restrict__ codebook,
-                          uint32_t m, uint32_t k) {
+                          uint32_t m, uint32_t k, float wscale,
+                          const half *__restrict__ sv = nullptr,
+                          float rsqrt_n = 0.0f, uint32_t in_features = 0,
+                          const int4 *__restrict__ block_meta = nullptr,
+                          uint32_t num_blocks = 1) {
     extern __shared__ __align__(16) half2 smem_codebook[];   // unused (0 bytes) when IS_3INST
+
+    const half2 *xsrc = x;                  // fragment source (global x, or smem under FUSE_IN)
+    if constexpr (FUSE_IN) {
+        static_assert(IS_3INST, "FUSE_IN is only instantiated for the 3inst (no-tlut) variant");
+        // Unified single-/multi-block layout: [persist: k fp32 | scratch: max_bs fp32].
+        // Each (sub-)block ping-pongs persist<->scratch through its butterfly; the fp16
+        // result then reuses SCRATCH as half2 (k*2 B <= max_bs*4 B always, because the
+        // leading pow2 of a binary decomposition is >= k/2). RS3 sub-blocks come from
+        // block_meta (int4 {offset, bs, log_bs, 0}, same as the multiblock RHT kernel).
+        const half *x_raw = reinterpret_cast<const half *>(x);
+        float *persist = reinterpret_cast<float *>(smem_codebook);
+        float *scratch = persist + k;                       // host sizes smem to k + max_bs
+        half2 *xh = reinterpret_cast<half2 *>(scratch);
+        for (uint32_t i = threadIdx.x; i < k; i += TR_BLOCK_SIZE) {
+            float xv = (i < in_features) ? __half2float(x_raw[i]) : 0.0f;
+            persist[i] = xv * __half2float(sv[i]);
+        }
+        __syncthreads();
+        const uint32_t nb = (num_blocks == 0) ? 1u : num_blocks;
+        for (uint32_t blk = 0; blk < nb; ++blk) {
+            const uint32_t off = (nb == 1) ? 0u : (uint32_t)block_meta[blk].x;
+            const uint32_t bs  = (nb == 1) ? k  : (uint32_t)block_meta[blk].y;
+            // RS4a: distance 1..16 as warp shuffles in place (bs pow2 ≥ 32 —
+            // trellis sub-blocks are ≥ 256); smem ping-pong resumes at h0.
+            // The pointer-tracked copy-back below is already parity-agnostic.
+            uint32_t h0 = 1;
+            if (bs >= 32) {
+                glq_fht_shuffle_low<8>(persist + off, (int)bs);
+                __syncthreads();
+                h0 = 32;
+            }
+            float *src = persist + off, *dst = scratch;
+            for (uint32_t h = h0; h < bs; h <<= 1) {
+                glq_fht_stage_smem(src, dst, (int)h, (int)bs);
+                __syncthreads();
+                float *t = src; src = dst; dst = t;
+            }
+            if (src != persist + off) {       // odd smem stage count: result in scratch
+                for (uint32_t i = threadIdx.x; i < bs; i += TR_BLOCK_SIZE)
+                    (persist + off)[i] = src[i];
+                __syncthreads();
+            }
+        }
+        // Normalize + RN-cast per (sub-)block. Single-block multiplies the HOST
+        // 1.0f/sqrtf(k) (bit-matches glq_input_rht_kernel); sub-blocks multiply the
+        // in-kernel rsqrtf(bs) (bit-matches glq_input_rht_multiblock_kernel). half2
+        // pairs never straddle sub-blocks (bs >= 256, offsets even).
+        for (uint32_t blk = 0; blk < nb; ++blk) {
+            const uint32_t off = (nb == 1) ? 0u : (uint32_t)block_meta[blk].x;
+            const uint32_t bs  = (nb == 1) ? k  : (uint32_t)block_meta[blk].y;
+            const float r = (nb == 1) ? rsqrt_n : rsqrtf((float)bs);
+            for (uint32_t i = threadIdx.x; i < bs / 2; i += TR_BLOCK_SIZE)
+                xh[off / 2 + i] = __floats2half2_rn(persist[off + 2 * i] * r,
+                                                    persist[off + 2 * i + 1] * r);
+        }
+        __syncthreads();
+        xsrc = xh;
+    }
 
     const uint32_t laneId = threadIdx.x % TR_WARP_SIZE;
     const uint32_t warpId = threadIdx.x / TR_WARP_SIZE;
@@ -331,8 +405,11 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
 
             if (ki % 2 == 0) {
                 __syncwarp();
+                // FUSE_IN reads the in-block FHT result from SHARED memory — a plain load
+                // (tr_ld_x is ld.global and would be illegal on an smem pointer).
                 x_buf[warpId][laneId / 8][laneId % 4].u32[(laneId % 8) / 4] =
-                    tr_ld_x(reinterpret_cast<const uint32_t *>(x) + x_idx);
+                    FUSE_IN ? reinterpret_cast<const uint32_t *>(xsrc)[x_idx]
+                            : tr_ld_x(reinterpret_cast<const uint32_t *>(xsrc) + x_idx);
                 __syncwarp();
                 x_idx += x_idx_step;
             }
@@ -370,8 +447,9 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
                 }
             }
             // Upstream prefetches unconditionally; bound it so we never touch x past its end.
-            if (ki % 2 == 0 && (x_idx + x_idx_step * 4) < x_half2)
-                asm("prefetch.global.L1 [%0];" ::"l"(x + x_idx + x_idx_step * 4));
+            // (Skipped under FUSE_IN — xsrc is shared memory, global prefetch doesn't apply.)
+            if (!FUSE_IN && ki % 2 == 0 && (x_idx + x_idx_step * 4) < x_half2)
+                asm("prefetch.global.L1 [%0];" ::"l"(xsrc + x_idx + x_idx_step * 4));
         }
 
         // m16n8k16 C-fragment: column 0 lives in c0/c2 of the lanes with laneId%4 == 0.
@@ -387,7 +465,9 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
             float reduced = 0.0f;
             for (uint32_t warpi = 0; warpi < TR_WARPS; warpi++)
                 reduced += reduce_gather[warpi][pi][laneId % 16];
-            out[(tileIdM * 2) * TR_MMA_M + laneId] = reduced;
+            // RS1: fold the ×wscale that used to be a separate elementwise kernel into the
+            // store — bit-exact (same fp32 operands), removes one launch per linear.
+            out[(tileIdM * 2) * TR_MMA_M + laneId] = reduced * wscale;
         }
         if (m_per_block > 1) __syncthreads();
         tileIdM += 1;
@@ -423,7 +503,7 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
                           const uint32_t *__restrict__ compressed,
                           const half2 *__restrict__ x,
                           const half2 *__restrict__ codebook,
-                          uint32_t m, uint32_t k, uint32_t B) {
+                          uint32_t m, uint32_t k, uint32_t B, float wscale) {
     extern __shared__ __align__(16) half2 smem_codebook[];
 
     const uint32_t laneId = threadIdx.x % TR_WARP_SIZE;
@@ -546,7 +626,8 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
                     float reduced = 0.0f;
                     for (uint32_t warpi = 0; warpi < TR_WARPS; warpi++)
                         reduced += reduce_gather[warpi][pi][laneId % 16];
-                    out[(size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId] = reduced;
+                    // RS1: ×wscale folded into the store (see matvec note).
+                    out[(size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId] = reduced * wscale;
                 }
             }
             __syncthreads();
@@ -682,6 +763,14 @@ void tr_init_once() {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
         cudaFuncSetAttribute(glq_trellis_decompress_kernel<4>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, TR_SMEM_BYTES);
+        // FUSE_IN (3inst matvec) smem = 2·k·4 + k·2 bytes; opt in up to k=8192 (81920 B) so
+        // the >48KB shapes launch. One-time here — never on the steady (capturable) path.
+        cudaFuncSetAttribute((const void *)glq_trellis_matvec_kernel<2, true, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 81920);
+        cudaFuncSetAttribute((const void *)glq_trellis_matvec_kernel<3, true, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 81920);
+        cudaFuncSetAttribute((const void *)glq_trellis_matvec_kernel<4, true, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 81920);
     });
 }
 
@@ -732,9 +821,10 @@ torch::Tensor glq_decompress_trellis_cuda(torch::Tensor trellis_packed, torch::T
     return W;
 }
 
-/* Fused B=1 GEMV: out (m,) fp32 = W(m,k) @ x(k,), weights never materialized. */
+/* Fused B=1 GEMV: out (m,) fp32 = wscale * (W(m,k) @ x(k,)), weights never materialized. */
 torch::Tensor glq_decode_matvec_trellis_cuda(torch::Tensor x, torch::Tensor trellis_packed,
-                                             torch::Tensor tlut, int64_t m, int64_t k) {
+                                             torch::Tensor tlut, int64_t m, int64_t k,
+                                             double wscale) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     CHECK_INPUT(tlut);
@@ -755,7 +845,7 @@ torch::Tensor glq_decode_matvec_trellis_cuda(torch::Tensor x, torch::Tensor trel
 
 #define TR_LAUNCH_MATVEC(RBITS)                                                        \
     glq_trellis_matvec_kernel<RBITS><<<tr_grid_x(), TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>( \
-        op, cp, xp, cb, (uint32_t)m, (uint32_t)k)
+        op, cp, xp, cb, (uint32_t)m, (uint32_t)k, (float)wscale)
     if (R == 2)      { TR_LAUNCH_MATVEC(2); }
     else if (R == 3) { TR_LAUNCH_MATVEC(3); }
     else             { TR_LAUNCH_MATVEC(4); }
@@ -763,9 +853,10 @@ torch::Tensor glq_decode_matvec_trellis_cuda(torch::Tensor x, torch::Tensor trel
     return out;
 }
 
-/* Batched GEMM: out (B, m) fp32 = x (B, k) @ W(m,k).T, weights never materialized. */
+/* Batched GEMM: out (B, m) fp32 = wscale * (x (B, k) @ W(m,k).T), weights never materialized. */
 torch::Tensor glq_decode_matmul_trellis_cuda(torch::Tensor x, torch::Tensor trellis_packed,
-                                             torch::Tensor tlut, int64_t m, int64_t k) {
+                                             torch::Tensor tlut, int64_t m, int64_t k,
+                                             double wscale) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     CHECK_INPUT(tlut);
@@ -790,7 +881,7 @@ torch::Tensor glq_decode_matmul_trellis_cuda(torch::Tensor x, torch::Tensor trel
 
 #define TR_LAUNCH_MATMUL(RBITS)                                                        \
     glq_trellis_matmul_kernel<RBITS><<<grid, TR_BLOCK_SIZE, TR_SMEM_BYTES, stream>>>(  \
-        op, cp, xp, cb, (uint32_t)m, (uint32_t)k, (uint32_t)B)
+        op, cp, xp, cb, (uint32_t)m, (uint32_t)k, (uint32_t)B, (float)wscale)
     if (R == 2)      { TR_LAUNCH_MATMUL(2); }
     else if (R == 3) { TR_LAUNCH_MATMUL(3); }
     else             { TR_LAUNCH_MATMUL(4); }
@@ -854,12 +945,12 @@ torch::Tensor glq_fused_linear_trellis_cuda(
     torch::Tensor y_rht;
     if (B == 1 && !force_dense) {
         auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
-        auto yv = glq_decode_matvec_trellis_cuda(xh, trellis_packed, tlut, m_pad, n_pad);
-        y_rht = (yv * (float)wscale).view({1, (long)m_pad}).contiguous();
+        // RS1: ×wscale happens in the kernel store — no separate elementwise launch.
+        auto yv = glq_decode_matvec_trellis_cuda(xh, trellis_packed, tlut, m_pad, n_pad, wscale);
+        y_rht = yv.view({1, (long)m_pad});
     } else if (B <= batch_max && !force_dense) {
         auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
-        auto yb = glq_decode_matmul_trellis_cuda(xh, trellis_packed, tlut, m_pad, n_pad);
-        y_rht = (yb * (float)wscale).contiguous();                       // (B, m_pad) fp32
+        y_rht = glq_decode_matmul_trellis_cuda(xh, trellis_packed, tlut, m_pad, n_pad, wscale);
     } else {
         // Prefill: decompress ONCE to fp16 (not fp32 — halves the transient) and let cuBLAS
         // do the GEMM. W is a transient per-layer buffer from the caching allocator; the
@@ -907,7 +998,8 @@ torch::Tensor glq_decompress_trellis_3inst_cuda(torch::Tensor trellis_packed,
 }
 
 torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
-                                                   int64_t m, int64_t k) {
+                                                   int64_t m, int64_t k, double wscale,
+                                                   c10::optional<torch::Tensor> out_opt) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
@@ -916,7 +1008,14 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
     tr_check_shape(m, k, trellis_packed, R);
     at::DeviceGuard guard(x.device());
 
-    auto out = torch::empty({m}, torch::dtype(torch::kFloat32).device(x.device()));
+    // S4b: an (m,) fp32 contiguous view (e.g. a shared y_rht row slice) may be supplied
+    // so the store lands in place — no extra copy between decode and the shards RHT.
+    auto out = out_opt.has_value()
+        ? *out_opt
+        : torch::empty({m}, torch::dtype(torch::kFloat32).device(x.device()));
+    TORCH_CHECK(out.is_contiguous() && out.numel() == m
+                    && out.scalar_type() == torch::kFloat32,
+                "out must be a contiguous (m,) fp32 tensor");
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
     const half2 *xp = (const half2 *)x.data_ptr<c10::Half>();
@@ -924,7 +1023,7 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 
 #define TR_LAUNCH_MATVEC3(RBITS)                                                       \
     glq_trellis_matvec_kernel<RBITS, true><<<tr_grid_x(), TR_BLOCK_SIZE, 0, stream>>>( \
-        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k)
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (float)wscale)
     if (R == 2)      { TR_LAUNCH_MATVEC3(2); }
     else if (R == 3) { TR_LAUNCH_MATVEC3(3); }
     else             { TR_LAUNCH_MATVEC3(4); }
@@ -932,8 +1031,72 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
     return out;
 }
 
+/* RS2b/RS3 — fused-input B=1 GEMV: takes the RAW (pre-RHT) fp16 x and performs the input
+ * RHT inside every matvec block (see the FUSE_IN kernel note). out (m,) fp32 =
+ * wscale * (W(m,k) @ blockRHT(x·sv)). Single-block pow2 shapes use the host 1/sqrtf(k);
+ * block-diagonal shapes pass blocks_n_meta (int4 {offset,bs,log_bs,0}, GPU) + num_blocks +
+ * max_bs and normalize per sub-block with rsqrtf(bs), matching the multiblock RHT kernel. */
+torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
+    torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
+    int64_t m, int64_t k, int64_t in_features, double wscale,
+    c10::optional<torch::Tensor> blocks_n_meta_opt, int64_t num_blocks, int64_t max_bs,
+    c10::optional<torch::Tensor> out_opt) {
+    // optional (not a default-constructed Tensor): pybind cannot round-trip an undefined
+    // at::Tensor as a py::arg default — single-block callers simply omit it.
+    torch::Tensor blocks_n_meta =
+        blocks_n_meta_opt.has_value() ? *blocks_n_meta_opt : torch::Tensor();
+    CHECK_INPUT(x_raw);
+    CHECK_INPUT(sv);
+    CHECK_INPUT(trellis_packed);
+    TORCH_CHECK(x_raw.scalar_type() == torch::kFloat16, "x_raw must be fp16");
+    TORCH_CHECK(x_raw.numel() == in_features, "x_raw must have in_features elements");
+    TORCH_CHECK(sv.scalar_type() == torch::kFloat16 && sv.numel() == k, "sv must be (k,) fp16");
+    const bool multiblock = num_blocks > 1;
+    if (multiblock) {
+        TORCH_CHECK(blocks_n_meta.is_cuda() && blocks_n_meta.numel() >= num_blocks * 4,
+                    "block-diag FUSE_IN needs GPU blocks_n_meta");
+        TORCH_CHECK(max_bs > 0 && max_bs <= 8192 && (max_bs & (max_bs - 1)) == 0,
+                    "block-diag FUSE_IN needs pow2 max_bs <= 8192, got ", max_bs);
+    } else {
+        TORCH_CHECK((k & (k - 1)) == 0 && k <= 8192,
+                    "FUSE_IN needs a single-block pow2 RHT dim <= 8192, got ", k);
+        max_bs = k;
+    }
+    int R = tr_bits_from_packed(trellis_packed);
+    tr_check_shape(m, k, trellis_packed, R);
+    at::DeviceGuard guard(x_raw.device());
+    tr_init_once();
+
+    // S4b: optional caller-provided (m,) fp32 contiguous destination (shared y_rht slice).
+    auto out = out_opt.has_value()
+        ? *out_opt
+        : torch::empty({m}, torch::dtype(torch::kFloat32).device(x_raw.device()));
+    TORCH_CHECK(out.is_contiguous() && out.numel() == m
+                    && out.scalar_type() == torch::kFloat32,
+                "out must be a contiguous (m,) fp32 tensor");
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
+    const half2 *xp = (const half2 *)x_raw.data_ptr<c10::Half>();   // RAW fp16 under FUSE_IN
+    const half *svp = (const half *)sv.data_ptr<c10::Half>();
+    const int4 *bm = multiblock ? (const int4 *)blocks_n_meta.data_ptr<int32_t>() : nullptr;
+    float *op = out.data_ptr<float>();
+    const float rsqrt_n = 1.0f / sqrtf((float)k);                   // matches single-block RHT
+    const size_t smem = (size_t)k * 4 + (size_t)max_bs * 4;         // persist + scratch/half2
+    TORCH_CHECK(smem <= 81920, "FUSE_IN smem ", smem, " exceeds the 81920 B opt-in");
+
+#define TR_LAUNCH_MATVEC3F(RBITS)                                                          \
+    glq_trellis_matvec_kernel<RBITS, true, true><<<tr_grid_x(), TR_BLOCK_SIZE, smem, stream>>>( \
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (float)wscale,       \
+        svp, rsqrt_n, (uint32_t)in_features, bm, (uint32_t)(multiblock ? num_blocks : 1))
+    if (R == 2)      { TR_LAUNCH_MATVEC3F(2); }
+    else if (R == 3) { TR_LAUNCH_MATVEC3F(3); }
+    else             { TR_LAUNCH_MATVEC3F(4); }
+#undef TR_LAUNCH_MATVEC3F
+    return out;
+}
+
 torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
-                                                   int64_t m, int64_t k) {
+                                                   int64_t m, int64_t k, double wscale) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     TORCH_CHECK(x.dim() == 2, "x must be (B, k)");
@@ -953,7 +1116,7 @@ torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 
 #define TR_LAUNCH_MATMUL3(RBITS)                                                       \
     glq_trellis_matmul_kernel<RBITS, true><<<grid, TR_BLOCK_SIZE, 0, stream>>>(        \
-        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (uint32_t)B)
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (uint32_t)B, (float)wscale)
     if (R == 2)      { TR_LAUNCH_MATMUL3(2); }
     else if (R == 3) { TR_LAUNCH_MATMUL3(3); }
     else             { TR_LAUNCH_MATMUL3(4); }
@@ -964,6 +1127,73 @@ torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 /* Fused 3INST linear: identical bracket + hybrid B-dispatch as the HYB fused op, minus the
  * tlut. Same env knobs (GLQ_TRELLIS_BATCH_MAX / GLQ_TRELLIS_DENSE). One host call →
  * cudagraph-capturable as a single node. */
+/* Steps 1-2 of the fused 3INST linear (input RHT + decode/matmul + ×wscale) →
+ * y_rht (B, m_pad) fp32. `y_out_slice`: optional contiguous (m_pad,) destination the B=1
+ * matvec branches store into DIRECTLY (S4b writes a shared shard buffer row with no copy);
+ * batched/dense branches ignore it and return a fresh tensor — the caller compares data
+ * pointers to decide whether a copy is still needed. */
+static torch::Tensor tr3_forward_yrht(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
+    c10::optional<torch::Tensor> y_out_slice
+) {
+    int B = x.size(0);
+
+    static const int64_t batch_max = [] {
+        const char *e = std::getenv("GLQ_TRELLIS_BATCH_MAX");
+        return e ? std::max<int64_t>(1, atoll(e)) : 64;
+    }();
+    static const bool force_dense = (std::getenv("GLQ_TRELLIS_DENSE") != nullptr);
+    // RS2b kill-switch: GLQ_TRELLIS_FUSE_INPUT=0 restores the standalone input-RHT kernel.
+    static const bool fuse_in = [] {
+        const char *e = std::getenv("GLQ_TRELLIS_FUSE_INPUT");
+        return !(e && e[0] == '0');
+    }();
+
+    // FUSE_IN eligibility: single-block pow2 (RS2b) or block-diagonal with GPU meta (RS3).
+    const int64_t fnb = blocks_n.numel() > 0 ? blocks_n.size(0) : 1;
+    int64_t fmax_bs = n_pad;
+    if (fnb > 1) fmax_bs = blocks_n.max().item<int64_t>();
+    const bool fusein_sb = fnb <= 1 && n_pad <= 8192 && ((n_pad & (n_pad - 1)) == 0);
+    const bool fusein_bd = fnb > 1 && fmax_bs <= 8192
+                           && blocks_n_meta.numel() > 0 && blocks_n_meta.is_cuda()
+                           && ((size_t)n_pad * 4 + (size_t)fmax_bs * 4) <= 81920;
+
+    torch::Tensor y_rht;
+    if (fuse_in && B == 1 && !force_dense && (fusein_sb || fusein_bd)) {
+        // ---- RS2b/RS3 fused path: input RHT + cast + decode + ×wscale in ONE kernel ----
+        auto yv = glq_decode_matvec_trellis_3inst_fusein_cuda(
+            x.contiguous().view({-1}), sv, trellis_packed, m_pad, n_pad, in_features, wscale,
+            blocks_n_meta, fnb, fmax_bs, y_out_slice);
+        y_rht = yv.view({1, (long)m_pad});
+    } else {
+        // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
+        auto x_rht = torch::empty({B, (long)n_pad},
+                                  torch::dtype(torch::kFloat32).device(x.device()));
+        glq_input_rht_blockdiag_cuda(x.contiguous(), sv, x_rht,
+                                     (int)in_features, (int)n_pad, blocks_n, blocks_n_meta);
+
+        // ---- Step 2: decode + matmul in the RHT domain → y_rht (B, m_pad) fp32 ----
+        if (B == 1 && !force_dense) {
+            auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
+            // RS1: ×wscale happens in the kernel store — no separate elementwise launch.
+            auto yv = glq_decode_matvec_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad,
+                                                           wscale, y_out_slice);
+            y_rht = yv.view({1, (long)m_pad});
+        } else if (B <= batch_max && !force_dense) {
+            auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
+            y_rht = glq_decode_matmul_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad,
+                                                          wscale);
+        } else {
+            auto W = glq_decompress_trellis_3inst_cuda(trellis_packed, m_pad, n_pad);   // fp16
+            auto xh = x_rht.to(torch::kFloat16);
+            y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
+        }
+    }
+    return y_rht;
+}
+
 torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     torch::Tensor x,               // (B, in_features) fp16, contiguous
     torch::Tensor sv,              // (n_pad,) fp16
@@ -982,33 +1212,8 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     int B = x.size(0);
     at::DeviceGuard guard(x.device());
 
-    // ---- Step 1: input RHT → x_rht (B, n_pad) fp32 ----
-    auto x_rht = torch::empty({B, (long)n_pad},
-                              torch::dtype(torch::kFloat32).device(x.device()));
-    glq_input_rht_blockdiag_cuda(x.contiguous(), sv, x_rht,
-                                 (int)in_features, (int)n_pad, blocks_n, blocks_n_meta);
-
-    // ---- Step 2: decode + matmul in the RHT domain → y_rht (B, m_pad) fp32 ----
-    static const int64_t batch_max = [] {
-        const char *e = std::getenv("GLQ_TRELLIS_BATCH_MAX");
-        return e ? std::max<int64_t>(1, atoll(e)) : 64;
-    }();
-    static const bool force_dense = (std::getenv("GLQ_TRELLIS_DENSE") != nullptr);
-
-    torch::Tensor y_rht;
-    if (B == 1 && !force_dense) {
-        auto xh = x_rht.view({(long)n_pad}).to(torch::kFloat16);
-        auto yv = glq_decode_matvec_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad);
-        y_rht = (yv * (float)wscale).view({1, (long)m_pad}).contiguous();
-    } else if (B <= batch_max && !force_dense) {
-        auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
-        auto yb = glq_decode_matmul_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad);
-        y_rht = (yb * (float)wscale).contiguous();                       // (B, m_pad) fp32
-    } else {
-        auto W = glq_decompress_trellis_3inst_cuda(trellis_packed, m_pad, n_pad);   // fp16
-        auto xh = x_rht.to(torch::kFloat16);
-        y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
-    }
+    auto y_rht = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                                  wscale, in_features, n_pad, m_pad, c10::nullopt);
 
     // ---- Step 3: output RHT → y (B, out_features) fp16 ----
     auto y = torch::empty({B, (long)out_features},
@@ -1016,4 +1221,35 @@ torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     glq_output_rht_blockdiag_cuda(y_rht, su, y, (int)out_features, (int)m_pad,
                                   blocks_m, blocks_m_meta);
     return y;
+}
+
+/* S4b: the fused 3INST linear STOPPED at the y_rht seam — per-shard calls of a fused
+ * QKV/gate_up linear each deposit their (B, m_pad) fp32 result into columns
+ * [col, col+m_pad) of the SHARED y_rht_out buffer, and ONE glq_output_rht_shards_cuda
+ * launch then replaces the per-shard output RHTs. B=1 matvec branches store the row
+ * slice in place (zero copy); batched/dense branches copy their fresh result in. */
+void glq_fused_linear_trellis_3inst_yrht_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
+    torch::Tensor y_rht_out,       // (B, total_m) fp32, contiguous
+    int64_t col                    // this shard's column offset in y_rht_out
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    CHECK_INPUT(y_rht_out);
+    TORCH_CHECK(y_rht_out.scalar_type() == torch::kFloat32
+                    && y_rht_out.dim() == 2 && y_rht_out.size(0) == x.size(0)
+                    && col + m_pad <= y_rht_out.size(1),
+                "y_rht_out must be (B, >= col+m_pad) fp32");
+    int64_t B = x.size(0);
+    at::DeviceGuard guard(x.device());
+
+    c10::optional<torch::Tensor> slice;
+    if (B == 1)
+        slice = y_rht_out.select(0, 0).narrow(0, col, m_pad);   // contiguous row slice
+    auto y = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                              wscale, in_features, n_pad, m_pad, slice);
+    if (!slice.has_value() || y.data_ptr() != slice->data_ptr())
+        y_rht_out.narrow(1, col, m_pad).copy_(y.view({B, (long)m_pad}));
 }

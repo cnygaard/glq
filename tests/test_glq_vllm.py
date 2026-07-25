@@ -213,6 +213,34 @@ def test_fused_linear_trellis_3inst_fake_shape():
     assert fy.device.type == "meta"
 
 
+def test_s4b_shard_batched_ops_fake_shape():
+    """Pins the S4b mutating-op schemas⇆fakes (11 args yrht / 6 args output_rht_shards).
+    Both write their output arg in place and return nothing; an arg-count drift between
+    the ``define`` strings and the fakes would raise here rather than at serve time."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear_trellis_3inst_yrht"):
+        pytest.skip("fused_linear_trellis_3inst_yrht not registered (no CUDA ext loaded)")
+
+    B, n, m, total = 2, 1024, 768, 1024
+    meta = torch.device("meta")
+    x = torch.empty(B, n, dtype=torch.float16, device=meta)
+    sv = torch.empty(n, dtype=torch.float16, device=meta)
+    packed = torch.empty((m // 16) * (n // 16), 32, dtype=torch.int16, device=meta)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    blk_n = torch.tensor([n], dtype=torch.int64, device=meta)
+    y_rht = torch.empty(B, total, dtype=torch.float32, device=meta)
+    r = torch.ops.glq.fused_linear_trellis_3inst_yrht(
+        x, sv, packed, blk_n, empty_i32, 1.0, n, n, m, y_rht, 0)
+    assert r is None
+
+    su = torch.empty(total, dtype=torch.float16, device=meta)
+    y = torch.empty(B, total, dtype=torch.float16, device=meta)
+    shard_meta = torch.empty(2, 4, dtype=torch.int32, device=meta)
+    r = torch.ops.glq.output_rht_shards(y_rht, su, y, total, shard_meta, 1024)
+    assert r is None
+
+
 @requires_vllm
 @pytest.mark.parametrize("bpw", [2, 3, 4])
 def test_trellis_create_weights_sizing(bpw):
@@ -572,15 +600,24 @@ def test_glq_vllm_gpu():
     )
 
     # --- 4. Weights stay compressed ---
-    found_qidxs = [False]
+    # check_layers runs in the engine-core subprocess (vLLM >= 0.25): it must RETURN
+    # its result — mutating a closed-over object only changes the subprocess copy.
     def check_layers(model):
+        found = False
         for name, mod in model.named_modules():
             if hasattr(mod, "Qidxs"):
                 assert mod.Qidxs.dtype == torch.int16, f"{name}.Qidxs is {mod.Qidxs.dtype}"
-                assert not hasattr(mod, "weight"), f"{name} has dense weight"
-                found_qidxs[0] = True
-    llm.apply_model(check_layers)
-    assert found_qidxs[0], "No GLQ layers found with Qidxs"
+                # vLLM >= 0.25 registers a numel-1 fp16 stub `weight` on every linear
+                # (PluggableLayer); the invariant is no DENSE weight alongside Qidxs.
+                w = getattr(mod, "weight", None)
+                assert w is None or w.numel() <= 1, \
+                    f"{name} has dense weight {tuple(w.shape)}"
+                found = True
+        return found
+
+    res = llm.apply_model(check_layers)
+    flags = res if isinstance(res, list) else [res]
+    assert any(flags), "No GLQ layers found with Qidxs"
 
     # --- 5. Generation correctness ---
     params = SamplingParams(max_tokens=30, temperature=0)

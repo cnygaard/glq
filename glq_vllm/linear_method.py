@@ -613,11 +613,19 @@ def _glq_apply_e8p(x, layer):
         bias=None, out_dtype=x.dtype)
 
 
+_GLQ_BATCH_OUT_RHT = os.environ.get("GLQ_TRELLIS_BATCH_OUT_RHT", "1") != "0"
+
+
 def _glq_apply_trellis(x, layer):
     """Trellis apply: one fused torch.ops call per shard, reusing the SAME staticmethod the
     HF path runs (E8RHTLinear._trellis_linear_apply) so serving and eager share one validated
     code path. Single layer → one call; fused QKV/gate_up → one call per shard, concatenated
-    (mirrors _glq_apply_e8p). Bias is applied once by apply(), not per shard."""
+    (mirrors _glq_apply_e8p). Bias is applied once by apply(), not per shard.
+
+    S4b (fused 3INST layers, GLQ_TRELLIS_BATCH_OUT_RHT=0 kills): each shard's fused op
+    stops at the y_rht seam and deposits into a shared (B, total_m) fp32 buffer; ONE
+    shard-batched output-RHT launch then replaces the per-shard output RHTs AND the
+    torch.cat (qkv 3→1 launches, gate/up 2→1)."""
     from glq.quantized_linear import E8RHTLinear
     _apply = E8RHTLinear._trellis_linear_apply
 
@@ -628,6 +636,33 @@ def _glq_apply_trellis(x, layer):
         return meta['_bn'], meta['_bm'], meta['_bnm'], meta['_bmm']
 
     if getattr(layer, 'glq_is_fused', False):
+        s4b = getattr(layer, '_glq_s4b', None)
+        if s4b is not None and _GLQ_BATCH_OUT_RHT:
+            _has_ops = hasattr(torch.ops, "glq")
+            if _has_ops and hasattr(torch.ops.glq, "fused_linear_trellis_3inst_yrht"):
+                _yrht = torch.ops.glq.fused_linear_trellis_3inst_yrht
+                _shards_rht = torch.ops.glq.output_rht_shards
+            else:
+                from glq import inference_kernel as _ik
+                _yrht = _ik._glq_cuda.glq_fused_linear_trellis_3inst_yrht_cuda
+                _shards_rht = _ik._glq_cuda.glq_output_rht_shards_cuda
+            xh = x.half().contiguous()
+            total_m = s4b['total_m']
+            y_rht = torch.empty((x.shape[0], total_m),
+                                dtype=torch.float32, device=x.device)
+            col = 0
+            for i, meta in enumerate(layer._glq_trellis_meta):
+                bn, _, bnm, _ = _blocks(meta)
+                _yrht(xh, layer.SV.get_shard(i), layer.trellis_packed.get_shard(i),
+                      bn, bnm, meta['wscale'], meta['in'], meta['n_pad'], meta['m_pad'],
+                      y_rht, col)
+                col += meta['m_pad']
+            y = torch.empty((x.shape[0], total_m),
+                            dtype=torch.float16, device=x.device)
+            _shards_rht(y_rht, s4b['su_cat'], y, total_m,
+                        s4b['shard_meta'], s4b['max_bs'])
+            return y.to(x.dtype)
+
         outs = []
         for i, meta in enumerate(layer._glq_trellis_meta):
             bn, bm, bnm, bmm = _blocks(meta)
@@ -1244,6 +1279,25 @@ class GLQLinearMethod(LinearMethodBase):
             meta['_bm'] = torch.tensor(bm, dtype=torch.int64, device='cpu')
             meta['_bnm'] = _pbm(bn).to(device)
             meta['_bmm'] = _pbm(bm).to(device)
+
+        # (3b) S4b shard-batched output RHT precompute (fused 3INST layers only): the
+        # concatenated per-shard sub-block meta (global offsets + normalization override,
+        # see _pack_shard_meta) and the concatenated SU sign vector. Frozen layer-held
+        # constants for the same capture-safety reasons as (3). Trellis never pads, so
+        # sum(m_pad) == sum(out) and y_rht offsets == output offsets.
+        layer._glq_s4b = None
+        if fused and layer.tlut.get_shard(0).numel() == 0:      # 3INST shards only
+            from glq.quantized_linear import _pack_shard_meta as _psm
+            shard_blocks = [_bd(meta['m_pad']) for meta in layer._glq_trellis_meta]
+            su_cat = torch.cat([
+                layer.SU.get_shard(i)[:meta['m_pad']].contiguous()
+                for i, meta in enumerate(layer._glq_trellis_meta)]).to(device)
+            layer._glq_s4b = {
+                'shard_meta': _psm(shard_blocks).to(device),
+                'su_cat': su_cat,
+                'total_m': sum(meta['m_pad'] for meta in layer._glq_trellis_meta),
+                'max_bs': max(max(b) for b in shard_blocks),
+            }
 
         # (4) Drop weight_loaders (function refs break vLLM v1 msgpack serialization).
         for _name, param in layer.named_parameters():
