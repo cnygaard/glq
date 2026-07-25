@@ -1,7 +1,7 @@
 # GLQ — fit larger LLMs on smaller GPUs
 
 **E8-lattice post-training quantization** for LLM weights: **2–8 bits/weight**,
-served on **vLLM · HuggingFace Transformers · SGLang**, with **deterministic**
+served on **vLLM · HuggingFace Transformers**, with **deterministic**
 fused CUDA kernels and opt-in **~4× KV-cache compression**. Validated from a
 24 GB RTX 3090 to a 96 GB RTX PRO 6000 Blackwell.
 
@@ -18,8 +18,8 @@ compression ratio.
   memory**, and good quality at 2–3 bpw. See
   [Trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq).
 - **2–8 bpw**, **no group-size constraint**, optional **per-layer mixed precision**.
-- **Serve anywhere** — a vLLM plugin (weight + MoE + embedding + KV cache), an HF
-  Transformers integration, and an SGLang fork. `pip install glq`, load, run.
+- **Serve anywhere** — a vLLM plugin (weight + MoE + embedding + KV cache) and an
+  HF Transformers integration. `pip install glq`, load, run.
 - **Smallest-in-class footprint** — a 31B fits ≈16.5 GiB at 5 bpw where bf16 needs
   ≈58 GiB, with quality within noise of bf16 on reasoning evals.
 - **Deterministic kernels** — bit-identical logits across runs (reproducible
@@ -31,7 +31,7 @@ compression ratio.
 [fit a bigger model on your card](#available-pre-quantized-checkpoints) ·
 [quantize your own](#quantize-your-own-model) ·
 [how GLQ compares](#how-glq-compares) · serve with
-[vLLM](#docker-image-nvidia-gpu) / [SGLang](#serving-with-sglang) ·
+[vLLM](#docker-image-nvidia-gpu) ·
 [how it works](#how-it-works)
 
 ## Quickstart
@@ -275,7 +275,7 @@ different things; here is the honest layout.
 | Core method | E8 lattice + RHT + LDLQ | activation-aware scale | block error-feedback | FP4 + per-tensor scale | per-layer bit allocation |
 | Footprint at ~4-bit | **smallest** (no per-group scales/zeros) | + group scales/zeros | + group scales/zeros | + FP8 scales | varies |
 | Speed on Blackwell | W4A16; **single-stream at bf16 parity** (trellis 3INST) | W4A16 (Marlin) | W4A16 (Marlin) | **fastest at batch** (native FP4) | n/a (GGUF) |
-| Serving stack | **vLLM · HF · SGLang** | vLLM · HF · SGLang · TRT | vLLM · HF · SGLang · TRT | vLLM · TRT-LLM | **llama.cpp / Ollama** (GGUF) |
+| Serving stack | **vLLM · HF** | vLLM · HF · TRT | vLLM · HF · TRT | vLLM · TRT-LLM | **llama.cpp / Ollama** (GGUF) |
 | KV-cache compression | **built-in (~4×)** | — | — | fp8 KV | (llama.cpp KV) |
 | Bit-exact deterministic kernels | **yes** | — | — | — | — |
 | Fine-tuning (QLoRA) | — | — | — | — | **yes** |
@@ -285,7 +285,7 @@ different things; here is the honest layout.
 - **GLQ** — smallest footprint at a target quality, the widest bit-range (2–8) with
   per-layer mixed precision, deterministic kernels, and built-in KV compression. The pick
   when you are **memory-bound** — fit a bigger model or longer context on a 24–32 GB card —
-  and serve on vLLM / HF / SGLang.
+  and serve on vLLM / HF.
 - **NVFP4 (ModelOpt)** — **fastest on Blackwell** (native FP4 tensor cores). The pick when
   you have a Blackwell GPU with memory to spare and want raw decode speed; it trades a larger
   footprint than GLQ for that speed.
@@ -729,31 +729,6 @@ is what makes cudagraph a win here — the equivalent unfused multi-op path is
 as of v0.6.7** (the 5–8 bpw N-stage decode landed there); the fused op is
 bit-exact against the unfused reference across all of 2–8 bpw (decode reproduces
 the quantize-side weight to ~66–68 dB SQNR per bit-width).
-
-### Serving with sglang
-
-A fork of sglang with GLQ support lives at
-[`cnygaard/sglang`](https://github.com/cnygaard/sglang) on the
-`glq-quantization` branch. It registers `"glq"` as a quantization
-method and reuses the existing `glq.inference_kernel` CUDA extension
-as a runtime dependency.
-
-```bash
-git clone -b glq-quantization https://github.com/cnygaard/sglang
-cd sglang/python && pip install -e .
-
-python -m sglang.launch_server \
-    --model xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw \
-    --tokenizer-path HuggingFaceTB/SmolLM2-360M-Instruct \
-    --quantization glq \
-    --attention-backend triton --sampling-backend pytorch
-```
-
-Requires the triton attention backend (flashinfer returns wrong
-logprobs in echo/prefill mode). Default CUDA-graph capture is
-supported (v0.3.2+). If you hit a graph-break in a model architecture
-we haven't tested, pass `--disable-piecewise-cuda-graph` as a
-fallback.
 
 ### Devstral-24B tokenizer
 
