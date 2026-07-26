@@ -168,6 +168,9 @@ class bitshift_codebook(nn.Module):
         # `torch.arange(...).to(X.device)` is a CPU→CUDA copy, which is ILLEGAL during CUDA-graph
         # capture and silently forced the overlap pass onto the eager fallback.
         self.register_buffer("_kv_arange", torch.arange(2 ** (K * V)).view(1, 1, -1))
+        # arange(2^(L-KV)) row vector for the view-min ACS: predecessor state =
+        # _prev_base[j] + argmin_k << (L-KV) — the closed form of the state_cand gather.
+        self.register_buffer("_prev_base", torch.arange(2 ** (L - K * V)).view(1, -1))
 
         # Viterbi CUDA-graph cache: (T, B, has_overlap) -> _VitGraph. Plain attrs (NOT buffers)
         # so `.to(device)` never touches them. Lazily populated on first CUDA `quantize_seq`.
@@ -183,15 +186,17 @@ class bitshift_codebook(nn.Module):
 
     @torch.compile
     def update(self, cost, thing):
+        # ACS in closed form. The candidate predecessors of new-state group j (= s >> KV)
+        # are exactly {j + k·2^(L-KV), k ∈ [0, 2^KV)} (see state_cand's construction), so the
+        # original expand+gather over state_cand is a strided VIEW of cost: cand_cost[b,j,k]
+        # == cost.view(B, 2^KV, 2^(L-KV))[b,k,j]. min over k keeps the identical ascending-k
+        # candidate order (same tie-break as the gathered min) — bit-exact, but coalesced and
+        # with zero index-tensor traffic. prev_state = j + argmin_k·2^(L-KV), arithmetically.
         state_err = (self.recons_state - thing.unsqueeze(-1)).square().sum(dim=0)
-        cand_cost = torch.gather(
-            cost.unsqueeze(-2).expand(-1, self.state_cand.shape[1], -1), -1,
-            self.state_cand.expand(len(cost), -1, 2 ** (self.K * self.V)))
-        best = torch.min(cand_cost, dim=-1)
+        best = cost.view(len(cost), 2 ** (self.K * self.V), -1).min(dim=1)
         cost = state_err + best.values.unsqueeze(-1).expand(
             -1, -1, 2 ** (self.K * self.V)).reshape(state_err.shape)
-        prev_state = torch.gather(
-            self.state_cand.expand(thing.shape[1], -1, -1), -1, best.indices.unsqueeze(-1))[..., 0]
+        prev_state = self._prev_base + (best.indices << (self.L - self.K * self.V))
         return prev_state, cost
 
     def viterbi(self, X, overlap=None):
