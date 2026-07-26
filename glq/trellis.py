@@ -231,10 +231,17 @@ class bitshift_codebook(nn.Module):
         final_state = torch.empty(T // self.V, B, dtype=self.idx_dtype, device=X.device)
         final_state[T // self.V - 1] = torch.argmin(cost, dim=-1)
         for i in range(T // self.V - 1, 0, -1):
-            final_state[i - 1] = torch.gather(
-                from_state[i], -1,
-                (final_state[i].to(torch.int64).unsqueeze(-1)) >> (self.K * self.V))[..., 0]
+            self._tb_step(from_state[i], final_state[i], final_state[i - 1])
         return final_state
+
+    @torch.compile
+    def _tb_step(self, from_row, fs_i, fs_out):
+        # One fused kernel per traceback step (was 3: int64 cast+shift, gather, row copy).
+        # Identical ops in identical order to the original eager body — bit-exact; the
+        # 255-step sequential chain itself is inherent to the trellis.
+        fs_out.copy_(torch.gather(
+            from_row, -1,
+            (fs_i.to(torch.int64).unsqueeze(-1)) >> (self.K * self.V))[..., 0])
 
     # -- CUDA-graph capture of `viterbi` (see module header) ------------------
     @torch.no_grad()

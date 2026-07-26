@@ -208,6 +208,27 @@ def test_no_fill_kernel_in_viterbi():
     assert not fills, f"fill kernels still launched in viterbi: {fills}"
 
 
+def test_viterbi_kernel_budget():
+    """VT3 mechanism: one eager no-overlap viterbi must stay within ~3 kernels/step —
+    2 for the compiled ACS update + 1 for the compiled traceback step (+ small init slack).
+    Pre-VT3 the eager traceback cost ~3 kernels/step (gather + cast/shift + row copy),
+    putting the total at ~1280; the budget of 800 fails that and passes the fused form."""
+    torch._dynamo.reset()
+    cb = _cb(4, "3inst")
+    torch.manual_seed(13)
+    X = (torch.randn(256, 60, device="cuda") * 0.5).to(torch.float16)
+    cb.viterbi(X)                      # warm all compiles outside the profile
+    torch.cuda.synchronize()
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cb.viterbi(X)
+        torch.cuda.synchronize()
+    total = sum(e.count for e in prof.key_averages()
+                if e.self_device_time_total > 0
+                and "Memcpy" not in e.key and "Memset" not in e.key)
+    assert total <= 800, f"viterbi launched {total} kernels (budget 800, ~3/step)"
+
+
 def test_env_kill_switch_forces_eager(monkeypatch):
     monkeypatch.setenv("GLQ_TRELLIS_NO_CUDAGRAPH", "1")
     assert gt._trellis_cudagraph_on() is False
