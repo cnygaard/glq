@@ -300,6 +300,58 @@ class bitshift_codebook(nn.Module):
             entry.graph.replay()
             return entry.out_buf.clone()
 
+    # -- one graph per tail-biting PAIR (single-chunk shapes) ------------------
+    def _pair_body(self, x_buf):
+        """Both tail-biting passes + the overlap derivation, as one replayable region.
+        Single-chunk `quantize_seq` is an exact reshape identity around `viterbi`, so this
+        equals the two-`quantize_seq` path bit-for-bit; the `>>` runs on-device (int32)."""
+        T = x_buf.shape[0]
+        roll_X = torch.roll(x_buf, T // (2 * self.V) * self.V, 0)
+        s1 = self.viterbi(roll_X, None)
+        overlap = s1[T // (2 * self.V)] >> (self.K * self.V)
+        return self.viterbi(x_buf, overlap)
+
+    @torch.no_grad()
+    def _capture_pair(self, X, warmup_iters=3):
+        if self._vit_graph_pool is None:
+            self._vit_graph_pool = torch.cuda.graph_pool_handle()
+        x_buf = torch.empty_like(X)
+        x_buf.copy_(X)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(warmup_iters):
+                self._pair_body(x_buf)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._vit_graph_pool):
+            out_buf = self._pair_body(x_buf)
+        return _VitGraph(graph, x_buf, None, out_buf)
+
+    @torch.no_grad()
+    def _pair_graphed(self, X):
+        """Replay the pair graph for (T, NO) single-chunk quantizes; None on capture failure
+        (caller falls back to the classic two-`quantize_seq` path). Locking as in
+        `_viterbi_graphed` — capture is process-global and the static buffers are shared."""
+        key = ("pair", int(X.shape[0]), int(X.shape[1]))
+        with self._vit_lock:
+            if key not in self._vit_graphs:
+                try:
+                    self._vit_graphs[key] = self._capture_pair(X)
+                except Exception as e:
+                    warnings.warn(
+                        f"trellis pair CUDA-graph capture failed for {key}; using the "
+                        f"per-pass path. {type(e).__name__}: {e}", RuntimeWarning,
+                        stacklevel=2)
+                    self._vit_graphs[key] = None
+            entry = self._vit_graphs[key]
+            if entry is None:
+                return None
+            entry.x_buf.copy_(X)
+            entry.graph.replay()
+            return entry.out_buf.clone()
+
     def free_viterbi_graphs(self):
         """Release captured Viterbi graphs + their pool (call after quantization to reclaim VRAM)."""
         self._vit_graphs.clear()
@@ -324,11 +376,20 @@ class bitshift_codebook(nn.Module):
 
     def quantize(self, X):
         X = X.T.contiguous().to(torch.float16)
-        T = X.shape[0]
-        roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
-        state = self.quantize_seq(roll_X, overlap=None)
-        overlap = state[T // (2 * self.V)] >> self.K * self.V
-        state = self.quantize_seq(X, overlap=overlap)
+        T, NO = X.shape
+        # Single-chunk shapes take ONE graph per tail-biting pair: both Viterbi passes plus
+        # the overlap shift replay as a single launch (halves graph launches + Python/copy/
+        # clone round-trips per quantize). Multi-chunk / CPU / kill-switch keep the classic
+        # per-pass path below; so does a failed pair capture (None from _pair_graphed).
+        state = None
+        if (X.is_cuda and _trellis_cudagraph_on()
+                and NO <= min(2 ** (24 - self.L), _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
+            state = self._pair_graphed(X)
+        if state is None:
+            roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
+            state = self.quantize_seq(roll_X, overlap=None)
+            overlap = state[T // (2 * self.V)] >> self.K * self.V
+            state = self.quantize_seq(X, overlap=overlap)
         hatX = self.recons(state).transpose(0, 1).reshape(X.shape)
         return hatX.T.contiguous().to(X.device), state.T.contiguous().to(X.device)
 

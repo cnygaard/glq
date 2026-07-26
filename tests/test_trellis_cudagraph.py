@@ -101,10 +101,10 @@ def test_full_layer_trellis_ldlq_graph_parity(variant, shape):
 
 @pytest.mark.parametrize("variant", ["hyb", "3inst"])
 def test_graph_actually_captured_both_passes(variant):
-    """Closes the silent-fallback blind spot: a graphed `trellis_ldlq` must ACTUALLY capture a
-    real graph for BOTH tail-biting passes (overlap False AND True) — not fall back to eager.
-    Pre-fix, the overlap=True pass raised 'CPU→CUDA copy during capture' and got a None sentinel;
-    this asserts both keys hold a live _VitGraph. B = min(256, m//16) = 36 for 576×576."""
+    """Closes the silent-fallback blind spot: a graphed `trellis_ldlq` must ACTUALLY capture
+    the tail-biting PAIR graph (both Viterbi passes + the in-graph overlap derivation in ONE
+    replayable graph) — not fall back to eager or to per-pass graphs. Asserts the pair key
+    holds a live _VitGraph. B = min(256, m//16) = 36 for 576×576."""
     gt._GLQ_TRELLIS_CUDAGRAPH_ENABLED = True
     tlut = _TLUT.clone() if variant == "hyb" else None
     cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
@@ -114,10 +114,9 @@ def test_graph_actually_captured_both_passes(variant):
     H = (Xc.T @ Xc) / 512
     gt.trellis_ldlq(W, H, cb, for_kernel=True)
     graphs = cb.cb._vit_graphs
-    for has_overlap in (False, True):
-        key = (256, 36, has_overlap)
-        assert key in graphs and graphs[key] is not None, \
-            f"{key} not captured (None sentinel = eager fallback) — graph did not engage"
+    key = ("pair", 256, 36)
+    assert key in graphs and graphs[key] is not None, \
+        f"{key} not captured (None sentinel / missing = fallback) — pair graph did not engage"
 
 
 # ---------------------------------------------------------------------------
