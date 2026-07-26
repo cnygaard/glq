@@ -24,18 +24,20 @@ _TLUT = (torch.randn(2 ** 9, 2, generator=torch.Generator().manual_seed(0))
          * 0.9682458365518543).to(torch.float16)
 
 
-def _cb(K):
-    return gt.TrellisCodebook(variant="hyb", K=K, tlut=_TLUT.clone(), device="cuda").cb
+def _cb(K, variant="hyb"):
+    tlut = _TLUT.clone() if variant == "hyb" else None
+    return gt.TrellisCodebook(variant=variant, K=K, tlut=tlut, device="cuda").cb
 
 
 # ---------------------------------------------------------------------------
-# THE gate: graphed viterbi == eager viterbi, bit-exact, across K / B / overlap
+# THE gate: graphed viterbi == eager viterbi, bit-exact, across variant / K / B
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
 @pytest.mark.parametrize("K", [2, 3, 4])
 @pytest.mark.parametrize("B", [12, 36, 256])
 @pytest.mark.parametrize("has_overlap", [False, True])
-def test_viterbi_cudagraph_bitexact_vs_eager(K, B, has_overlap):
-    cb = _cb(K)
+def test_viterbi_cudagraph_bitexact_vs_eager(variant, K, B, has_overlap):
+    cb = _cb(K, variant)
     torch.manual_seed(1000 * K + B)
     X = (torch.randn(256, B, device="cuda") * 0.5).to(torch.float16)
     overlap = None
@@ -72,8 +74,9 @@ def test_graphed_differs_from_a_different_input():
 # ---------------------------------------------------------------------------
 # The strongest gate: the WHOLE encoder (trellis_ldlq) is bit-exact graphs-on vs -off
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
 @pytest.mark.parametrize("shape", [(576, 576), (192, 576), (1536, 576)])
-def test_full_layer_trellis_ldlq_graph_parity(shape):
+def test_full_layer_trellis_ldlq_graph_parity(variant, shape):
     m, n = shape
     torch.manual_seed(3)
     W = (torch.randn(m, n, device="cuda") * 0.05).float()
@@ -82,7 +85,8 @@ def test_full_layer_trellis_ldlq_graph_parity(shape):
 
     def run(enabled):
         gt._GLQ_TRELLIS_CUDAGRAPH_ENABLED = enabled
-        cb = gt.TrellisCodebook(variant="hyb", K=4, tlut=_TLUT.clone(), device="cuda")
+        tlut = _TLUT.clone() if variant == "hyb" else None
+        cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
         return gt.trellis_ldlq(W, H, cb, for_kernel=True)
 
     try:
@@ -95,13 +99,15 @@ def test_full_layer_trellis_ldlq_graph_parity(shape):
     assert abs(s_on - s_off) == 0.0, "Wscale differ"
 
 
-def test_graph_actually_captured_both_passes():
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
+def test_graph_actually_captured_both_passes(variant):
     """Closes the silent-fallback blind spot: a graphed `trellis_ldlq` must ACTUALLY capture a
     real graph for BOTH tail-biting passes (overlap False AND True) — not fall back to eager.
     Pre-fix, the overlap=True pass raised 'CPU→CUDA copy during capture' and got a None sentinel;
     this asserts both keys hold a live _VitGraph. B = min(256, m//16) = 36 for 576×576."""
     gt._GLQ_TRELLIS_CUDAGRAPH_ENABLED = True
-    cb = gt.TrellisCodebook(variant="hyb", K=4, tlut=_TLUT.clone(), device="cuda")
+    tlut = _TLUT.clone() if variant == "hyb" else None
+    cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
     torch.manual_seed(2)
     W = (torch.randn(576, 576, device="cuda") * 0.05).float()
     Xc = torch.randn(512, 576, device="cuda")
@@ -112,6 +118,45 @@ def test_graph_actually_captured_both_passes():
         key = (256, 36, has_overlap)
         assert key in graphs and graphs[key] is not None, \
             f"{key} not captured (None sentinel = eager fallback) — graph did not engage"
+
+
+# ---------------------------------------------------------------------------
+# ACS update equivalence: `update` must stay value-identical to the ORIGINAL
+# gather-form ACS (inlined here as the frozen reference). Guards the view-min
+# restructure: identical candidate ordering ⇒ identical min tie-breaks ⇒
+# bit-identical prev_state AND cost.
+# ---------------------------------------------------------------------------
+def _update_reference(cb, cost, thing):
+    """The original QTIP gather-form ACS, frozen (do not refactor with trellis.py)."""
+    state_err = (cb.recons_state - thing.unsqueeze(-1)).square().sum(dim=0)
+    cand_cost = torch.gather(
+        cost.unsqueeze(-2).expand(-1, cb.state_cand.shape[1], -1), -1,
+        cb.state_cand.expand(len(cost), -1, 2 ** (cb.K * cb.V)))
+    best = torch.min(cand_cost, dim=-1)
+    new_cost = state_err + best.values.unsqueeze(-1).expand(
+        -1, -1, 2 ** (cb.K * cb.V)).reshape(state_err.shape)
+    prev_state = torch.gather(
+        cb.state_cand.expand(thing.shape[1], -1, -1), -1,
+        best.indices.unsqueeze(-1))[..., 0]
+    return prev_state, new_cost
+
+
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
+@pytest.mark.parametrize("K", [2, 3, 4])
+def test_trellis_update_equiv(variant, K):
+    cb = _cb(K, variant)
+    torch.manual_seed(100 * K)
+    B = 36
+    # a realistic cost state: run the real init so magnitudes/duplicate-ties match prod
+    X = (torch.randn(256, B, device="cuda") * 0.5).to(torch.float16)
+    cost = (cb.recons_state - X[:cb.V].unsqueeze(-1)).square().sum(dim=0)
+    thing = X[cb.V:2 * cb.V]
+    prev_ref, cost_ref = _update_reference(cb, cost.clone(), thing)
+    prev_new, cost_new = cb.update(cost.clone(), thing)
+    assert torch.equal(prev_new.to(torch.int64), prev_ref.to(torch.int64)), \
+        f"{variant} K={K}: prev_state diverged from the gather-form reference"
+    assert torch.equal(cost_new, cost_ref), \
+        f"{variant} K={K}: cost diverged from the gather-form reference"
 
 
 def test_env_kill_switch_forces_eager(monkeypatch):
