@@ -152,11 +152,43 @@ def test_trellis_update_equiv(variant, K):
     cost = (cb.recons_state - X[:cb.V].unsqueeze(-1)).square().sum(dim=0)
     thing = X[cb.V:2 * cb.V]
     prev_ref, cost_ref = _update_reference(cb, cost.clone(), thing)
-    prev_new, cost_new = cb.update(cost.clone(), thing)
+    prev_new = torch.empty(B, 2 ** (cb.L - cb.K * cb.V),
+                           dtype=torch.int32, device="cuda")
+    cost_new = cb.update(cost.clone(), thing, prev_new)
     assert torch.equal(prev_new.to(torch.int64), prev_ref.to(torch.int64)), \
         f"{variant} K={K}: prev_state diverged from the gather-form reference"
     assert torch.equal(cost_new, cost_ref), \
         f"{variant} K={K}: cost diverged from the gather-form reference"
+
+
+def test_update_is_two_kernels():
+    """VT2 mechanism: the ACS update must stay fused to exactly TWO kernels — the view-min
+    reduction (with the prev_state shift+int32-cast+row-store fused into its epilogue) and
+    the state_err/cost-update pointwise kernel. A third kernel means inductor de-fused the
+    out_row mutation or the cast — the condition under which the fused-store commit reverts.
+
+    Needs a fresh dynamo state: the parity matrix above compiles `update` for ~18
+    (variant, K, B) specializations, exceeding dynamo's per-function cache limit (8), after
+    which NEW shapes silently run eager — a suite-order artifact, not a production one
+    (a real quantize sees only the model's 3-4 distinct B values)."""
+    torch._dynamo.reset()
+    cb = _cb(4, "3inst")
+    torch.manual_seed(12)
+    B = 60
+    X = (torch.randn(256, B, device="cuda") * 0.5).to(torch.float16)
+    cost = (cb.recons_state - X[:cb.V].unsqueeze(-1)).square().sum(dim=0)
+    out = torch.empty(B, 2 ** (cb.L - cb.K * cb.V), dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        cb.update(cost.clone(), X[cb.V:2 * cb.V], out)      # warm/compile
+    torch.cuda.synchronize()
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cb.update(cost.clone(), X[cb.V:2 * cb.V], out)
+        torch.cuda.synchronize()
+    kernels = [e.key for e in prof.key_averages()
+               if e.self_device_time_total > 0
+               and "Memcpy" not in e.key and "Memset" not in e.key]
+    assert len(kernels) == 2, f"update de-fused into {len(kernels)} kernels: {kernels}"
 
 
 def test_no_fill_kernel_in_viterbi():

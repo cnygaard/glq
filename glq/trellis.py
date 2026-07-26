@@ -185,7 +185,7 @@ class bitshift_codebook(nn.Module):
         return self.lut[:, encoded.int().to(self.lut.device)].to(encoded.device)
 
     @torch.compile
-    def update(self, cost, thing):
+    def update(self, cost, thing, out_row):
         # ACS in closed form. The candidate predecessors of new-state group j (= s >> KV)
         # are exactly {j + k·2^(L-KV), k ∈ [0, 2^KV)} (see state_cand's construction), so the
         # original expand+gather over state_cand is a strided VIEW of cost: cand_cost[b,j,k]
@@ -199,9 +199,13 @@ class bitshift_codebook(nn.Module):
         # int32: states < 2^16 always fit; halves the from_state stream (the largest pure-DRAM
         # write in the loop) and the traceback's gather-source reads. Cast fuses into the
         # reduction epilogue under inductor.
-        prev_state = (self._prev_base
-                      + (best.indices << (self.L - self.K * self.V))).to(torch.int32)
-        return prev_state, cost
+        # Written straight into the caller's from_state row (functionalized mutation → the
+        # store fuses into the reduction epilogue; a separate return would cost an extra
+        # copy kernel per step). Every from_state[i] slice has identical shape/stride, so
+        # this compiles ONCE, exactly like the X[i*V:(i+1)*V] input slices.
+        out_row.copy_((self._prev_base
+                       + (best.indices << (self.L - self.K * self.V))).to(torch.int32))
+        return cost
 
     def viterbi(self, X, overlap=None):
         T, B = X.shape
@@ -218,7 +222,7 @@ class bitshift_codebook(nn.Module):
         from_state = torch.empty(T // self.V, B, 2 ** (self.L - self.K * self.V),
                                  dtype=torch.int32, device=self.state.device)
         for i in range(1, T // self.V):
-            from_state[i], cost = self.update(cost, X[i * self.V:(i + 1) * self.V])
+            cost = self.update(cost, X[i * self.V:(i + 1) * self.V], from_state[i])
         if overlap is not None:
             mask = torch.ones(B, 2 ** self.L, device=X.device) * self.fakeinf
             allow = (overlap.unsqueeze(-1) + self.sumdelta.unsqueeze(0))
