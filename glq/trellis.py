@@ -58,6 +58,31 @@ def _trellis_cudagraph_on():
             and not os.environ.get("GLQ_TRELLIS_NO_CUDAGRAPH")
             and torch.cuda.is_available())
 
+
+# Stage-6 fused Triton ACS step (glq/trellis_step_kernel.py): one kernel per Viterbi step
+# instead of the two the compiled `update` produces. Bit-exact (torch.equal-gated); the
+# compiled `update` remains the CPU / kill-switch / no-triton fallback.
+_GLQ_TRELLIS_FUSED_STEP_ENABLED = True
+_fused_step_mod = None                       # lazy import result: module or False
+
+
+def _fused_step_available():
+    global _fused_step_mod
+    if _fused_step_mod is None:
+        try:
+            from . import trellis_step_kernel as _tsk
+            _fused_step_mod = _tsk if _tsk._HAS_TRITON else False
+        except Exception:
+            _fused_step_mod = False
+    return _fused_step_mod is not False
+
+
+def _fused_step_on():
+    return (_GLQ_TRELLIS_FUSED_STEP_ENABLED
+            and os.environ.get("GLQ_TRELLIS_FUSED_STEP", "1") != "0"
+            and torch.cuda.is_available()
+            and _fused_step_available())
+
 # MMA-fragment intra-tile reorder (QTIP lib/algo/ldlq.py:10-13). Applied to the 256-element
 # tile BEFORE trellis-quantizing (for_kernel) so decoded lanes land in tensor-core fragment
 # order; INV restores natural (row-major 16×16) order for the reconstructed weight.
@@ -221,7 +246,25 @@ class bitshift_codebook(nn.Module):
         # was pure dead work (380 µs/call, 5.8% of quantize GPU time at int64).
         from_state = torch.empty(T // self.V, B, 2 ** (self.L - self.K * self.V),
                                  dtype=torch.int32, device=self.state.device)
+        use_fused = X.is_cuda and _fused_step_on()
         for i in range(1, T // self.V):
+            if use_fused:
+                try:
+                    cost = _fused_step_mod.fused_update(
+                        self, cost, X[i * self.V:(i + 1) * self.V], from_state[i])
+                    continue
+                except Exception as e:
+                    # Loud, process-wide fallback (mirrors the graph-capture sentinel):
+                    # a Triton compile/launch failure must not kill quantization — the
+                    # compiled update is bit-exact. Nothing was written for this step
+                    # (the failure precedes the kernel's stores), so redoing it is safe.
+                    global _GLQ_TRELLIS_FUSED_STEP_ENABLED
+                    _GLQ_TRELLIS_FUSED_STEP_ENABLED = False
+                    use_fused = False
+                    warnings.warn(
+                        f"fused trellis ACS step failed; falling back to the compiled "
+                        f"update for this process. {type(e).__name__}: {e}",
+                        RuntimeWarning, stacklevel=2)
             cost = self.update(cost, X[i * self.V:(i + 1) * self.V], from_state[i])
         if overlap is not None:
             mask = torch.ones(B, 2 ** self.L, device=X.device) * self.fakeinf

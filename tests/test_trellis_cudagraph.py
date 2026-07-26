@@ -143,6 +143,10 @@ def _update_reference(cb, cost, thing):
 @pytest.mark.parametrize("variant", ["hyb", "3inst"])
 @pytest.mark.parametrize("K", [2, 3, 4])
 def test_trellis_update_equiv(variant, K):
+    """ALGEBRA gate, eager-vs-eager: the view-min update body must equal the frozen
+    gather-form ACS when both run un-compiled (inductor may fma-contract the cost
+    arithmetic, a ±1ulp difference that is NOT an algebra bug — the compiled-vs-fused
+    bit-parity is pinned separately by tests/test_trellis_fused_step.py)."""
     cb = _cb(K, variant)
     torch.manual_seed(100 * K)
     B = 36
@@ -153,7 +157,12 @@ def test_trellis_update_equiv(variant, K):
     prev_ref, cost_ref = _update_reference(cb, cost.clone(), thing)
     prev_new = torch.empty(B, 2 ** (cb.L - cb.K * cb.V),
                            dtype=torch.int32, device="cuda")
-    cost_new = cb.update(cost.clone(), thing, prev_new)
+    was_disabled = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True          # run the decorated update body eagerly
+    try:
+        cost_new = cb.update(cost.clone(), thing, prev_new)
+    finally:
+        torch._dynamo.config.disable = was_disabled
     assert torch.equal(prev_new.to(torch.int64), prev_ref.to(torch.int64)), \
         f"{variant} K={K}: prev_state diverged from the gather-form reference"
     assert torch.equal(cost_new, cost_ref), \
@@ -161,10 +170,11 @@ def test_trellis_update_equiv(variant, K):
 
 
 def test_update_is_two_kernels():
-    """VT2 mechanism: the ACS update must stay fused to exactly TWO kernels — the view-min
-    reduction (with the prev_state shift+int32-cast+row-store fused into its epilogue) and
-    the state_err/cost-update pointwise kernel. A third kernel means inductor de-fused the
-    out_row mutation or the cast — the condition under which the fused-store commit reverts.
+    """FALLBACK-path guard (the fused Triton step has its own suite): the compiled ACS
+    update — still the CPU / GLQ_TRELLIS_FUSED_STEP=0 path — must stay fused to exactly
+    TWO kernels: the view-min reduction (prev shift+cast+store in its epilogue) and the
+    state_err/cost-update pointwise kernel. A third kernel means inductor de-fused the
+    out_row mutation or the cast.
 
     Needs a fresh dynamo state: the parity matrix above compiles `update` for ~18
     (variant, K, B) specializations, exceeding dynamo's per-function cache limit (8), after
@@ -225,7 +235,9 @@ def test_viterbi_kernel_budget():
     total = sum(e.count for e in prof.key_averages()
                 if e.self_device_time_total > 0
                 and "Memcpy" not in e.key and "Memset" not in e.key)
-    assert total <= 800, f"viterbi launched {total} kernels (budget 800, ~3/step)"
+    # 255 fused ACS + 255 traceback + init slack. The compiled-update path lands ≥765,
+    # so this bound also FAILS on a silent fused-step fallback (assert the mechanism).
+    assert total <= 560, f"viterbi launched {total} kernels (budget 560, ~2/step)"
 
 
 def test_env_kill_switch_forces_eager(monkeypatch):
