@@ -196,7 +196,11 @@ class bitshift_codebook(nn.Module):
         best = cost.view(len(cost), 2 ** (self.K * self.V), -1).min(dim=1)
         cost = state_err + best.values.unsqueeze(-1).expand(
             -1, -1, 2 ** (self.K * self.V)).reshape(state_err.shape)
-        prev_state = self._prev_base + (best.indices << (self.L - self.K * self.V))
+        # int32: states < 2^16 always fit; halves the from_state stream (the largest pure-DRAM
+        # write in the loop) and the traceback's gather-source reads. Cast fuses into the
+        # reduction epilogue under inductor.
+        prev_state = (self._prev_base
+                      + (best.indices << (self.L - self.K * self.V))).to(torch.int32)
         return prev_state, cost
 
     def viterbi(self, X, overlap=None):
@@ -212,7 +216,7 @@ class bitshift_codebook(nn.Module):
         # the traceback reads them, and row 0 is never read — the (T//V, B, 2^(L-KV)) fill
         # was pure dead work (380 µs/call, 5.8% of quantize GPU time at int64).
         from_state = torch.empty(T // self.V, B, 2 ** (self.L - self.K * self.V),
-                                 dtype=self.state.dtype, device=self.state.device)
+                                 dtype=torch.int32, device=self.state.device)
         for i in range(1, T // self.V):
             from_state[i], cost = self.update(cost, X[i * self.V:(i + 1) * self.V])
         if overlap is not None:
