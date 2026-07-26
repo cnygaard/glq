@@ -652,6 +652,13 @@ def _glq_apply_trellis(x, layer):
                                 dtype=torch.float32, device=x.device)
             col = 0
             for i, meta in enumerate(layer._glq_trellis_meta):
+                if not meta.get('loaded', True):
+                    # Never-loaded shard (KV-shared k/v): exact-zero columns. y_rht
+                    # is torch.empty, so the region must be zeroed explicitly; the
+                    # output RHT maps zeros to zeros. Slice zero_() is graph-safe.
+                    y_rht[:, col:col + meta['m_pad']].zero_()
+                    col += meta['m_pad']
+                    continue
                 bn, _, bnm, _ = _blocks(meta)
                 _yrht(xh, layer.SV.get_shard(i), layer.trellis_packed.get_shard(i),
                       bn, bnm, meta['wscale'], meta['in'], meta['n_pad'], meta['m_pad'],
@@ -665,6 +672,10 @@ def _glq_apply_trellis(x, layer):
 
         outs = []
         for i, meta in enumerate(layer._glq_trellis_meta):
+            if not meta.get('loaded', True):
+                outs.append(torch.zeros(x.shape[0], meta['out'],
+                                        dtype=x.dtype, device=x.device))
+                continue
             bn, bm, bnm, bmm = _blocks(meta)
             outs.append(_apply(
                 x, layer.SV.get_shard(i), layer.SU.get_shard(i),
@@ -1246,12 +1257,18 @@ class GLQLinearMethod(LinearMethodBase):
         # trellis path happens here, once — never in apply().
         in_f = layer.glq_in_features
         if fused:
+            # 'loaded': gemma-4 E-series KV-shared layers have NO k/v weights in the
+            # checkpoint, yet vLLM builds the full q/k/v QKVParallelLinear for every
+            # layer — those shards stay at their sentinel init (numel-0 packed,
+            # Wscale 0). apply() emits exact-zero columns for them (attention
+            # discards those columns), mirroring the shell path's zeros semantics.
             layer._glq_trellis_meta = [{
                 'wscale': float(layer.Wscale.get_shard(i).item()),
                 'in': in_f,
                 'out': int(layer.glq_shard_sizes[i]),
                 'n_pad': int(layer.glq_n_pad),
                 'm_pad': int(layer.glq_shard_sizes[i]),   # trellis never pads
+                'loaded': layer.trellis_packed.get_shard(i).numel() > 0,
             } for i in range(n_shards)]
         else:
             layer._glq_trellis_meta = [{
@@ -1260,6 +1277,7 @@ class GLQLinearMethod(LinearMethodBase):
                 'out': int(layer.glq_out_features),
                 'n_pad': int(layer.glq_n_pad),
                 'm_pad': int(layer.glq_m_pad),
+                'loaded': True,
             }]
 
         # (3) Precompute the block-diagonal RHT tensors ONCE, here — *before*

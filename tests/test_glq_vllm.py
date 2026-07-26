@@ -636,3 +636,89 @@ def test_glq_vllm_gpu():
     assert tok_per_sec >= 10, f"Throughput {tok_per_sec:.1f} tok/s below 10 tok/s minimum"
 
     del llm
+
+
+# ── Unloaded fused shard (gemma-4 E-series KV-shared layers) ────────────
+
+@requires_vllm
+@requires_gpu
+def test_trellis_fused_unloaded_shard_zero_columns():
+    """vLLM builds q/k/v shards for EVERY gemma-4 E-series layer, but KV-shared
+    layers carry no k/v weights in ANY checkpoint — those shards never load
+    (sentinel empty packed, Wscale 0). The trellis apply must emit ZERO columns
+    for them (the shell path's de-facto semantics: attention discards those
+    columns), instead of aborting in the kernel's trellis_packed 2-D check.
+    Covers BOTH the S4b shard-batched branch and the per-shard fallback."""
+    import glq_vllm.linear_method as lm
+    from glq.quantized_linear import E8RHTLinear
+
+    # BasevLLMParameter asserts a TP group; a world-size-1 gloo group suffices.
+    # vLLM 0.25 additionally requires a current-config context around both the
+    # parallel-state init and any CustomOp/parameter construction.
+    from vllm.config import VllmConfig, set_current_vllm_config
+    ctx = set_current_vllm_config(VllmConfig())
+    ctx.__enter__()
+    import vllm.distributed.parallel_state as ps
+    from vllm.distributed import (init_distributed_environment,
+                                  initialize_model_parallel)
+    if not ps.model_parallel_is_initialized():
+        init_distributed_environment(
+            world_size=1, rank=0, local_rank=0, backend="gloo",
+            distributed_init_method="tcp://127.0.0.1:29511")
+        initialize_model_parallel(1, 1)
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    n, m0, m1, K = 64, 32, 32, 2
+    ldr = lambda *a, **k: None
+
+    layer = torch.nn.Module()
+    layer.glq_is_fused = True
+    layer.glq_num_shards = 2
+    layer.glq_shard_sizes = [m0, m1]
+    layer.glq_in_features = n
+    layer.glq_n_pad = n
+    layer.trellis_packed = lm.GLQShardedParameter(
+        [m0, m1], 1, torch.int16, weight_loader=ldr, sentinel=True)
+    layer.tlut = lm.GLQShardedParameter(
+        [m0, m1], 1, torch.float16, weight_loader=ldr, sentinel=True)
+    layer.SU = lm.GLQShardedParameter([m0, m1], -1, torch.float16, weight_loader=ldr)
+    layer.SV = lm.GLQShardedParameter([n, n], -1, torch.float16, weight_loader=ldr)
+    layer.Wscale = lm.GLQShardedParameter([1, 1], 0, torch.float32, weight_loader=ldr)
+
+    # "Load" shard 0 only: random-but-valid packed bits decode fine; shard 1 stays
+    # exactly as an absent checkpoint key leaves it (numel-0 packed, Wscale 0).
+    packed0 = torch.randint(-2**15, 2**15 - 1,
+                            ((m0 // 16) * (n // 16), 16 * K), dtype=torch.int16)
+    layer.trellis_packed._shard_data[0] = packed0.clone()
+    layer.SU._shard_data[0] = torch.where(
+        torch.rand(m0) < 0.5, -torch.ones(m0), torch.ones(m0)).half()
+    layer.SV._shard_data[0] = torch.where(
+        torch.rand(n) < 0.5, -torch.ones(n), torch.ones(n)).half()
+    layer.Wscale._shard_data[0] = torch.tensor([2.0])
+
+    method = lm.GLQLinearMethod(None, bpw=K, codebook_type="trellis",
+                                variant="3inst")
+    method._setup_trellis_weights(layer, dev)
+
+    x = torch.randn(3, n, dtype=torch.float16, device=dev)
+    y_s4b = lm._glq_apply_trellis(x, layer)          # default shard-batched path
+    prev = lm._GLQ_BATCH_OUT_RHT
+    lm._GLQ_BATCH_OUT_RHT = False
+    try:
+        y_seq = lm._glq_apply_trellis(x, layer)      # per-shard fallback path
+    finally:
+        lm._GLQ_BATCH_OUT_RHT = prev
+
+    meta = layer._glq_trellis_meta[0]
+    ref = E8RHTLinear._trellis_linear_apply(
+        x, layer.SV.get_shard(0), layer.SU.get_shard(0),
+        layer.trellis_packed.get_shard(0), layer.tlut.get_shard(0),
+        meta['_bn'], meta['_bm'], meta['_bnm'], meta['_bmm'], meta['wscale'],
+        n, m0, n, m0, bias=None, out_dtype=x.dtype)
+    zeros = torch.zeros(3, m1, dtype=x.dtype, device=dev)
+    for name, y in (("s4b", y_s4b), ("sequential", y_seq)):
+        assert y.shape == (3, m0 + m1), name
+        assert torch.equal(y[:, :m0], ref), f"{name}: loaded shard must be unaffected"
+        assert torch.equal(y[:, m0:], zeros), \
+            f"{name}: unloaded shard must contribute exact zeros"
