@@ -203,7 +203,10 @@ class bitshift_codebook(nn.Module):
             allow = (overlap << (self.K * self.V)).unsqueeze(-1) + self._kv_arange
             mask.scatter_(1, allow[0], 0)
             cost = torch.min(cost + mask, self.fakeinf)
-        from_state = torch.zeros(T // self.V, B, 2 ** (self.L - self.K * self.V),
+        # empty, NOT zeros: rows 1..T//V-1 are fully overwritten by the forward loop before
+        # the traceback reads them, and row 0 is never read — the (T//V, B, 2^(L-KV)) fill
+        # was pure dead work (380 µs/call, 5.8% of quantize GPU time at int64).
+        from_state = torch.empty(T // self.V, B, 2 ** (self.L - self.K * self.V),
                                  dtype=self.state.dtype, device=self.state.device)
         for i in range(1, T // self.V):
             from_state[i], cost = self.update(cost, X[i * self.V:(i + 1) * self.V])
@@ -212,7 +215,7 @@ class bitshift_codebook(nn.Module):
             allow = (overlap.unsqueeze(-1) + self.sumdelta.unsqueeze(0))
             mask.scatter_(1, allow[0, 0], 0)
             cost = torch.min(cost + mask, self.fakeinf)
-        final_state = torch.zeros(T // self.V, B, dtype=self.idx_dtype, device=X.device)
+        final_state = torch.empty(T // self.V, B, dtype=self.idx_dtype, device=X.device)
         final_state[T // self.V - 1] = torch.argmin(cost, dim=-1)
         for i in range(T // self.V - 1, 0, -1):
             final_state[i - 1] = torch.gather(

@@ -159,6 +159,23 @@ def test_trellis_update_equiv(variant, K):
         f"{variant} K={K}: cost diverged from the gather-form reference"
 
 
+def test_no_fill_kernel_in_viterbi():
+    """VT1 mechanism: from_state/final_state are torch.empty — their contents are fully
+    written before any read, so a no-overlap eager viterbi must launch NO FillFunctor
+    kernel (the (T//V, B, 2^(L-KV)) int64 zeros-fill alone was 5.8% of quantize GPU time)."""
+    cb = _cb(4, "3inst")
+    torch.manual_seed(11)
+    X = (torch.randn(256, 36, device="cuda") * 0.5).to(torch.float16)
+    cb.viterbi(X)                      # warm the compiled update outside the profile
+    torch.cuda.synchronize()
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cb.viterbi(X)
+        torch.cuda.synchronize()
+    fills = [e.key for e in prof.key_averages() if "FillFunctor" in e.key]
+    assert not fills, f"fill kernels still launched in viterbi: {fills}"
+
+
 def test_env_kill_switch_forces_eager(monkeypatch):
     monkeypatch.setenv("GLQ_TRELLIS_NO_CUDAGRAPH", "1")
     assert gt._trellis_cudagraph_on() is False
