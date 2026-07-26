@@ -447,9 +447,9 @@ ahead/tied on AIME-2024 for the 31B and 26B-A4B. †At n=30 the 12B AIME-2024 ga
 16.5 GiB fits one 24–32 GB card where bf16 (~58 GiB) needs three. See each model card
 for the full paired tables, thinking budgets, and caveats.
 
-GLQ also decodes at **near-bf16 throughput on memory-bound GPUs** — e.g. SmolLM3-3B
-3.5 bpw ran at ~94% of bf16 tok/s (single-stream and batched) on an L40S — because
-the compressed weights cut DRAM bandwidth enough to offset the dequant cost.
+For decode speed vs bf16 on the current stack, see
+[How GLQ compares](#how-glq-compares) — single-stream trellis-3INST at bf16
+parity, bf16 ahead at batch (measured numbers there).
 
 ## How it works
 
