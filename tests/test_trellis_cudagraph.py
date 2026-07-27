@@ -24,18 +24,20 @@ _TLUT = (torch.randn(2 ** 9, 2, generator=torch.Generator().manual_seed(0))
          * 0.9682458365518543).to(torch.float16)
 
 
-def _cb(K):
-    return gt.TrellisCodebook(variant="hyb", K=K, tlut=_TLUT.clone(), device="cuda").cb
+def _cb(K, variant="hyb"):
+    tlut = _TLUT.clone() if variant == "hyb" else None
+    return gt.TrellisCodebook(variant=variant, K=K, tlut=tlut, device="cuda").cb
 
 
 # ---------------------------------------------------------------------------
-# THE gate: graphed viterbi == eager viterbi, bit-exact, across K / B / overlap
+# THE gate: graphed viterbi == eager viterbi, bit-exact, across variant / K / B
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
 @pytest.mark.parametrize("K", [2, 3, 4])
 @pytest.mark.parametrize("B", [12, 36, 256])
 @pytest.mark.parametrize("has_overlap", [False, True])
-def test_viterbi_cudagraph_bitexact_vs_eager(K, B, has_overlap):
-    cb = _cb(K)
+def test_viterbi_cudagraph_bitexact_vs_eager(variant, K, B, has_overlap):
+    cb = _cb(K, variant)
     torch.manual_seed(1000 * K + B)
     X = (torch.randn(256, B, device="cuda") * 0.5).to(torch.float16)
     overlap = None
@@ -72,8 +74,9 @@ def test_graphed_differs_from_a_different_input():
 # ---------------------------------------------------------------------------
 # The strongest gate: the WHOLE encoder (trellis_ldlq) is bit-exact graphs-on vs -off
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
 @pytest.mark.parametrize("shape", [(576, 576), (192, 576), (1536, 576)])
-def test_full_layer_trellis_ldlq_graph_parity(shape):
+def test_full_layer_trellis_ldlq_graph_parity(variant, shape):
     m, n = shape
     torch.manual_seed(3)
     W = (torch.randn(m, n, device="cuda") * 0.05).float()
@@ -82,7 +85,8 @@ def test_full_layer_trellis_ldlq_graph_parity(shape):
 
     def run(enabled):
         gt._GLQ_TRELLIS_CUDAGRAPH_ENABLED = enabled
-        cb = gt.TrellisCodebook(variant="hyb", K=4, tlut=_TLUT.clone(), device="cuda")
+        tlut = _TLUT.clone() if variant == "hyb" else None
+        cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
         return gt.trellis_ldlq(W, H, cb, for_kernel=True)
 
     try:
@@ -95,23 +99,183 @@ def test_full_layer_trellis_ldlq_graph_parity(shape):
     assert abs(s_on - s_off) == 0.0, "Wscale differ"
 
 
-def test_graph_actually_captured_both_passes():
-    """Closes the silent-fallback blind spot: a graphed `trellis_ldlq` must ACTUALLY capture a
-    real graph for BOTH tail-biting passes (overlap False AND True) — not fall back to eager.
-    Pre-fix, the overlap=True pass raised 'CPU→CUDA copy during capture' and got a None sentinel;
-    this asserts both keys hold a live _VitGraph. B = min(256, m//16) = 36 for 576×576."""
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
+def test_graph_actually_captured_both_passes(variant):
+    """Closes the silent-fallback blind spot: a graphed `trellis_ldlq` must ACTUALLY capture
+    the tail-biting PAIR graph (both Viterbi passes + the in-graph overlap derivation in ONE
+    replayable graph) — not fall back to eager or to per-pass graphs. Asserts the pair key
+    holds a live _VitGraph. B = min(256, m//16) = 36 for 576×576."""
     gt._GLQ_TRELLIS_CUDAGRAPH_ENABLED = True
-    cb = gt.TrellisCodebook(variant="hyb", K=4, tlut=_TLUT.clone(), device="cuda")
+    tlut = _TLUT.clone() if variant == "hyb" else None
+    cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
     torch.manual_seed(2)
     W = (torch.randn(576, 576, device="cuda") * 0.05).float()
     Xc = torch.randn(512, 576, device="cuda")
     H = (Xc.T @ Xc) / 512
     gt.trellis_ldlq(W, H, cb, for_kernel=True)
     graphs = cb.cb._vit_graphs
-    for has_overlap in (False, True):
-        key = (256, 36, has_overlap)
-        assert key in graphs and graphs[key] is not None, \
-            f"{key} not captured (None sentinel = eager fallback) — graph did not engage"
+    key = ("pair", 256, 36)
+    assert key in graphs and graphs[key] is not None, \
+        f"{key} not captured (None sentinel / missing = fallback) — pair graph did not engage"
+
+
+# ---------------------------------------------------------------------------
+# ACS update equivalence: `update` must stay value-identical to the ORIGINAL
+# gather-form ACS (inlined here as the frozen reference). Guards the view-min
+# restructure: identical candidate ordering ⇒ identical min tie-breaks ⇒
+# bit-identical prev_state AND cost.
+# ---------------------------------------------------------------------------
+def _update_reference(cb, cost, thing):
+    """The original QTIP gather-form ACS, frozen (do not refactor with trellis.py)."""
+    state_err = (cb.recons_state - thing.unsqueeze(-1)).square().sum(dim=0)
+    cand_cost = torch.gather(
+        cost.unsqueeze(-2).expand(-1, cb.state_cand.shape[1], -1), -1,
+        cb.state_cand.expand(len(cost), -1, 2 ** (cb.K * cb.V)))
+    best = torch.min(cand_cost, dim=-1)
+    new_cost = state_err + best.values.unsqueeze(-1).expand(
+        -1, -1, 2 ** (cb.K * cb.V)).reshape(state_err.shape)
+    prev_state = torch.gather(
+        cb.state_cand.expand(thing.shape[1], -1, -1), -1,
+        best.indices.unsqueeze(-1))[..., 0]
+    return prev_state, new_cost
+
+
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
+@pytest.mark.parametrize("K", [2, 3, 4])
+def test_trellis_update_equiv(variant, K):
+    """ALGEBRA gate, eager-vs-eager: the view-min update body must equal the frozen
+    gather-form ACS when both run un-compiled (inductor may fma-contract the cost
+    arithmetic, a ±1ulp difference that is NOT an algebra bug — the compiled-vs-fused
+    bit-parity is pinned separately by tests/test_trellis_fused_step.py)."""
+    cb = _cb(K, variant)
+    torch.manual_seed(100 * K)
+    B = 36
+    # a realistic cost state: run the real init so magnitudes/duplicate-ties match prod
+    X = (torch.randn(256, B, device="cuda") * 0.5).to(torch.float16)
+    cost = (cb.recons_state - X[:cb.V].unsqueeze(-1)).square().sum(dim=0)
+    thing = X[cb.V:2 * cb.V]
+    prev_ref, cost_ref = _update_reference(cb, cost.clone(), thing)
+    prev_new = torch.empty(B, 2 ** (cb.L - cb.K * cb.V),
+                           dtype=torch.int32, device="cuda")
+    was_disabled = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True          # run the decorated update body eagerly
+    try:
+        cost_new = cb.update(cost.clone(), thing, prev_new)
+    finally:
+        torch._dynamo.config.disable = was_disabled
+    assert torch.equal(prev_new.to(torch.int64), prev_ref.to(torch.int64)), \
+        f"{variant} K={K}: prev_state diverged from the gather-form reference"
+    assert torch.equal(cost_new, cost_ref), \
+        f"{variant} K={K}: cost diverged from the gather-form reference"
+
+
+def test_update_is_two_kernels():
+    """FALLBACK-path guard (the fused Triton step has its own suite): the compiled ACS
+    update — still the CPU / GLQ_TRELLIS_FUSED_STEP=0 path — must stay fused to exactly
+    TWO kernels: the view-min reduction (prev shift+cast+store in its epilogue) and the
+    state_err/cost-update pointwise kernel. A third kernel means inductor de-fused the
+    out_row mutation or the cast.
+
+    Needs a fresh dynamo state: the parity matrix above compiles `update` for ~18
+    (variant, K, B) specializations, exceeding dynamo's per-function cache limit (8), after
+    which NEW shapes silently run eager — a suite-order artifact, not a production one
+    (a real quantize sees only the model's 3-4 distinct B values)."""
+    torch._dynamo.reset()
+    cb = _cb(4, "3inst")
+    torch.manual_seed(12)
+    B = 60
+    X = (torch.randn(256, B, device="cuda") * 0.5).to(torch.float16)
+    cost = (cb.recons_state - X[:cb.V].unsqueeze(-1)).square().sum(dim=0)
+    out = torch.empty(B, 2 ** (cb.L - cb.K * cb.V), dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        cb.update(cost.clone(), X[cb.V:2 * cb.V], out)      # warm/compile
+    torch.cuda.synchronize()
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cb.update(cost.clone(), X[cb.V:2 * cb.V], out)
+        torch.cuda.synchronize()
+    kernels = [e.key for e in prof.key_averages()
+               if e.self_device_time_total > 0
+               and "Memcpy" not in e.key and "Memset" not in e.key]
+    assert len(kernels) == 2, f"update de-fused into {len(kernels)} kernels: {kernels}"
+
+
+def test_no_fill_kernel_in_viterbi():
+    """VT1 mechanism: from_state/final_state are torch.empty — their contents are fully
+    written before any read, so a no-overlap eager viterbi must launch NO FillFunctor
+    kernel (the (T//V, B, 2^(L-KV)) int64 zeros-fill alone was 5.8% of quantize GPU time)."""
+    cb = _cb(4, "3inst")
+    torch.manual_seed(11)
+    X = (torch.randn(256, 36, device="cuda") * 0.5).to(torch.float16)
+    cb.viterbi(X)                      # warm the compiled update outside the profile
+    torch.cuda.synchronize()
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cb.viterbi(X)
+        torch.cuda.synchronize()
+    fills = [e.key for e in prof.key_averages() if "FillFunctor" in e.key]
+    assert not fills, f"fill kernels still launched in viterbi: {fills}"
+
+
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
+def test_chunk_width_is_bit_exact(variant, monkeypatch):
+    """The per-device Viterbi chunk width (L2-derived, GLQ_TRELLIS_CHUNK_B override) is a
+    pure speed knob: rows never interact and the pad columns are discarded, so 160 tiles
+    quantized as 1×160, 3×54, or 10×16 must give identical states AND hatX."""
+    tlut = _TLUT.clone() if variant == "hyb" else None
+    cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
+    torch.manual_seed(21)
+    tiles = (torch.randn(160, 256, device="cuda") * 0.5).float()
+
+    outs = []
+    for width in ("512", "64", "17"):        # 1 chunk / 3×54 / 10×16
+        monkeypatch.setenv("GLQ_TRELLIS_CHUNK_B", width)
+        gt._chunk_b_cache.clear()
+        outs.append(cb.quantize_tiles(tiles))
+    for width, (hat, st) in zip(("64", "17"), outs[1:]):
+        assert torch.equal(st, outs[0][1]), f"chunk={width}: states differ from single-chunk"
+        assert torch.equal(hat, outs[0][0]), f"chunk={width}: hatX differs from single-chunk"
+
+    # Mechanism: the knob must actually have re-chunked, else this passes vacuously.
+    widths = {k[2] if k[0] == "pair" else k[1] for k in cb.cb._vit_graphs}
+    assert {160, 54, 16} <= widths, f"chunk knob ignored; widths captured: {sorted(widths)}"
+
+
+def test_chunk_b_scales_with_l2():
+    """The default width is read from the device's L2, not hard-coded: it must equal the
+    documented fraction of L2 divided by the 512 KB/row cost ping-pong (16-row granularity,
+    floor 16, cap 2^(24-L))."""
+    cb = _cb(4, "3inst")
+    gt._chunk_b_cache.clear()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    l2 = torch.cuda.get_device_properties(dev.index).L2_cache_size
+    expect = int(gt._GLQ_TRELLIS_L2_FRACTION * l2 / (2 * 4 * 2 ** cb.L)) // 16 * 16
+    expect = max(16, min(2 ** (24 - cb.L), expect))
+    assert cb._chunk_b(dev) == expect, "chunk width is not tracking L2_cache_size"
+    assert cb._chunk_b(torch.device("cpu")) == 2 ** (24 - cb.L), "CPU must keep the old cap"
+
+
+def test_viterbi_kernel_budget():
+    """VT3 mechanism: one eager no-overlap viterbi must stay within ~3 kernels/step —
+    2 for the compiled ACS update + 1 for the compiled traceback step (+ small init slack).
+    Pre-VT3 the eager traceback cost ~3 kernels/step (gather + cast/shift + row copy),
+    putting the total at ~1280; the budget of 800 fails that and passes the fused form."""
+    torch._dynamo.reset()
+    cb = _cb(4, "3inst")
+    torch.manual_seed(13)
+    X = (torch.randn(256, 60, device="cuda") * 0.5).to(torch.float16)
+    cb.viterbi(X)                      # warm all compiles outside the profile
+    torch.cuda.synchronize()
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cb.viterbi(X)
+        torch.cuda.synchronize()
+    total = sum(e.count for e in prof.key_averages()
+                if e.self_device_time_total > 0
+                and "Memcpy" not in e.key and "Memset" not in e.key)
+    # 255 fused ACS + 255 traceback + init slack. The compiled-update path lands ≥765,
+    # so this bound also FAILS on a silent fused-step fallback (assert the mechanism).
+    assert total <= 560, f"viterbi launched {total} kernels (budget 560, ~2/step)"
 
 
 def test_env_kill_switch_forces_eager(monkeypatch):

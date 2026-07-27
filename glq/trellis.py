@@ -58,6 +58,41 @@ def _trellis_cudagraph_on():
             and not os.environ.get("GLQ_TRELLIS_NO_CUDAGRAPH")
             and torch.cuda.is_available())
 
+
+# Stage-6 fused Triton ACS step (glq/trellis_step_kernel.py): one kernel per Viterbi step
+# instead of the two the compiled `update` produces. Bit-exact (torch.equal-gated); the
+# compiled `update` remains the CPU / kill-switch / no-triton fallback.
+_GLQ_TRELLIS_FUSED_STEP_ENABLED = True
+_fused_step_mod = None                       # lazy import result: module or False
+
+# Rows (16-row weight tiles) per Viterbi call. Each ACS step ping-pongs two (B, 2^L) fp32
+# cost buffers, so the resident set is 512 KB·B at L=16 — and once it outgrows L2 the
+# per-row cost jumps hard. Measured µs/row: a 48 MB-L2 L4 goes 359 (B=60) → 1185 (B=160),
+# while a 128 MB-L2 RTX PRO 6000 stays flat at 72-75 from B=100 to B=192. The right width
+# is therefore per-GPU, read from L2 at runtime, not a constant. Chunking is bit-exact —
+# Viterbi rows never interact and pad columns are discarded — so this is purely a speed
+# knob; override with GLQ_TRELLIS_CHUNK_B. Fraction is fitted to the two GPUs above.
+_GLQ_TRELLIS_L2_FRACTION = 0.75
+_chunk_b_cache = {}
+
+
+def _fused_step_available():
+    global _fused_step_mod
+    if _fused_step_mod is None:
+        try:
+            from . import trellis_step_kernel as _tsk
+            _fused_step_mod = _tsk if _tsk._HAS_TRITON else False
+        except Exception:
+            _fused_step_mod = False
+    return _fused_step_mod is not False
+
+
+def _fused_step_on():
+    return (_GLQ_TRELLIS_FUSED_STEP_ENABLED
+            and os.environ.get("GLQ_TRELLIS_FUSED_STEP", "1") != "0"
+            and torch.cuda.is_available()
+            and _fused_step_available())
+
 # MMA-fragment intra-tile reorder (QTIP lib/algo/ldlq.py:10-13). Applied to the 256-element
 # tile BEFORE trellis-quantizing (for_kernel) so decoded lanes land in tensor-core fragment
 # order; INV restores natural (row-major 16×16) order for the reconstructed weight.
@@ -168,6 +203,9 @@ class bitshift_codebook(nn.Module):
         # `torch.arange(...).to(X.device)` is a CPU→CUDA copy, which is ILLEGAL during CUDA-graph
         # capture and silently forced the overlap pass onto the eager fallback.
         self.register_buffer("_kv_arange", torch.arange(2 ** (K * V)).view(1, 1, -1))
+        # arange(2^(L-KV)) row vector for the view-min ACS: predecessor state =
+        # _prev_base[j] + argmin_k << (L-KV) — the closed form of the state_cand gather.
+        self.register_buffer("_prev_base", torch.arange(2 ** (L - K * V)).view(1, -1))
 
         # Viterbi CUDA-graph cache: (T, B, has_overlap) -> _VitGraph. Plain attrs (NOT buffers)
         # so `.to(device)` never touches them. Lazily populated on first CUDA `quantize_seq`.
@@ -182,17 +220,27 @@ class bitshift_codebook(nn.Module):
         return self.lut[:, encoded.int().to(self.lut.device)].to(encoded.device)
 
     @torch.compile
-    def update(self, cost, thing):
+    def update(self, cost, thing, out_row):
+        # ACS in closed form. The candidate predecessors of new-state group j (= s >> KV)
+        # are exactly {j + k·2^(L-KV), k ∈ [0, 2^KV)} (see state_cand's construction), so the
+        # original expand+gather over state_cand is a strided VIEW of cost: cand_cost[b,j,k]
+        # == cost.view(B, 2^KV, 2^(L-KV))[b,k,j]. min over k keeps the identical ascending-k
+        # candidate order (same tie-break as the gathered min) — bit-exact, but coalesced and
+        # with zero index-tensor traffic. prev_state = j + argmin_k·2^(L-KV), arithmetically.
         state_err = (self.recons_state - thing.unsqueeze(-1)).square().sum(dim=0)
-        cand_cost = torch.gather(
-            cost.unsqueeze(-2).expand(-1, self.state_cand.shape[1], -1), -1,
-            self.state_cand.expand(len(cost), -1, 2 ** (self.K * self.V)))
-        best = torch.min(cand_cost, dim=-1)
+        best = cost.view(len(cost), 2 ** (self.K * self.V), -1).min(dim=1)
         cost = state_err + best.values.unsqueeze(-1).expand(
             -1, -1, 2 ** (self.K * self.V)).reshape(state_err.shape)
-        prev_state = torch.gather(
-            self.state_cand.expand(thing.shape[1], -1, -1), -1, best.indices.unsqueeze(-1))[..., 0]
-        return prev_state, cost
+        # int32: states < 2^16 always fit; halves the from_state stream (the largest pure-DRAM
+        # write in the loop) and the traceback's gather-source reads. Cast fuses into the
+        # reduction epilogue under inductor.
+        # Written straight into the caller's from_state row (functionalized mutation → the
+        # store fuses into the reduction epilogue; a separate return would cost an extra
+        # copy kernel per step). Every from_state[i] slice has identical shape/stride, so
+        # this compiles ONCE, exactly like the X[i*V:(i+1)*V] input slices.
+        out_row.copy_((self._prev_base
+                       + (best.indices << (self.L - self.K * self.V))).to(torch.int32))
+        return cost
 
     def viterbi(self, X, overlap=None):
         T, B = X.shape
@@ -203,22 +251,50 @@ class bitshift_codebook(nn.Module):
             allow = (overlap << (self.K * self.V)).unsqueeze(-1) + self._kv_arange
             mask.scatter_(1, allow[0], 0)
             cost = torch.min(cost + mask, self.fakeinf)
-        from_state = torch.zeros(T // self.V, B, 2 ** (self.L - self.K * self.V),
-                                 dtype=self.state.dtype, device=self.state.device)
+        # empty, NOT zeros: rows 1..T//V-1 are fully overwritten by the forward loop before
+        # the traceback reads them, and row 0 is never read — the (T//V, B, 2^(L-KV)) fill
+        # was pure dead work (380 µs/call, 5.8% of quantize GPU time at int64).
+        from_state = torch.empty(T // self.V, B, 2 ** (self.L - self.K * self.V),
+                                 dtype=torch.int32, device=self.state.device)
+        use_fused = X.is_cuda and _fused_step_on()
         for i in range(1, T // self.V):
-            from_state[i], cost = self.update(cost, X[i * self.V:(i + 1) * self.V])
+            if use_fused:
+                try:
+                    cost = _fused_step_mod.fused_update(
+                        self, cost, X[i * self.V:(i + 1) * self.V], from_state[i])
+                    continue
+                except Exception as e:
+                    # Loud, process-wide fallback (mirrors the graph-capture sentinel):
+                    # a Triton compile/launch failure must not kill quantization — the
+                    # compiled update is bit-exact. Nothing was written for this step
+                    # (the failure precedes the kernel's stores), so redoing it is safe.
+                    global _GLQ_TRELLIS_FUSED_STEP_ENABLED
+                    _GLQ_TRELLIS_FUSED_STEP_ENABLED = False
+                    use_fused = False
+                    warnings.warn(
+                        f"fused trellis ACS step failed; falling back to the compiled "
+                        f"update for this process. {type(e).__name__}: {e}",
+                        RuntimeWarning, stacklevel=2)
+            cost = self.update(cost, X[i * self.V:(i + 1) * self.V], from_state[i])
         if overlap is not None:
             mask = torch.ones(B, 2 ** self.L, device=X.device) * self.fakeinf
             allow = (overlap.unsqueeze(-1) + self.sumdelta.unsqueeze(0))
             mask.scatter_(1, allow[0, 0], 0)
             cost = torch.min(cost + mask, self.fakeinf)
-        final_state = torch.zeros(T // self.V, B, dtype=self.idx_dtype, device=X.device)
+        final_state = torch.empty(T // self.V, B, dtype=self.idx_dtype, device=X.device)
         final_state[T // self.V - 1] = torch.argmin(cost, dim=-1)
         for i in range(T // self.V - 1, 0, -1):
-            final_state[i - 1] = torch.gather(
-                from_state[i], -1,
-                (final_state[i].to(torch.int64).unsqueeze(-1)) >> (self.K * self.V))[..., 0]
+            self._tb_step(from_state[i], final_state[i], final_state[i - 1])
         return final_state
+
+    @torch.compile
+    def _tb_step(self, from_row, fs_i, fs_out):
+        # One fused kernel per traceback step (was 3: int64 cast+shift, gather, row copy).
+        # Identical ops in identical order to the original eager body — bit-exact; the
+        # 255-step sequential chain itself is inherent to the trellis.
+        fs_out.copy_(torch.gather(
+            from_row, -1,
+            (fs_i.to(torch.int64).unsqueeze(-1)) >> (self.K * self.V))[..., 0])
 
     # -- CUDA-graph capture of `viterbi` (see module header) ------------------
     @torch.no_grad()
@@ -277,15 +353,96 @@ class bitshift_codebook(nn.Module):
             entry.graph.replay()
             return entry.out_buf.clone()
 
+    # -- one graph per tail-biting PAIR (single-chunk shapes) ------------------
+    def _pair_body(self, x_buf):
+        """Both tail-biting passes + the overlap derivation, as one replayable region.
+        Single-chunk `quantize_seq` is an exact reshape identity around `viterbi`, so this
+        equals the two-`quantize_seq` path bit-for-bit; the `>>` runs on-device (int32)."""
+        T = x_buf.shape[0]
+        roll_X = torch.roll(x_buf, T // (2 * self.V) * self.V, 0)
+        s1 = self.viterbi(roll_X, None)
+        overlap = s1[T // (2 * self.V)] >> (self.K * self.V)
+        return self.viterbi(x_buf, overlap)
+
+    @torch.no_grad()
+    def _capture_pair(self, X, warmup_iters=3):
+        if self._vit_graph_pool is None:
+            self._vit_graph_pool = torch.cuda.graph_pool_handle()
+        x_buf = torch.empty_like(X)
+        x_buf.copy_(X)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(warmup_iters):
+                self._pair_body(x_buf)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._vit_graph_pool):
+            out_buf = self._pair_body(x_buf)
+        return _VitGraph(graph, x_buf, None, out_buf)
+
+    @torch.no_grad()
+    def _pair_graphed(self, X):
+        """Replay the pair graph for (T, NO) single-chunk quantizes; None on capture failure
+        (caller falls back to the classic two-`quantize_seq` path). Locking as in
+        `_viterbi_graphed` — capture is process-global and the static buffers are shared."""
+        key = ("pair", int(X.shape[0]), int(X.shape[1]))
+        with self._vit_lock:
+            if key not in self._vit_graphs:
+                try:
+                    self._vit_graphs[key] = self._capture_pair(X)
+                except Exception as e:
+                    warnings.warn(
+                        f"trellis pair CUDA-graph capture failed for {key}; using the "
+                        f"per-pass path. {type(e).__name__}: {e}", RuntimeWarning,
+                        stacklevel=2)
+                    self._vit_graphs[key] = None
+            entry = self._vit_graphs[key]
+            if entry is None:
+                return None
+            entry.x_buf.copy_(X)
+            entry.graph.replay()
+            return entry.out_buf.clone()
+
     def free_viterbi_graphs(self):
         """Release captured Viterbi graphs + their pool (call after quantization to reclaim VRAM)."""
         self._vit_graphs.clear()
         self._vit_graph_pool = None
 
+    def _chunk_b(self, device):
+        """Viterbi rows per call on this device: the largest B whose cost ping-pong still
+        sits in L2, floored at 16 and capped at the historical 2^(24-L)."""
+        env = os.environ.get("GLQ_TRELLIS_CHUNK_B")
+        if env:
+            return max(1, int(env))
+        hard_cap = 2 ** (24 - self.L)
+        if getattr(device, "type", None) != "cuda":
+            return hard_cap
+        idx = torch.cuda.current_device() if device.index is None else device.index
+        key = (idx, self.L)
+        if key not in _chunk_b_cache:
+            try:
+                l2 = int(getattr(torch.cuda.get_device_properties(idx), "L2_cache_size", 0))
+            except Exception:
+                l2 = 0
+            if l2 > 0:
+                per_row = 2 * 4 * (2 ** self.L)          # cost + cost_new, fp32
+                b = int(_GLQ_TRELLIS_L2_FRACTION * l2 / per_row) // 16 * 16
+                _chunk_b_cache[key] = max(16, min(hard_cap, b))
+            else:                                        # unknown L2 → historical behaviour
+                _chunk_b_cache[key] = hard_cap
+        return _chunk_b_cache[key]
+
     def quantize_seq(self, X, overlap=None):
         T, NO = X.shape
-        bs = min(2 ** (24 - self.L), NO)
-        pad_amt = math.ceil(NO / bs) * bs - NO
+        # Balanced chunks: take the fewest chunks that respect the device width, then even
+        # them out. Rounding NO up to a multiple of the width instead would process 288 rows
+        # for a 160-row layer at width 144 — slower than not chunking at all.
+        cap = min(self._chunk_b(X.device), NO)
+        nchunks = math.ceil(NO / cap)
+        bs = math.ceil(NO / nchunks)
+        pad_amt = nchunks * bs - NO
         X = torch.nn.functional.pad(X, (0, pad_amt))
         T, N = X.shape
         X = X.reshape(T, N // bs, bs).transpose(0, 1).contiguous()
@@ -301,11 +458,20 @@ class bitshift_codebook(nn.Module):
 
     def quantize(self, X):
         X = X.T.contiguous().to(torch.float16)
-        T = X.shape[0]
-        roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
-        state = self.quantize_seq(roll_X, overlap=None)
-        overlap = state[T // (2 * self.V)] >> self.K * self.V
-        state = self.quantize_seq(X, overlap=overlap)
+        T, NO = X.shape
+        # Single-chunk shapes take ONE graph per tail-biting pair: both Viterbi passes plus
+        # the overlap shift replay as a single launch (halves graph launches + Python/copy/
+        # clone round-trips per quantize). Multi-chunk / CPU / kill-switch keep the classic
+        # per-pass path below; so does a failed pair capture (None from _pair_graphed).
+        state = None
+        if (X.is_cuda and _trellis_cudagraph_on()
+                and NO <= min(self._chunk_b(X.device), _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
+            state = self._pair_graphed(X)
+        if state is None:
+            roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
+            state = self.quantize_seq(roll_X, overlap=None)
+            overlap = state[T // (2 * self.V)] >> self.K * self.V
+            state = self.quantize_seq(X, overlap=overlap)
         hatX = self.recons(state).transpose(0, 1).reshape(X.shape)
         return hatX.T.contiguous().to(X.device), state.T.contiguous().to(X.device)
 
