@@ -81,8 +81,17 @@ if _HAS_TRITON:
 # uniform 4096-f32 (16 KB) contiguous span for every config; grid is (16, B). Static —
 # no autotune (capture-time re-benchmarking is illegal under CUDA graphs).
 _CFG = {
-    (1, 2): (1024, 4, 4), (1, 3): (512, 8, 4), (1, 4): (256, 16, 4),
+    # (1, 1) is the RVQ 1-bit residual stage; verified torch.equal vs the compiled update.
+    (1, 1): (2048, 2, 4), (1, 2): (1024, 4, 4), (1, 3): (512, 8, 4), (1, 4): (256, 16, 4),
     (2, 4): (256, 16, 4), (2, 6): (64, 16, 4), (2, 8): (16, 16, 4),
+    # NO entries for V=1 KV>=5 yet. The geometry works (TILE_J = NGROUP//16, KCHUNK 16), but
+    # the result is NOT bit-exact against the compiled `update`: backpointers match while the
+    # stored cost differs by 1-2 ULP at K=5..8. `cost.view(B, 2**KV, -1)` changes shape with
+    # K, so inductor and Triton contract `err + d*d` into an FMA at different tilings — the
+    # fp-contraction hazard that happened not to fire at K<=4. A near-tie can then flip an
+    # argmin, so this would break the byte-identical-checkpoint gate. Resolve the contraction
+    # (match the reference DAG on both sides) before enabling; until then K>=5 falls back
+    # loudly to the compiled update, which is correct, just ~2x slower.
 }
 
 

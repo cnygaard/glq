@@ -524,16 +524,26 @@ class GLQQuantizer(HfQuantizer):
                     "layout (config.json lacks trellis_layout: \"kernel\") and cannot be "
                     "decoded by this glq version. Re-quantize with glq >= 0.7 "
                     "(--codebook trellis, variant 3inst).")
-            tlut, K = None, 2
+            tlut, K, K2 = None, 2, None
+            trellis_codebook2 = None
             for _m in model.modules():
                 if (isinstance(_m, E8RHTLinear) and getattr(_m, "_is_trellis", False)
                         and _m.trellis_packed.numel() > 0
                         and _m.trellis_packed.device.type != 'meta'):
                     K = max(_m.trellis_packed.shape[1] // 16, 1)
+                    # Stacked RVQ (5-8 bpw): the residual stage's rate is self-describing
+                    # from its OWN packed width, and the buffer's presence is the stage
+                    # count — which is why no config.json key is needed for either.
+                    _p2 = getattr(_m, "trellis_packed2", None)
+                    if _p2 is not None and _p2.numel() > 0 and _p2.device.type != 'meta':
+                        K2 = max(_p2.shape[1] // 16, 1)
                     if _m.tlut.numel() > 0:
                         tlut = _m.tlut.detach().to(torch.float32)
                     break
             codebook = TrellisCodebook(variant=variant, K=K, tlut=tlut, device='cpu')
+            if K2 is not None:
+                trellis_codebook2 = TrellisCodebook(variant=variant, K=K2, tlut=tlut,
+                                                    device='cpu')
         pretrained_path = getattr(cfg, "_name_or_path", None) if cfg is not None else None
         if codebook is None:
             codebook = _resolve_shell_codebook(pretrained_path)
@@ -551,12 +561,12 @@ class GLQQuantizer(HfQuantizer):
 
         codebook2 = None
         if cb_type == "trellis":
-            # The trellis is SINGLE-STAGE at every rate — bpw is the trellis rate K,
-            # not a stage count — so there is no residual grid to supply. It must be
-            # branched out explicitly: the shell arms below reach for shell-only RVQ
-            # machinery (`make_small`, which TrellisCodebook has no business owning)
-            # the moment K >= 3.
-            pass
+            # 2-4 bpw is single-stage (bpw IS the trellis rate K), so codebook2 stays None.
+            # 5-8 bpw stacks a K=(bpw-4) residual, built above from trellis_packed2's own
+            # width. Either way this must be branched out of the shell arms below, which
+            # reach for shell-only RVQ machinery (`make_small`, which TrellisCodebook has
+            # no business owning) the moment K >= 3.
+            codebook2 = trellis_codebook2
         elif cb_type == "e8p":
             # E8P RVQ: the E8P residual stages decode against the stage-0 grid
             # (`codebook`); `codebook2` only supplies the E81B grid for the E81B

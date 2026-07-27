@@ -168,6 +168,14 @@ class bitshift_codebook(nn.Module):
     def __init__(self, L=16, K=2, V=2, tlut_bits=9, decode_mode="quantlut_sym", tlut=None):
         super().__init__()
         self.idx_dtype = torch.int32
+        # K*V is the bits consumed per trellis STEP; L is the shift-register width. At
+        # K*V == L every state reaches every state (the trellis degenerates to memoryless)
+        # AND `pack_trellis`'s `bf[:, :-(L - K*V)]` slices to empty, silently producing
+        # zero-length packed rows. Above L the shifts are negative. Fail loudly instead.
+        if K * V >= L:
+            raise ValueError(
+                f"trellis needs K*V < L: got K={K}, V={V} (K*V={K * V}) with L={L}. "
+                f"At K*V == L the trellis is degenerate and the bit-packing slices to empty.")
         self.L, self.K, self.V = L, K, V
         self.tlut_bits, self.decode_mode = tlut_bits, decode_mode
 
@@ -680,11 +688,166 @@ def trellis_ldlq(W, H, cb, Wscale=None, for_kernel=True):
     return hatWr, Qidxs, Wscale
 
 
+# ---------------------------------------------------------------------------
+# Trellis RVQ (stacked 5-8 bpw): recipe, N-stage LDLQ, N-stage decode
+# ---------------------------------------------------------------------------
+def trellis_rvq_recipe(bpw):
+    """Per-stage trellis rate K for integer ``bpw`` 2-8.
+
+    2-4 is a single native-rate trellis. 5-8 stacks a K=4 primary with a K=(bpw-4)
+    residual: 5=4+1, 6=4+2, 7=4+3, 8=4+4. Two reasons it is not one native K=5..8 code:
+
+    * Quality — a native rate loses the trellis coding gain as K grows, because a weight's
+      context is only ``ceil(L/K)`` symbols (2 at K=8 with L=16). Measured on 6 real
+      SmolLM3-3B layers, native ties stacked at 5 bpw (+0.09 dB) then trails by 0.32 /
+      0.89 / 2.37 dB at 6 / 7 / 8.
+    * Kernels — ``glq_trellis.cu`` packs each decode chunk into a uint32 of width ``8*R``,
+      so R>=5 has no kernel at all. Every stage here stays at R<=4.
+
+    6 bpw is 4+2 rather than the marginally better 3+3 (+0.22 dB): ``tr_ld_cs`` vectorizes
+    uint2/uint4 but emits three scalar loads for uint3, so 3+3 costs 6 load instructions
+    against 4+2's 2 for the same bits.
+    """
+    bpw = int(bpw)
+    if not 2 <= bpw <= 8:
+        raise ValueError(f"trellis supports integer bpw 2-8, got {bpw}")
+    return [bpw] if bpw <= 4 else [4, bpw - 4]
+
+
+# Multiplier on the free rms-ratio residual-scale estimate, keyed by the RESIDUAL stage's
+# rate K2. The rms ratio is computed from the STAGE-1 residual, so it is identical at every
+# bpw on a layer and cannot see K2 — yet the optimum moves a lot with it, because the scale
+# trades granular error against overload: at K2=1 (two levels) you want to amplify MORE than
+# rms-matching so the levels straddle the bulk, while at K2=4 the cells are already fine and
+# tail clipping dominates, so you want to amplify LESS.
+#
+# Calibrated by expanding-bracket + golden-section search on 3 real SmolLM3-3B attention
+# layers (`benchmarks/_trellis_rs_validate.py`). Excluding one pathological layer
+# (layers.0.self_attn.q_proj, also the outlier in the Phase-0 study), the optimal multiplier
+# varies only 1.01-1.05x ACROSS layers at fixed K2 — i.e. the per-layer rms ratio already
+# carries the layer dependence and this constant carries the rate dependence. Values are the
+# median over layers, which matches the outlier-excluded mean to 2-3%.
+#
+# SCOPE: fitted on SmolLM3-3B self-attention. Re-check on an MLP (down_proj) and a second
+# model before treating as universal. The outlier layer wants ~0.30 at K2=4 where the
+# constant gives 0.74, so a shape-aware estimate (residual kurtosis, still free from the
+# same block) is the obvious refinement if high-bpw layers ever look weak.
+_RESID_SCALE_CAL = {1: 1.29, 2: 1.06, 3: 0.94, 4: 0.74}
+
+
+def trellis_ldlq_nstage(W, H, cbs, Wscale=None, for_kernel=True, resid_scales=None):
+    """LDLQ reverse sweep with an N-stage residual (RVQ) trellis quantizer.
+
+    Returns ``(hatWr_norm, [Qidxs per stage], Wscale, cum_inv_rs)`` where
+    ``cum_inv_rs[s] = 1 / prod(resid_scales[:s])`` is the reconstruction weight of stage s,
+    so the decode is the plain weighted sum ``sum_s decode(stage_s) * cum_inv_rs[s]``.
+
+    The residual stages run INSIDE the per-column-block loop, matching e8p
+    (``glq/ldlq.py``): LDLQ feedback then compensates only the FINAL residual. Staging the
+    whole layer through stage 1 and only then quantizing the residual would decouple the
+    two and lose that.
+
+    ``len(cbs) == 1`` delegates to :func:`trellis_ldlq` so the shipped 2/3/4 bpw path stays
+    bit-identical — those checkpoints are byte-compare-gated.
+    """
+    if len(cbs) == 1:
+        hatWr, Qidxs, Wscale = trellis_ldlq(W, H, cbs[0], Wscale=Wscale,
+                                            for_kernel=for_kernel)
+        return hatWr, [Qidxs], Wscale, [1.0]
+
+    dev = cbs[0].device
+    W, H = W.float().to(dev), H.float().to(dev)
+    m, n = W.shape
+    b = TD
+    assert n % b == 0 and m % b == 0, f"trellis needs m,n %16 (got {m}x{n})"
+    perm = _PERMUTE.to(dev)
+    inv_perm = _INV_PERMUTE.to(dev)
+
+    damp = 0.01 * torch.diag(H).mean()
+    L, _ = block_LDL(H + damp * torch.eye(n, device=dev), block_size=b)
+
+    if Wscale is None:
+        Wscale = W.pow(2).mean().sqrt().item() * cbs[0].opt_scale
+    Wr = W / Wscale
+    hatWr = torch.zeros_like(Wr)
+    R = Wr.clone()
+    Qidxs = [torch.zeros(m, n // cb.V, dtype=torch.int32, device=dev) for cb in cbs]
+
+    rs = list(resid_scales) if resid_scales is not None else None
+    cum_inv_rs = None
+    for k in reversed(range(n // b)):
+        kb, ke = k * b, (k + 1) * b
+        feedback = R[:, ke:] @ L[ke:, kb:ke] if ke < n else 0.0
+        WXWX = Wr[:, kb:ke] + feedback
+        tiles = WXWX.reshape(m // b, b * b)
+        if for_kernel:
+            tiles = tiles[:, perm]
+
+        hatX, state = cbs[0].quantize_tiles(tiles)
+        _store_states(Qidxs[0], state, cbs[0], m, b, k)
+        resid = tiles - hatX
+
+        if rs is None:
+            # Fit the residual amplification once, from the first block processed:
+            #   rs = rms(target)/rms(residual)  *  C[K2]
+            # The rms ratio carries the PER-LAYER scale (a global constant loses up to 2 dB
+            # on real layers) and _RESID_SCALE_CAL carries the PER-RATE correction the ratio
+            # cannot see. Estimated from one block (m*16 samples, ample for an rms), so it
+            # costs no extra Viterbi pass — a search would cost ~10x on a multi-hour quantize.
+            r_t = tiles.float().pow(2).mean().sqrt().item()
+            r_r = max(resid.float().pow(2).mean().sqrt().item(), 1e-12)
+            base = r_t / r_r
+            rs = [base * _RESID_SCALE_CAL.get(cbs[s + 1].K, 1.0)
+                  for s in range(len(cbs) - 1)]
+        if cum_inv_rs is None:
+            cum_inv_rs = [1.0]
+            for r in rs:
+                cum_inv_rs.append(cum_inv_rs[-1] / r)
+
+        recon = hatX
+        resid = resid * rs[0]
+        for s in range(1, len(cbs)):
+            hatX_s, state_s = cbs[s].quantize_tiles(resid)
+            _store_states(Qidxs[s], state_s, cbs[s], m, b, k)
+            recon = recon + hatX_s * cum_inv_rs[s]
+            if s < len(cbs) - 1:
+                resid = (resid - hatX_s) * rs[s]
+
+        if for_kernel:
+            recon = recon[:, inv_perm]
+        hatWr[:, kb:ke] = recon.reshape(m, b).to(hatWr.dtype)
+        R[:, kb:ke] = Wr[:, kb:ke] - hatWr[:, kb:ke]
+    return hatWr, Qidxs, Wscale, cum_inv_rs
+
+
+def _store_states(Qidxs, state, cb, m, b, k):
+    """Write one column block's trellis states into the per-stage index slab."""
+    w = b // cb.V
+    Qidxs[:, w * k:w * (k + 1)] = state.reshape(m, w)
+
+
+def decode_layer_nstage(cbs, packed_list, cum_inv_rs, m, n, has_kernel=True):
+    """Pure-torch N-stage decode: ``sum_s decode_layer(stage_s) * cum_inv_rs[s]``.
+
+    Matmul linearity means the CUDA path may equivalently decode each stage and sum the
+    OUTPUTS (what e8p does), so this stays the oracle for either implementation.
+    """
+    out = None
+    for cb, packed, scale in zip(cbs, packed_list, cum_inv_rs):
+        d = decode_layer(cb, packed, m, n, has_kernel=has_kernel) * scale
+        out = d if out is None else out + d
+    return out
+
+
 def quantize_layer_trellis_rht(W, H, cb, block_diagonal=True, for_kernel=None):
     """RHT + trellis-LDLQ, mirroring ``quantize_layer_e8_shell_rht``.
 
     Returns (W_hat (m,n) in original weight space, artifacts dict with the compressed
     trellis + per-codebook metadata needed to reconstruct at inference).
+
+    ``cb`` is a codebook LIST for the stacked 5-8 bpw RVQ (stage 1 K=4 + stage 2 K=bpw-4);
+    a bare codebook is accepted and treated as a single stage, which keeps the shipped
+    2/3/4 bpw path — and its byte-identical checkpoints — on exactly the old code.
 
     ``for_kernel`` selects the stored tile layout (the MMA-fragment ``_PERMUTE`` + byte
     flip). It MUST match the layout the decoder uses — i.e. the codebook's ``has_kernel``.
@@ -692,9 +855,16 @@ def quantize_layer_trellis_rht(W, H, cb, block_diagonal=True, for_kernel=None):
     variant automatically; the driver relies on this. Both shipped variants (HYB + 3inst)
     are has_kernel=True → kernel layout. Pass explicitly only in tests.
     """
+    if isinstance(cb, (list, tuple)):
+        cbs = list(cb)
+    else:
+        # The driver attaches the stacked recipe to the primary codebook (see
+        # quantize_model.py) so the rest of its duck-typing stays single-object.
+        cbs = list(getattr(cb, "rvq_stages", None) or [cb])
+    cb0 = cbs[0]
     if for_kernel is None:
-        for_kernel = cb.has_kernel
-    dev = cb.device
+        for_kernel = cb0.has_kernel
+    dev = cb0.device
     m, n = W.shape
     Wf, Hf = W.float().to(dev), H.float().to(dev)
     damp = 0.01 * torch.mean(torch.diag(Hf))
@@ -703,17 +873,27 @@ def quantize_layer_trellis_rht(W, H, cb, block_diagonal=True, for_kernel=None):
     Wt = rht.transform_weights(Wf)
     Ht = rht.transform_hessian(Hf)
     assert Wt.shape == (m, n), f"trellis needs no RHT padding; got {tuple(Wt.shape)} for {m}x{n}"
-    hatWr_norm, Qidxs, Wscale = trellis_ldlq(Wt, Ht, cb, for_kernel=for_kernel)
+    hatWr_norm, Qidxs, Wscale, cum_inv_rs = trellis_ldlq_nstage(
+        Wt, Ht, cbs, for_kernel=for_kernel)
     W_hat = rht.inverse_transform_weights(hatWr_norm * Wscale)
     # Artifacts are the per-layer E8RHTLinear-trellis buffers — TENSORS ONLY (the driver
     # .cpu()'s every value + writes it to the state_dict). Codebook metadata (variant/K/V)
-    # lives in config.json (K is re-derived from the packed shape at load).
+    # lives in config.json (each stage's K is re-derived from ITS OWN packed shape at load,
+    # and the presence of trellis_packed2 IS the stage count — so no new config key).
     artifacts = {
-        "trellis_packed": pack_layer(cb, Qidxs, m, n, has_kernel=for_kernel).cpu(),
+        "trellis_packed": pack_layer(cb0, Qidxs[0], m, n, has_kernel=for_kernel).cpu(),
         "SU": rht.su.detach().to(torch.float16).cpu(),          # (m,) RHT row signs
         "SV": rht.sv.detach().to(torch.float16).cpu(),          # (n,) RHT col signs
         "Wscale": torch.tensor(float(Wscale), dtype=torch.float32),
     }
-    if cb.tlut is not None:
-        artifacts["tlut"] = cb.tlut.detach().to(torch.float16).cpu()
+    if len(cbs) > 1:
+        # Stage 2 of the stacked RVQ. Emitted ONLY when it exists — the loader keys the
+        # stage count off this buffer's presence, so a zero-size placeholder here would
+        # falsely advertise a second stage.
+        artifacts["trellis_packed2"] = pack_layer(
+            cbs[1], Qidxs[1], m, n, has_kernel=for_kernel).cpu()
+        artifacts["inv_resid_scale2"] = torch.tensor(float(cum_inv_rs[1]),
+                                                     dtype=torch.float32)
+    if cb0.tlut is not None:
+        artifacts["tlut"] = cb0.tlut.detach().to(torch.float16).cpu()
     return W_hat, artifacts

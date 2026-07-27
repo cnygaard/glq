@@ -714,19 +714,19 @@ class TestTrellisMixedBpwGuard:
                      bpw=3.5, codebook_type="e8p")
         assert "uniform integer bpw" not in str(exc.value)
 
-    @pytest.mark.parametrize("bpw", [1, 5, 8])
-    def test_bpw_outside_2_4_rejected(self, bpw, tmp_path):
-        """The trellis rate K *is* the bpw, and the CUDA kernel templates on
-        R in {2,3,4} (``tr_bits_from_packed`` hard-checks it). Reaching 5-8 bpw
-        needs RVQ stacking, which is not implemented. Refuse up front — a K=5
-        run would otherwise Viterbi-encode for GPU-hours and only fail at serve."""
-        with pytest.raises(ValueError, match="trellis codebook supports bpw 2-4"):
+    @pytest.mark.parametrize("bpw", [1, 9, 12])
+    def test_bpw_outside_2_8_rejected(self, bpw, tmp_path):
+        """2-4 is a native-rate trellis, 5-8 stacks 4+(bpw-4); outside that there is no
+        recipe. Refuse up front — a bad rate would otherwise Viterbi-encode for GPU-hours
+        and only fail at serve time."""
+        with pytest.raises(ValueError, match="trellis codebook supports bpw 2-8"):
             quantize(model_name="x/y", output_dir=str(tmp_path),
                      bpw=bpw, codebook_type="trellis")
 
-    @pytest.mark.parametrize("bpw", [2, 3, 4])
-    def test_bpw_2_3_4_accepted(self, bpw, tmp_path):
-        """K=2/3/4 must get *past* the guards (and then fail on the model load)."""
+    @pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7, 8])
+    def test_bpw_2_to_8_accepted(self, bpw, tmp_path):
+        """Every supported rate must get *past* the guards (and then fail on model load).
+        5-8 are the stacked-RVQ rates added alongside the native 2-4."""
         with pytest.raises(Exception) as exc:  # noqa: PT011
             quantize(model_name="x/y", output_dir=str(tmp_path),
                      bpw=bpw, codebook_type="trellis")

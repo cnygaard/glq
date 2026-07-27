@@ -1,6 +1,8 @@
 """E8RHTLinear — quantized linear layer with E8 shell codebook + RHT."""
 
 import math
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +23,9 @@ _GLQ_FUSED_E8P_ENABLED = True
 # Kill-switch for the fused QTIP-trellis linear op (glq_fused_linear_trellis_cuda). Default
 # on; flip to False to force the pure-torch decode reference (used by the A/B parity test).
 _GLQ_FUSED_TRELLIS_ENABLED = True
+# One-shot latch so the "5-8 bpw has no fused kernel" notice fires once per process, not
+# once per layer (a 3B model would emit it ~200 times).
+_WARNED_TRELLIS_RVQ_EAGER = False
 
 
 def _pack_block_meta(block_sizes):
@@ -339,6 +344,12 @@ class E8RHTLinear(nn.Module):
         decoded weight is materialized+cached lazily in _forward_trellis (pure-torch S0
         reference; the S1 CUDA kernel fuses decode into the matvec)."""
         self.register_buffer('trellis_packed', torch.zeros(0, dtype=torch.int16))
+        # Stacked-RVQ residual stage (5-8 bpw only). Registered EAGERLY at 0-size even for
+        # 2-4 bpw: from_pretrained's meta-assign path only populates buffers that already
+        # exist, so lazy registration in _load_from_state_dict silently drops them. 0-size
+        # (never a small placeholder) is what makes numel()==0 a sound "no stage 2" test.
+        self.register_buffer('trellis_packed2', torch.zeros(0, dtype=torch.int16))
+        self.register_buffer('inv_resid_scale2', torch.zeros((), dtype=torch.float32))
         self.register_buffer('tlut', torch.zeros(0, dtype=torch.float16))
         self.register_buffer('SU', torch.ones(self.m_pad, dtype=torch.float16))
         self.register_buffer('SV', torch.ones(self.n_pad, dtype=torch.float16))
@@ -395,10 +406,18 @@ class E8RHTLinear(nn.Module):
             self._trellis_has_kernel = getattr(codebook, 'has_kernel', True)
             self._trellis_W_rht = None
             self._trellis_op = None      # re-resolve (has_kernel gates the CUDA path)
+            # Stage-2 FLAG and stage-2 SCALE are resolved in ONE block, deliberately. The
+            # e8p stage-3/4 silent drop came from resolving them under different conditions:
+            # the flag said "stage present" while the scale stayed 0.0, and the decode then
+            # dropped the stage with no error and no warning.
+            self._trellis_has_stage2 = self.trellis_packed2.numel() > 0
             if self.Wscale.device.type != "meta":
                 self._wscale_float = self.Wscale.item()
+                self._inv_rs2_float = (self.inv_resid_scale2.item()
+                                       if self._trellis_has_stage2 else 0.0)
             else:
                 self._wscale_float = None
+                self._inv_rs2_float = None
             return
         # Skip scalar caching for meta tensors (offloaded layers);
         # values will be resolved lazily in forward() if needed.
@@ -437,7 +456,7 @@ class E8RHTLinear(nn.Module):
         if self._is_trellis:
             # Resize the 0-size compressed placeholders to the checkpoint's exact shapes
             # so super()'s copy matches (non-meta path); meta-assign replaces wholesale.
-            for suffix in ('trellis_packed', 'tlut'):
+            for suffix in ('trellis_packed', 'trellis_packed2', 'tlut'):
                 key = prefix + suffix
                 if key in state_dict:
                     buf = getattr(self, suffix)
@@ -801,6 +820,15 @@ class E8RHTLinear(nn.Module):
             cb.cb.fakeinf = cb.cb.fakeinf.to(device)
             cb.device = device
 
+    def _ensure_trellis_codebook2_device(self, device):
+        """Same, for the stacked-RVQ residual codebook (a different rate K, so a
+        genuinely separate object — it cannot share stage 1's state buffers)."""
+        cb = self.codebook2
+        if cb is not None and cb.cb.lut.device != device:
+            cb.cb = cb.cb.to(device)
+            cb.cb.fakeinf = cb.cb.fakeinf.to(device)
+            cb.device = device
+
     @staticmethod
     def _trellis_linear_apply(x2d, SV, SU, trellis_packed, tlut,
                               blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
@@ -851,6 +879,21 @@ class E8RHTLinear(nn.Module):
         """
         if self._trellis_op is not None:
             return bool(self._trellis_op)
+        if getattr(self, '_trellis_has_stage2', False):
+            # Stacked RVQ (5-8 bpw) has no fused kernel: the op signature takes a single
+            # `trellis_packed`, so taking it here would decode stage 1 ONLY and return a
+            # plausible-but-wrong result — the exact shape of the e8p stage-3/4 silent drop.
+            # Warn once per process; a silent fallback on a perf-relevant path is what
+            # CLAUDE.md's assert-the-mechanism rule forbids.
+            global _WARNED_TRELLIS_RVQ_EAGER
+            if not _WARNED_TRELLIS_RVQ_EAGER:
+                _WARNED_TRELLIS_RVQ_EAGER = True
+                warnings.warn(
+                    "GLQ trellis 5-8 bpw (stacked RVQ) has no fused CUDA kernel yet; "
+                    "falling back to the pure-torch decode for every such layer. Correct "
+                    "but materially slower — 2-4 bpw is unaffected.", RuntimeWarning)
+            self._trellis_op = False
+            return False
         ok = False
         if x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel:
             from . import inference_kernel as _ik
@@ -894,11 +937,20 @@ class E8RHTLinear(nn.Module):
 
         # ---- pure-torch reference / fallback (dense) ----
         from .hadamard import block_diagonal_fht
-        from .trellis import decode_layer
+        from .trellis import decode_layer, decode_layer_nstage
         if self._trellis_W_rht is None or self._trellis_W_rht.device != x.device:
             self._ensure_trellis_codebook_device(x.device)
-            hatWr = decode_layer(self.codebook, self.trellis_packed,
-                                 self.m_pad, self.n_pad, self._trellis_has_kernel)
+            if getattr(self, '_trellis_has_stage2', False):
+                # Stacked RVQ (5-8 bpw): sum_s decode(stage_s) * cum_inv_rs[s].
+                self._ensure_trellis_codebook2_device(x.device)
+                hatWr = decode_layer_nstage(
+                    [self.codebook, self.codebook2],
+                    [self.trellis_packed, self.trellis_packed2],
+                    [1.0, self._inv_rs2_float],
+                    self.m_pad, self.n_pad, self._trellis_has_kernel)
+            else:
+                hatWr = decode_layer(self.codebook, self.trellis_packed,
+                                     self.m_pad, self.n_pad, self._trellis_has_kernel)
             self._trellis_W_rht = (hatWr.float() * self._wscale_float).to(x.device)
         x2df = x2d.float()
         x_rht = block_diagonal_fht(x2df * self.SV.float().unsqueeze(0), self.blocks_n)
