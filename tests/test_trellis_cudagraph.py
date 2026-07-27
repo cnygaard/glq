@@ -217,6 +217,44 @@ def test_no_fill_kernel_in_viterbi():
     assert not fills, f"fill kernels still launched in viterbi: {fills}"
 
 
+@pytest.mark.parametrize("variant", ["hyb", "3inst"])
+def test_chunk_width_is_bit_exact(variant, monkeypatch):
+    """The per-device Viterbi chunk width (L2-derived, GLQ_TRELLIS_CHUNK_B override) is a
+    pure speed knob: rows never interact and the pad columns are discarded, so 160 tiles
+    quantized as 1×160, 3×54, or 10×16 must give identical states AND hatX."""
+    tlut = _TLUT.clone() if variant == "hyb" else None
+    cb = gt.TrellisCodebook(variant=variant, K=4, tlut=tlut, device="cuda")
+    torch.manual_seed(21)
+    tiles = (torch.randn(160, 256, device="cuda") * 0.5).float()
+
+    outs = []
+    for width in ("512", "64", "17"):        # 1 chunk / 3×54 / 10×16
+        monkeypatch.setenv("GLQ_TRELLIS_CHUNK_B", width)
+        gt._chunk_b_cache.clear()
+        outs.append(cb.quantize_tiles(tiles))
+    for width, (hat, st) in zip(("64", "17"), outs[1:]):
+        assert torch.equal(st, outs[0][1]), f"chunk={width}: states differ from single-chunk"
+        assert torch.equal(hat, outs[0][0]), f"chunk={width}: hatX differs from single-chunk"
+
+    # Mechanism: the knob must actually have re-chunked, else this passes vacuously.
+    widths = {k[2] if k[0] == "pair" else k[1] for k in cb.cb._vit_graphs}
+    assert {160, 54, 16} <= widths, f"chunk knob ignored; widths captured: {sorted(widths)}"
+
+
+def test_chunk_b_scales_with_l2():
+    """The default width is read from the device's L2, not hard-coded: it must equal the
+    documented fraction of L2 divided by the 512 KB/row cost ping-pong (16-row granularity,
+    floor 16, cap 2^(24-L))."""
+    cb = _cb(4, "3inst")
+    gt._chunk_b_cache.clear()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    l2 = torch.cuda.get_device_properties(dev.index).L2_cache_size
+    expect = int(gt._GLQ_TRELLIS_L2_FRACTION * l2 / (2 * 4 * 2 ** cb.L)) // 16 * 16
+    expect = max(16, min(2 ** (24 - cb.L), expect))
+    assert cb._chunk_b(dev) == expect, "chunk width is not tracking L2_cache_size"
+    assert cb._chunk_b(torch.device("cpu")) == 2 ** (24 - cb.L), "CPU must keep the old cap"
+
+
 def test_viterbi_kernel_budget():
     """VT3 mechanism: one eager no-overlap viterbi must stay within ~3 kernels/step —
     2 for the compiled ACS update + 1 for the compiled traceback step (+ small init slack).

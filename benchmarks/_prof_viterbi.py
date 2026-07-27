@@ -14,6 +14,7 @@ Two modes:
 SmolLM2-360M: hidden=960, intermediate=2560, GQA (15 q heads / 5 kv heads, head_dim 64).
 Env: GLQ_TRELLIS_NO_CUDAGRAPH / GLQ_TRELLIS_CUDAGRAPH_MAX_B pass through to glq.trellis.
 """
+import os
 import sys
 
 import torch
@@ -48,7 +49,11 @@ def sweep():
     B = m/16 tile-stripes; qkv lockstep would merge 60+20+20 -> 100 on the 360M."""
     reps = 50
     rows = []
-    for B in (20, 60, 100, 128, 160, 192, 224, 256):
+    # GLQ_SWEEP_BS overrides the widths — use it to resolve the low-B region on small-L2
+    # GPUs, where the per-row cost is still falling below the default's smallest point.
+    bs_list = [int(x) for x in os.environ.get(
+        "GLQ_SWEEP_BS", "20,60,100,128,160,192,224,256").split(",")]
+    for B in bs_list:
         torch.manual_seed(B)
         tiles = (torch.randn(B, 256, device=dev) * 0.5).float()
         for _ in range(3):
@@ -63,19 +68,22 @@ def sweep():
         us = st.elapsed_time(en) / reps * 1000
         rows.append((B, us))
         print(f"B={B:4d}  {us:9.0f} us/quantize  {us / B:7.1f} us/row", flush=True)
+    best_b, best_us = min(rows, key=lambda r: r[1] / r[0])
+    print(f"\nbest us/row: B={best_b} at {best_us / best_b:.1f} us/row", flush=True)
     # least-squares fit T(B) = F + c*B over the L2-safe range (B <= 192)
-    fit = [(b, t) for b, t in rows if b <= 192]
+    fit = [(b, t) for b, t in rows if b <= 192] or rows
     n = len(fit)
     sb = sum(b for b, _ in fit); st_ = sum(t for _, t in fit)
     sbb = sum(b * b for b, _ in fit); sbt = sum(b * t for b, t in fit)
     c = (n * sbt - sb * st_) / (n * sbb - sb * sb)
     F = (st_ - c * sb) / n
     t = dict(rows)
-    ratio = (t[100] / 100) / (t[60] / 60)
-    print(f"\nfit: T(B) = {F:.0f} us + {c:.1f} us/row   (B<=192)")
-    print(f"Stage-5 GO rule: F >= 1300 us -> {'GO' if F >= 1300 else 'NO-GO'} (F={F:.0f})")
-    print(f"                 us/row(100)/us/row(60) <= 1.05 -> "
-          f"{'GO' if ratio <= 1.05 else 'NO-GO'} (ratio={ratio:.3f})")
+    print(f"fit: T(B) = {F:.0f} us + {c:.1f} us/row   (B<=192)")
+    if 60 in t and 100 in t:
+        ratio = (t[100] / 100) / (t[60] / 60)
+        print(f"Stage-5 GO rule: F >= 1300 us -> {'GO' if F >= 1300 else 'NO-GO'} (F={F:.0f})")
+        print(f"                 us/row(100)/us/row(60) <= 1.05 -> "
+              f"{'GO' if ratio <= 1.05 else 'NO-GO'} (ratio={ratio:.3f})")
 
 
 if "--sweep" in sys.argv:

@@ -65,6 +65,16 @@ def _trellis_cudagraph_on():
 _GLQ_TRELLIS_FUSED_STEP_ENABLED = True
 _fused_step_mod = None                       # lazy import result: module or False
 
+# Rows (16-row weight tiles) per Viterbi call. Each ACS step ping-pongs two (B, 2^L) fp32
+# cost buffers, so the resident set is 512 KB·B at L=16 — and once it outgrows L2 the
+# per-row cost jumps hard. Measured µs/row: a 48 MB-L2 L4 goes 359 (B=60) → 1185 (B=160),
+# while a 128 MB-L2 RTX PRO 6000 stays flat at 72-75 from B=100 to B=192. The right width
+# is therefore per-GPU, read from L2 at runtime, not a constant. Chunking is bit-exact —
+# Viterbi rows never interact and pad columns are discarded — so this is purely a speed
+# knob; override with GLQ_TRELLIS_CHUNK_B. Fraction is fitted to the two GPUs above.
+_GLQ_TRELLIS_L2_FRACTION = 0.75
+_chunk_b_cache = {}
+
 
 def _fused_step_available():
     global _fused_step_mod
@@ -400,10 +410,39 @@ class bitshift_codebook(nn.Module):
         self._vit_graphs.clear()
         self._vit_graph_pool = None
 
+    def _chunk_b(self, device):
+        """Viterbi rows per call on this device: the largest B whose cost ping-pong still
+        sits in L2, floored at 16 and capped at the historical 2^(24-L)."""
+        env = os.environ.get("GLQ_TRELLIS_CHUNK_B")
+        if env:
+            return max(1, int(env))
+        hard_cap = 2 ** (24 - self.L)
+        if getattr(device, "type", None) != "cuda":
+            return hard_cap
+        idx = torch.cuda.current_device() if device.index is None else device.index
+        key = (idx, self.L)
+        if key not in _chunk_b_cache:
+            try:
+                l2 = int(getattr(torch.cuda.get_device_properties(idx), "L2_cache_size", 0))
+            except Exception:
+                l2 = 0
+            if l2 > 0:
+                per_row = 2 * 4 * (2 ** self.L)          # cost + cost_new, fp32
+                b = int(_GLQ_TRELLIS_L2_FRACTION * l2 / per_row) // 16 * 16
+                _chunk_b_cache[key] = max(16, min(hard_cap, b))
+            else:                                        # unknown L2 → historical behaviour
+                _chunk_b_cache[key] = hard_cap
+        return _chunk_b_cache[key]
+
     def quantize_seq(self, X, overlap=None):
         T, NO = X.shape
-        bs = min(2 ** (24 - self.L), NO)
-        pad_amt = math.ceil(NO / bs) * bs - NO
+        # Balanced chunks: take the fewest chunks that respect the device width, then even
+        # them out. Rounding NO up to a multiple of the width instead would process 288 rows
+        # for a 160-row layer at width 144 — slower than not chunking at all.
+        cap = min(self._chunk_b(X.device), NO)
+        nchunks = math.ceil(NO / cap)
+        bs = math.ceil(NO / nchunks)
+        pad_amt = nchunks * bs - NO
         X = torch.nn.functional.pad(X, (0, pad_amt))
         T, N = X.shape
         X = X.reshape(T, N // bs, bs).transpose(0, 1).contiguous()
@@ -426,7 +465,7 @@ class bitshift_codebook(nn.Module):
         # per-pass path below; so does a failed pair capture (None from _pair_graphed).
         state = None
         if (X.is_cuda and _trellis_cudagraph_on()
-                and NO <= min(2 ** (24 - self.L), _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
+                and NO <= min(self._chunk_b(X.device), _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
             state = self._pair_graphed(X)
         if state is None:
             roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
