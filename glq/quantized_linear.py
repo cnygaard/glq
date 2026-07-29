@@ -1,6 +1,7 @@
 """E8RHTLinear — quantized linear layer with E8 shell codebook + RHT."""
 
 import math
+import os
 import warnings
 
 import torch
@@ -22,7 +23,11 @@ _GLQ_FUSED_E8P_ENABLED = True
 
 # Kill-switch for the fused QTIP-trellis linear op (glq_fused_linear_trellis_cuda). Default
 # on; flip to False to force the pure-torch decode reference (used by the A/B parity test).
-_GLQ_FUSED_TRELLIS_ENABLED = True
+# Also settable as GLQ_FUSED_TRELLIS=0, which is what makes the fused-vs-eager paired e2e
+# runnable from a shell without patching the module. Note this is the ONLY switch that
+# reaches the pure-torch decode: GLQ_TRELLIS_DENSE picks the dense branch *inside* the fused
+# op, which still consumes trellis_packed2 and so cannot isolate the kernel.
+_GLQ_FUSED_TRELLIS_ENABLED = os.environ.get("GLQ_FUSED_TRELLIS", "1") != "0"
 # One-shot latch so the "5-8 bpw has no fused kernel" notice fires once per process, not
 # once per layer (a 3B model would emit it ~200 times).
 _WARNED_TRELLIS_RVQ_EAGER = False
@@ -833,7 +838,8 @@ class E8RHTLinear(nn.Module):
     def _trellis_linear_apply(x2d, SV, SU, trellis_packed, tlut,
                               blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
                               wscale, in_features, out_features, n_pad, m_pad,
-                              bias=None, out_dtype=torch.float16):
+                              bias=None, out_dtype=torch.float16,
+                              trellis_packed2=None, inv_resid_scale2=0.0):
         """Capture-safe trellis linear core: input_rht → trellis decode/matmul → ×Wscale →
         output_rht, as ONE op.
 
@@ -845,11 +851,25 @@ class E8RHTLinear(nn.Module):
 
         The variant is carried by ``tlut``: non-empty → HYB (tlut kernels); empty → 3INST,
         which routes to the no-tlut lookup-free entry (`<R, IS_3INST>` instantiations).
+
+        ``trellis_packed2``/``inv_resid_scale2`` are the stacked-RVQ (5-8 bpw) residual stage
+        and route to the separate ``_rvq2`` entry. They are APPEND-ONLY parameters on purpose:
+        glq_vllm's ``_glq_apply_trellis`` passes 14 positional arguments, so inserting the
+        residual buffer next to ``trellis_packed`` would silently shift ``blocks_n`` into
+        ``tlut``'s slot and run the whole RHT on the wrong block decomposition.
         """
         from . import inference_kernel as _ik
         _ik._try_load_cuda_ext()
         _has_glq_ops = hasattr(torch.ops, "glq")
+        has_s2 = trellis_packed2 is not None and trellis_packed2.numel() > 0
         if tlut is not None and tlut.numel() > 0:                    # HYB
+            # This staticmethod is the single choke point shared by HF and vLLM, whose gating
+            # lives in different files; one hard refusal here beats two gates that can drift.
+            if has_s2:
+                raise NotImplementedError(
+                    "HYB trellis has no 2-stage fused entry — taking the 1-stage tlut op for "
+                    "a stacked-RVQ layer would decode stage 1 only and return "
+                    "plausible-but-wrong output. Re-quantize 5-8 bpw with variant 3inst.")
             if _has_glq_ops and hasattr(torch.ops.glq, "fused_linear_trellis"):
                 _fused = torch.ops.glq.fused_linear_trellis
             else:
@@ -857,6 +877,15 @@ class E8RHTLinear(nn.Module):
             y = _fused(x2d.half().contiguous(), SV, SU, trellis_packed, tlut,
                        blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
                        float(wscale), in_features, out_features, n_pad, m_pad).to(out_dtype)
+        elif has_s2:                                     # 3INST + stacked RVQ (5-8 bpw)
+            if _has_glq_ops and hasattr(torch.ops.glq, "fused_linear_trellis_3inst_rvq2"):
+                _fused = torch.ops.glq.fused_linear_trellis_3inst_rvq2
+            else:
+                _fused = _ik._glq_cuda.glq_fused_linear_trellis_3inst_rvq2_cuda
+            y = _fused(x2d.half().contiguous(), SV, SU, trellis_packed, trellis_packed2,
+                       blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                       float(wscale), float(inv_resid_scale2),
+                       in_features, out_features, n_pad, m_pad).to(out_dtype)
         else:                                                        # 3INST (lookup-free)
             if _has_glq_ops and hasattr(torch.ops.glq, "fused_linear_trellis_3inst"):
                 _fused = torch.ops.glq.fused_linear_trellis_3inst
@@ -879,30 +908,40 @@ class E8RHTLinear(nn.Module):
         """
         if self._trellis_op is not None:
             return bool(self._trellis_op)
-        if getattr(self, '_trellis_has_stage2', False):
-            # Stacked RVQ (5-8 bpw) has no fused kernel: the op signature takes a single
-            # `trellis_packed`, so taking it here would decode stage 1 ONLY and return a
-            # plausible-but-wrong result — the exact shape of the e8p stage-3/4 silent drop.
-            # Warn once per process; a silent fallback on a perf-relevant path is what
-            # CLAUDE.md's assert-the-mechanism rule forbids.
+        has_s2 = getattr(self, '_trellis_has_stage2', False)
+        ok = False
+        if x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel:
+            from . import inference_kernel as _ik
+            is_3inst = self.tlut.numel() == 0
+            if has_s2:
+                # Stacked RVQ (5-8 bpw) needs the SEPARATE rvq2 entry. Probing that symbol is
+                # a true capability check: an older extension simply lacks it and we fall back
+                # rather than handing a 2-stage layer to the 1-stage op, which would decode
+                # stage 1 only and return plausible-but-wrong output (the e8p silent drop).
+                # HYB has no 2-stage entry at all, so it can never qualify.
+                entry = "glq_fused_linear_trellis_3inst_rvq2_cuda"
+                eligible = is_3inst
+            else:
+                entry = ("glq_fused_linear_trellis_3inst_cuda" if is_3inst
+                         else "glq_fused_linear_trellis_cuda")
+                eligible = True
+            if (eligible and _ik._try_load_cuda_ext()
+                    and hasattr(_ik._glq_cuda, entry)
+                    and _ik._glq_cuda.glq_trellis_kernel_supported(self.m_pad, self.n_pad)):
+                ok = True
+        if has_s2 and not ok:
+            # Warn only on the REFUSALS (HYB, stale build, unsupported shape, CPU) — a silent
+            # fallback on a perf-relevant path is what CLAUDE.md's assert-the-mechanism rule
+            # forbids. One-shot: a 3B model has ~200 such layers.
             global _WARNED_TRELLIS_RVQ_EAGER
             if not _WARNED_TRELLIS_RVQ_EAGER:
                 _WARNED_TRELLIS_RVQ_EAGER = True
                 warnings.warn(
-                    "GLQ trellis 5-8 bpw (stacked RVQ) has no fused CUDA kernel yet; "
-                    "falling back to the pure-torch decode for every such layer. Correct "
-                    "but materially slower — 2-4 bpw is unaffected.", RuntimeWarning)
-            self._trellis_op = False
-            return False
-        ok = False
-        if x2d.is_cuda and _GLQ_FUSED_TRELLIS_ENABLED and self._trellis_has_kernel:
-            from . import inference_kernel as _ik
-            entry = ("glq_fused_linear_trellis_cuda" if self.tlut.numel() > 0
-                     else "glq_fused_linear_trellis_3inst_cuda")
-            if (_ik._try_load_cuda_ext()
-                    and hasattr(_ik._glq_cuda, entry)
-                    and _ik._glq_cuda.glq_trellis_kernel_supported(self.m_pad, self.n_pad)):
-                ok = True
+                    "GLQ trellis stacked RVQ (5-8 bpw): no usable fused CUDA entry for this "
+                    "layer — needs a 3INST checkpoint and an extension carrying "
+                    "glq_fused_linear_trellis_3inst_rvq2_cuda (rebuild with "
+                    "`rm -rf ~/.cache/torch_extensions/*/glq_cuda`). Falling back to the "
+                    "pure-torch decode: correct but materially slower.", RuntimeWarning)
         self._trellis_op = ok
         return ok
 
@@ -920,8 +959,15 @@ class E8RHTLinear(nn.Module):
         """
         shape = x.shape
         x2d = x.reshape(-1, self.in_features)
-        if self._wscale_float is None:
+        has_s2 = getattr(self, '_trellis_has_stage2', False)
+        # Flag and scale resolve in ONE block, mirroring set_codebook. The e8p stage-3/4
+        # silent drop came from resolving them under different conditions — the flag said
+        # "stage present" while the scale stayed 0.0, and the stage vanished silently.
+        # NEVER write `self._inv_rs2_float or 0.0` here: that turns the loud failure this
+        # leaves behind on a meta/offloaded layer into exactly that silent drop.
+        if self._wscale_float is None or (has_s2 and self._inv_rs2_float is None):
             self._wscale_float = self.Wscale.item()
+            self._inv_rs2_float = self.inv_resid_scale2.item() if has_s2 else 0.0
 
         if self._trellis_op_usable(x2d):
             if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
@@ -932,7 +978,9 @@ class E8RHTLinear(nn.Module):
                 self._blocks_n_tensor, self._blocks_m_tensor,
                 self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
                 self._wscale_float, self.in_features, self.out_features,
-                self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype)
+                self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype,
+                trellis_packed2=self.trellis_packed2,
+                inv_resid_scale2=self._inv_rs2_float)
             return y.reshape(*shape[:-1], self.out_features)
 
         # ---- pure-torch reference / fallback (dense) ----

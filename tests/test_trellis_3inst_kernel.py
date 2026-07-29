@@ -37,6 +37,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import glq.trellis as gt  # noqa: E402
 
 KS = [2, 3, 4]
+# Residual-stage rates for stacked RVQ (5-8 bpw = K=4 primary + K=(bpw-4) residual). R=1 is
+# reachable ONLY as a stage-2 rate (bpw 5) and never as a primary, so it is exercised by the
+# V=1 decode mirror and the 3INST kernels but not by HYB, which has no lookup-free path.
+KS_RESID = [1, 2, 3, 4]
 MASK32 = (1 << 32) - 1
 
 
@@ -177,7 +181,12 @@ def _load_chunks(pu16, weight_idx, R):
     BEFORE HYB's byte_perm (R=2:u16, R=3:reg_24_i, R=4:r_i)."""
     wi = np.asarray(weight_idx, dtype=np.int64)
     ld = np.stack([pu16[wi + t] for t in range(2 * R)], axis=1).astype(np.int64)
-    if R == 2:
+    if R == 1:
+        # 4 chunks x 8 bits = ONE u32 per lane (vs R=2's uint2, R=4's uint4). Chunk order is
+        # memory order, lowest address first, exactly as for R>=2.
+        r1 = _u32(ld[:, 0] | (ld[:, 1] << 16))
+        chunks = [_u32((r1 >> (8 * i)) & 0xFF) for i in range(4)]
+    elif R == 2:
         chunks = [_u32(ld[:, i]) for i in range(4)]
     elif R == 3:
         r1 = _u32(ld[:, 0] | (ld[:, 1] << 16)); r2 = _u32(ld[:, 2] | (ld[:, 3] << 16))
@@ -192,7 +201,16 @@ def _load_chunks(pu16, weight_idx, R):
 def _v1_states(chunk, R, width):
     """V=1: 8 states at K-bit stride from a window chunk. Ext = chunk (MSB at bit 8R-1) high, next
     lane's chunk-top (tail-biting continuation) low. state_j = (Ext >> (8R - R*j)) & 0xFFFF."""
-    cont = (_shfl_next(chunk) >> (width - 16)) & 0xFFFF
+    if width >= 16:
+        cont = (_shfl_next(chunk) >> (width - 16)) & 0xFFFF
+    else:
+        # R=1 (width 8, the bpw-5 residual stage). "Continuation = top 16 bits of the NEXT
+        # lane's chunk" is an identity only while 8R >= 16; here an 8-bit chunk cannot supply
+        # 16 bits, and `>> (width - 16)` would be a NEGATIVE shift. The 16 stream bits
+        # following this chunk live in the next TWO lanes, so both are pulled (mod-32 wrap
+        # keeps the tail-biting cycle). Each fragment slot x/y/z/w is its own stream across
+        # the 32 lanes, which is why the shuffle stays within a slot.
+        cont = _u32(((_shfl_next(chunk) & 0xFF) << 8) | (np.roll(chunk, -2) & 0xFF))
     Ext = (_u32(chunk) << 16) | _u32(cont)
     return np.stack([(Ext >> (width - R * j)) & 0xFFFF for j in range(8)], axis=1)
 
@@ -265,11 +283,14 @@ def test_mirror2a_hyb_transliteration_matches_decode_layer(K):
     assert np.array_equal(got, ref), f"HYB K={K}: {int((got != ref).sum())} mismatches"
 
 
-@pytest.mark.parametrize("K", KS)
+@pytest.mark.parametrize("K", KS_RESID)
 def test_mirror2b_v1_transliteration_matches_decode_layer(K):
     """Stage 2b — THE crux gate: the V=1 (3inst) per-lane extraction (8 states @ K-stride, widened
     reg_cs2 overflow: R=3 -> 2, R=4 -> 3 overflow states) is byte-identical to decode_layer. Pins
-    the exact CUDA bit-math (tr_load_reg_cs/tr_decode_regw <R,3inst>) BEFORE any nvcc build."""
+    the exact CUDA bit-math (tr_load_reg_cs/tr_decode_regw <R,3inst>) BEFORE any nvcc build.
+
+    K=1 (the bpw-5 residual stage) is the structurally different case: an 8-bit chunk cannot
+    supply the 16-bit continuation, so it spans TWO following lanes. See _v1_states."""
     m, n = 64, 128
     cb, packed = _make("3inst", K, m, n)
     ref = gt.decode_layer(cb, packed, m, n, has_kernel=True).float().numpy()
@@ -866,3 +887,175 @@ def test_fused_linear_3inst_is_cudagraph_capturable(K):
     torch.cuda.synchronize()
     assert torch.allclose(static_y.float(), y_eager.float(), atol=2e-2, rtol=2e-2), \
         f"K={K} graph replay != eager, max|Δ|={(static_y.float() - y_eager.float()).abs().max().item()}"
+
+
+# ===========================================================================
+# Stacked-RVQ (5-8 bpw) gates — stage 1 (K=4) writes, stage 2 (K=bpw-4) accumulates.
+#
+# Skip unless the LOADED extension actually carries the rvq2 entry. Without this a stale
+# .so makes every test below silently exercise the dense eager fallback and pass green,
+# proving nothing about the kernel.
+# ===========================================================================
+def _has_rvq2():
+    if not torch.cuda.is_available():
+        return False
+    from glq import inference_kernel as ik
+    return bool(ik._try_load_cuda_ext()) and hasattr(
+        ik._glq_cuda, "glq_fused_linear_trellis_3inst_rvq2_cuda")
+
+
+needs_rvq2 = pytest.mark.skipif(
+    not _has_rvq2(), reason="glq CUDA ext lacks the stacked-RVQ trellis entry (stale build?)")
+
+BPWS_RVQ = [5, 6, 7, 8]
+
+
+def _trellis_3inst_rvq2_layer(in_f=512, out_f=256, seed=11, bpw=6):
+    """Quantize + load a 2-stage (stacked-RVQ) E8RHTLinear. Mirrors _trellis_3inst_layer,
+    but hands quantize_layer_trellis_rht the codebook LIST so it emits stage-2 artifacts."""
+    from glq.quantized_linear import E8RHTLinear
+    dev = "cuda"
+    torch.manual_seed(seed)
+    W = (torch.randn(out_f, in_f, device=dev) * 0.05).float()
+    X = torch.randn(512, in_f, device=dev)
+    H = (X.T @ X) / 512
+    cbs = [gt.TrellisCodebook(variant="3inst", K=k, device=dev)
+           for k in gt.trellis_rvq_recipe(bpw)]
+    W_hat, art = gt.quantize_layer_trellis_rht(W, H, cbs)
+    assert "trellis_packed2" in art and "inv_resid_scale2" in art, "no stage-2 artifacts"
+    assert "tlut" not in art                       # lookup-free: nothing to store
+    sd = {"trellis_packed": art["trellis_packed"],
+          "trellis_packed2": art["trellis_packed2"],
+          "inv_resid_scale2": torch.as_tensor(art["inv_resid_scale2"], dtype=torch.float32),
+          "SU": art["SU"], "SV": art["SV"],
+          "Wscale": torch.as_tensor(art["Wscale"], dtype=torch.float32)}
+    layer = E8RHTLinear(in_f, out_f, codebook_type="trellis").to(dev)
+    layer.load_state_dict({k: v.to(dev) for k, v in sd.items()}, strict=False)
+    layer.set_codebook(cbs[0], cbs[1])
+    assert layer._trellis_has_stage2 is True
+    return layer, W_hat, art, cbs
+
+
+# ---- The new R=1 bit-math, straight against the torch oracle ------------------------------
+@needs_rvq2
+@pytest.mark.parametrize("K", KS_RESID)
+@pytest.mark.parametrize("m,n", [(64, 128), (256, 512)])
+def test_cuda_3inst_decompress_bitexact_all_residual_rates(m, n, K):
+    """Bit-exact decompress for every residual rate, K=1 INCLUDED. K=1 is the only rate whose
+    bit-unpack is structurally different (an 8-bit chunk cannot supply the 16-bit
+    continuation, so it spans two lanes), and it is the one the CPU mirror already pins —
+    this proves the CUDA port of that same math."""
+    cb, packed = _quantized_3inst_cuda(m, n, K, seed=m + K)
+    ref = gt.decode_layer(cb, packed, m, n, has_kernel=True)               # fp32 oracle
+    W = _ext().glq_decompress_trellis_3inst_cuda(packed, m, n, K == 1)     # allow_r1
+    assert torch.equal(W.float(), ref.float()), \
+        f"K={K} bad={int((W.float() != ref.float()).sum())}"
+
+
+@needs_rvq2
+def test_r1_is_refused_as_a_primary_stage():
+    """R=1 must be reachable ONLY as a residual. A K=1 buffer handed to a stage-1 call has
+    to fail loudly — the launcher ladders end in a bare `else` that runs the R=4 kernel, so
+    a silently-widened bound would read a neighbour's bits and return plausible garbage."""
+    m, n = 64, 128
+    _, packed = _quantized_3inst_cuda(m, n, 1, seed=99)
+    with pytest.raises(RuntimeError, match="bits/weight"):
+        _ext().glq_decompress_trellis_3inst_cuda(packed, m, n)   # allow_r1 defaults False
+
+
+# ---- THE gate: decode vs W_hat (never decode-vs-decode) -----------------------------------
+@needs_rvq2
+@pytest.mark.parametrize("bpw", BPWS_RVQ)
+@pytest.mark.parametrize("B", [1, 4])
+def test_fused_rvq2_matches_W_hat(bpw, B):
+    """Against the quantizer's own W_hat, NOT another decode: a fused-vs-eager A/B shares the
+    scale wiring, so a stage dropped in BOTH legs passes it while quality collapses.
+
+    bpw 8 is load-bearing here — at K1==K2 a stage swap is shape-invisible, so it is the only
+    rate that can catch that class by value."""
+    in_f, out_f = 512, 256
+    layer, W_hat, _, _ = _trellis_3inst_rvq2_layer(in_f, out_f, bpw=bpw)
+    torch.manual_seed(3)
+    x = (torch.randn(B, in_f, device="cuda") * 0.5).to(torch.float16)
+    ref = x.float() @ W_hat.float().t()
+    y = layer(x)
+    assert layer._trellis_op is True, "stacked-RVQ fused CUDA path did not engage"
+    assert _sqnr(ref, y.float()) > 40.0, \
+        f"bpw={bpw} B={B} SQNR {_sqnr(ref, y.float()):.1f} dB"
+
+
+@needs_rvq2
+@pytest.mark.parametrize("bpw", BPWS_RVQ)
+def test_rvq2_stage2_actually_contributes(bpw):
+    """Drop the residual buffer and the output MUST move. `_trellis_op is True` on BOTH legs
+    is essential: without it this degenerates into fused-vs-eager and proves nothing about
+    what the kernel dereferenced."""
+    in_f, out_f = 512, 256
+    layer, _, _, _ = _trellis_3inst_rvq2_layer(in_f, out_f, bpw=bpw)
+    torch.manual_seed(5)
+    x = (torch.randn(1, in_f, device="cuda") * 0.5).to(torch.float16)
+    y_full = layer(x).float().clone()
+    assert layer._trellis_op is True
+
+    layer1, _, _, _ = _trellis_3inst_rvq2_layer(in_f, out_f, bpw=bpw)
+    layer1.trellis_packed2 = torch.zeros(0, dtype=torch.int16, device="cuda")
+    layer1._trellis_has_stage2 = False
+    layer1._inv_rs2_float = 0.0
+    layer1._trellis_op = None                      # re-resolve: now a 1-stage layer
+    y_s1 = layer1(x).float()
+    assert layer1._trellis_op is True, "stage-1-only leg fell off the fused path"
+    assert (y_full - y_s1).abs().max().item() > 1e-3, \
+        f"bpw={bpw}: dropping stage 2 changed nothing — the kernel ignored trellis_packed2"
+
+
+@needs_rvq2
+def test_rvq2_zero_scale_changes_the_output():
+    """Catches 'kernel reads packed2 but ignores inv_resid_scale2'. The op refuses a zero
+    scale outright (half-configured == the e8p stage-drop shape), which is itself the proof
+    that the scale reaches the kernel."""
+    in_f, out_f = 512, 256
+    layer, _, _, _ = _trellis_3inst_rvq2_layer(in_f, out_f, bpw=6)
+    x = (torch.randn(1, in_f, device="cuda") * 0.5).to(torch.float16)
+    layer(x)                                        # resolve the fused path first
+    layer._inv_rs2_float = 0.0
+    with pytest.raises(RuntimeError, match="half-configured|requires a populated stage 2"):
+        layer(x)
+
+
+@needs_rvq2
+@pytest.mark.parametrize("bpw", BPWS_RVQ)
+def test_rvq2_is_deterministic(bpw):
+    """`+=` accumulation must stay bit-stable: one writer per element per pass (disjoint
+    block m-ranges), no atomics, no scratch."""
+    in_f, out_f = 512, 256
+    layer, _, _, _ = _trellis_3inst_rvq2_layer(in_f, out_f, bpw=bpw)
+    x = (torch.randn(1, in_f, device="cuda") * 0.5).to(torch.float16)
+    a, b = layer(x), layer(x)
+    assert torch.equal(a, b), f"bpw={bpw} stacked decode is not bit-stable"
+
+
+@needs_rvq2
+@pytest.mark.parametrize("bpw", [5, 8])
+def test_fused_rvq2_is_cudagraph_capturable(bpw):
+    """Two launches per linear must still capture as one graph — catches a host sync or a
+    conditional allocation slipping into the stage-2 path."""
+    in_f, out_f = 512, 256
+    layer, _, _, _ = _trellis_3inst_rvq2_layer(in_f, out_f, seed=13, bpw=bpw)
+    x = torch.randn(1, in_f, device="cuda", dtype=torch.float16)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            y_eager = layer(x)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    assert layer._trellis_op is True, "stacked-RVQ fused CUDA path did not engage"
+    static_x = x.clone()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        static_y = layer(static_x)
+    static_x.copy_(x)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.allclose(static_y.float(), y_eager.float(), atol=2e-2, rtol=2e-2), \
+        f"bpw={bpw} graph replay != eager"

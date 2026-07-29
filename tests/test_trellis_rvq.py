@@ -267,25 +267,80 @@ class TestCheckpointRoundTrip:
         assert lin._trellis_has_stage2 is True
         assert lin._inv_rs2_float != 0.0
 
-    def test_stacked_layer_refuses_the_fused_cuda_op(self, monkeypatch):
-        """Mechanism, not output: the fused op takes a single `trellis_packed`, so taking
-        it for a 2-stage layer would decode stage 1 only and return PLAUSIBLE numbers.
-        Comparing values cannot catch that; asserting the dispatch can.
-
-        The notice is a one-shot per-process latch (else a 3B model emits it ~200 times),
-        so reset it here rather than depending on test order.
-        """
-        import glq.quantized_linear as ql
+    def _stacked_layer(self, bpw):
+        """A loaded 2-stage E8RHTLinear (no GPU needed)."""
         from glq.quantized_linear import E8RHTLinear
-        monkeypatch.setattr(ql, "_WARNED_TRELLIS_RVQ_EAGER", False)
-        W, _, _, arts, _ = self._quantize(6)
+        W, _, _, arts, _ = self._quantize(bpw)
         m, n = W.shape
         lin = E8RHTLinear(n, m, bias=False, codebook_type="trellis")
         lin.load_state_dict(dict(arts), strict=False)
-        cbs = _cbs(6)
+        cbs = _cbs(bpw)
         lin.set_codebook(cbs[0], cbs[1])
-        with pytest.warns(RuntimeWarning, match="no fused CUDA kernel"):
-            assert lin._trellis_op_usable(torch.zeros(1, n)) is False
+        return lin, n
+
+    @staticmethod
+    def _fake_ext(monkeypatch, *symbols):
+        """Stand in for a built CUDA extension carrying exactly `symbols`, and make the
+        layer look CUDA-resident. Lets the DISPATCH DECISION be tested on CPU."""
+        import types
+        import glq.inference_kernel as ik
+        import glq.quantized_linear as ql
+        ns = types.SimpleNamespace(glq_trellis_kernel_supported=lambda m, k: True,
+                                   **{s: object() for s in symbols})
+        monkeypatch.setattr(ik, "_glq_cuda", ns, raising=False)
+        monkeypatch.setattr(ik, "_try_load_cuda_ext", lambda: True)
+        monkeypatch.setattr(ql, "_WARNED_TRELLIS_RVQ_EAGER", False)
+        return ns
+
+    @pytest.mark.parametrize("bpw", [5, 6, 7, 8])
+    def test_stacked_layer_takes_the_fused_path_when_the_ext_has_rvq2(self, monkeypatch, bpw):
+        """Mechanism, not output: a 2-stage layer must route to the rvq2 entry. Values
+        cannot prove this — the 1-stage op returns PLAUSIBLE numbers from stage 1 alone."""
+        self._fake_ext(monkeypatch, "glq_fused_linear_trellis_3inst_cuda",
+                       "glq_fused_linear_trellis_3inst_rvq2_cuda")
+        lin, n = self._stacked_layer(bpw)
+        x = torch.zeros(1, n)
+        monkeypatch.setattr(type(x), "is_cuda", property(lambda s: True), raising=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)   # success must NOT warn
+            assert lin._trellis_op_usable(x) is True
+
+    def test_stacked_layer_falls_back_when_the_ext_lacks_rvq2(self, monkeypatch):
+        """A STALE build must fall back loudly, never hand a 2-stage layer to the 1-stage op
+        (which would silently decode stage 1 only — the e8p stage-drop shape). This is the
+        property the whole separate-symbol design exists to guarantee."""
+        self._fake_ext(monkeypatch, "glq_fused_linear_trellis_3inst_cuda")   # no rvq2
+        lin, n = self._stacked_layer(6)
+        x = torch.zeros(1, n)
+        monkeypatch.setattr(type(x), "is_cuda", property(lambda s: True), raising=False)
+        with pytest.warns(RuntimeWarning, match="rvq2"):
+            assert lin._trellis_op_usable(x) is False
+
+    def test_hyb_stacked_never_takes_the_fused_path(self, monkeypatch):
+        """There is no 2-stage HYB entry, so a tlut-carrying stacked layer must refuse even
+        when the extension is fully built — taking the tlut op would drop stage 2."""
+        self._fake_ext(monkeypatch, "glq_fused_linear_trellis_cuda",
+                       "glq_fused_linear_trellis_3inst_cuda",
+                       "glq_fused_linear_trellis_3inst_rvq2_cuda")
+        lin, n = self._stacked_layer(6)
+        lin.tlut = torch.zeros(512, 2, dtype=torch.float16)      # pretend HYB
+        x = torch.zeros(1, n)
+        monkeypatch.setattr(type(x), "is_cuda", property(lambda s: True), raising=False)
+        with pytest.warns(RuntimeWarning):
+            assert lin._trellis_op_usable(x) is False
+
+    def test_trellis_linear_apply_params_are_append_only(self):
+        """glq_vllm passes 14 POSITIONAL args to this staticmethod. Inserting the residual
+        buffer next to trellis_packed would shift blocks_n into tlut's slot and run the RHT
+        on the wrong block decomposition — plausible output, wrong answer."""
+        import inspect
+        from glq.quantized_linear import E8RHTLinear
+        names = list(inspect.signature(E8RHTLinear._trellis_linear_apply).parameters)
+        assert names[:14] == [
+            "x2d", "SV", "SU", "trellis_packed", "tlut",
+            "blocks_n", "blocks_m", "blocks_n_meta", "blocks_m_meta",
+            "wscale", "in_features", "out_features", "n_pad", "m_pad"]
+        assert names[14:] == ["bias", "out_dtype", "trellis_packed2", "inv_resid_scale2"]
 
     def test_single_stage_layer_does_not_warn(self):
         """The notice must be specific to the stacked path — 2-4 bpw is unaffected and
