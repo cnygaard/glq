@@ -92,9 +92,9 @@ A few popular checkpoints (all on the [**`xv0y5ncu`** HF org](https://huggingfac
 | [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic |
 | [`SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-360M | 4.0 | Apache 2.0 | 0.25 GiB | tiny / CI demo |
 
-**24 checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has SmolLM3
-at 6 bpw, the Gemma-4 12B/31B/E4B family across **3–8 bpw** (incl. `e8p`
-variants), and Nemotron. Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
+**21 checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has SmolLM3
+at 6 bpw and the Gemma-4 12B/31B/E4B family across **3–8 bpw** (incl. `e8p`
+variants). Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
 each model card and in [How GLQ compares](#how-glq-compares) and
 [Quality & footprint](#quality--footprint) below.
 
@@ -106,8 +106,8 @@ the same VRAM.</sub>
 
 <sub>² Quantized before block-diagonal FHT became the quantizer default: power-of-2 FHT padding
 is stored as real bits, so the checkpoint holds more bits per weight than its nominal rate and
-the footprint is correspondingly larger than 4 bpw implies (the Nemotron repos share this). The
-`-block-diagonal-` repos above are true-to-label re-quants.</sub>
+the footprint is correspondingly larger than 4 bpw implies. The `-block-diagonal-` repos above
+are true-to-label re-quants.</sub>
 
 ### Quantize your own model
 
