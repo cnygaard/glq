@@ -81,6 +81,62 @@ sm_89, including the R=1 bit-exact decompress.
 the **dense prefill** branch (two decompresses + one fused add + one GEMM). The 1.9× is the
 **B=1 decode** GEMV. Different paths; neither generalizes to the other.
 
+## vLLM serving — SmolLM3-3B on L40S (sm_89)
+
+vLLM 0.25.1, torch 2.11.0+cu128, transformers 5.14.0, fp16, `max_model_len=2048`,
+`gpu_memory_utilization=0.85`, capture sizes 1–32. Both checkpoints come from the same
+quantization run (`…-6bpw` and `…-4bpw-paired`), so this is a matched pair.
+Driver: `benchmarks/run_model.py`; footprint is vLLM's own `Model loading took` line.
+
+| | 4 bpw (1 stage) | 6 bpw (4+2) | ratio |
+|---|---|---|---|
+| weights | 1.81 GiB | **2.46 GiB** | 1.36× |
+| KV cache | 495,776 tok | 486,240 tok | — |
+| decode B=1 | 131.0 tok/s | **89.7 tok/s** | 0.68× |
+| decode B=32 | 1768.9 tok/s (55.3/seq) | **1076.7 tok/s** (33.6/seq) | 0.61× |
+| TTFT B=1 | 31 ms | 33 ms | — |
+| load | 125.9 s | 128.9 s | — |
+
+The footprint decomposes: +0.65 GiB for +2 bits over 2.813e9 quantized weights is 0.655 GiB.
+Nothing else moved, which is what says the residual is resident and the rest of the model is
+not silently dense.
+
+`cudagraph_mode=FULL` was requested; vLLM downgraded it to `FULL_AND_PIECEWISE` itself
+("not supported with FlashAttentionBackend"). Graphs were captured on both arms — 0.12 GiB
+at 6 bpw, 0.10 at 4 bpw — and `run_model.py` fails the run outright if they are not, so the
+tok/s above are on-graph numbers.
+
+### Loader gate — vLLM ≡ HF, token for token
+
+`benchmarks/_trellis_rvq2_vllm_hf_parity.py`, greedy, 64 tokens, same prompt **token ids**
+fed to both runtimes:
+
+| checkpoint | vLLM vs HF eager | greedy B=32 |
+|---|---|---|
+| 6 bpw (4+2) | **64/64 identical** | all 32 identical to each other and to B=1 |
+| 4 bpw (control) | **64/64 identical** | all 32 identical to each other and to B=1 |
+
+This is the check the unit tests structurally cannot make. They prove the *arithmetic* (both
+vLLM apply paths are `torch.equal` to the shared HF staticmethod); this proves the **loader**
+— that a real merged qkv/gate_up parameter puts each shard's `trellis_packed2` and its own
+`inv_resid_scale2` in the right slot. A residual loaded one shard over still produces fluent
+text. The two checkpoints diverge from *each other* by token ~8, so 6 bpw is demonstrably not
+serving the 4 bpw weights.
+
+### Stage-2 gate: the fused per-tile kernel is NOT worth building yet
+
+The microbench's sm_89 two-launch overhead (+12.7% at 6 bpw) does survive end-to-end, but
+small. Working backwards from B=1: 7.63 ms/token at 4 bpw vs 11.15 at 6 bpw is Δ 3.52 ms;
+at the microbench's 2.36× that puts the trellis matvec at ~2.6 ms, ~34% of the step.
+Removing the whole 12.7% would give ~95.7 tok/s — **+6.7%**.
+
+That is the optimistic bound: it assumes every microsecond of the overhead is recoverable,
+and the variant that would recover it is per-tile interleaving — the one the register
+analysis says spills at the 64-register wall (`__launch_bounds__(1024,1)`, zero headroom).
+A spill costs occupancy and would plausibly eat the whole 6.7%. 8 bpw is where the case is
+strongest (+21.1% microbench), so if this is revisited, revisit it there, and run the ncu
+pass first — the mechanism is still unknown and the obvious explanation is falsified.
+
 ## Test gates
 
 300 on GPU + 138 local. On GPU: 28 stacked-RVQ gates (R=1 bit-exact decompress at every

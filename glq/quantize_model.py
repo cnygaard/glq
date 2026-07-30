@@ -825,7 +825,7 @@ def quantize(
     if codebook_type == "trellis":
         if mixed_precision:
             raise ValueError(
-                "--codebook trellis requires a uniform integer bpw (2, 3 or 4); got "
+                "--codebook trellis requires a uniform integer bpw (2-8); got "
                 f"{'bpw_map' if bpw_map is not None else repr(bpw)}"
                 f"{' with min/max range' if has_range else ''}. Mixed-bpw trellis is "
                 "not implemented: every layer would be encoded at a single K while "

@@ -616,6 +616,23 @@ def _glq_apply_e8p(x, layer):
 _GLQ_BATCH_OUT_RHT = os.environ.get("GLQ_TRELLIS_BATCH_OUT_RHT", "1") != "0"
 
 
+def _trellis_yrht_rvq2_entry():
+    """The stacked-RVQ (5-8 bpw) y_rht entry, or None on a build that predates it.
+
+    Resolved by NAME, in both op-registry and pybind form, because the failure it guards is
+    silent: the 1-stage ``..._yrht`` entry accepts every argument S4b already has and would
+    run happily on a 2-stage layer, dropping the residual and serving 4 bpw quality with no
+    error. None here makes _setup_trellis_weights disable S4b instead, so the per-shard path
+    resolves its own ``_rvq2`` op and raises if that is missing too.
+    """
+    if (hasattr(torch.ops, "glq")
+            and hasattr(torch.ops.glq, "fused_linear_trellis_3inst_yrht_rvq2")):
+        return torch.ops.glq.fused_linear_trellis_3inst_yrht_rvq2
+    from glq import inference_kernel as _ik
+    _ik._try_load_cuda_ext()
+    return getattr(_ik._glq_cuda, "glq_fused_linear_trellis_3inst_yrht_rvq2_cuda", None)
+
+
 def _glq_apply_trellis(x, layer):
     """Trellis apply: one fused torch.ops call per shard, reusing the SAME staticmethod the
     HF path runs (E8RHTLinear._trellis_linear_apply) so serving and eager share one validated
@@ -646,6 +663,10 @@ def _glq_apply_trellis(x, layer):
                 from glq import inference_kernel as _ik
                 _yrht = _ik._glq_cuda.glq_fused_linear_trellis_3inst_yrht_cuda
                 _shards_rht = _ik._glq_cuda.glq_output_rht_shards_cuda
+            # Stacked RVQ (5-8 bpw) deposits into the SAME y_rht buffer through the _rvq2
+            # entry, so S4b's one batched output RHT covers both stages of every shard.
+            # _setup_trellis_weights already refused to build s4b if this entry is missing.
+            _yrht2 = _trellis_yrht_rvq2_entry() if s4b['has_s2'] else None
             xh = x.half().contiguous()
             total_m = s4b['total_m']
             y_rht = torch.empty((x.shape[0], total_m),
@@ -660,9 +681,16 @@ def _glq_apply_trellis(x, layer):
                     col += meta['m_pad']
                     continue
                 bn, _, bnm, _ = _blocks(meta)
-                _yrht(xh, layer.SV.get_shard(i), layer.trellis_packed.get_shard(i),
-                      bn, bnm, meta['wscale'], meta['in'], meta['n_pad'], meta['m_pad'],
-                      y_rht, col)
+                if meta['has_s2']:
+                    _yrht2(xh, layer.SV.get_shard(i),
+                           layer.trellis_packed.get_shard(i),
+                           layer.trellis_packed2.get_shard(i),
+                           bn, bnm, meta['wscale'], meta['inv_rs2'],
+                           meta['in'], meta['n_pad'], meta['m_pad'], y_rht, col)
+                else:
+                    _yrht(xh, layer.SV.get_shard(i), layer.trellis_packed.get_shard(i),
+                          bn, bnm, meta['wscale'], meta['in'], meta['n_pad'], meta['m_pad'],
+                          y_rht, col)
                 col += meta['m_pad']
             y = torch.empty((x.shape[0], total_m),
                             dtype=torch.float16, device=x.device)
@@ -677,12 +705,19 @@ def _glq_apply_trellis(x, layer):
                                         dtype=x.dtype, device=x.device))
                 continue
             bn, bm, bnm, bmm = _blocks(meta)
+            # trellis_packed2/inv_resid_scale2 are KEYWORD arguments — the 14 positional args
+            # above are the 1-stage signature, and the residual was appended to the shared
+            # staticmethod precisely so these call sites keep their positional meaning.
+            # Passing them unconditionally is safe: an absent stage is a numel-0 shard with
+            # inv_rs2 == 0.0, which routes back to the 1-stage entry.
             outs.append(_apply(
                 x, layer.SV.get_shard(i), layer.SU.get_shard(i),
                 layer.trellis_packed.get_shard(i), layer.tlut.get_shard(i),
                 bn, bm, bnm, bmm, meta['wscale'],
                 meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
-                bias=None, out_dtype=x.dtype))
+                bias=None, out_dtype=x.dtype,
+                trellis_packed2=layer.trellis_packed2.get_shard(i),
+                inv_resid_scale2=meta['inv_rs2']))
         return torch.cat(outs, dim=-1)
 
     meta = layer._glq_trellis_meta[0]
@@ -691,7 +726,8 @@ def _glq_apply_trellis(x, layer):
         x, layer.SV, layer.SU, layer.trellis_packed, layer.tlut,
         bn, bm, bnm, bmm, meta['wscale'],
         meta['in'], meta['out'], meta['n_pad'], meta['m_pad'],
-        bias=None, out_dtype=x.dtype)
+        bias=None, out_dtype=x.dtype,
+        trellis_packed2=layer.trellis_packed2, inv_resid_scale2=meta['inv_rs2'])
 
 
 class GLQLinearMethod(LinearMethodBase):
@@ -758,18 +794,13 @@ class GLQLinearMethod(LinearMethodBase):
                         f"GLQ trellis needs out%32==0 and in%64==0 per shard, got out={_osz}, "
                         f"in={input_size_per_partition} (trellis never pads). Reduce the "
                         f"tensor-parallel size, or use --codebook e8p for this model.")
-            # 5-8 bpw is stacked RVQ: TWO packed buffers (K=4 primary + K=bpw-4 residual).
-            # The CUDA decode and the HF/eager path support it, but nothing below in this
-            # file does — `_R = int(self.bpw)` would size stage 1 at 16*bpw against a
-            # 64-column checkpoint, and the resulting shape mismatch strands param.data on
-            # CPU and aborts at cudagraph capture (see the FULL-SIZE note in the is_trellis
-            # branch). Refuse with a clear message instead of failing there.
-            if int(self.bpw) >= 5:
+            if self.variant == "hyb" and int(self.bpw) >= 5:
+                # Stacked RVQ has no 2-stage HYB kernel and never will — the fused entries
+                # take no tlut. `_trellis_linear_apply` raises on HYB+stage2, but that would
+                # fire mid-forward; refuse at load instead.
                 raise ValueError(
-                    f"GLQ trellis {int(self.bpw)} bpw (stacked RVQ) is not wired for vLLM "
-                    "serving yet — it needs the trellis_packed2 / inv_resid_scale2 buffers "
-                    "registered and threaded through apply(). Serve it via HF transformers "
-                    "(the fused CUDA decode works there), or use 2-4 bpw on vLLM.")
+                    f"GLQ trellis {int(self.bpw)} bpw needs variant 3inst — stacked RVQ has "
+                    "no 2-stage HYB decode. Re-quantize with GLQ_TRELLIS_VARIANT=3inst.")
 
         weight_loader = extra_weight_attrs.get("weight_loader")
 
@@ -788,6 +819,14 @@ class GLQLinearMethod(LinearMethodBase):
             ops = output_partition_sizes
             layer.trellis_packed = GLQShardedParameter(
                 ops, 1, torch.int16, weight_loader=weight_loader, sentinel=True)
+            # Stacked-RVQ residual (5-8 bpw). sentinel=True does double duty: the buffer is
+            # shape-agnostic (the loader resizes it to whatever K2 the checkpoint carries),
+            # AND get_shard(i).numel() == 0 becomes the per-shard "no stage 2" test — which
+            # also covers a never-loaded KV-shared shard without a separate flag.
+            layer.trellis_packed2 = GLQShardedParameter(
+                ops, 1, torch.int16, weight_loader=weight_loader, sentinel=True)
+            layer.inv_resid_scale2 = GLQShardedParameter(
+                [1] * len(ops), 0, torch.float32, weight_loader=weight_loader)
             layer.tlut = GLQShardedParameter(
                 ops, 1, torch.float16, weight_loader=weight_loader, sentinel=True)
             layer.SU = GLQShardedParameter(ops, -1, torch.float16, weight_loader=weight_loader)
@@ -899,9 +938,26 @@ class GLQLinearMethod(LinearMethodBase):
                 # registered param after process_weights, reverting the move, and the kernel
                 # aborts on a CPU tensor at cudagraph capture.
                 m_pad, n_pad = out_sz, input_size_per_partition   # trellis never pads
-                _R = int(self.bpw)                               # packed cols == 16*R
+                # Both stage rates come from the quantizer's own recipe, never from bpw
+                # directly: above 4 bpw the layer is stacked RVQ (K=4 primary + K=bpw-4
+                # residual), so `16 * bpw` would size stage 1 at 96 cols against a 64-col
+                # checkpoint and trip exactly the CPU-stranding path described above. Sharing
+                # trellis_rvq_recipe with the quantizer is what keeps the serving layout from
+                # drifting from the storage layout.
+                from glq.trellis import trellis_rvq_recipe
+                _K1, *_rest = trellis_rvq_recipe(int(self.bpw))   # packed cols == 16*K
+                _K2 = _rest[0] if _rest else 0
+                _rows = (m_pad // 16) * (n_pad // 16)
                 layer.trellis_packed = _make_glq_param(torch.zeros(
-                    (m_pad // 16) * (n_pad // 16), 16 * _R, dtype=torch.int16))
+                    _rows, 16 * _K1, dtype=torch.int16))
+                # Stage 2 is FULL-SIZE when the recipe has one (same in-place-copy_ invariant)
+                # and 0-size otherwise — never a small placeholder, because numel()==0 is what
+                # the decode uses to decide the stage is absent.
+                layer.trellis_packed2 = _make_glq_param(
+                    torch.zeros(_rows, 16 * _K2, dtype=torch.int16) if _K2
+                    else torch.zeros(0, dtype=torch.int16))
+                layer.inv_resid_scale2 = _make_glq_param(
+                    torch.zeros((), dtype=torch.float32))
                 # hyb: full-size (512, 2) tlut, loaded from the checkpoint. 3inst: ZERO-SIZE —
                 # no checkpoint key exists, and numel()==0 is what routes the apply to the
                 # no-tlut lookup-free op. (A full-size zeros tlut here would silently take
@@ -1254,7 +1310,8 @@ class GLQLinearMethod(LinearMethodBase):
         # time and effectively restores it after process_weights, so the move is lost and the
         # kernel aborts on a CPU tensor at capture. Mutating .data (or GLQShardedParameter's
         # private _shard_data list) preserves object identity, so the move sticks.
-        for attr in ('trellis_packed', 'tlut', 'SU', 'SV', 'Wscale'):
+        for attr in ('trellis_packed', 'trellis_packed2', 'inv_resid_scale2',
+                     'tlut', 'SU', 'SV', 'Wscale'):
             t = getattr(layer, attr, None)
             if t is None:
                 continue
@@ -1274,6 +1331,10 @@ class GLQLinearMethod(LinearMethodBase):
             # layer — those shards stay at their sentinel init (numel-0 packed,
             # Wscale 0). apply() emits exact-zero columns for them (attention
             # discards those columns), mirroring the shell path's zeros semantics.
+            # has_s2 and inv_rs2 resolve TOGETHER, in this one expression. The e8p stage-3/4
+            # silent drop came from a flag that said "stage present" beside a scale still at
+            # 0.0, resolved under a different condition — the stage then vanished with no
+            # error. Keeping them in one place makes that state unrepresentable.
             layer._glq_trellis_meta = [{
                 'wscale': float(layer.Wscale.get_shard(i).item()),
                 'in': in_f,
@@ -1281,8 +1342,12 @@ class GLQLinearMethod(LinearMethodBase):
                 'n_pad': int(layer.glq_n_pad),
                 'm_pad': int(layer.glq_shard_sizes[i]),   # trellis never pads
                 'loaded': layer.trellis_packed.get_shard(i).numel() > 0,
+                'has_s2': layer.trellis_packed2.get_shard(i).numel() > 0,
+                'inv_rs2': (float(layer.inv_resid_scale2.get_shard(i).item())
+                            if layer.trellis_packed2.get_shard(i).numel() > 0 else 0.0),
             } for i in range(n_shards)]
         else:
+            _has_s2 = layer.trellis_packed2.numel() > 0
             layer._glq_trellis_meta = [{
                 'wscale': float(layer.Wscale.item()),
                 'in': in_f,
@@ -1290,7 +1355,38 @@ class GLQLinearMethod(LinearMethodBase):
                 'n_pad': int(layer.glq_n_pad),
                 'm_pad': int(layer.glq_m_pad),
                 'loaded': True,
+                'has_s2': _has_s2,
+                'inv_rs2': float(layer.inv_resid_scale2.item()) if _has_s2 else 0.0,
             }]
+
+        # (2b) Load-time invariant: what the checkpoint carries must match the recipe the
+        # buffers were sized from. vLLM has no dense fallback — unlike the HF path, which can
+        # warn and decode in torch — so a layer that disagrees would silently serve
+        # stage-1-only output at 4 bpw quality. Failing at load turns that whole class into an
+        # error with a cause attached, and leaves has_s2 uniform across the loaded shards,
+        # which the S4b gate in (3b) relies on. A zero scale beside a present buffer is the
+        # same bug wearing a different mask, so check both directions and both fields.
+        from glq.trellis import trellis_rvq_recipe
+        _bpw = int(getattr(layer, 'glq_bpw', 2))
+        _want_s2 = len(trellis_rvq_recipe(_bpw)) > 1
+        for i, meta in enumerate(layer._glq_trellis_meta):
+            if not meta.get('loaded', True):
+                continue      # KV-shared shard: no weights at all, not a half-written one
+            if _want_s2 and not meta['has_s2']:
+                raise RuntimeError(
+                    f"GLQ trellis {_bpw} bpw shard {i}: trellis_packed2 is missing, so the "
+                    "residual stage would be dropped and the layer would serve 4 bpw quality. "
+                    "Re-export the checkpoint with a glq that writes stacked-RVQ storage.")
+            if _want_s2 and meta['inv_rs2'] == 0.0:
+                raise RuntimeError(
+                    f"GLQ trellis {_bpw} bpw shard {i}: trellis_packed2 is present but "
+                    "inv_resid_scale2 is 0.0 — the residual would decode to nothing. The "
+                    "checkpoint is half-written.")
+            if not _want_s2 and meta['has_s2']:
+                raise RuntimeError(
+                    f"GLQ trellis {_bpw} bpw shard {i}: the checkpoint carries a "
+                    "trellis_packed2 the recipe has no stage for. quantization_config bpw "
+                    "and the stored stage layout disagree.")
 
         # (3) Precompute the block-diagonal RHT tensors ONCE, here — *before*
         # torch.compile/cudagraph capture. Building them lazily inside apply() would make
@@ -1317,17 +1413,26 @@ class GLQLinearMethod(LinearMethodBase):
         # sum(m_pad) == sum(out) and y_rht offsets == output offsets.
         layer._glq_s4b = None
         if fused and layer.tlut.get_shard(0).numel() == 0:      # 3INST shards only
-            from glq.quantized_linear import _pack_shard_meta as _psm
-            shard_blocks = [_bd(meta['m_pad']) for meta in layer._glq_trellis_meta]
-            su_cat = torch.cat([
-                layer.SU.get_shard(i)[:meta['m_pad']].contiguous()
-                for i, meta in enumerate(layer._glq_trellis_meta)]).to(device)
-            layer._glq_s4b = {
-                'shard_meta': _psm(shard_blocks).to(device),
-                'su_cat': su_cat,
-                'total_m': sum(meta['m_pad'] for meta in layer._glq_trellis_meta),
-                'max_bs': max(max(b) for b in shard_blocks),
-            }
+            # A stacked-RVQ layer additionally needs the _rvq2 y_rht entry to exist in THIS
+            # build; without it S4b would take the 1-stage entry, which accepts every
+            # argument it already has and silently drops the residual. Falling back to the
+            # per-shard path costs launches, not correctness — and that path resolves its
+            # own _rvq2 op and raises if that is missing too. (2b) has already made has_s2
+            # uniform across the loaded shards, so any() is the layer's answer.
+            has_s2 = any(m['has_s2'] for m in layer._glq_trellis_meta)
+            if not has_s2 or _trellis_yrht_rvq2_entry() is not None:
+                from glq.quantized_linear import _pack_shard_meta as _psm
+                shard_blocks = [_bd(meta['m_pad']) for meta in layer._glq_trellis_meta]
+                su_cat = torch.cat([
+                    layer.SU.get_shard(i)[:meta['m_pad']].contiguous()
+                    for i, meta in enumerate(layer._glq_trellis_meta)]).to(device)
+                layer._glq_s4b = {
+                    'shard_meta': _psm(shard_blocks).to(device),
+                    'su_cat': su_cat,
+                    'total_m': sum(meta['m_pad'] for meta in layer._glq_trellis_meta),
+                    'max_bs': max(max(b) for b in shard_blocks),
+                    'has_s2': has_s2,
+                }
 
         # (4) Drop weight_loaders (function refs break vLLM v1 msgpack serialization).
         for _name, param in layer.named_parameters():
