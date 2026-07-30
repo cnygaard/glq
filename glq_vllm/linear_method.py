@@ -758,6 +758,18 @@ class GLQLinearMethod(LinearMethodBase):
                         f"GLQ trellis needs out%32==0 and in%64==0 per shard, got out={_osz}, "
                         f"in={input_size_per_partition} (trellis never pads). Reduce the "
                         f"tensor-parallel size, or use --codebook e8p for this model.")
+            # 5-8 bpw is stacked RVQ: TWO packed buffers (K=4 primary + K=bpw-4 residual).
+            # The CUDA decode and the HF/eager path support it, but nothing below in this
+            # file does — `_R = int(self.bpw)` would size stage 1 at 16*bpw against a
+            # 64-column checkpoint, and the resulting shape mismatch strands param.data on
+            # CPU and aborts at cudagraph capture (see the FULL-SIZE note in the is_trellis
+            # branch). Refuse with a clear message instead of failing there.
+            if int(self.bpw) >= 5:
+                raise ValueError(
+                    f"GLQ trellis {int(self.bpw)} bpw (stacked RVQ) is not wired for vLLM "
+                    "serving yet — it needs the trellis_packed2 / inv_resid_scale2 buffers "
+                    "registered and threaded through apply(). Serve it via HF transformers "
+                    "(the fused CUDA decode works there), or use 2-4 bpw on vLLM.")
 
         weight_loader = extra_weight_attrs.get("weight_loader")
 

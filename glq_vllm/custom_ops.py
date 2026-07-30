@@ -359,6 +359,32 @@ def _ensure_registered():
                       cuda.glq_fused_linear_trellis_3inst_yrht_cuda, dispatch_key)
         _glq_lib._register_fake("fused_linear_trellis_3inst_yrht",
                                 _fused_linear_trellis_3inst_yrht_fake)
+    # Stacked RVQ (5-8 bpw): SEPARATE ops, guarded on their OWN symbols. `hasattr` tests a
+    # name, not an arity — widening the 1-stage schemas above would let a stale extension
+    # register a schema it cannot satisfy and fail deep in dispatch. With distinct names an
+    # old build simply never defines these, and the caller falls back with a warning.
+    if hasattr(cuda, "glq_fused_linear_trellis_3inst_rvq2_cuda"):
+        _glq_lib.define(
+            "fused_linear_trellis_3inst_rvq2(Tensor x, Tensor sv, Tensor su, "
+            "Tensor trellis_packed, Tensor trellis_packed2, "
+            "Tensor blocks_n, Tensor blocks_m, Tensor blocks_n_meta, Tensor blocks_m_meta, "
+            "float wscale, float inv_resid_scale2, int in_features, int out_features, "
+            "int n_pad, int m_pad) -> Tensor")
+        _glq_lib.impl("fused_linear_trellis_3inst_rvq2",
+                      cuda.glq_fused_linear_trellis_3inst_rvq2_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_linear_trellis_3inst_rvq2",
+                                _fused_linear_trellis_3inst_rvq2_fake)
+    if hasattr(cuda, "glq_fused_linear_trellis_3inst_yrht_rvq2_cuda"):
+        _glq_lib.define(
+            "fused_linear_trellis_3inst_yrht_rvq2(Tensor x, Tensor sv, "
+            "Tensor trellis_packed, Tensor trellis_packed2, "
+            "Tensor blocks_n, Tensor blocks_n_meta, float wscale, float inv_resid_scale2, "
+            "int in_features, int n_pad, int m_pad, "
+            "Tensor(a!) y_rht_out, int col) -> ()")
+        _glq_lib.impl("fused_linear_trellis_3inst_yrht_rvq2",
+                      cuda.glq_fused_linear_trellis_3inst_yrht_rvq2_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_linear_trellis_3inst_yrht_rvq2",
+                                _fused_linear_trellis_3inst_yrht_rvq2_fake)
     if hasattr(cuda, "glq_output_rht_shards_cuda"):
         _glq_lib.define(
             "output_rht_shards(Tensor y_rht, Tensor su, Tensor(a!) y, "
@@ -390,6 +416,24 @@ def _fused_linear_trellis_3inst_yrht_fake(x, sv, trellis_packed, blocks_n, block
                                           y_rht_out, col):
     # Mutating op: writes y_rht_out[:, col:col+m_pad] in place, returns nothing.
     # test_fused_linear_trellis_3inst_yrht_fake_shape pins the positional mirror.
+    return None
+
+
+def _fused_linear_trellis_3inst_rvq2_fake(x, sv, su, trellis_packed, trellis_packed2,
+                                          blocks_n, blocks_m, blocks_n_meta, blocks_m_meta,
+                                          wscale, inv_resid_scale2,
+                                          in_features, out_features, n_pad, m_pad):
+    # Stacked-RVQ (5-8 bpw) variant: same output contract as the 1-stage fake, plus the
+    # residual buffer and its scale. test_fused_linear_trellis_3inst_rvq2_fake_shape pins the
+    # positional mirror — an off-by-one here only surfaces at serve time under real tensors.
+    return torch.empty((x.shape[0], out_features), dtype=torch.float16, device=x.device)
+
+
+def _fused_linear_trellis_3inst_yrht_rvq2_fake(x, sv, trellis_packed, trellis_packed2,
+                                               blocks_n, blocks_n_meta,
+                                               wscale, inv_resid_scale2,
+                                               in_features, n_pad, m_pad, y_rht_out, col):
+    # Mutating op: writes y_rht_out[:, col:col+m_pad] in place, returns nothing.
     return None
 
 

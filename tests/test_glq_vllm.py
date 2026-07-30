@@ -213,6 +213,62 @@ def test_fused_linear_trellis_3inst_fake_shape():
     assert fy.device.type == "meta"
 
 
+def test_fused_linear_trellis_3inst_rvq2_fake_shape():
+    """Pins the stacked-RVQ (5-8 bpw) schema⇆fake arg count/order — 15 args: the 13-arg
+    1-stage list plus ``trellis_packed2`` after its stage-1 partner and ``inv_resid_scale2``
+    after ``wscale`` (the e8p argument-order convention). Deliberately a SEPARATE op from
+    ``fused_linear_trellis_3inst``, whose 13-arg test above is left untouched and therefore
+    doubles as the back-compat gate for every shipped 2-4 bpw checkpoint."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear_trellis_3inst_rvq2"):
+        pytest.skip("fused_linear_trellis_3inst_rvq2 not registered (no CUDA ext loaded)")
+
+    B, in_features, out_features = 2, 1024, 768
+    n_pad, m_pad = in_features, out_features        # trellis never pads
+    meta = torch.device("meta")
+    x = torch.empty(B, in_features, dtype=torch.float16, device=meta)
+    sv = torch.empty(n_pad, dtype=torch.float16, device=meta)
+    su = torch.empty(m_pad, dtype=torch.float16, device=meta)
+    rows = (m_pad // 16) * (n_pad // 16)
+    packed = torch.empty(rows, 16 * 4, dtype=torch.int16, device=meta)   # stage 1: K1 = 4
+    packed2 = torch.empty(rows, 16 * 2, dtype=torch.int16, device=meta)  # stage 2: K2 = 2 (6 bpw)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    blk_n = torch.tensor([n_pad], dtype=torch.int64, device=meta)
+    blk_m = torch.tensor([m_pad], dtype=torch.int64, device=meta)
+
+    fy = torch.ops.glq.fused_linear_trellis_3inst_rvq2(
+        x, sv, su, packed, packed2,
+        blk_n, blk_m, empty_i32, empty_i32,
+        1.0, 0.25, in_features, out_features, n_pad, m_pad,
+    )
+    assert fy.shape == (B, out_features), f"got {tuple(fy.shape)}"
+    assert fy.dtype == torch.float16
+    assert fy.device.type == "meta"
+
+
+def test_s4b_rvq2_fake_shape():
+    """Pins the stacked-RVQ S4b mutating-op schema⇆fake (13 args)."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_linear_trellis_3inst_yrht_rvq2"):
+        pytest.skip("fused_linear_trellis_3inst_yrht_rvq2 not registered (no CUDA ext)")
+
+    B, n, m, total = 2, 1024, 768, 1024
+    meta = torch.device("meta")
+    x = torch.empty(B, n, dtype=torch.float16, device=meta)
+    sv = torch.empty(n, dtype=torch.float16, device=meta)
+    rows = (m // 16) * (n // 16)
+    packed = torch.empty(rows, 16 * 4, dtype=torch.int16, device=meta)
+    packed2 = torch.empty(rows, 16 * 2, dtype=torch.int16, device=meta)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    blk_n = torch.tensor([n], dtype=torch.int64, device=meta)
+    y_rht = torch.empty(B, total, dtype=torch.float32, device=meta)
+    r = torch.ops.glq.fused_linear_trellis_3inst_yrht_rvq2(
+        x, sv, packed, packed2, blk_n, empty_i32, 1.0, 0.25, n, n, m, y_rht, 0)
+    assert r is None
+
+
 def test_s4b_shard_batched_ops_fake_shape():
     """Pins the S4b mutating-op schemas⇆fakes (11 args yrht / 6 args output_rht_shards).
     Both write their output arg in place and return nothing; an arg-count drift between
@@ -276,6 +332,34 @@ def test_trellis_rejects_unservable_shape():
     m = GLQLinearMethod(None, bpw=2, codebook_type="trellis")
     with pytest.raises(ValueError, match="never pads"):
         m.create_weights(torch.nn.Module(), 2048, [48], 2048, 48, torch.float16)  # 48 % 32 != 0
+
+
+@requires_vllm
+@pytest.mark.parametrize("bpw", [5, 6, 7, 8])
+def test_trellis_stacked_rvq_refused_on_vllm(bpw):
+    """5-8 bpw is stacked RVQ (two packed buffers); vLLM only registers one. Without this
+    refusal, create_weights would size stage 1 at 16*bpw against a 64-column checkpoint and
+    the mismatch would strand param.data on CPU, aborting at cudagraph capture — a failure
+    far from its cause. The HF path serves these correctly today.
+
+    Mechanism, not output: assert the DISPATCH refuses. Delete this test when the serving
+    wiring lands."""
+    from glq_vllm.linear_method import GLQLinearMethod
+    m = GLQLinearMethod(None, bpw=bpw, codebook_type="trellis")
+    with pytest.raises(ValueError, match="stacked RVQ"):
+        m.create_weights(torch.nn.Module(), 2048, [3072], 2048, 3072, torch.float16)
+
+
+@requires_vllm
+@pytest.mark.parametrize("bpw", [2, 3, 4])
+def test_trellis_single_stage_still_accepted_on_vllm(bpw):
+    """The 5-8 refusal must not catch 2-4 bpw — those serve on vLLM today and must keep
+    working. This is the negative half of the guard above."""
+    from glq_vllm.linear_method import GLQLinearMethod
+    m = GLQLinearMethod(None, bpw=bpw, codebook_type="trellis")
+    layer = torch.nn.Module()
+    m.create_weights(layer, 2048, [3072], 2048, 3072, torch.float16)   # must not raise
+    assert layer.glq_is_trellis is True
 
 
 @requires_vllm

@@ -116,6 +116,14 @@ __inline__ __device__ uint4 tr_ld_cs(const uint4 *p) {
         : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(p));
     return out;
 }
+// R=1 (the bpw-5 RVQ residual stage) needs only ONE u32 per lane — 4 chunks x 8 bits. The
+// warp's 32 loads are one fully-coalesced 128 B segment, so this is the cheapest of the four
+// load paths (uint3 at R=3 is the most expensive: PTX has no .v3, hence three scalar loads).
+__inline__ __device__ uint32_t tr_ld_cs(const uint32_t *p) {
+    uint32_t out;
+    asm("ld.global.cs.u32 %0, [%1];" : "=r"(out) : "l"(p));
+    return out;
+}
 __inline__ __device__ uint32_t tr_ld_x(const uint32_t *p) {
     uint32_t out;
     asm("ld.global.L1::evict_last.u32 %0, [%1];" : "=r"(out) : "l"(p));
@@ -147,7 +155,29 @@ __device__ inline half tr_decode_3inst_half(uint32_t s) {
 template <uint32_t R, bool IS_3INST = false>
 __device__ inline void tr_load_reg_cs(const uint16_t *__restrict__ compressed, int weight_idx,
                                       uint32_t laneId, uint4 &reg_cs_next, uint4 &reg_cs2_next) {
-    if constexpr (IS_3INST && R == 2) {
+    if constexpr (IS_3INST && R == 1) {
+        // Four 8-bit chunks in ONE u32 (vs R=2's uint2 of u16s, R=4's uint4 of u32s); chunk i
+        // = byte i, memory order, same rule as every other rate. Per-lane stride is 2 u16 and
+        // every index term is even, so the u32 load is naturally aligned.
+        const uint32_t r = tr_ld_cs((const uint32_t *)&compressed[weight_idx]);
+        reg_cs_next.x =  r        & 0xFFu;
+        reg_cs_next.y = (r >>  8) & 0xFFu;
+        reg_cs_next.z = (r >> 16) & 0xFFu;
+        reg_cs_next.w =  r >> 24;
+        // "Continuation = the top 16 bits of the NEXT lane's chunk" is an identity only while
+        // 8R >= 16. Here the chunk is 8 bits and cannot supply 16, so the continuation spans
+        // the next TWO lanes (R>=2's `next >> (WIDTH-16)` would be a NEGATIVE shift). Mod-32
+        // wrap keeps the tail-biting cycle; each fragment slot x/y/z/w is its own stream
+        // across the lanes, which is why the shuffle stays within a slot. Two whole-u32
+        // shuffles serve all four fragments — R>=2 needs four. Pinned bit-exact by
+        // tests/test_trellis_3inst_kernel.py::test_mirror2b_v1_transliteration[1].
+        const uint32_t n1 = __shfl_sync(TR_FULL_MASK, r, laneId + 1);
+        const uint32_t n2 = __shfl_sync(TR_FULL_MASK, r, laneId + 2);
+        reg_cs2_next.x = (( n1        & 0xFFu) << 8) | ( n2        & 0xFFu);
+        reg_cs2_next.y = (((n1 >>  8) & 0xFFu) << 8) | ((n2 >>  8) & 0xFFu);
+        reg_cs2_next.z = (((n1 >> 16) & 0xFFu) << 8) | ((n2 >> 16) & 0xFFu);
+        reg_cs2_next.w = (( n1 >> 24)          << 8) | ( n2 >> 24);
+    } else if constexpr (IS_3INST && R == 2) {
         ditto2 reg_load; reg_load.u32x2 = tr_ld_cs((const uint2 *)&compressed[weight_idx]);
         reg_cs_next.x = reg_load.u32x2.x & 0xFFFFu;      // chunk = one u16 of stream (width 16)
         reg_cs_next.y = reg_load.u32x2.x >> 16;
@@ -278,7 +308,7 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
                           const half *__restrict__ sv = nullptr,
                           float rsqrt_n = 0.0f, uint32_t in_features = 0,
                           const int4 *__restrict__ block_meta = nullptr,
-                          uint32_t num_blocks = 1) {
+                          uint32_t num_blocks = 1, bool accum = false) {
     extern __shared__ __align__(16) half2 smem_codebook[];   // unused (0 bytes) when IS_3INST
 
     const half2 *xsrc = x;                  // fragment source (global x, or smem under FUSE_IN)
@@ -467,7 +497,16 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
                 reduced += reduce_gather[warpi][pi][laneId % 16];
             // RS1: fold the ×wscale that used to be a separate elementwise kernel into the
             // store — bit-exact (same fp32 operands), removes one launch per linear.
-            out[(tileIdM * 2) * TR_MMA_M + laneId] = reduced * wscale;
+            // RVQ (5-8 bpw): stage 2 ACCUMULATES onto stage 1's output. No atomics needed —
+            // each block owns a disjoint m-range, so every element has exactly one writer per
+            // pass, and the two passes are stream-ordered. Stage 1 (accum=false) IS the
+            // initializer, so `out` is never read before it is written and needs no zeroing.
+            // __fadd_rn (not `+`) forbids FFMA contraction, keeping the summed result exactly
+            // equal to the two stages computed separately — which is what lets the parity
+            // test use torch.equal instead of a tolerance.
+            const uint32_t oi = (tileIdM * 2) * TR_MMA_M + laneId;
+            const float v = reduced * wscale;
+            out[oi] = accum ? __fadd_rn(out[oi], v) : v;
         }
         if (m_per_block > 1) __syncthreads();
         tileIdM += 1;
@@ -503,7 +542,8 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
                           const uint32_t *__restrict__ compressed,
                           const half2 *__restrict__ x,
                           const half2 *__restrict__ codebook,
-                          uint32_t m, uint32_t k, uint32_t B, float wscale) {
+                          uint32_t m, uint32_t k, uint32_t B, float wscale,
+                          bool accum = false) {
     extern __shared__ __align__(16) half2 smem_codebook[];
 
     const uint32_t laneId = threadIdx.x % TR_WARP_SIZE;
@@ -626,8 +666,12 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
                     float reduced = 0.0f;
                     for (uint32_t warpi = 0; warpi < TR_WARPS; warpi++)
                         reduced += reduce_gather[warpi][pi][laneId % 16];
-                    // RS1: ×wscale folded into the store (see matvec note).
-                    out[(size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId] = reduced * wscale;
+                    // RS1: ×wscale folded into the store; RVQ stage 2 accumulates (see the
+                    // matvec note — disjoint (m-range, token-tile) ownership makes `+=` safe
+                    // and deterministic, and __fadd_rn keeps it exactly stage1+stage2).
+                    const size_t oi = (size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId;
+                    const float v = reduced * wscale;
+                    out[oi] = accum ? __fadd_rn(out[oi], v) : v;
                 }
             }
             __syncthreads();
@@ -775,10 +819,18 @@ void tr_init_once() {
 }
 
 // R (bits/weight) is recoverable from the packed shape: cols == ceil(256*R/16) == 16*R.
-int tr_bits_from_packed(const torch::Tensor &packed) {
+/* `allow_r1` is opt-in per call site, NOT a widened global bound. R=1 exists only as the
+ * stacked-RVQ residual rate (bpw 5 = 4+1) and is instantiated only for 3INST; HYB and every
+ * primary-stage call site keep the R>=2 floor, so an R=1 buffer can never be mistaken for a
+ * stage-1 tensor. Widening this check alone would be actively dangerous: the launcher ladders
+ * end in a bare `else` that runs the R=4 kernel, which over 16-column data reads a
+ * neighbour's bits and returns plausible garbage. */
+int tr_bits_from_packed(const torch::Tensor &packed, bool allow_r1 = false) {
     TORCH_CHECK(packed.dim() == 2, "trellis_packed must be 2-D [(m/16)*(k/16), 16*R]");
     int R = (int)packed.size(1) / 16;
-    TORCH_CHECK(R >= 2 && R <= 4, "trellis kernel supports R (bits/weight) 2-4, got ", R);
+    const int lo = allow_r1 ? 1 : 2;
+    TORCH_CHECK(R >= lo && R <= 4,
+                "trellis kernel supports R (bits/weight) ", lo, "-4, got ", R);
     return R;
 }
 
@@ -976,9 +1028,9 @@ torch::Tensor glq_fused_linear_trellis_cuda(
  * carve-out is precisely the occupancy win). */
 
 torch::Tensor glq_decompress_trellis_3inst_cuda(torch::Tensor trellis_packed,
-                                                int64_t m, int64_t k) {
+                                                int64_t m, int64_t k, bool allow_r1 = false) {
     CHECK_INPUT(trellis_packed);
-    int R = tr_bits_from_packed(trellis_packed);
+    int R = tr_bits_from_packed(trellis_packed, allow_r1);
     tr_check_shape(m, k, trellis_packed, R);
     at::DeviceGuard guard(trellis_packed.device());
 
@@ -990,7 +1042,8 @@ torch::Tensor glq_decompress_trellis_3inst_cuda(torch::Tensor trellis_packed,
 #define TR_LAUNCH_DECOMP3(RBITS)                                                       \
     glq_trellis_decompress_kernel<RBITS, true><<<tr_grid_x(), TR_BLOCK_SIZE, 0, stream>>>( \
         wp, cp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k)
-    if (R == 2)      { TR_LAUNCH_DECOMP3(2); }
+    if (R == 1)      { TR_LAUNCH_DECOMP3(1); }   // RVQ residual rate (bpw 5); see tr_bits_from_packed
+    else if (R == 2) { TR_LAUNCH_DECOMP3(2); }
     else if (R == 3) { TR_LAUNCH_DECOMP3(3); }
     else             { TR_LAUNCH_DECOMP3(4); }
 #undef TR_LAUNCH_DECOMP3
@@ -999,12 +1052,17 @@ torch::Tensor glq_decompress_trellis_3inst_cuda(torch::Tensor trellis_packed,
 
 torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
                                                    int64_t m, int64_t k, double wscale,
-                                                   c10::optional<torch::Tensor> out_opt) {
+                                                   c10::optional<torch::Tensor> out_opt,
+                                                   bool accum = false) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
     TORCH_CHECK(x.numel() == k, "x must have k elements, got ", x.numel());
-    int R = tr_bits_from_packed(trellis_packed);
+    // accum IS the "this is a residual stage" predicate, so it also gates R=1 — the two can
+    // never disagree, and a stage-1 launch can never reach the R=1 instantiation.
+    TORCH_CHECK(!accum || out_opt.has_value(),
+                "accumulate mode needs the caller's `out` (stage 1 is the initializer)");
+    int R = tr_bits_from_packed(trellis_packed, /*allow_r1=*/accum);
     tr_check_shape(m, k, trellis_packed, R);
     at::DeviceGuard guard(x.device());
 
@@ -1023,8 +1081,10 @@ torch::Tensor glq_decode_matvec_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 
 #define TR_LAUNCH_MATVEC3(RBITS)                                                       \
     glq_trellis_matvec_kernel<RBITS, true><<<tr_grid_x(), TR_BLOCK_SIZE, 0, stream>>>( \
-        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (float)wscale)
-    if (R == 2)      { TR_LAUNCH_MATVEC3(2); }
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (float)wscale,   \
+        (const half *)nullptr, 0.0f, 0u, (const int4 *)nullptr, 1u, accum)
+    if (R == 1)      { TR_LAUNCH_MATVEC3(1); }   // residual stage only (gated by `accum`)
+    else if (R == 2) { TR_LAUNCH_MATVEC3(2); }
     else if (R == 3) { TR_LAUNCH_MATVEC3(3); }
     else             { TR_LAUNCH_MATVEC3(4); }
 #undef TR_LAUNCH_MATVEC3
@@ -1096,18 +1156,29 @@ torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
 }
 
 torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tensor trellis_packed,
-                                                   int64_t m, int64_t k, double wscale) {
+                                                   int64_t m, int64_t k, double wscale,
+                                                   c10::optional<torch::Tensor> out_opt = c10::nullopt,
+                                                   bool accum = false) {
     CHECK_INPUT(x);
     CHECK_INPUT(trellis_packed);
     TORCH_CHECK(x.dim() == 2, "x must be (B, k)");
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be fp16");
     TORCH_CHECK(x.size(1) == k, "x must have k columns, got ", x.size(1));
-    int R = tr_bits_from_packed(trellis_packed);
+    // As in the GEMV: `accum` marks a residual stage, so it alone unlocks R=1, and it
+    // requires the caller's buffer because stage 1 is what initialized it.
+    TORCH_CHECK(!accum || out_opt.has_value(),
+                "accumulate mode needs the caller's `out` (stage 1 is the initializer)");
+    int R = tr_bits_from_packed(trellis_packed, /*allow_r1=*/accum);
     tr_check_shape(m, k, trellis_packed, R);
     at::DeviceGuard guard(x.device());
 
     const int64_t B = x.size(0);
-    auto out = torch::empty({B, m}, torch::dtype(torch::kFloat32).device(x.device()));
+    auto out = out_opt.has_value()
+        ? *out_opt
+        : torch::empty({B, m}, torch::dtype(torch::kFloat32).device(x.device()));
+    TORCH_CHECK(out.is_contiguous() && out.numel() == B * m
+                    && out.scalar_type() == torch::kFloat32,
+                "out must be a contiguous (B, m) fp32 tensor");
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const uint32_t *cp = (const uint32_t *)trellis_packed.data_ptr<int16_t>();
     const half2 *xp = (const half2 *)x.data_ptr<c10::Half>();
@@ -1116,8 +1187,10 @@ torch::Tensor glq_decode_matmul_trellis_3inst_cuda(torch::Tensor x, torch::Tenso
 
 #define TR_LAUNCH_MATMUL3(RBITS)                                                       \
     glq_trellis_matmul_kernel<RBITS, true><<<grid, TR_BLOCK_SIZE, 0, stream>>>(        \
-        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (uint32_t)B, (float)wscale)
-    if (R == 2)      { TR_LAUNCH_MATMUL3(2); }
+        op, cp, xp, (const half2 *)nullptr, (uint32_t)m, (uint32_t)k, (uint32_t)B,      \
+        (float)wscale, accum)
+    if (R == 1)      { TR_LAUNCH_MATMUL3(1); }   // residual stage only (gated by `accum`)
+    else if (R == 2) { TR_LAUNCH_MATMUL3(2); }
     else if (R == 3) { TR_LAUNCH_MATMUL3(3); }
     else             { TR_LAUNCH_MATMUL3(4); }
 #undef TR_LAUNCH_MATMUL3
@@ -1136,9 +1209,24 @@ static torch::Tensor tr3_forward_yrht(
     torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
     torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
     double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
-    c10::optional<torch::Tensor> y_out_slice
+    c10::optional<torch::Tensor> y_out_slice,
+    torch::Tensor trellis_packed2 = torch::Tensor(),   // stacked RVQ (5-8 bpw); empty = absent
+    double inv_resid_scale2 = 0.0
 ) {
     int B = x.size(0);
+
+    // Stacked RVQ: W = decode(stage1) + inv_resid_scale2 * decode(stage2), summed by matmul
+    // linearity as y1 + rs2*y2. The buffer's presence IS the stage count, so a present buffer
+    // with a zero scale (or vice versa) is a half-configured layer — exactly the shape of the
+    // e8p stage-3/4 silent drop, where the flag said "present" while the scale stayed 0.0 and
+    // the stage vanished with no error. Refuse instead.
+    const bool has_s2 = trellis_packed2.defined() && trellis_packed2.numel() > 0;
+    TORCH_CHECK(has_s2 == (inv_resid_scale2 != 0.0),
+                "trellis RVQ stage 2 is half-configured: trellis_packed2 is ",
+                has_s2 ? "present" : "absent", " but inv_resid_scale2 = ", inv_resid_scale2,
+                ". Refusing rather than silently decoding stage 1 only.");
+    // Scale folded host-side into ONE double so the kernel store stays a single multiply.
+    const double wscale2 = wscale * inv_resid_scale2;
 
     static const int64_t batch_max = [] {
         const char *e = std::getenv("GLQ_TRELLIS_BATCH_MAX");
@@ -1161,7 +1249,11 @@ static torch::Tensor tr3_forward_yrht(
                            && ((size_t)n_pad * 4 + (size_t)fmax_bs * 4) <= 81920;
 
     torch::Tensor y_rht;
-    if (fuse_in && B == 1 && !force_dense && (fusein_sb || fusein_bd)) {
+    // FUSE_IN computes the input RHT in smem and DISCARDS it, so a second decode pass would
+    // have no transformed x to read — re-running the transform would silently garbage stage 2.
+    // Stage-2 layers therefore take the explicit-x_rht path, costing one extra launch for the
+    // input RHT. (Follow-up: have pass 1 export xh to a caller buffer and restore FUSE_IN.)
+    if (fuse_in && B == 1 && !force_dense && !has_s2 && (fusein_sb || fusein_bd)) {
         // ---- RS2b/RS3 fused path: input RHT + cast + decode + ×wscale in ONE kernel ----
         auto yv = glq_decode_matvec_trellis_3inst_fusein_cuda(
             x.contiguous().view({-1}), sv, trellis_packed, m_pad, n_pad, in_features, wscale,
@@ -1180,13 +1272,29 @@ static torch::Tensor tr3_forward_yrht(
             // RS1: ×wscale happens in the kernel store — no separate elementwise launch.
             auto yv = glq_decode_matvec_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad,
                                                            wscale, y_out_slice);
+            // Stage 2 accumulates ONTO stage 1's output — same buffer, no temp tensor and no
+            // extra pass over y. Stream-ordered after stage 1, disjoint m-range per block.
+            if (has_s2)
+                glq_decode_matvec_trellis_3inst_cuda(xh, trellis_packed2, m_pad, n_pad,
+                                                     wscale2, yv, /*accum=*/true);
             y_rht = yv.view({1, (long)m_pad});
         } else if (B <= batch_max && !force_dense) {
             auto xh = x_rht.to(torch::kFloat16);                             // (B, n_pad)
             y_rht = glq_decode_matmul_trellis_3inst_cuda(xh, trellis_packed, m_pad, n_pad,
                                                           wscale);
+            if (has_s2)
+                glq_decode_matmul_trellis_3inst_cuda(xh, trellis_packed2, m_pad, n_pad,
+                                                     wscale2, y_rht, /*accum=*/true);
         } else {
             auto W = glq_decompress_trellis_3inst_cuda(trellis_packed, m_pad, n_pad);   // fp16
+            if (has_s2) {
+                // Dense prefill sums the WEIGHTS before one GEMM — same result by linearity,
+                // and one GEMM instead of two. The fp16 add keeps opmath in fp32 internally
+                // with no m×k fp32 transient, matching this branch's existing fp16 rationale.
+                auto W2 = glq_decompress_trellis_3inst_cuda(trellis_packed2, m_pad, n_pad,
+                                                            /*allow_r1=*/true);
+                W.add_(W2, (float)inv_resid_scale2);
+            }
             auto xh = x_rht.to(torch::kFloat16);
             y_rht = (at::matmul(xh, W.t()).to(torch::kFloat32) * (float)wscale).contiguous();
         }
@@ -1250,6 +1358,82 @@ void glq_fused_linear_trellis_3inst_yrht_cuda(
         slice = y_rht_out.select(0, 0).narrow(0, col, m_pad);   // contiguous row slice
     auto y = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
                               wscale, in_features, n_pad, m_pad, slice);
+    if (!slice.has_value() || y.data_ptr() != slice->data_ptr())
+        y_rht_out.narrow(1, col, m_pad).copy_(y.view({B, (long)m_pad}));
+}
+
+/* ══ Stacked-RVQ (5-8 bpw) entries — SEPARATE symbols, not widened signatures ══
+ * The Python registration is guarded by `hasattr(cuda, "<symbol>")`, which tests a NAME,
+ * not an arity. Widening the shipped 13-arg entry would let a STALE .so pass that guard and
+ * then bind a 13-arg function to a 15-arg schema — failing deep inside dispatch, possibly
+ * mid-capture. A new symbol turns the guard into a true capability probe: absent → the op is
+ * never defined → the caller falls back to the eager decode with a warning. Every 2-4 bpw
+ * checkpoint keeps the byte-identical old entry (so its tests stay the back-compat gate),
+ * and both share ONE core (tr3_forward_yrht), so the 1- and 2-stage math cannot drift. */
+torch::Tensor glq_fused_linear_trellis_3inst_rvq2_cuda(
+    torch::Tensor x,               // (B, in_features) fp16, contiguous
+    torch::Tensor sv,              // (n_pad,) fp16
+    torch::Tensor su,              // (m_pad,) fp16
+    torch::Tensor trellis_packed,  // stage 1: ((m_pad/16)*(n_pad/16), 16*R1) int16, R1 = 4
+    torch::Tensor trellis_packed2, // stage 2: same rows, 16*R2 cols, R2 = bpw-4 in 1..4
+    torch::Tensor blocks_n, torch::Tensor blocks_m,
+    torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
+    double wscale, double inv_resid_scale2,
+    int64_t in_features, int64_t out_features,
+    int64_t n_pad, int64_t m_pad
+) {
+    // This entry is 2-stage BY CONSTRUCTION: refusing an empty stage 2 here makes it
+    // impossible to reach the fused path in a configuration that would decode stage 1 only.
+    TORCH_CHECK(trellis_packed2.numel() > 0 && inv_resid_scale2 != 0.0,
+                "the rvq2 entry requires a populated stage 2 (got packed2.numel()=",
+                trellis_packed2.numel(), ", inv_resid_scale2=", inv_resid_scale2,
+                "); single-stage layers must use glq_fused_linear_trellis_3inst_cuda");
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    CHECK_INPUT(trellis_packed2);
+    int B = x.size(0);
+    at::DeviceGuard guard(x.device());
+
+    auto y_rht = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                                  wscale, in_features, n_pad, m_pad, c10::nullopt,
+                                  trellis_packed2, inv_resid_scale2);
+
+    auto y = torch::empty({B, (long)out_features},
+                          torch::dtype(torch::kFloat16).device(x.device()));
+    glq_output_rht_blockdiag_cuda(y_rht, su, y, (int)out_features, (int)m_pad,
+                                  blocks_m, blocks_m_meta);
+    return y;
+}
+
+/* S4b shard-batched variant of the above (see the 1-stage yrht note). */
+void glq_fused_linear_trellis_3inst_yrht_rvq2_cuda(
+    torch::Tensor x, torch::Tensor sv,
+    torch::Tensor trellis_packed, torch::Tensor trellis_packed2,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, double inv_resid_scale2,
+    int64_t in_features, int64_t n_pad, int64_t m_pad,
+    torch::Tensor y_rht_out, int64_t col
+) {
+    TORCH_CHECK(trellis_packed2.numel() > 0 && inv_resid_scale2 != 0.0,
+                "the rvq2 yrht entry requires a populated stage 2 (got packed2.numel()=",
+                trellis_packed2.numel(), ", inv_resid_scale2=", inv_resid_scale2, ")");
+    CHECK_INPUT(x);
+    CHECK_INPUT(trellis_packed);
+    CHECK_INPUT(trellis_packed2);
+    CHECK_INPUT(y_rht_out);
+    TORCH_CHECK(y_rht_out.scalar_type() == torch::kFloat32
+                    && y_rht_out.dim() == 2 && y_rht_out.size(0) == x.size(0)
+                    && col + m_pad <= y_rht_out.size(1),
+                "y_rht_out must be (B, >= col+m_pad) fp32");
+    int64_t B = x.size(0);
+    at::DeviceGuard guard(x.device());
+
+    c10::optional<torch::Tensor> slice;
+    if (B == 1)
+        slice = y_rht_out.select(0, 0).narrow(0, col, m_pad);   // contiguous row slice
+    auto y = tr3_forward_yrht(x, sv, trellis_packed, blocks_n, blocks_n_meta,
+                              wscale, in_features, n_pad, m_pad, slice,
+                              trellis_packed2, inv_resid_scale2);
     if (!slice.has_value() || y.data_ptr() != slice->data_ptr())
         y_rht_out.narrow(1, col, m_pad).copy_(y.view({B, (long)m_pad}));
 }

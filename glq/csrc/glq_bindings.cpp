@@ -257,11 +257,13 @@ torch::Tensor glq_fused_linear_trellis_cuda(
     double wscale, int64_t in_features, int64_t out_features,
     int64_t n_pad, int64_t m_pad);
 // 3INST (lookup-free V=1) trellis variants — no tlut, zero dynamic smem.
+// `allow_r1` / `accum` unlock the R=1 instantiation, which exists ONLY as the stacked-RVQ
+// residual rate (bpw 5 = 4+1). Defaults keep every primary-stage call site at R>=4..2.
 torch::Tensor glq_decompress_trellis_3inst_cuda(
-    torch::Tensor trellis_packed, int64_t m, int64_t k);
+    torch::Tensor trellis_packed, int64_t m, int64_t k, bool allow_r1);
 torch::Tensor glq_decode_matvec_trellis_3inst_cuda(
     torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale,
-    c10::optional<torch::Tensor> out_opt);
+    c10::optional<torch::Tensor> out_opt, bool accum);
 torch::Tensor glq_decode_matvec_trellis_3inst_fusein_cuda(
     torch::Tensor x_raw, torch::Tensor sv, torch::Tensor trellis_packed,
     int64_t m, int64_t k, int64_t in_features, double wscale,
@@ -275,7 +277,8 @@ void glq_output_rht_blockdiag_cuda(torch::Tensor y_rht, torch::Tensor su, torch:
                                    int out_features, int m_pad,
                                    torch::Tensor blocks_m, torch::Tensor blocks_m_meta);
 torch::Tensor glq_decode_matmul_trellis_3inst_cuda(
-    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale);
+    torch::Tensor x, torch::Tensor trellis_packed, int64_t m, int64_t k, double wscale,
+    c10::optional<torch::Tensor> out_opt, bool accum);
 torch::Tensor glq_fused_linear_trellis_3inst_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor su,
     torch::Tensor trellis_packed,
@@ -288,6 +291,25 @@ void glq_fused_linear_trellis_3inst_yrht_cuda(
     torch::Tensor x, torch::Tensor sv, torch::Tensor trellis_packed,
     torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
     double wscale, int64_t in_features, int64_t n_pad, int64_t m_pad,
+    torch::Tensor y_rht_out, int64_t col);
+// Stacked-RVQ (5-8 bpw) 3INST entries. Deliberately SEPARATE symbols so `hasattr(cuda, ...)`
+// is a real capability probe — see the note in glq_trellis.cu. Residual buffer goes right
+// after its stage-1 partner and the residual scale right after wscale, matching
+// glq_fused_linear_e8p_cuda's argument order.
+torch::Tensor glq_fused_linear_trellis_3inst_rvq2_cuda(
+    torch::Tensor x, torch::Tensor sv, torch::Tensor su,
+    torch::Tensor trellis_packed, torch::Tensor trellis_packed2,
+    torch::Tensor blocks_n, torch::Tensor blocks_m,
+    torch::Tensor blocks_n_meta, torch::Tensor blocks_m_meta,
+    double wscale, double inv_resid_scale2,
+    int64_t in_features, int64_t out_features,
+    int64_t n_pad, int64_t m_pad);
+void glq_fused_linear_trellis_3inst_yrht_rvq2_cuda(
+    torch::Tensor x, torch::Tensor sv,
+    torch::Tensor trellis_packed, torch::Tensor trellis_packed2,
+    torch::Tensor blocks_n, torch::Tensor blocks_n_meta,
+    double wscale, double inv_resid_scale2,
+    int64_t in_features, int64_t n_pad, int64_t m_pad,
     torch::Tensor y_rht_out, int64_t col);
 void glq_output_rht_shards_cuda(torch::Tensor y_rht, torch::Tensor su, torch::Tensor y,
                                 int64_t out_features, torch::Tensor shard_meta,
@@ -309,12 +331,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_fused_linear_trellis_cuda", &glq_fused_linear_trellis_cuda,
           "GLQ fused trellis input_rht + decode/matmul + output_rht, one host call (CUDA)");
     m.def("glq_decompress_trellis_3inst_cuda", &glq_decompress_trellis_3inst_cuda,
-          "QTIP 3INST (lookup-free) trellis dense decompress to fp16 weight (CUDA)");
+          "QTIP 3INST (lookup-free) trellis dense decompress to fp16 weight (CUDA)",
+          py::arg("trellis_packed"), py::arg("m"), py::arg("k"),
+          py::arg("allow_r1") = false);
     m.def("glq_decode_matvec_trellis_3inst_cuda", &glq_decode_matvec_trellis_3inst_cuda,
-          "QTIP 3INST trellis fused B=1 tensor-core GEMV, no tlut, zero smem (CUDA)",
+          "QTIP 3INST trellis fused B=1 tensor-core GEMV, no tlut, zero smem (CUDA); "
+          "accum=True adds onto `out` (stacked-RVQ stage 2) and unlocks R=1",
           py::arg("x"), py::arg("trellis_packed"),
           py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0,
-          py::arg("out") = py::none());
+          py::arg("out") = py::none(), py::arg("accum") = false);
     m.def("glq_decode_matvec_trellis_3inst_fusein_cuda",
           &glq_decode_matvec_trellis_3inst_fusein_cuda,
           "3INST B=1 GEMV with the input RHT fused into every block (raw fp16 x + sv in); "
@@ -329,14 +354,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_output_rht_blockdiag_cuda", &glq_output_rht_blockdiag_cuda,
           "GLQ block-diagonal output RHT (per-block FHT+SU+unpad) host entry (CUDA)");
     m.def("glq_decode_matmul_trellis_3inst_cuda", &glq_decode_matmul_trellis_3inst_cuda,
-          "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA)",
+          "QTIP 3INST trellis batched B>1 tensor-core GEMM, no tlut, zero smem (CUDA); "
+          "accum=True adds onto `out` (stacked-RVQ stage 2) and unlocks R=1",
           py::arg("x"), py::arg("trellis_packed"),
-          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0);
+          py::arg("m"), py::arg("k"), py::arg("wscale") = 1.0,
+          py::arg("out") = py::none(), py::arg("accum") = false);
     m.def("glq_fused_linear_trellis_3inst_cuda", &glq_fused_linear_trellis_3inst_cuda,
           "GLQ fused 3INST trellis input_rht + decode/matmul + output_rht, one host call (CUDA)");
     m.def("glq_fused_linear_trellis_3inst_yrht_cuda", &glq_fused_linear_trellis_3inst_yrht_cuda,
           "S4b: fused 3INST linear stopped at the y_rht seam — writes wscale*(W @ RHT(x·sv)) "
           "fp32 into columns [col, col+m_pad) of the shared y_rht_out buffer");
+    m.def("glq_fused_linear_trellis_3inst_rvq2_cuda",
+          &glq_fused_linear_trellis_3inst_rvq2_cuda,
+          "GLQ fused 3INST trellis linear for STACKED RVQ (5-8 bpw): input_rht + stage-1 "
+          "decode/matmul + stage-2 accumulate + output_rht, one host call (CUDA)");
+    m.def("glq_fused_linear_trellis_3inst_yrht_rvq2_cuda",
+          &glq_fused_linear_trellis_3inst_yrht_rvq2_cuda,
+          "S4b shard-batched variant of the stacked-RVQ 3INST linear (stops at y_rht)");
     m.def("glq_output_rht_shards_cuda", &glq_output_rht_shards_cuda,
           "S4b: ONE output-RHT launch spanning every sub-block of every shard "
           "(shard_meta rows {offset, bs, log_bs, rsqrt_bits})");

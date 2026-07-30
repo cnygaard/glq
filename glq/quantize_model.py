@@ -397,7 +397,10 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
         # Hessian-weighted proxy tr(ΔW·H·ΔWᵀ)/m — same metric the shell path reports, so
         # sensitivity/mixed-bpw allocation stays consistent across codebooks.
         proxy = ((d @ H.float().to(d.device)) * d).sum().item() / W.shape[0]
-        return W_hat, artifacts, {"sqnr": sqnr, "bpw": codebook.K,
+        # bpw is the SUM over RVQ stages (5-8 bpw = K4 primary + K(bpw-4) residual), not
+        # the primary's K — reporting codebook.K would advertise every stacked rate as 4.
+        _stage_bpw = sum(c.K for c in getattr(codebook, "rvq_stages", None) or [codebook])
+        return W_hat, artifacts, {"sqnr": sqnr, "bpw": _stage_bpw,
                                   "Wscale": float(artifacts["Wscale"]), "proxy_loss": proxy}
     dev = codebook.device
     m, n = W.shape
@@ -828,15 +831,14 @@ def quantize(
                 "not implemented: every layer would be encoded at a single K while "
                 "config.json advertised the per-layer map, which fails to load."
             )
-        # The trellis rate K *is* the bpw, and the CUDA kernel templates on
-        # R in {2,3,4} (``tr_bits_from_packed`` hard-checks it). 5-8 bpw needs RVQ
-        # stacking (5=3+2, 6=4+2, 7=4+3, 8=4+4), which is not implemented. Catch it
-        # here: a K=5 run would otherwise Viterbi-encode for GPU-hours, write a
-        # checkpoint, and only fail at serve time.
-        if not 2 <= bpw <= 4:
+        # 2-4 is a single native-rate trellis; 5-8 stacks a K=4 primary with a
+        # K=(bpw-4) residual (``trellis_rvq_recipe``). Every stage stays at R<=4 because
+        # the CUDA kernel packs each decode chunk into a uint32 of width 8*R, so a native
+        # K>=5 has no kernel at all. Beyond 8 there is no recipe.
+        if not 2 <= bpw <= 8:
             raise ValueError(
-                f"trellis codebook supports bpw 2-4, got {bpw}. Higher rates need "
-                "RVQ stacking (not implemented); use --codebook e8p for 5-8 bpw."
+                f"trellis codebook supports bpw 2-8, got {bpw} (2-4 native, 5-8 RVQ "
+                "stacked as 4+(bpw-4))."
             )
 
     if nsamples < 64:
@@ -988,13 +990,17 @@ def quantize(
         from .codebook_e8p import E8PCodebook
         codebook = E8PCodebook(device=device)         # QuIP# padded-D̂8, TC-GEMV decode (2-8 bpw RVQ)
     elif codebook_type == "trellis":
-        from .trellis import TrellisCodebook           # QTIP TCQ — dim-256 trellis, beats e8p at low bpw
+        from .trellis import TrellisCodebook, trellis_rvq_recipe  # QTIP TCQ — dim-256 trellis
         _variant = os.environ.get("GLQ_TRELLIS_VARIANT", "hyb")
-        # The mixed-precision guard above pins bpw to a uniform int here, so the
-        # trellis rate K == bpw exactly. (A silent `else 2` fallback used to hide
-        # the mixed-bpw mismatch behind a wrong-but-loadable K=2 checkpoint.)
-        _K = int(bpw)
-        codebook = TrellisCodebook(variant=_variant, K=_K, device=device)
+        # The mixed-precision guard above pins bpw to a uniform int here. 2-4 is one
+        # native-rate codebook (the shipped, byte-identical path); 5-8 stacks [K=4, K=bpw-4].
+        # The residual stage rides on the PRIMARY codebook as `.rvq_stages` rather than
+        # replacing `codebook` with a list, so every `is_trellis` / `codebook.K` duck-type
+        # in this driver keeps working untouched.
+        _cbs = [TrellisCodebook(variant=_variant, K=_k, device=device)
+                for _k in trellis_rvq_recipe(int(bpw))]
+        codebook = _cbs[0]
+        codebook.rvq_stages = _cbs
     else:
         codebook = E8ShellCodebook(device=device, target_size=codebook_size)
 
