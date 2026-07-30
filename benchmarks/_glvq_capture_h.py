@@ -21,6 +21,10 @@ LAYERS = [int(x) for x in os.environ.get("GLVQ_LAYERS", "0,18,35").split(",")]
 # the wall-clock). Override with GLVQ_SUBS to trade coverage against runtime.
 SUBS = [s for s in os.environ.get(
     "GLVQ_SUBS", "self_attn.q_proj,mlp.down_proj").split(",") if s.strip()]
+# Decoder-stack prefix. Dense Llama-likes put the blocks at `model.layers.N`, but
+# multimodal wrappers nest them one level deeper — gemma-4 E-series is
+# `model.language_model.layers.N` under Gemma4ForConditionalGeneration.
+PREFIX = os.environ.get("GLVQ_PREFIX", "model.layers")
 NSAMPLES, SEQLEN = 128, 2048
 OUT = os.environ.get("GLVQ_OUT", "/opt/dlami/nvme/glvq/layers.pt")
 
@@ -30,7 +34,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
     model.eval()
     mods = dict(model.named_modules())
-    names = [f"model.layers.{L}.{s}" for L in LAYERS for s in SUBS]
+    names = [f"{PREFIX}.{L}.{s}" for L in LAYERS for s in SUBS]
     for nm in names:
         assert nm in mods, f"missing {nm}; layer-0 keys: {[k for k in mods if 'layers.0.' in k][:10]}"
     caps = {nm: HessianCapture(mods[nm]) for nm in names}
