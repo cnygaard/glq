@@ -49,8 +49,32 @@ disk**. (Verify *bytes*, never nominal bpw.)
 Stage 2's cost is **flat in K2** — K2=1 carries a quarter the bits of K2=4 and costs the
 same ~7 µs — so the cost is per *state-decode*, not per bit. The ~1.9× is therefore doubled
 decode ALU (stacked 4+2 decodes 512 states per 16×16 tile where a native K=6 would decode
-256) and is irreducible: no fusion strategy avoids it. The two-launch overhead is ~0
-(negative = noise), far below the ~10% that would justify a one-kernel variant.
+256) and is irreducible: no fusion strategy avoids it.
+
+### The two-launch overhead is hardware-dependent — do not quote one number
+
+On sm_120 it is ~0 (−1.0% to −3.8%, i.e. noise), which says a one-kernel variant would buy
+nothing there. On **sm_89 (L4) the same microbench gives +10.5% / +12.7% / +15.3% / +21.1%**
+at bpw 5/6/7/8 — above the ~10% that justifies fusing, and growing with K2:
+
+| arm | sm_120 (RTX PRO 6000) | sm_89 (L4) |
+|---|---|---|
+| 4 bpw baseline | 7.3 µs | 27.8 µs |
+| 4+2 (6 bpw) | 13.9 µs — **1.91×**, overhead −1.9% | 65.6 µs — **2.36×**, overhead **+12.7%** |
+| 4+4 (8 bpw) | 13.7 µs — **1.89×**, overhead −3.8% | 75.8 µs — **2.73×**, overhead **+21.1%** |
+
+The doubled-ALU floor is universal (stage-2 cost is flat in K2 on both). The launch/locality
+penalty is not. Quote the decode cost per architecture.
+
+**Mechanism not established.** The obvious L2-capacity explanation is falsified — the L4 has
+48 MiB of L2 against 8+8 MiB of weight buffers — and the weight loads use `ld.global.cs`
+(evict-first), which undercuts any L2-residency story either way. An ncu comparison of the
+two-launch sequence against each pass alone would settle it. Note that recovering this needs
+*per-tile* interleaving, which is the variant that spills at the 64-register wall; a
+one-kernel phase-sequential variant is still two full sweeps and would not help.
+
+Correctness is fully portable: 28 RVQ gates and 192 regression tests pass unchanged on
+sm_89, including the R=1 bit-exact decompress.
 
 **Do not conflate the two wall-clocks.** The PPL runs above show 6 bpw at 29 s vs 4 bpw at
 24 s (1.21×), but seqlen 2048 drives B=2048 ≫ `GLQ_TRELLIS_BATCH_MAX=64`, so PPL exercises

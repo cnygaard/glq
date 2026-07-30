@@ -99,6 +99,17 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     ):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
+        # Trellis MoE is NOT implemented at any bpw. Without this guard a trellis checkpoint
+        # falls through the `codebook_type == "e8p"` check below into the SHELL branch, which
+        # registers `w13_Qidxs`/`w2_Qidxs` codebook-index buffers — the wrong storage format
+        # for a trellis checkpoint (which carries `trellis_packed` + `tlut`). That either
+        # errors deep in a shape mismatch at load or serves garbage. Refuse up front.
+        if self.codebook_type == "trellis":
+            raise ValueError(
+                "GLQ trellis MoE is not implemented — a trellis checkpoint would be loaded "
+                "into shell-codebook buffers and produce wrong output. Serve MoE models with "
+                "--codebook e8_shell or e8p, or run this checkpoint via HF transformers.")
+
         # w13 = gate_up_proj (or just up_proj for non-gated)
         is_gated = getattr(self.moe, 'is_act_and_mul', None)
         if is_gated is None:

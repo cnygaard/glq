@@ -335,6 +335,34 @@ def test_trellis_rejects_unservable_shape():
 
 
 @requires_vllm
+@pytest.mark.parametrize("bpw", [5, 6, 7, 8])
+def test_trellis_stacked_rvq_refused_on_vllm(bpw):
+    """5-8 bpw is stacked RVQ (two packed buffers); vLLM only registers one. Without this
+    refusal, create_weights would size stage 1 at 16*bpw against a 64-column checkpoint and
+    the mismatch would strand param.data on CPU, aborting at cudagraph capture — a failure
+    far from its cause. The HF path serves these correctly today.
+
+    Mechanism, not output: assert the DISPATCH refuses. Delete this test when the serving
+    wiring lands."""
+    from glq_vllm.linear_method import GLQLinearMethod
+    m = GLQLinearMethod(None, bpw=bpw, codebook_type="trellis")
+    with pytest.raises(ValueError, match="stacked RVQ"):
+        m.create_weights(torch.nn.Module(), 2048, [3072], 2048, 3072, torch.float16)
+
+
+@requires_vllm
+@pytest.mark.parametrize("bpw", [2, 3, 4])
+def test_trellis_single_stage_still_accepted_on_vllm(bpw):
+    """The 5-8 refusal must not catch 2-4 bpw — those serve on vLLM today and must keep
+    working. This is the negative half of the guard above."""
+    from glq_vllm.linear_method import GLQLinearMethod
+    m = GLQLinearMethod(None, bpw=bpw, codebook_type="trellis")
+    layer = torch.nn.Module()
+    m.create_weights(layer, 2048, [3072], 2048, 3072, torch.float16)   # must not raise
+    assert layer.glq_is_trellis is True
+
+
+@requires_vllm
 def test_glq_config_trellis_variant():
     """`variant` round-trips. Both shipped variants (hyb, 3inst-kernel-layout) are accepted;
     a pre-kernel NATURAL-layout 3inst checkpoint (no trellis_layout marker) and unknown
