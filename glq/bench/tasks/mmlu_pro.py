@@ -52,16 +52,19 @@ def run(ctx, config: dict):
 
     correct = trunc = noans = 0
     gen = 0
+    per_item = []                        # 1/0 per question, dataset order
     for i, o in enumerate(outs):
         c = o.outputs[0]
         gen += len(c.token_ids)
         if c.finish_reason == "length":
             trunc += 1
         pred = extract_mmlu_letter(c.text)
+        hit = pred is not None and pred == golds[i].upper()
         if pred is None:
             noans += 1
-        elif pred == golds[i].upper():
+        elif hit:
             correct += 1
+        per_item.append(int(hit))
 
     mean_gen = gen / len(msgs) if msgs else 0.0
     assert_engaged(mean_gen, thinking=thinking, config=config,
@@ -77,7 +80,13 @@ def run(ctx, config: dict):
                 "min_mean_gen": float(config.get("min_mean_gen", _DEFAULT_MIN_MEAN_GEN)),
                 "dataset": "TIGER-Lab/MMLU-Pro"},
         extra={"correct": correct, "n": len(msgs), "truncated": trunc,
-               "no_answer": noans, "mean_gen_tokens": round(mean_gen, 1)})
+               "no_answer": noans, "mean_gen_tokens": round(mean_gen, 1),
+               # Per-item 1/0 in dataset order (the selection is deterministic:
+               # shuffle(seed=0).select(range(n))), so two arms line up item-for-item and
+               # can be compared with McNemar on the discordant pairs. Differencing two
+               # marginal percentages throws that pairing away and needs far more items
+               # for the same power.
+               "per_item": per_item})
     tp = ThroughputResult(output_tok_s=round(gen / dt, 1) if dt > 0 else None,
                           batch=len(msgs), measure="in_run_chat")
     return res, tp

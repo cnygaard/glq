@@ -115,6 +115,9 @@ def run(ctx, config: dict):
         extra={"avg_k": avg_k, "n": len(msgs), "samples": nseq,
                "solved_any": sum(1 for p in per_problem if p > 0),       # pass@k
                "solved_all": sum(1 for p in per_problem if p == 1.0),
+               # Fraction of the k samples correct, per problem, in dataset order — lets
+               # two arms be compared paired instead of by differencing two avg@k numbers.
+               "per_item": [round(p, 4) for p in per_problem],
                "truncated": trunc, "no_answer": noans,
                "mean_gen_tokens": round(mean_gen, 1)})
     tp = ThroughputResult(output_tok_s=round(gen / dt, 1) if dt > 0 else None,

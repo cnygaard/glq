@@ -27,9 +27,17 @@ class TaskSpec:
 
 
 TASKS: dict[str, TaskSpec] = {
+    # n=240, not 60. At p~0.85 the standard error is 4.6 pt at n=60 and 2.3 pt at n=240 —
+    # and one question is 1.7 pt at n=60, so a "93.3 vs 91.7" row is a ONE-question gap
+    # being read as a quality difference. n=60 was inherited from runs whose job was
+    # catching a broken harness (30.6% vs 91.7%), which it does fine; it cannot do
+    # quantization deltas. MMLU-Pro items generate ~2-4k thinking tokens against AIME's
+    # ~15k, so 4x the items is minutes, not hours. Raise further with --n when a specific
+    # claim needs it; even 240 cannot resolve a 2-3 pt gap, so compare arms PAIRED using
+    # extra["per_item"] rather than differencing two percentages.
     "mmlu_pro": TaskSpec(
         "mmlu_pro", "glq.bench.tasks.mmlu_pro", metric="accuracy", standardized=True,
-        defaults={"n": 60, "budget": 16384, "thinking": True}),
+        defaults={"n": 240, "budget": 16384, "thinking": True}),
     "aime_2024": TaskSpec(
         "aime_2024", "glq.bench.tasks.aime", metric="accuracy", standardized=True,
         defaults={"sets": ["2024"], "n": 30, "budget": 32768, "thinking": True}),
