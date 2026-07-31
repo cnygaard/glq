@@ -27,17 +27,27 @@ class TaskSpec:
 
 
 TASKS: dict[str, TaskSpec] = {
-    # n=240, not 60. At p~0.85 the standard error is 4.6 pt at n=60 and 2.3 pt at n=240 —
-    # and one question is 1.7 pt at n=60, so a "93.3 vs 91.7" row is a ONE-question gap
-    # being read as a quality difference. n=60 was inherited from runs whose job was
-    # catching a broken harness (30.6% vs 91.7%), which it does fine; it cannot do
-    # quantization deltas. MMLU-Pro items generate ~2-4k thinking tokens against AIME's
-    # ~15k, so 4x the items is minutes, not hours. Raise further with --n when a specific
-    # claim needs it; even 240 cannot resolve a 2-3 pt gap, so compare arms PAIRED using
-    # extra["per_item"] rather than differencing two percentages.
+    # n=500, sized from a power calculation rather than from the standard error alone.
+    # Target effect is 3 pt — the published GLQ-vs-bf16 gaps are 1.6-3.4 pt, and 3 pt is
+    # about where a checkpoint choice would actually change. At p~0.85, 80% power:
+    #
+    #                     unpaired      paired (McNemar, ~8% discordance)
+    #     5 pt            ~900/arm      ~250
+    #     3 pt            ~2500         ~700
+    #     2 pt            ~5600         ~1600
+    #
+    # Pairing is worth ~3.5x the items, which is why extra["per_item"] matters more than n:
+    # two quantizations of one model agree on most questions and only the discordant pairs
+    # carry signal. 500 detects ~3.5 pt paired at ~25 min/arm (measured 2.9 s/item) — the
+    # knee. Below ~250 even 5 pt is invisible; above ~1000 you pay an hour an arm chasing
+    # gaps wikitext2_ppl resolves in five minutes.
+    #
+    # The 8% discordance is an assumption, and per_item makes it measurable: re-derive n
+    # from the observed rate once two arms exist. Big models may want to stay lower — 500
+    # is ~25 min on a 3B but 1.5-2 h on a 31B.
     "mmlu_pro": TaskSpec(
         "mmlu_pro", "glq.bench.tasks.mmlu_pro", metric="accuracy", standardized=True,
-        defaults={"n": 240, "budget": 16384, "thinking": True}),
+        defaults={"n": 500, "budget": 16384, "thinking": True}),
     "aime_2024": TaskSpec(
         "aime_2024", "glq.bench.tasks.aime", metric="accuracy", standardized=True,
         defaults={"sets": ["2024"], "n": 30, "budget": 32768, "thinking": True}),
@@ -47,9 +57,16 @@ TASKS: dict[str, TaskSpec] = {
     "aime_2026": TaskSpec(
         "aime_2026", "glq.bench.tasks.aime", metric="accuracy", standardized=True,
         defaults={"sets": ["2026"], "n": 30, "budget": 65536, "thinking": True}),
+    # kind="hf", matching the adapter's docstring: perplexity isn't natural through vLLM's
+    # generate API, so it loads its own HF model. Registered as "quality" it landed in the
+    # shared-engine group and the runner spun up a vLLM engine beside it that nothing used
+    # — wasted minutes on a 3B, an OOM risk on a 31B.
+    # `max_chunks`, not `nsamples`: the adapter reads max_chunks (the old key was dead
+    # config, so the real sample count was silently 80 whatever you set).
     "wikitext2_ppl": TaskSpec(
         "wikitext2_ppl", "glq.bench.tasks.perplexity", metric="perplexity",
-        standardized=True, defaults={"seqlen": 2048, "nsamples": 128}),
+        standardized=True, kind="hf",
+        defaults={"seqlen": 2048, "max_chunks": 128}),
     "throughput": TaskSpec(
         "throughput", "glq.bench.tasks.throughput", metric="tokens_per_s",
         standardized=False, kind="throughput",

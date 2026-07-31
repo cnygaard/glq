@@ -55,6 +55,12 @@ def test_registry_lists_and_loads_all_adapters():
     assert registry.get_task("decode_sweep").kind == "throughput"
     assert registry.get_task("decode_sweep").standardized is False
     assert registry.get_task("decode_sweep").defaults["concurrencies"] == [1, 32]
+    # Perplexity loads its own HF model — as "quality" it joined the shared-engine group
+    # and the runner started a vLLM engine nothing used.
+    assert registry.get_task("wikitext2_ppl").kind == "hf"
+    # The adapter reads max_chunks; a `nsamples` key here would be silently ignored.
+    assert "max_chunks" in registry.get_task("wikitext2_ppl").defaults
+    assert "nsamples" not in registry.get_task("wikitext2_ppl").defaults
     assert registry.get_task("aime_2026").defaults["sets"] == ["2026"]
     with pytest.raises(KeyError):
         registry.get_task("does_not_exist")
