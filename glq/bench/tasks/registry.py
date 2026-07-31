@@ -46,6 +46,20 @@ TASKS: dict[str, TaskSpec] = {
         "throughput", "glq.bench.tasks.throughput", metric="tokens_per_s",
         standardized=False, kind="throughput",
         defaults={"input_len": 1024, "output_len": 256, "num_prompts": 64}),
+    # Per-concurrency decode speed via `vllm bench sweep serve` — the measure behind the
+    # README's single-stream figures and benchmarks/cmp_results_l4/. Use this, not
+    # `throughput`, for the model-picker table's tok/s columns; `throughput` is one
+    # aggregate rate that includes prefill.
+    "decode_sweep": TaskSpec(
+        "decode_sweep", "glq.bench.tasks.decode_sweep", metric="tokens_per_s",
+        standardized=False, kind="throughput",
+        defaults={"concurrencies": [1, 32], "num_runs": 3, "max_model_len": 2048}),
+    # Reserved so the picker table's coding column has a name before it has a harness:
+    # LiveCodeBench is not an lm-eval task and needs the standalone LCB repo with a code
+    # execution sandbox. Raises rather than silently reporting nothing.
+    "livecodebench": TaskSpec(
+        "livecodebench", "glq.bench.tasks.livecodebench", metric="pass_at_1",
+        standardized=True, defaults={"release": "v5", "n": None}),
 }
 
 

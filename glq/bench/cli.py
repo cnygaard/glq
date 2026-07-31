@@ -43,12 +43,15 @@ def _load_weights(path: str | None) -> dict:
 # Handlers
 # --------------------------------------------------------------------------- #
 def _cmd_run(args) -> int:
+    import json
+
     from . import runner
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    task_config = json.loads(args.task_config) if args.task_config else None
     recs = runner.run(
         model=args.model, tasks=tasks, quant=args.quant, runtime=args.runtime,
         n=args.n, budget=args.budget, avg_k=args.avg_k, gpu_mem_util=args.gpu_mem_util,
-        max_model_len=args.max_model_len, hf_token=None,
+        max_model_len=args.max_model_len, hf_token=None, task_config=task_config,
     )
     from .record import write_jsonl
     out = args.out or "bench_records.jsonl"
@@ -154,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="samples per problem for avg@k scoring (aime); default 1 = pass@1")
     r.add_argument("--gpu-mem-util", dest="gpu_mem_util", type=float, default=0.9)
     r.add_argument("--max-model-len", dest="max_model_len", type=int, default=None)
+    r.add_argument("--task-config", dest="task_config", default=None,
+                   help='JSON merged into every task config, last word. Model-level knobs '
+                        'live here because they belong to the chat template, not the task '
+                        '— e.g. SmolLM3 needs \'{"system": null, "temperature": 0.6, '
+                        '"top_k": null}\' or it silently runs no-think.')
     r.add_argument("--out", default=None, help="local JSONL to write records to")
     r.add_argument("--push", action="store_true", help="also append+push to results repo")
     r.set_defaults(func=_cmd_run)

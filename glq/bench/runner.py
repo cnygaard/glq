@@ -32,7 +32,7 @@ class RunContext:
     pbar_factory: Any = None         # per-task vLLM use_tqdm= heartbeat factory
 
 
-def _task_config(spec, *, n, budget, avg_k=1) -> dict:
+def _task_config(spec, *, n, budget, avg_k=1, overrides=None) -> dict:
     cfg = dict(spec.defaults)
     cfg["task_name"] = spec.name
     cfg["standardized"] = spec.standardized
@@ -42,13 +42,20 @@ def _task_config(spec, *, n, budget, avg_k=1) -> dict:
         cfg["budget"] = budget
     if avg_k and avg_k > 1:
         cfg["avg_k"] = avg_k
+    # Free-form last word, because some knobs belong to the MODEL rather than the task:
+    # sampling and the system message differ per chat template (SmolLM3 wants 0.6/no
+    # system message, gemma-4 wants 1.0/0.95/64), and a task-level default cannot be right
+    # for both. Applied last so an explicit override always wins.
+    if overrides:
+        cfg.update(overrides)
     return cfg
 
 
 def run(*, model: str, tasks: list[str], quant: str | None = None,
         runtime: str = "vllm", n: int | None = None, budget: int | None = None,
         avg_k: int = 1, gpu_mem_util: float = 0.9, max_model_len: int | None = None,
-        hf_token: str | None = None) -> list[BenchRecord]:
+        hf_token: str | None = None,
+        task_config: dict | None = None) -> list[BenchRecord]:
     """Run ``tasks`` on ``model`` and return one ``BenchRecord`` per task."""
     from .hfmeta import model_meta
     from .provenance import env_snapshot, hardware_snapshot
@@ -75,7 +82,7 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
 
     def _record(s, idx, total, kind_serving):
         ctx.pbar_factory = pbar_factory(s.name)
-        cfg = _task_config(s, n=n, budget=budget, avg_k=avg_k)
+        cfg = _task_config(s, n=n, budget=budget, avg_k=avg_k, overrides=task_config)
         log_ts(f"[task {idx}/{total}] {s.name} starting "
                f"(n={cfg.get('n', '?')}, budget={cfg.get('budget', '?')})")
         t0 = time.time()
@@ -90,7 +97,8 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
     total = len(specs)
     # ---- quality tasks share one vLLM engine --------------------------------
     if quality:
-        budgets = [int(_task_config(s, n=n, budget=budget).get("budget", 16384))
+        budgets = [int(_task_config(s, n=n, budget=budget,
+                                    overrides=task_config).get("budget", 16384))
                    for s in quality]
         mml = max_model_len or (max(budgets) + 4096)
         from . import runtime as rt

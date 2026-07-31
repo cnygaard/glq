@@ -41,17 +41,117 @@ def test_parse_vllm_bench_throughput():
 # ---- registry: every adapter imports + is callable ---------------------------
 def test_registry_lists_and_loads_all_adapters():
     names = set(registry.list_tasks())
-    assert {"mmlu_pro", "aime_2024", "aime_2025", "aime_2026",
-            "wikitext2_ppl", "throughput"} <= names
+    assert {"mmlu_pro", "aime_2024", "aime_2025", "aime_2026", "wikitext2_ppl",
+            "throughput", "decode_sweep", "livecodebench"} <= names
     for name in names:
         spec = registry.get_task(name)
         assert callable(spec.load())            # imports the adapter module (CPU-safe)
     assert registry.get_task("mmlu_pro").standardized is True
     assert registry.get_task("throughput").standardized is False
     assert registry.get_task("throughput").kind == "throughput"
+    # decode_sweep runs `vllm bench sweep serve`, which owns its own server, so it cannot
+    # share the quality tasks' engine; and it is GPU-dependent, so it must never be folded
+    # into the %-of-bf16 quality index.
+    assert registry.get_task("decode_sweep").kind == "throughput"
+    assert registry.get_task("decode_sweep").standardized is False
+    assert registry.get_task("decode_sweep").defaults["concurrencies"] == [1, 32]
     assert registry.get_task("aime_2026").defaults["sets"] == ["2026"]
     with pytest.raises(KeyError):
         registry.get_task("does_not_exist")
+
+
+def test_livecodebench_is_reserved_not_silent():
+    """The picker table has a coding column with no harness behind it. The task must fail
+    loudly — a silently-absent task reads as 'this model scores nothing at coding'."""
+    run = registry.get_task("livecodebench").load()
+    with pytest.raises(NotImplementedError, match="no harness"):
+        run(ctx=None, config={})
+
+
+# ---- AIME: the thinking gate --------------------------------------------------
+class _FakeCompletion:
+    def __init__(self, text, ntok):
+        self.text = text
+        self.token_ids = list(range(ntok))
+        self.finish_reason = "stop"
+
+
+class _FakeOutput:
+    def __init__(self, text, ntok, k=1):
+        self.outputs = [_FakeCompletion(text, ntok) for _ in range(k)]
+
+
+class _FakeLLM:
+    """Records what it was asked, answers correctly, at a chosen generation length."""
+    def __init__(self, ntok):
+        self.ntok = ntok
+        self.seen_msgs = None
+
+    def chat(self, msgs, sp, chat_template_kwargs=None, use_tqdm=None):
+        self.seen_msgs = msgs
+        return [_FakeOutput("the answer is \\boxed{42}", self.ntok) for _ in msgs]
+
+
+class _FakeCtx:
+    def __init__(self, llm):
+        self.handle = type("H", (), {"llm": llm})()
+
+
+class _FakeSamplingParams:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _patch_rows(monkeypatch, n=3):
+    """Stub the dataset AND vllm.SamplingParams: these tests exercise the adapter's
+    prompt-shaping and its thinking gate, both of which must be checkable on CPU in CI
+    where vLLM is not installed."""
+    import sys
+    import types
+
+    from glq.bench.tasks import aime
+    monkeypatch.setattr(aime, "_rows",
+                        lambda year: [(f"{year}-{i}", f"problem {i}", 42) for i in range(n)])
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.SamplingParams = _FakeSamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+
+def test_aime_omits_system_message_by_default(monkeypatch):
+    """A custom system message is what puts a SmolLM3 template into /no_think. Default to
+    user-only turns so the correct behaviour is the one you get without thinking about it."""
+    from glq.bench.tasks import aime
+    _patch_rows(monkeypatch)
+    llm = _FakeLLM(ntok=15000)
+    aime.run(_FakeCtx(llm), {"sets": ["2026"], "budget": 32768})
+    assert all(t["role"] == "user" for turns in llm.seen_msgs for t in turns)
+
+    aime.run(_FakeCtx(llm), {"sets": ["2026"], "budget": 32768, "system": "You are terse."})
+    assert llm.seen_msgs[0][0] == {"role": "system", "content": "You are terse."}
+
+
+def test_aime_rejects_a_run_that_never_engaged_thinking(monkeypatch):
+    """The load-bearing guard. A no-think SmolLM3 run answers in ~1.8k tokens and looks like
+    a completed thinking eval — it scores low and reads as a quantization regression. The
+    only reliable signal is generation length, so it has to be enforced, not just logged."""
+    from glq.bench.tasks import aime
+    _patch_rows(monkeypatch)
+    with pytest.raises(RuntimeError, match="never engaged"):
+        aime.run(_FakeCtx(_FakeLLM(ntok=1800)), {"sets": ["2026"], "budget": 32768})
+
+
+def test_aime_gate_is_scoped_to_thinking_runs(monkeypatch):
+    """A deliberate no-think run is a legitimate measurement — the floor must not veto it,
+    and an explicit min_mean_gen=0 must be able to turn it off for a genuinely terse model."""
+    from glq.bench.tasks import aime
+    _patch_rows(monkeypatch)
+    res, _ = aime.run(_FakeCtx(_FakeLLM(ntok=1800)),
+                      {"sets": ["2026"], "budget": 32768, "thinking": False})
+    assert res.value == 1.0
+    res2, _ = aime.run(_FakeCtx(_FakeLLM(ntok=1800)),
+                       {"sets": ["2026"], "budget": 32768, "min_mean_gen": 0})
+    assert res2.value == 1.0
+    assert res2.extra["mean_gen_tokens"] == 1800
 
 
 # ---- vLLM serving command builder --------------------------------------------
