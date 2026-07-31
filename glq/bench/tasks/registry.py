@@ -79,6 +79,14 @@ TASKS: dict[str, TaskSpec] = {
         "decode_sweep", "glq.bench.tasks.decode_sweep", metric="tokens_per_s",
         standardized=False, kind="throughput",
         defaults={"concurrencies": [1, 32], "num_runs": 3, "max_model_len": 2048}),
+    # Agentic terminal ability — the only task here that is multi-turn, so the only one that
+    # can see errors compound. standardized=False until a bf16 arm exists: with no reference
+    # the %-of-bf16 index cannot use it, and including it would distort the index.
+    # kind="throughput" because it runs its own vllm server and harbor subprocess.
+    "terminal_bench": TaskSpec(
+        "terminal_bench", "glq.bench.tasks.terminal_bench", metric="reward_mean",
+        standardized=False, kind="throughput",
+        defaults={"dataset": "terminal-bench/terminal-bench-2", "n_attempts": 1}),
     # Reserved so the picker table's coding column has a name before it has a harness:
     # LiveCodeBench is not an lm-eval task and needs the standalone LCB repo with a code
     # execution sandbox. Raises rather than silently reporting nothing.

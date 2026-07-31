@@ -58,6 +58,10 @@ def test_registry_lists_and_loads_all_adapters():
     # Perplexity loads its own HF model — as "quality" it joined the shared-engine group
     # and the runner started a vLLM engine nothing used.
     assert registry.get_task("wikitext2_ppl").kind == "hf"
+    # terminal_bench runs its own vllm server + harbor subprocess, so it cannot share the
+    # quality engine; and with no bf16 reference yet it must stay out of the index.
+    assert registry.get_task("terminal_bench").kind == "throughput"
+    assert registry.get_task("terminal_bench").standardized is False
     # The adapter reads max_chunks; a `nsamples` key here would be silently ignored.
     assert "max_chunks" in registry.get_task("wikitext2_ppl").defaults
     assert "nsamples" not in registry.get_task("wikitext2_ppl").defaults
