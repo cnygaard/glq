@@ -132,7 +132,7 @@ pass writes a per-layer `bpw_allocation.json`, then a quantize pass
 applies it. See [`examples/quantize_mixed_precision.md`](examples/quantize_mixed_precision.md).
 
 **Trellis (TCQ) quantization** — the fastest-decoding GLQ format and the
-recommended pick at 2–4 bpw:
+recommended pick from 2 bpw up:
 
 ```bash
 GLQ_TRELLIS_VARIANT=3inst glq-quantize \
@@ -148,9 +148,12 @@ lookup-table variant in our paired tests. (`hyb` remains the env default
 only for back-compat with existing hyb checkpoints.)
 
 Trellis constraints differ from the shell/e8p paths: **integer bpw only
-(2 / 3 / 4)** — mixed precision and fractional rates are rejected rather
+(2–8)** — mixed precision and fractional rates are rejected rather
 than silently rounded — and the fused kernel needs layer dims with
 `out % 32 == 0`, `in % 64 == 0` (standard transformer shapes qualify).
+Above 4 bpw the layer becomes a two-stage stacked RVQ (a K=4 code plus a
+K=bpw−4 residual), which costs roughly 2× the decode of a single stage;
+5–8 bpw checkpoints need **glq ≥ 0.8.0** and `GLQ_TRELLIS_VARIANT=3inst`.
 Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
 automatically — the PLE table quantizes via the shell codebook (requires
 glq ≥ 0.7.2). Use `--streaming` for Gemma-4 family models.
@@ -677,8 +680,8 @@ nominal rate exactly.
 
 The table above applies to the shell and e8p codebooks. The
 [trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq)
-is a single K-bit trellis code with no residual stages — integer
-2 / 3 / 4 bpw only.
+takes integer rates only: 2–4 bpw as a single K-bit trellis code, 5–8 bpw
+as two stacked codes (K=4 plus a K=bpw−4 residual).
 
 ### Trellis codebook (`--codebook trellis`) — QTIP-derived TCQ
 
@@ -687,7 +690,7 @@ quantization** (TCQ) over 256-weight sequences, following
 [QTIP](https://github.com/Cornell-RelaxML/qtip) (Tseng et al., 2024): a Viterbi search
 encodes each row against a tail-biting trellis, so neighbouring weights share state and
 the effective codebook is exponentially larger than a flat lookup at the same rate. In our
-SmolLM3-3B tests it is GLQ's best format at **2–4 bpw** — at 2 bpw it clearly beats the
+SmolLM3-3B tests it is GLQ's best format across **2–8 bpw** — at 2 bpw it clearly beats the
 e8p codebook (PPL 11.74 vs 13.21) — and at 4 bpw its decode is GLQ's fastest
 (single-stream at bf16 parity, see
 [the measured table](#trellis-3inst-vs-bf16-vs-nvfp4-measured)).
@@ -706,12 +709,23 @@ All bit-exact — wikitext-2 PPL is unchanged to the fourth decimal across the e
 optimization series. Runtime opt-outs, should you ever need the unfused paths:
 `GLQ_TRELLIS_FUSE_INPUT=0`, `GLQ_TRELLIS_BATCH_OUT_RHT=0`.
 
+**Rates 5–8 bpw (stacked RVQ, v0.8.0).** A trellis code's window collapses as K grows —
+at 16 bits of state a native K=6 keeps far less history than K=4 — so above 4 bpw GLQ
+stacks **two** codes instead of widening one: a K=4 primary plus a K=(bpw−4) residual
+fitted per layer. Measured on SmolLM3-3B, that is worth it: 6 bpw reaches wikitext-2 PPL
+**9.1310** against bf16's 9.1220, closing 92% of the 4 bpw → bf16 gap, at exactly 6.00
+bits/weight on disk. The cost is decode: two stages means ~2× the state decodes, which is
+irreducible — measured 1.9× on sm_120 and 2.3–2.7× on sm_89 at B=1. These serve on vLLM
+(`--quantization glq`, 3INST only; HYB has no two-stage kernel), and a checkpoint whose
+stored stages disagree with its declared bpw is rejected at load rather than served a
+stage short.
+
 **Storage layout.** Trellis checkpoints store indices in the decoder-native "kernel"
 layout (`trellis_layout: "kernel"` in the config) — loading them requires
-**glq ≥ 0.7.0**; older versions abort with a layout error rather than decode garbage.
-Rates are integer 2 / 3 / 4 bpw with a single trellis code per layer (no residual
-stages, no mixed precision — both are rejected at quantize time). Quantization cost is
-the Viterbi encode: ~35 min for a 3B on one GPU (CUDA-graph-cached).
+**glq ≥ 0.7.0**, or **≥ 0.8.0** for the 5–8 bpw two-stage layout; older versions abort
+with a layout error rather than decode garbage. Mixed precision and fractional rates are
+rejected at quantize time. Quantization cost is the Viterbi encode: ~35 min for a 3B on
+one GPU (CUDA-graph-cached).
 
 ### E8P codebook (`--codebook e8p`) — derivative of QuIP#
 
