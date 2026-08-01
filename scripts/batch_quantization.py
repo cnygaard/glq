@@ -21,9 +21,16 @@ Data structure (the easy-to-read surface):
   * bpw semantics: an *integer* bpw with no min/max  -> uniform quant (1 pass).
                    a fractional bpw, or any min/max  -> mixed precision (2 passes:
                    the avg target is ``bpw``; the allocator stays within [min,max]).
-  * codebook: ``e8_shell`` (default) | ``e8_relaxed`` | ``e8p``. ``e8p`` is the QuIP#
-              tensor-core RVQ recipe — uniform integer bpw 2-8 only (no mixed precision,
-              no ``codebook_size``); its output dir is tagged ``…-GLQ-<n>bpw-e8p``.
+  * codebook: ``e8_shell`` (default) | ``e8_relaxed`` | ``e8p`` | ``trellis``.
+              ``e8p`` is the QuIP# tensor-core RVQ recipe — uniform integer bpw 2-8 only
+              (no mixed precision, no ``codebook_size``); dir tagged ``…-GLQ-<n>bpw-e8p``.
+              ``trellis`` is QTIP trellis-coded quantization — also uniform integer 2-8
+              (2-4 native, 5-8 stacked RVQ). Its ``variant`` defaults to ``3inst``
+              (lookup-free, and the only variant that decodes 5-8 bpw) — note this
+              DIVERGES from ``glq-quantize``, whose own default is ``hyb`` for back-compat.
+              ``hyb`` is still reachable at 2-4 bpw and refused at 5-8. The variant is
+              exported as ``GLQ_TRELLIS_VARIANT`` per job and appears in the output dir
+              name: ``<model>-trellis-<variant>-<n>bpw``.
 
 Mixed precision is TWO ``glq-quantize`` invocations (the CLI itself splits them):
     pass 1 (profile):  --bpw <avg> --min-bpw <m> --max-bpw <M>
@@ -104,6 +111,25 @@ JOBS: dict[str, dict] = {
     "gemma-4-e4b@4bpw":  {"model": "google/gemma-4-e4b-it", "bpw": 4},
     "gemma-4-e4b@mix5":  {"model": "google/gemma-4-e4b-it", "bpw": 5.0,
                           "min_bpw": 3, "max_bpw": 8},  # avg 5.0, per-layer 3..8
+    # Trellis (QTIP TCQ). variant defaults to 3inst, so these produce
+    # SmolLM3-3B-trellis-3inst-{4,6}bpw; pass "variant": "hyb" only to reproduce an
+    # older hyb checkpoint (2-4 bpw only).
+    # "smollm3@trellis4": {"model": "HuggingFaceTB/SmolLM3-3B", "bpw": 4,
+    #                      "codebook": "trellis"},
+    # "smollm3@trellis6": {"model": "HuggingFaceTB/SmolLM3-3B", "bpw": 6,
+    #                      "codebook": "trellis"},
+    # Smallest stacked-RVQ checkpoint that still says something coherent — the fixture for
+    # exercising the vLLM smoke gate on a 2-stage trellis without a multi-hour quantize.
+    "smollm2-360m@trellis6": {"model": "HuggingFaceTB/SmolLM2-360M-Instruct", "bpw": 6,
+                              "codebook": "trellis"},
+    # gemma-4-26B-A4B trellis. NOTE: MoE + trellis has NO vLLM path — glq_vllm's
+    # fused_moe_method refuses trellis at any bpw — so these are HF-transformers-only
+    # checkpoints. Quantization also takes the per-expert loop (the e8p batched path
+    # asserts is_e8p), which is much slower than the e8p equivalent.
+    "gemma4-26b@trellis4": {"model": "google/gemma-4-26B-A4B-it", "bpw": 4,
+                            "codebook": "trellis", "streaming": True},
+    "gemma4-26b@trellis5": {"model": "google/gemma-4-26B-A4B-it", "bpw": 5,
+                            "codebook": "trellis", "streaming": True},
 }
 
 
@@ -121,8 +147,13 @@ class QuantJob:
     min_bpw: int | None = None        # mixed-precision floor (2..8)
     max_bpw: int | None = None        # mixed-precision ceiling (2..8)
     codebook_size: int | None = None  # E8 shell entries (default 65536; 4096 = Blackwell smem)
-    codebook: str = "e8_shell"        # codebook type: e8_shell | e8_relaxed | e8p
-                                      # (e8p = QuIP# tensor-core RVQ, uniform bpw 2/3/4)
+    codebook: str = "e8_shell"        # codebook type: e8_shell | e8_relaxed | e8p | trellis
+                                      # (e8p = QuIP# tensor-core RVQ, uniform bpw 2-8;
+                                      #  trellis = QTIP TCQ, uniform bpw 2-8)
+    variant: str | None = None        # trellis only: 3inst (default, lookup-free) | hyb
+                                      # (tlut). Exported as GLQ_TRELLIS_VARIANT per job.
+                                      # None on a non-trellis job; set explicitly there and
+                                      # it raises rather than being silently ignored.
     nsamples: int = 128               # CLAUDE.md mandate
     seqlen: int = 2048
     tune_iters: int = 0
@@ -152,10 +183,48 @@ class QuantJob:
             raise ValueError(
                 f"{self.model}: avg bpw {self.bpw} not within "
                 f"[{self.min_bpw}, {self.max_bpw}]")
-        valid_cb = ("e8_shell", "e8_relaxed", "e8p")
+        valid_cb = ("e8_shell", "e8_relaxed", "e8p", "trellis")
         if self.codebook not in valid_cb:
             raise ValueError(
                 f"{self.model}: codebook must be one of {valid_cb}, got {self.codebook!r}")
+        if self.codebook == "trellis":
+            # QTIP trellis-coded quantization. 2-4 are native rates; 5-8 are stacked RVQ
+            # (K=4 primary + K=bpw-4 residual). quantize_model.py enforces the same rules,
+            # but only after loading the model — hours in on a 30B. Fail here instead.
+            # Default 3inst, NOT quantize_model.py's 'hyb'. This tool makes new checkpoints,
+            # and for those 3inst is what you want: lookup-free kernels, and the only variant
+            # that decodes 5-8 bpw. hyb stays reachable for reproducing the older quants.
+            if self.variant is None:
+                self.variant = "3inst"
+            if self.variant not in ("hyb", "3inst"):
+                raise ValueError(
+                    f"{self.model}: trellis variant must be 'hyb' or '3inst', got "
+                    f"{self.variant!r}")
+            if self.variant == "hyb" and int(self.bpw) >= 5:
+                # Mirrors the load-time refusal in glq_vllm/linear_method.py: stacked RVQ has
+                # no 2-stage HYB kernel (the fused entries take no tlut). quantize_model.py
+                # will happily WRITE this checkpoint, so without the guard the batch spends
+                # hours producing something that cannot be loaded at all.
+                raise ValueError(
+                    f"{self.model}: trellis {int(self.bpw)} bpw needs variant '3inst' — "
+                    f"stacked RVQ (5-8 bpw) has no 2-stage HYB decode, so a 'hyb' checkpoint "
+                    f"at this rate quantizes fine and then fails to serve")
+            if self.is_mixed:
+                raise ValueError(
+                    f"{self.model}: codebook 'trellis' requires a uniform integer bpw — "
+                    f"drop min/max and use an integer bpw in 2-8 (no mixed precision)")
+            if int(self.bpw) not in (2, 3, 4, 5, 6, 7, 8):
+                raise ValueError(
+                    f"{self.model}: codebook 'trellis' supports bpw 2-8 only "
+                    f"(2-4 native, 5-8 stacked RVQ), got {self.bpw}")
+            if self.codebook_size is not None:
+                raise ValueError(
+                    f"{self.model}: codebook_size is an e8_shell/e8_relaxed knob — not valid "
+                    f"with 'trellis' (its rate is set by the trellis K, not a table size)")
+        elif self.variant is not None:
+            raise ValueError(
+                f"{self.model}: variant {self.variant!r} only applies to codebook 'trellis', "
+                f"not {self.codebook!r}")
         if self.codebook == "e8p":
             # e8p is a fixed-grid N-stage RVQ recipe (E8P=+2bpw, E81B=+1bpw final
             # stage of odd bpw): 2=[E8P] … 8=[E8P×4). Uniform integer bpw only at
@@ -202,10 +271,18 @@ def jobs_from_dict(d: dict) -> list[QuantJob]:
 
 def output_name(job: QuantJob) -> str:
     """Auto dir name matching the published convention (Gemma-4-31B-it-GLQ-5.0bpw-mix3-8).
-    Non-default codebooks get a suffix: e8p -> '-e8p', e8_relaxed -> '-relaxed'."""
+    Non-default codebooks get a suffix: e8p -> '-e8p', e8_relaxed -> '-relaxed'.
+
+    Trellis uses its own published shape instead (SmolLM3-3B-trellis-3inst-4bpw): the
+    variant has to be in the name, because a hyb and a 3inst checkpoint at the same rate
+    are not interchangeable — only 3inst has the lookup-free kernels, and only 3inst can
+    be served at 5-8 bpw. Without it both land in one directory and overwrite each other.
+    """
     if job.output:
         return job.output
     base = job.model.rstrip("/").split("/")[-1]
+    if job.codebook == "trellis":
+        return f"{base}-trellis-{job.variant}-{int(job.bpw)}bpw"
     cb = {"e8p": "-e8p", "e8_relaxed": "-relaxed"}.get(job.codebook, "")
     if job.is_mixed:
         mn = job.min_bpw if job.min_bpw is not None else 2
@@ -230,6 +307,21 @@ def _shared_flags(job: QuantJob, device: str) -> list[str]:
         f += ["--trust-remote-code"]
     f += list(job.extra_args)
     return f
+
+
+def job_env(job: QuantJob, base: dict | None = None) -> dict:
+    """Environment for this job's child process, inheriting `base` (default os.environ).
+
+    The trellis variant is not a CLI flag — quantize_model.py reads GLQ_TRELLIS_VARIANT
+    from the environment. Setting it per job (rather than relying on an exported shell
+    value) is what stops an ambient `3inst` from silently deciding a `hyb` job, or worse,
+    an absent variable defaulting a whole batch to `hyb` — which cannot be served at
+    5-8 bpw on vLLM at all, and only reveals itself hours later at load time.
+    """
+    env = dict(os.environ if base is None else base)
+    if job.codebook == "trellis":
+        env["GLQ_TRELLIS_VARIANT"] = job.variant
+    return env
 
 
 def commands_for(job: QuantJob, out_dir: Path, quantize_cmd: str,
@@ -263,9 +355,17 @@ def _tail(path: Path, n: int = 1500) -> str:
         return ""
 
 
-def run_pass(label: str, cmd: list[str], log_path: Path, args) -> dict:
+def run_pass(label: str, cmd: list[str], log_path: Path, args,
+             env: dict | None = None) -> dict:
     """Run one glq-quantize pass best-effort. Streams output live to log_path."""
     printable = " ".join(shlex.quote(c) for c in cmd)
+    # Env that isn't on the command line is env that isn't in the log — and the trellis
+    # variant is exactly that. Print it beside the command so a checkpoint's provenance is
+    # recoverable from the log alone.
+    marked = [f"{k}={v}" for k, v in sorted((env or {}).items())
+              if k.startswith("GLQ_")]
+    if marked:
+        printable = " ".join(marked) + " " + printable
     if args.dry_run:
         print(f"    DRY-RUN [{label}]: {printable}")
         return {"pass": label, "status": "dry-run", "cmd": printable}
@@ -276,7 +376,7 @@ def run_pass(label: str, cmd: list[str], log_path: Path, args) -> dict:
             logf.write(f"\n===== {label}: {printable} =====\n")
             logf.flush()
             p = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                               timeout=args.timeout)
+                               timeout=args.timeout, env=env)
         st = "ok" if p.returncode == 0 else "failed"
         rec = {"pass": label, "status": st, "returncode": p.returncode,
                "elapsed_s": round(time.time() - t0, 1), "cmd": printable}
@@ -648,6 +748,7 @@ def main() -> int:
             passes: list[dict] = [{"pass": "all", "status": "skipped-existing"}]
         else:
             passes = []
+            child_env = job_env(job)
             for label, cmd in commands_for(job, out_dir, args.quantize_cmd,
                                            args.device or job.device):
                 # resume: skip a finished profile pass (allocation already on disk)
@@ -656,7 +757,7 @@ def main() -> int:
                     print("    SKIP [profile] — bpw_allocation.json exists")
                     passes.append({"pass": label, "status": "skipped-existing"})
                     continue
-                rec = run_pass(label, cmd, log_path, args)
+                rec = run_pass(label, cmd, log_path, args, env=child_env)
                 passes.append(rec)
                 if rec["status"] not in ("ok", "dry-run", "skipped-existing"):
                     print("    -> aborting remaining passes for this job")
@@ -664,7 +765,11 @@ def main() -> int:
 
         entry = {"name": job.name, "model": job.model, "bpw": job.bpw,
                  "min_bpw": job.min_bpw, "max_bpw": job.max_bpw,
-                 "mixed": job.is_mixed, "dir": str(out_dir), "repo_id": repo_id,
+                 "mixed": job.is_mixed, "codebook": job.codebook,
+                 # variant only means something for trellis, but recording it unconditionally
+                 # keeps the index rows one shape.
+                 "variant": job.variant if job.codebook == "trellis" else None,
+                 "dir": str(out_dir), "repo_id": repo_id,
                  "log": str(log_path), "passes": passes}
         passed = bool(passes) and all(
             x["status"] in ("ok", "skipped-existing") for x in passes)

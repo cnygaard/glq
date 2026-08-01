@@ -157,6 +157,10 @@ K=bpw−4 residual), which costs roughly 2× the decode of a single stage;
 Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
 automatically — the PLE table quantizes via the shell codebook (requires
 glq ≥ 0.7.2). Use `--streaming` for Gemma-4 family models.
+
+For how it actually works — the RHT bracket, the LDLQ + Viterbi encode, the
+packed-tile storage layout and the fused decode — see
+[docs/trellis-3inst.md](docs/trellis-3inst.md).
 See [Trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq)
 for details.
 

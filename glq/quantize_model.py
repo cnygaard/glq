@@ -572,6 +572,32 @@ def quantize_layer_e8_shell_rht(W, H, codebook, bpw=2, tune_iters=0,
     return W_hat, artifacts, metrics
 
 
+def split_trellis_packed(packed, gate_rows, up_rows, n):
+    """Row-split a jointly-quantized ``[gate; up]`` trellis buffer into its two halves.
+
+    ``pack_layer`` produces ``[(m//16)*(n//16), ...]`` — axis 0 is a FLATTENED
+    (row-block, col-block) index, row-block-major, so the rows of one 16-row block are
+    ``n//16`` consecutive entries rather than one.
+
+    The 32-row alignment is not a convenience: ``kernel_tile_flip`` reshapes to
+    ``(m//16//2, 2, n//16//2, 2, 32, K)`` and permutes to ``(rb2, cb2, 32, 2, 2, K)``,
+    which makes a PAIR of 16-row blocks one self-contained, contiguous unit whose internal
+    permutation depends only on (n, K). Cutting on a pair boundary therefore yields exactly
+    what re-packing that half would produce; cutting inside a pair interleaves gate and up
+    bytes, and the result still loads and still decodes — to the wrong weights.
+    """
+    tiles_per_block = n // 16
+    assert gate_rows % 32 == 0 and up_rows % 32 == 0, (
+        f"trellis gate_up split: rows ({gate_rows},{up_rows}) must be multiples of 32 — "
+        f"the MMA byte flip pairs 16-row blocks, so a cut inside a pair mixes gate and up")
+    g = (gate_rows // 16) * tiles_per_block
+    u = (up_rows // 16) * tiles_per_block
+    assert g + u == packed.shape[0], (
+        f"trellis gate_up split: (gate+up) tiles {g + u} != axis-0 {packed.shape[0]} "
+        f"(n={n} disagrees with the packed shape, or the m-dim is RHT-padded)")
+    return packed[:g].clone(), packed[g:g + u].clone()
+
+
 def quantize_experts_e8_shell_rht_batched(W_stack, H_stack, codebook, bpw=2,
                                           tune_iters=0, apply_left=True,
                                           block_diagonal=True):
@@ -1442,8 +1468,10 @@ def quantize(
         _ROW_ARTS = {'Qidxs', 'Qidxs2', 'Qidxs3', 'SU'}
         _SHARED_ARTS = {'SV', 'Wscale', 'inv_resid_scale', 'inv_resid_scale2'}
 
+        # trellis: `tlut` is the codebook LUT (hyb only) — one table for the whole layer,
+        # so both halves get a copy, exactly like SV/Wscale.
         def _is_shared_art(k):
-            return k in _SHARED_ARTS or k.startswith('inv_resid_scale')
+            return k in _SHARED_ARTS or k.startswith('inv_resid_scale') or k == 'tlut'
 
         def _is_row_art(k):
             return k in _ROW_ARTS or k.endswith('_e8p') or k.endswith('_e81b')
@@ -1454,10 +1482,18 @@ def quantize(
             rows//16); shell Qidxs/SU and ``*_e81b`` are one entry per row. Asserts
             the gate/up boundary is tile-aligned and the split covers the buffer."""
             gate_arts, up_arts = {}, {}
+            # n for the trellis split comes from the shared RHT column signs — the only
+            # artifact that carries the input width. The size assert inside the splitter is
+            # what catches it being wrong.
+            _n = int(arts['SV'].numel()) if 'SV' in arts else None
             for k, v in arts.items():
                 if _is_shared_art(k):
                     gate_arts[k] = v.clone()
                     up_arts[k] = v.clone()
+                elif k.startswith('trellis_packed'):
+                    assert _n is not None, "trellis gate_up split needs SV to recover n"
+                    gate_arts[k], up_arts[k] = split_trellis_packed(
+                        v, gate_rows, up_rows, _n)
                 elif _is_row_art(k):
                     t = 16 if k.endswith('_e8p') else 1
                     assert gate_rows % t == 0 and up_rows % t == 0, (

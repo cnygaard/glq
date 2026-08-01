@@ -49,4 +49,7 @@ research.txt
 results.txt
 compass_artifact_*
 
-docs/
+# Scratch: downloaded papers, ad-hoc notes. Maintained docs are un-ignored by name
+# (a bare `docs/` would hide them from git entirely — and from `git clean -xfd`).
+docs/*
+!docs/trellis-3inst.md
