@@ -70,6 +70,26 @@ def test_registry_lists_and_loads_all_adapters():
         registry.get_task("does_not_exist")
 
 
+def test_terminal_bench_serves_with_tool_calling_enabled():
+    """An agent that cannot call tools cannot touch the terminal. vLLM answers pi's
+    `tool_choice: "auto"` with a 400 unless BOTH flags are present, and the trial then dies
+    at setup with no score — so assert the flags, not just that a command was built."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.serve_command("xv/M-GLQ", "glq", {}, port=8000, served_id="glq-model")
+    assert "--enable-auto-tool-choice" in cmd
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "hermes"
+    assert cmd[cmd.index("--served-model-name") + 1] == "glq-model"
+    assert "--quantization" in cmd and "--reasoning-parser" not in cmd
+
+    # Per family: gemma-4 does not speak the Hermes <tool_call> markup.
+    cmd2 = tb.serve_command("org/M", "none", {"tool_call_parser": "pythonic",
+                                              "reasoning_parser": "deepseek_r1"},
+                            port=9000, served_id="m")
+    assert cmd2[cmd2.index("--tool-call-parser") + 1] == "pythonic"
+    assert cmd2[cmd2.index("--reasoning-parser") + 1] == "deepseek_r1"
+    assert "--quantization" not in cmd2          # bf16 arm serves unquantized
+
+
 def test_livecodebench_is_reserved_not_silent():
     """The picker table has a coding column with no harness behind it. The task must fail
     loudly — a silently-absent task reads as 'this model scores nothing at coding'."""

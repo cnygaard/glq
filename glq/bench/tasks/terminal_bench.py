@@ -5,13 +5,15 @@ whether the model can *drive a terminal to finish a job*, where errors compound 
 instead of being scored independently — the failure mode a multiple-choice benchmark cannot
 see.
 
-Three moving parts, in three environments, for reasons that are all version isolation:
+Two moving parts:
 
-* the **serving venv** runs `vllm serve --quantization glq` on the host (that is where glq
-  and its CUDA extension live);
-* the **harbor venv** (`GLQ_HARBOR_HOME`, Python ≥3.12) runs the benchmark — harbor pins its
-  own dependency set and must not resolve into the serving venv;
-* the **task container** runs pi, reaching the host server via
+* the **host**, where `vllm serve --quantization glq` and `harbor run` both live in the
+  serving venv. Harbor is an orchestrator — its dependencies are pydantic/typer/litellm/
+  fastapi, with no torch, vllm or transformers (those appear only under optional extras) —
+  so it installs alongside vLLM without disturbing it. Verified by dry run: pydantic and
+  httpx already satisfied and unchanged. (LiveCodeBench is the opposite case and genuinely
+  needs its own venv: Python 3.11 against our 3.12, plus its own heavy stack.)
+* the **task container**, which runs pi and reaches the host server via
   `benchmarks/harbor_pi_glq.py`.
 
 ``kind="throughput"``: this owns a server and subprocesses, so it must not join the quality
@@ -40,15 +42,17 @@ _DATASET = "terminal-bench/terminal-bench-2"
 _DEFAULT_HOST_IP = "172.17.0.1"
 
 
-def _harbor_python(home: str) -> str:
-    py = os.path.join(home, ".venv", "bin", "harbor")
-    if not os.path.exists(py):
-        raise RuntimeError(
-            f"no harbor CLI at {py}. Create it with `uv venv --python 3.12 && "
-            f"uv pip install harbor` and point GLQ_HARBOR_HOME at that directory. It is "
-            f"deliberately separate: harbor's pins would move vllm/transformers under "
-            f"every other benchmark.")
-    return py
+def _harbor_cli() -> str:
+    """The harbor CLI from this interpreter's venv, falling back to PATH."""
+    cand = os.path.join(os.path.dirname(os.sys.executable), "harbor")
+    if os.path.exists(cand):
+        return cand
+    found = shutil.which("harbor")
+    if found:
+        return found
+    raise RuntimeError("`harbor` not found — install it into the serving venv with "
+                       "`pip install harbor` (it is orchestration-only: no torch/vllm "
+                       "deps, so it does not disturb the serving stack).")
 
 
 def _wait_healthy(port: int, timeout_s: int, proc) -> None:
@@ -92,10 +96,36 @@ def _parse_result(job_dir: str) -> tuple[float, dict]:
                          "n_output_tokens": (doc.get("stats") or {}).get("n_output_tokens")}
 
 
+def serve_command(model: str, quant: str | None, config: dict, port: int,
+                  served_id: str) -> list[str]:
+    """The `vllm serve` argv for an agentic run.
+
+    Separate from run() so the flags an agent depends on are assertable without starting a
+    server — the tool-calling pair in particular is invisible until a rollout 400s.
+    """
+    vllm = shutil.which("vllm") or os.path.join(os.path.dirname(os.sys.executable), "vllm")
+    cmd = [vllm, "serve", model, "--port", str(port),
+           "--served-model-name", served_id,
+           "--max-model-len", str(int(config.get("max_model_len", 32768)))]
+    # Tool calling is not optional here: an agent that cannot call tools cannot touch the
+    # terminal, and vLLM rejects pi's `tool_choice: "auto"` with a 400 unless both flags are
+    # set. The parser is per model family — `hermes` reads the <tool_call>{...}</tool_call>
+    # markup SmolLM3 and Qwen-style templates emit.
+    parser = config.get("tool_call_parser", "hermes")
+    if parser:
+        cmd += ["--enable-auto-tool-choice", "--tool-call-parser", parser]
+    # Off by default because a mismatched reasoning parser mangles output. Worth setting for
+    # a thinking model: without it the <think> block arrives inside `content`, where the
+    # tool-call parser has to look past it.
+    if config.get("reasoning_parser"):
+        cmd += ["--reasoning-parser", config["reasoning_parser"]]
+    if quant and quant not in ("none", "bf16"):
+        cmd += ["--quantization", quant]
+    return cmd
+
+
 def run(ctx, config: dict):
-    home = config.get("harbor_home") or os.environ.get(
-        "GLQ_HARBOR_HOME", "/opt/dlami/nvme/harbor-env")
-    harbor = _harbor_python(home)
+    harbor = _harbor_cli()
     dataset = config.get("dataset", _DATASET)
     n_attempts = int(config.get("n_attempts", 1))
     n_tasks = config.get("n_tasks")
@@ -105,14 +135,10 @@ def run(ctx, config: dict):
     served_id = config.get("served_id") or "glq-model"
     serve_timeout = int(config.get("serve_timeout", 1800))
     run_timeout = int(config.get("run_timeout", 86400))
-    jobs_dir = config.get("jobs_dir") or os.path.join(home, "jobs")
+    jobs_dir = config.get("jobs_dir") or os.environ.get(
+        "GLQ_HARBOR_JOBS_DIR", "/opt/dlami/nvme/harbor_jobs")
 
-    vllm = shutil.which("vllm") or os.path.join(os.path.dirname(os.sys.executable), "vllm")
-    serve_cmd = [vllm, "serve", ctx.model, "--port", str(port),
-                 "--served-model-name", served_id,
-                 "--max-model-len", str(int(config.get("max_model_len", 32768)))]
-    if ctx.quant and ctx.quant not in ("none", "bf16"):
-        serve_cmd += ["--quantization", ctx.quant]
+    serve_cmd = serve_command(ctx.model, ctx.quant, config, port, served_id)
 
     log_path = os.path.join(jobs_dir, "vllm_serve.log")
     os.makedirs(jobs_dir, exist_ok=True)
@@ -133,10 +159,16 @@ def run(ctx, config: dict):
                "--jobs-dir", jobs_dir]
         if n_tasks:
             cmd += ["-l", str(int(n_tasks))]
+        # One server feeds every rollout, so concurrency here is free throughput: the
+        # bottleneck is container setup and agent think-time, not the GPU.
+        if config.get("n_concurrent"):
+            cmd += ["-n", str(int(config["n_concurrent"]))]
 
         env = dict(os.environ)
         env["GLQ_VLLM_BASE_URL"] = f"http://{host_ip}:{port}/v1"
-        # The agent module lives in this repo, not in harbor's venv.
+        # `benchmarks.harbor_pi_glq` is a repo path, not an installed package, so it is only
+        # importable if the repo root is on the path — harbor resolves --agent-import-path
+        # with a plain import.
         env["PYTHONPATH"] = os.pathsep.join(
             filter(None, [os.getcwd(), env.get("PYTHONPATH", "")]))
         t0 = time.time()

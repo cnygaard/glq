@@ -58,10 +58,16 @@ class PiGLQAgent(Pi):
         # Their install first: apt/curl, the nvm node bootstrap, and a working `pi`.
         await super().install(environment)
 
+        # nvm is not on the PATH of a fresh non-login shell — harbor's own Pi sources it in
+        # every command it sends (`get_version_command`, `run`), and so must we, or npm is
+        # simply "command not found".
+        # --force because the legacy package already claimed the `pi` bin: without it npm
+        # aborts with EEXIST rather than overwriting, which is the whole point of the overlay.
         await self.exec_as_agent(
             environment,
-            command=("set -euo pipefail; "
-                     f"npm install -g --ignore-scripts {_PI_PACKAGE} && pi --version"),
+            command=("set -euo pipefail; . ~/.nvm/nvm.sh; "
+                     f"npm install -g --force --ignore-scripts {_PI_PACKAGE} && "
+                     "pi --version"),
         )
 
         base_url = os.environ.get("GLQ_VLLM_BASE_URL")
