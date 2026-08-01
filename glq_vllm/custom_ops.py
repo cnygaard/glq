@@ -14,6 +14,27 @@ from torch.library import Library
 _glq_lib = Library("glq", "FRAGMENT")
 _registered = False
 
+# Module-level so the arity can be checked WITHOUT the CUDA extension: every other schema
+# lives inline in _ensure_registered() behind a `hasattr(cuda, ...)` guard, which means a
+# schema⇆fake drift is invisible on any machine without a built .so and only surfaces deep
+# in dispatch — possibly mid-capture. test_fused_moe_trellis_3inst_schema_matches_fake reads
+# this constant and compares it against the fake's signature on plain CPU.
+FUSED_MOE_TRELLIS_3INST_SCHEMA = (
+    "fused_moe_trellis_3inst(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+    "Tensor w13_trellis_packed, Tensor w13_trellis_packed2, "
+    "Tensor w13_SU, Tensor w13_SV, Tensor w13_Wscale, "
+    "Tensor w13_inv_resid_scale2, "
+    "Tensor w2_trellis_packed, Tensor w2_trellis_packed2, "
+    "Tensor w2_SU, Tensor w2_SV, Tensor w2_Wscale, "
+    "Tensor w2_inv_resid_scale2, "
+    "int hidden_size, int intermediate_size, int w13_out_features, "
+    "int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2, "
+    "Tensor blocks_n_w13, Tensor blocks_m_w13, "
+    "Tensor blocks_n_w13_meta, Tensor blocks_m_w13_meta, "
+    "Tensor blocks_n_w2, Tensor blocks_m_w2, "
+    "Tensor blocks_n_w2_meta, Tensor blocks_m_w2_meta, "
+    "int activation_type) -> Tensor")
+
 
 def _ensure_registered():
     """Register GLQ CUDA C kernels as torch custom ops. Idempotent."""
@@ -255,6 +276,20 @@ def _ensure_registered():
             "Tensor e81b_grid) -> Tensor")
         _glq_lib.impl("fused_moe_e8p", cuda.glq_fused_moe_e8p_cuda, dispatch_key)
         _glq_lib._register_fake("fused_moe_e8p", _fused_moe_e8p_fake)
+
+    # -- 10d. fused_moe_trellis_3inst: the same grouped-MoE scaffold with the 3INST
+    #         trellis decode. Its reason for existing is cudagraph capture: the Python
+    #         per-expert loop it replaces does `topk_ids.unique()`, a host sync that makes
+    #         the MoE step uncapturable, so vLLM had to run --enforce-eager.
+    #         A DISTINCT symbol/op name, not a widened `fused_moe_e8p` — the hasattr guard
+    #         tests a name, not an arity, so only a new name is a real capability probe
+    #         against a stale .so (see the note above fused_linear_trellis_3inst_rvq2). --
+    if hasattr(cuda, "glq_fused_moe_trellis_3inst_cuda"):
+        _glq_lib.define(FUSED_MOE_TRELLIS_3INST_SCHEMA)
+        _glq_lib.impl("fused_moe_trellis_3inst",
+                      cuda.glq_fused_moe_trellis_3inst_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_moe_trellis_3inst",
+                                _fused_moe_trellis_3inst_fake)
 
     # -- 11. embedding_dequant: GLQ per-row embedding lookup (gather + dequant +
     #         inverse RHT) for the Gemma-4 GLQ-quantized PLE embedding. The shared
@@ -659,6 +694,26 @@ def _fused_moe_e8p_fake(x, topk_ids, topk_weights,
                         w13_Qidxs2_e81b, w13_Qidxs3_e81b, w13_Qidxs4_e81b,
                         w2_Qidxs2_e81b, w2_Qidxs3_e81b, w2_Qidxs4_e81b, e81b_grid):
     # Same output contract as the shell grouped MoE op: (num_tokens, hidden) fp16.
+    return torch.empty((*x.shape[:-1], hidden_size),
+                       dtype=torch.float16, device=x.device)
+
+
+def _fused_moe_trellis_3inst_fake(x, topk_ids, topk_weights,
+                                  w13_trellis_packed, w13_trellis_packed2,
+                                  w13_SU, w13_SV, w13_Wscale, w13_inv_resid_scale2,
+                                  w2_trellis_packed, w2_trellis_packed2,
+                                  w2_SU, w2_SV, w2_Wscale, w2_inv_resid_scale2,
+                                  hidden_size, intermediate_size, w13_out_features,
+                                  n_pad_w13, m_pad_w13, n_pad_w2, m_pad_w2,
+                                  blocks_n_w13, blocks_m_w13,
+                                  blocks_n_w13_meta, blocks_m_w13_meta,
+                                  blocks_n_w2, blocks_m_w2,
+                                  blocks_n_w2_meta, blocks_m_w2_meta,
+                                  activation_type):
+    # Same output contract as every other GLQ MoE op: (num_tokens, hidden) fp16. The
+    # positional list must stay in lockstep with the schema above — an arity drift here
+    # fails deep inside dispatch, possibly mid-capture, which is what
+    # test_fused_moe_trellis_3inst_fake_shape exists to catch.
     return torch.empty((*x.shape[:-1], hidden_size),
                        dtype=torch.float16, device=x.device)
 

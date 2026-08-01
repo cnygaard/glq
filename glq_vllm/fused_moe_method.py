@@ -368,14 +368,38 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                         "decode to nothing. The checkpoint is half-written.")
         layer._glq_trellis_moe_meta = meta
 
-    def _apply_trellis(self, layer, x, topk_weights, topk_ids):
-        """Trellis MoE: per-expert loop reusing ``E8RHTLinear._trellis_linear_apply`` — the
-        same staticmethod the single-linear vLLM path and HF both run, so all three share one
-        validated decode.
+        # Can the fused grouped op serve this layer? Everything here is a static property of
+        # the WEIGHTS, so resolve it once at load rather than per forward. Each clause is a
+        # hard requirement of glq_fused_moe_trellis_3inst_cuda, and failing the gate means
+        # the eager per-expert loop — correct, just not capturable. The gated-activation
+        # requirement is deliberately NOT folded in here: `layer.activation` is a runner
+        # attribute that need not be set at load time, and a missing one would read as the
+        # silu default. apply() checks it, as _apply_e8p's ladder does.
+        ok = True
+        for pfx in ("w13", "w2"):
+            m = meta[pfx]
+            ok = ok and m['m_pad'] % 32 == 0 and m['n_pad'] % 64 == 0
+            ok = ok and m['m_pad'] <= 16384 and m['n_pad'] <= 16384
+            # Stage-1 rate must be 2-4: the kernel's R ladder ends in a bare `else` that
+            # runs R=4, which over narrower data decodes a neighbour's bits into plausible
+            # garbage. R=1 is legal ONLY as the bpw-5 residual.
+            r1 = getattr(layer, f"{pfx}_trellis_packed").shape[-1] // 16
+            ok = ok and 2 <= r1 <= 4
+            if m['has_s2']:
+                r2 = getattr(layer, f"{pfx}_trellis_packed2").shape[-1] // 16
+                ok = ok and 1 <= r2 <= 4
+        layer.glq_trellis_fused_ok = bool(ok)
 
-        Eager, NOT cudagraph-capturable (the loop's `.unique()` syncs), exactly like
-        ``_apply_e8p`` before its grouped kernel landed. Correct and compressed first; a
-        grouped trellis kernel is the follow-up.
+    def _apply_trellis(self, layer, x, topk_weights, topk_ids):
+        """Trellis MoE **fallback**: per-expert loop reusing ``E8RHTLinear._trellis_linear_apply``
+        — the same staticmethod the single-linear vLLM path and HF both run, so all three
+        share one validated decode.
+
+        Eager and NOT cudagraph-capturable: the loop's `.unique()` and `.item()` are host
+        syncs. ``torch.ops.glq.fused_moe_trellis_3inst`` is the capturable path and the
+        default; this stays reachable for prefill (tokens > ``GLQ_MOE_BD_MAX_TOKENS``), for
+        layers the fused gate rejects, and via ``GLQ_MOE_FORCE_FALLBACK=1`` — which is what
+        makes it the A/B reference the fused path is validated against.
         """
         from glq.quantized_linear import E8RHTLinear
         _apply = E8RHTLinear._trellis_linear_apply
@@ -672,8 +696,47 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         further runner-only kwargs added by newer vLLM versions.
         """
         if getattr(layer, 'glq_is_trellis', False):
-            # Phase A: per-expert loop only. There is no grouped trellis MoE kernel yet, so
-            # this is eager and NOT cudagraph-capturable — correct and compressed, not fast.
+            import os as _os
+            from glq import inference_kernel as _ik
+            activation = getattr(layer, 'activation', None)
+            _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
+            # Fused grouped-trellis op: device-side expert dispatch with no host sync, so
+            # the whole MoE decode step is capturable under FULL cudagraph. That, not kernel
+            # throughput, is the reason it exists — the fallback loop's topk_ids.unique()
+            # forces --enforce-eager. GLQ_MOE_FORCE_FALLBACK=1 forces the loop (A/B
+            # isolation); tokens > cap (prefill) also take the loop, which is eager anyway
+            # and lets the per-expert dense path handle large batches.
+            if (getattr(layer, 'glq_trellis_fused_ok', False)
+                    and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                    and x.shape[0] <= _bd_cap
+                    and self._activation_type(activation) < 3
+                    and _ik._try_load_cuda_ext()
+                    and hasattr(_ik._glq_cuda, 'glq_fused_moe_trellis_3inst_cuda')
+                    and hasattr(torch.ops, 'glq')
+                    and hasattr(torch.ops.glq, 'fused_moe_trellis_3inst')):
+                dtype = x.dtype
+                meta = layer._glq_trellis_moe_meta
+                m13, m2 = meta['w13'], meta['w2']
+                output = torch.ops.glq.fused_moe_trellis_3inst(
+                    x.half().contiguous(),
+                    topk_ids.to(torch.int64),
+                    topk_weights.float().contiguous(),
+                    layer.w13_trellis_packed, layer.w13_trellis_packed2,
+                    layer.w13_SU, layer.w13_SV, layer.w13_Wscale,
+                    layer.w13_inv_resid_scale2,
+                    layer.w2_trellis_packed, layer.w2_trellis_packed2,
+                    layer.w2_SU, layer.w2_SV, layer.w2_Wscale,
+                    layer.w2_inv_resid_scale2,
+                    layer.glq_hidden_size, layer.glq_intermediate_size, layer.glq_w13_out,
+                    m13['n_pad'], m13['m_pad'], m2['n_pad'], m2['m_pad'],
+                    m13['_bn'], m13['_bm'], m13['_bnm'], m13['_bmm'],
+                    m2['_bn'], m2['_bm'], m2['_bnm'], m2['_bmm'],
+                    self._activation_type(activation),
+                )
+                if dtype != torch.float16:
+                    output = output.to(dtype)
+                return output
+            # Fallback: per-expert loop (Phase A baseline; eager, correct, compressed).
             return self._apply_trellis(layer, x, topk_weights, topk_ids)
 
         if getattr(layer, 'glq_is_e8p', False):

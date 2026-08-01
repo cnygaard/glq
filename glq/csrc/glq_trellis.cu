@@ -536,15 +536,48 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
  * scratch and NO allocation → capture-safe by construction. (e8p's split-K scratch uses a
  * per-call raw_alloc/raw_delete, which glq_cuda.cu:3405-3412 itself flags as illegal during
  * capture — we deliberately do not copy that.) */
-template <uint32_t R, bool IS_3INST = false>
+/* GROUPED (fused MoE): the SAME kernel serving one expert per 8-token tile, so the whole
+ * routed-expert step is one launch with device-side dispatch and no host sync — the property
+ * that lets vLLM capture the MoE decode in a CUDA graph. Deliberately an `if constexpr` arm
+ * of this kernel rather than a forked copy: e8p's grouped kernel IS a fork
+ * (glq_e8p.cu:437, "byte-identical to the single kernel"), and a body that must stay
+ * byte-identical by inspection is a body that eventually won't be. Three additions, all
+ * hoisted above the k-loop so the steady state is untouched:
+ *   1. expert route — eidx = m_indices[blockIdx.y*8], and the weight base advances by
+ *      eidx*w_estride_u16. Reading the expert from the tile's FIRST slot is sound because
+ *      the host pads every expert run to GLQ_MOE_GROUP_TILE=16 slots and fills them as a
+ *      dense prefix, so an 8-slot tile lies wholly inside one expert's run.
+ *   2. pad-tile early return (eidx < 0) — block-uniform, before any __syncthreads.
+ *   3. per-expert scale from wscale_dev[eidx], times inv_rs_dev[eidx] on a residual stage
+ *      (same fold e8p uses, so stacked-RVQ stage 2 needs no second scale path).
+ * The base offset is size_t, not the body's signed int weight_idx: gemma-4's w13 is 2.97 M
+ * u16 per expert and 128 experts clears INT_MAX by only 5×. */
+template <uint32_t R, bool IS_3INST = false, bool GROUPED = false>
 __global__ static void __launch_bounds__(TR_BLOCK_SIZE, 1)
 glq_trellis_matmul_kernel(float *__restrict__ out,
                           const uint32_t *__restrict__ compressed,
                           const half2 *__restrict__ x,
                           const half2 *__restrict__ codebook,
                           uint32_t m, uint32_t k, uint32_t B, float wscale,
-                          bool accum = false) {
+                          bool accum = false,
+                          const int *__restrict__ m_indices = nullptr,
+                          const float *__restrict__ wscale_dev = nullptr,
+                          const float *__restrict__ inv_rs_dev = nullptr,
+                          size_t w_estride_u16 = 0) {
     extern __shared__ __align__(16) half2 smem_codebook[];
+
+    // Grouped route (see the note above). Local copies, not reassigned parameters: the
+    // body's `compressed` is __restrict__-qualified and its value must not change under it.
+    const uint32_t *cp = compressed;
+    float ws = wscale;
+    if constexpr (GROUPED) {
+        const uint32_t base = blockIdx.y * 8;
+        const int eidx = (base < B) ? m_indices[base] : -1;
+        if (eidx < 0) return;                       // whole tile is padding — nothing to do
+        cp = (const uint32_t *)((const uint16_t *)compressed + (size_t)eidx * w_estride_u16);
+        ws = wscale_dev[eidx];
+        if (inv_rs_dev != nullptr) ws *= inv_rs_dev[eidx];
+    }
 
     const uint32_t laneId = threadIdx.x % TR_WARP_SIZE;
     const uint32_t warpId = threadIdx.x / TR_WARP_SIZE;
@@ -596,7 +629,7 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
         // allocation-layout-dependent cudaErrorIllegalAddress). The predicate is warp-uniform,
         // so the __shfl_syncs inside stay converged; the skipped value was never consumed.
         if (this_warp_k > 0)
-            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed, weight_idx, laneId, reg_cs_next, reg_cs2_next);
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)cp, weight_idx, laneId, reg_cs_next, reg_cs2_next);
         uint4 reg_cs, reg_cs2;
         float4 reg_p[2] = {};
 
@@ -604,7 +637,7 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
         for (uint32_t ki = 0; ki < this_warp_k; ki += 1) {
             if (ki + 1 != this_warp_k && ki % 2 == 1) weight_idx += weight_step * 2;
             reg_cs = reg_cs_next; reg_cs2 = reg_cs2_next;
-            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)compressed,
+            tr_load_reg_cs<R, IS_3INST>((const uint16_t *)cp,
                                         weight_idx + (1 - ki % 2) * u16_per_tile_block,
                                         laneId, reg_cs_next, reg_cs2_next);
 
@@ -669,8 +702,9 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
                     // RS1: ×wscale folded into the store; RVQ stage 2 accumulates (see the
                     // matvec note — disjoint (m-range, token-tile) ownership makes `+=` safe
                     // and deterministic, and __fadd_rn keeps it exactly stage1+stage2).
+                    // GROUPED: `ws` is this tile's expert scale; ungrouped it IS `wscale`.
                     const size_t oi = (size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId;
-                    const float v = reduced * wscale;
+                    const float v = reduced * ws;
                     out[oi] = accum ? __fadd_rn(out[oi], v) : v;
                 }
             }
@@ -1436,4 +1470,71 @@ void glq_fused_linear_trellis_3inst_yrht_rvq2_cuda(
                               trellis_packed2, inv_resid_scale2);
     if (!slice.has_value() || y.data_ptr() != slice->data_ptr())
         y_rht_out.narrow(1, col, m_pad).copy_(y.view({B, (long)m_pad}));
+}
+
+/* ══ Grouped (per-expert) 3INST matmul for the fused MoE — the capturable decode path ══
+ *
+ * Counterpart of launch_grouped_matmul_e8p (glq_e8p.cu), called from glq_fused_moe_trellis_
+ * 3inst_cuda in glq_cuda.cu. Two launches at most and NO scratch, NO reduce kernel and NO
+ * allocation: the matmul kernel's in-block fixed-order reduce is already complete, and each
+ * (m-range, token-tile) owns disjoint output. That is what makes the whole MoE step safe to
+ * capture — e8p needs a split-K scratch plane plus a reduce pass here.
+ *
+ * Stacked RVQ (5-8 bpw): stage 2 is the same kernel with accum=true and the per-expert scale
+ * pre-multiplied by inv_resid_scale2 inside the kernel, exactly as the single-linear path
+ * composes y1 + rs2*y2 by matmul linearity. R2 == 0 means "no residual" — and R2 == 1 is
+ * reachable ONLY here (bpw 5 = 4+1), which is why the R ladder below drops to 1 for stage 2
+ * and not for stage 1.
+ *
+ * `x_grouped` (M_sum_max, k) fp16 is already in the RHT domain and pad rows are zeroed by
+ * glq_moe_gather_rows_kernel; `y_out` (M_sum_max, m) fp32 rows for pad TILES are left
+ * untouched and are never read (the grouped output RHT skips m_indices < 0). */
+void launch_grouped_matmul_trellis_3inst(
+    float *y_out,                  // (M_sum_max, m) fp32
+    const int16_t *packed,         // (E, tiles, 16*R1) int16 — stage 1
+    const int16_t *packed2,        // (E, tiles, 16*R2) int16 — stage 2, or nullptr
+    const half *x_grouped,         // (M_sum_max, k) fp16, RHT domain, grouped
+    int R1, int R2,                // bits/weight per stage; R2 == 0 ⇒ no residual
+    size_t stride1_u16, size_t stride2_u16,   // int16 elements per expert, per stage
+    int M_sum_max, int m, int k,
+    const int *m_indices,          // (M_sum_max,) expert per slot, -1 = pad
+    const float *wscale_dev,       // (E,) fp32
+    const float *inv_rs2_dev,      // (E,) fp32 — read only when packed2 != nullptr
+    cudaStream_t stream
+) {
+    // Both ladders below end in a bare `else` that runs the R=4 kernel, which over
+    // narrower data reads a neighbour's bits and returns PLAUSIBLE GARBAGE (the hazard
+    // tr_bits_from_packed's comment describes). Bound the rates here so a caller that
+    // mis-derives R fails loudly instead.
+    TORCH_CHECK(R1 >= 2 && R1 <= 4, "grouped trellis stage 1 needs R 2-4, got ", R1);
+    TORCH_CHECK(R2 >= 0 && R2 <= 4, "grouped trellis stage 2 needs R 0-4, got ", R2);
+    TORCH_CHECK((packed2 != nullptr) == (R2 > 0),
+                "grouped trellis stage 2 is half-configured: packed2 is ",
+                packed2 ? "present" : "absent", " but R2 = ", R2);
+    TORCH_CHECK(packed2 == nullptr || inv_rs2_dev != nullptr,
+                "grouped trellis stage 2 present but inv_resid_scale2 pointer is null");
+    // Cap grid.x at the number of m-tile-pairs: the kernel derives m_per_block from
+    // gridDim.x, so blocks beyond that would launch only to hit `tileIdM*2 >= tileCountM`
+    // and return. Harmless but not free at 128 experts × 2 shards × every layer.
+    const uint32_t m_pairs = (uint32_t)((m / TR_MMA_M + 1) / 2);
+    const uint32_t gx = m_pairs < tr_grid_x() ? m_pairs : tr_grid_x();
+    dim3 grid(gx, (unsigned)((M_sum_max + 7) / 8));   // 8 token-slots per mma N-tile
+
+#define TR_LAUNCH_GROUPED(RBITS, PTR, STRIDE, IRS, ACC)                                 \
+    glq_trellis_matmul_kernel<RBITS, true, true><<<grid, TR_BLOCK_SIZE, 0, stream>>>(   \
+        y_out, (const uint32_t *)(PTR), (const half2 *)x_grouped, (const half2 *)nullptr, \
+        (uint32_t)m, (uint32_t)k, (uint32_t)M_sum_max, 0.0f, (ACC),                     \
+        m_indices, wscale_dev, (IRS), (STRIDE))
+
+    if (R1 == 2)      { TR_LAUNCH_GROUPED(2, packed, stride1_u16, nullptr, false); }
+    else if (R1 == 3) { TR_LAUNCH_GROUPED(3, packed, stride1_u16, nullptr, false); }
+    else              { TR_LAUNCH_GROUPED(4, packed, stride1_u16, nullptr, false); }
+
+    if (packed2 != nullptr && R2 > 0) {
+        if (R2 == 1)      { TR_LAUNCH_GROUPED(1, packed2, stride2_u16, inv_rs2_dev, true); }
+        else if (R2 == 2) { TR_LAUNCH_GROUPED(2, packed2, stride2_u16, inv_rs2_dev, true); }
+        else if (R2 == 3) { TR_LAUNCH_GROUPED(3, packed2, stride2_u16, inv_rs2_dev, true); }
+        else              { TR_LAUNCH_GROUPED(4, packed2, stride2_u16, inv_rs2_dev, true); }
+    }
+#undef TR_LAUNCH_GROUPED
 }
