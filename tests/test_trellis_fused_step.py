@@ -65,8 +65,11 @@ def _both(cb, cost, thing):
 # ---------------------------------------------------------------------------
 # THE gate: fused == compiled, bit-exact, across variant / K / B / masked
 # ---------------------------------------------------------------------------
+# K=1 is the stacked-RVQ residual stage of a 5 bpw checkpoint (recipe 4+1), so it runs on
+# every such quantization — but it was covered only by a claim in _CFG's comment, never by
+# this gate. K=5..8 stay out deliberately: they have no _CFG entry and fall back loudly.
 @pytest.mark.parametrize("variant", ["hyb", "3inst"])
-@pytest.mark.parametrize("K", [2, 3, 4])
+@pytest.mark.parametrize("K", [1, 2, 3, 4])
 @pytest.mark.parametrize("B", [12, 20, 36, 60, 128, 256])
 @pytest.mark.parametrize("masked", [False, True])
 def test_fused_step_equiv(variant, K, B, masked):

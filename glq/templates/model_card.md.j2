@@ -10,7 +10,7 @@
 
 - **Base model:** [`{{ base_model }}`](https://huggingface.co/{{ base_model }})
 {% if is_trellis %}
-- **Method:** trellis-coded quantization (QTIP TCQ, `{{ variant }}` variant) + RHT + LDLQ — {{ "%.1f"|format(avg_bpw) }} bpw uniform (native trellis rate — one decode pass, no residual stacking)
+- **Method:** trellis-coded quantization (QTIP TCQ, `{{ variant }}` variant) + RHT + LDLQ — {{ "%.1f"|format(avg_bpw) }} bpw uniform ({% if avg_bpw >= 5 %}stacked residual VQ: a K=4 primary trellis plus a K={{ avg_bpw|int - 4 }} residual stage, decoded in two passes{% else %}native trellis rate — one decode pass, no residual stacking{% endif %})
 {% else %}
 - **Method:** E8 shell codebook + RHT + LDLQ{% if is_mixed %} — mixed precision (per-layer {{ min_bpw }}–{{ max_bpw }} bpw, avg {{ "%.1f"|format(avg_bpw) }}){% else %} — {{ "%.1f"|format(avg_bpw) }} bpw uniform{% endif %}
 {% endif %}
@@ -24,11 +24,15 @@
 ```bash
 pip install glq
 ```
-{% if is_trellis and variant == "3inst" %}
+{% if is_trellis and avg_bpw >= 5 %}
 
-> **Requires `glq >= 0.7.0`.** This checkpoint stores the trellis in the kernel
-> (MMA-fragment) layout that the lookup-free 3INST CUDA kernels consume
-> (`trellis_layout: "kernel"` in `config.json`); older glq versions cannot decode it.
+> **Requires `glq >= 0.8.0`** — that release added stacked residual VQ end to end: the
+> loader, the CUDA decode kernel and vLLM serving. Older builds decode the primary stage
+> only, silently giving 4 bpw quality.
+{% elif is_trellis and variant == "3inst" %}
+
+> **Requires `glq >= 0.7.0`** — this checkpoint stores the trellis in the kernel
+> (MMA-fragment) layout that the lookup-free 3INST CUDA kernels consume.
 {% endif %}
 
 ## Use with vLLM (recommended)

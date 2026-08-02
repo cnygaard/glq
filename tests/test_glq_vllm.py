@@ -2,6 +2,7 @@
 
 import os
 import time
+import types
 
 # vLLM v1 serializes model state between processes; GLQ params have
 # function references (weight_loader) that aren't msgpack-serializable.
@@ -489,19 +490,141 @@ def test_trellis_setup_refuses_unexpected_stage2():
 
 
 @requires_vllm
-def test_trellis_moe_refused():
-    """Trellis MoE has no implementation at ALL (1-stage included): without this refusal a
-    trellis expert layer falls through the ``== e8p`` check into SHELL buffer registration
-    (w13_Qidxs codebook indices), which is a different storage format entirely — silent
-    wrong answers, and gemma-4-26B-A4B is MoE."""
+def test_trellis_hyb_moe_refused():
+    """HYB trellis MoE stays refused: the fused trellis entries take no tlut, so a HYB
+    checkpoint would decode against a codebook the kernel never sees.
+
+    The blanket trellis-MoE refusal this replaces is gone (3INST serves now). What it was
+    really guarding — a trellis layer falling through the ``== e8p`` check into SHELL buffer
+    registration, a different storage format entirely — is closed better, by
+    ``_create_weights_trellis`` claiming the codebook before that branch is reachable."""
     from glq_vllm.fused_moe_method import GLQFusedMoEMethod
     # Built without __init__ on purpose: FusedMoEMethodBase wants a live FusedMoEConfig,
     # and the guard fires before create_weights reads anything but codebook_type.
     method = GLQFusedMoEMethod.__new__(GLQFusedMoEMethod)
     method.codebook_type = "trellis"
-    with pytest.raises(ValueError, match="trellis MoE is not implemented"):
+    method.quant_config = types.SimpleNamespace(variant="hyb", bpw=4)
+    with pytest.raises(ValueError, match="only the 3inst variant"):
         method.create_weights(torch.nn.Module(), 8, 128, 256, torch.float16,
                               weight_loader=lambda *a, **k: None)
+
+
+def test_fused_moe_trellis_3inst_schema_matches_fake():
+    """The schema⇆fake arity check that does NOT need a built CUDA extension.
+
+    Every other op's ``define`` string is inline behind ``hasattr(cuda, ...)``, so its arity
+    is only checkable where the .so exists — and a drift there fails deep inside dispatch,
+    possibly mid-capture. This one reads the schema constant and the fake's signature
+    directly, so an added/removed/reordered argument is caught on plain CPU at edit time.
+    Names are compared too, not just the count: a reorder keeps the count identical while
+    binding weights to the wrong parameter, which decodes to plausible garbage."""
+    import inspect
+    from glq_vllm.custom_ops import (FUSED_MOE_TRELLIS_3INST_SCHEMA,
+                                     _fused_moe_trellis_3inst_fake)
+
+    args = FUSED_MOE_TRELLIS_3INST_SCHEMA.split("(", 1)[1].rsplit(")", 1)[0]
+    schema_names = [a.strip().split()[-1] for a in args.split(",")]
+    fake_names = list(inspect.signature(_fused_moe_trellis_3inst_fake).parameters)
+    assert schema_names == fake_names, (
+        f"schema/fake mismatch\n schema: {schema_names}\n fake:   {fake_names}")
+    # 15 tensors + 7 ints + 8 block tensors + activation_type. Stated as a number so an
+    # accidental deletion that keeps both sides in step still trips.
+    assert len(schema_names) == 31
+
+
+@requires_vllm
+def test_fused_moe_trellis_3inst_fake_shape():
+    """The fake returns the MoE output contract, (num_tokens, hidden) fp16 — same as every
+    other GLQ MoE op, which is what lets apply() swap paths without the compiler noticing.
+    Meta tensors, so it runs without a GPU (but needs the ext for the op to be registered)."""
+    import glq_vllm.custom_ops
+    glq_vllm.custom_ops._ensure_registered()
+    if not hasattr(torch.ops.glq, "fused_moe_trellis_3inst"):
+        pytest.skip("fused_moe_trellis_3inst not registered (no CUDA ext loaded)")
+
+    E, T, top_k = 8, 3, 2
+    hidden, inter, w13_out = 256, 128, 256
+    meta = torch.device("meta")
+    x = torch.empty(T, hidden, dtype=torch.float16, device=meta)
+    topk_ids = torch.empty(T, top_k, dtype=torch.int64, device=meta)
+    topk_w = torch.empty(T, top_k, dtype=torch.float32, device=meta)
+
+    def _packed(m, n):
+        return torch.empty(E, (m // 16) * (n // 16), 64, dtype=torch.int16, device=meta)
+    sentinel = torch.empty(E, 1, 1, dtype=torch.int16, device=meta)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=meta)
+    y = torch.ops.glq.fused_moe_trellis_3inst(
+        x, topk_ids, topk_w,
+        _packed(w13_out, hidden), sentinel,
+        torch.empty(E, w13_out, dtype=torch.float16, device=meta),
+        torch.empty(hidden, dtype=torch.float16, device=meta),
+        torch.empty(E, dtype=torch.float32, device=meta),
+        torch.empty(E, dtype=torch.float32, device=meta),
+        _packed(hidden, inter), sentinel,
+        torch.empty(E, hidden, dtype=torch.float16, device=meta),
+        torch.empty(inter, dtype=torch.float16, device=meta),
+        torch.empty(E, dtype=torch.float32, device=meta),
+        torch.empty(E, dtype=torch.float32, device=meta),
+        hidden, inter, w13_out, hidden, w13_out, inter, hidden,
+        torch.tensor([hidden], dtype=torch.int64, device=meta),
+        torch.tensor([w13_out], dtype=torch.int64, device=meta), empty_i32, empty_i32,
+        torch.tensor([inter], dtype=torch.int64, device=meta),
+        torch.tensor([hidden], dtype=torch.int64, device=meta), empty_i32, empty_i32,
+        1,
+    )
+    assert y.shape == (T, hidden) and y.dtype == torch.float16
+    assert y.device.type == "meta"
+
+
+def _trellis_moe_layer(bpw=4, num_experts=8, hidden=256, inter=128):
+    """A trellis MoE layer as the loader leaves it: create_weights registers full-size
+    buffers, then _process_trellis derives the block-diag meta and the fused gate."""
+    from glq_vllm.fused_moe_method import GLQFusedMoEMethod
+    method = GLQFusedMoEMethod.__new__(GLQFusedMoEMethod)
+    method.codebook_type = "trellis"
+    method.quant_config = types.SimpleNamespace(variant="3inst", bpw=bpw)
+    method.moe = types.SimpleNamespace(is_act_and_mul=True)
+    layer = torch.nn.Module()
+    method.create_weights(layer, num_experts, hidden, inter, torch.float16,
+                          weight_loader=lambda *a, **k: None)
+    if bpw >= 5:                       # a real residual needs a nonzero scale to be valid
+        layer.w13_inv_resid_scale2.data.fill_(0.75)
+        layer.w2_inv_resid_scale2.data.fill_(0.75)
+    return method, layer
+
+
+@requires_vllm
+@pytest.mark.parametrize("bpw", [4, 6])
+def test_trellis_moe_fused_gate_accepts_servable_layer(bpw):
+    """The positive half of the gate: a gemma-4-shaped layer at 4 and 6 bpw must route to the
+    fused grouped op, because that is the ONLY cudagraph-capturable path — falling back to
+    the per-expert loop is silently correct, so nothing else would notice."""
+    _m, layer = _trellis_moe_layer(bpw=bpw)
+    _m._process_trellis(layer)
+    assert layer.glq_trellis_fused_ok is True
+    assert layer._glq_trellis_moe_meta['w13']['has_s2'] is (bpw >= 5)
+
+
+@requires_vllm
+def test_trellis_moe_fused_gate_rejects_unservable_shape():
+    """The kernel needs m % 32 and k % 64; trellis never pads, so a TP split that violates
+    it cannot be hidden. The gate must decline rather than let the op abort mid-forward —
+    the loop still serves the layer correctly, just eagerly."""
+    _m, layer = _trellis_moe_layer(hidden=256, inter=160)     # w2 k = 160, 160 % 64 != 0
+    _m._process_trellis(layer)
+    assert layer.glq_trellis_fused_ok is False
+
+
+@requires_vllm
+def test_trellis_moe_fused_gate_ignores_missing_activation_attr():
+    """``layer.activation`` is a runner attribute that need not exist at load time. Folding
+    the gated-activation requirement into the load-time flag would read a missing one as the
+    silu default and wrongly admit a non-gated layer, so the flag must not depend on it —
+    apply() checks the activation at dispatch, where it is actually known."""
+    _m, layer = _trellis_moe_layer()
+    assert not hasattr(layer, 'activation')
+    _m._process_trellis(layer)
+    assert layer.glq_trellis_fused_ok is True
 
 
 @requires_vllm

@@ -99,16 +99,17 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     ):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # Trellis MoE is NOT implemented at any bpw. Without this guard a trellis checkpoint
-        # falls through the `codebook_type == "e8p"` check below into the SHELL branch, which
-        # registers `w13_Qidxs`/`w2_Qidxs` codebook-index buffers — the wrong storage format
-        # for a trellis checkpoint (which carries `trellis_packed` + `tlut`). That either
-        # errors deep in a shape mismatch at load or serves garbage. Refuse up front.
-        if self.codebook_type == "trellis":
+        # HYB trellis MoE stays refused: the fused trellis entries take no tlut, so a HYB
+        # checkpoint would decode against a codebook that never reached the kernel. 3INST is
+        # supported below. (The old blanket trellis refusal is gone — falling through to the
+        # SHELL branch was the danger, and _create_weights_trellis now claims the codebook
+        # before that can happen.)
+        if self.codebook_type == "trellis" and getattr(self.quant_config, "variant",
+                                                       "hyb") != "3inst":
             raise ValueError(
-                "GLQ trellis MoE is not implemented — a trellis checkpoint would be loaded "
-                "into shell-codebook buffers and produce wrong output. Serve MoE models with "
-                "--codebook e8_shell or e8p, or run this checkpoint via HF transformers.")
+                "GLQ trellis MoE supports only the 3inst variant — the fused trellis entries "
+                "take no tlut, so a HYB checkpoint would decode against a codebook the kernel "
+                "never sees. Re-quantize with GLQ_TRELLIS_VARIANT=3inst.")
 
         # w13 = gate_up_proj (or just up_proj for non-gated)
         is_gated = getattr(self.moe, 'is_act_and_mul', None)
@@ -119,6 +120,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         if self.codebook_type == "e8p":
             self._create_weights_e8p(layer, num_experts, hidden_size,
                                      intermediate_size_per_partition, is_gated, w13_out)
+            return
+
+        if self.codebook_type == "trellis":
+            self._create_weights_trellis(layer, num_experts, hidden_size,
+                                         intermediate_size_per_partition, is_gated, w13_out)
             return
 
         # GLQ (post-v0.2.9) stores BLOCK-DIAGONAL artifacts: m_pad/n_pad equal the
@@ -268,6 +274,171 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         _reg("w13", mp16_w13, nb64_w13, m_pad_w13, n_pad_w13)
         _reg("w2", mp16_w2, nb64_w2, m_pad_w2, n_pad_w2)
 
+    def _create_weights_trellis(self, layer, num_experts, hidden_size, inter, is_gated,
+                                w13_out):
+        """Per-expert trellis buffers, registered FULL-SIZE so vLLM's FusedMoE loader
+        ``copy_``s each expert in place (registering small and resizing is what broke the
+        e8p cudagraph path — see the param_data revert).
+
+        Shapes come from ``glq_vllm.moe_shapes.trellis_moe_shapes``, which derives the
+        per-stage rates from ``trellis_rvq_recipe`` rather than a second table, and refuses
+        a gate/up split that is not 32-row aligned.
+        """
+        from .moe_shapes import trellis_moe_shapes
+
+        bpw = int(float(getattr(self.quant_config, 'bpw', 4)))
+        shapes = trellis_moe_shapes(num_experts, hidden_size, inter, w13_out, bpw)
+
+        layer.glq_num_experts = num_experts
+        layer.glq_hidden_size = hidden_size
+        layer.glq_intermediate_size = inter
+        layer.glq_w13_out = w13_out
+        layer.glq_is_gated = is_gated
+        layer.glq_is_trellis = True
+        layer.glq_bpw = bpw
+        # trellis never pads: m_pad/n_pad ARE the true dims (block-diagonal RHT).
+        layer.glq_m_pad_w13, layer.glq_n_pad_w13 = w13_out, hidden_size
+        layer.glq_m_pad_w2, layer.glq_n_pad_w2 = hidden_size, inter
+
+        _i16 = torch.int16
+        for pfx in ("w13", "w2"):
+            setattr(layer, f"{pfx}_trellis_packed", _make_glq_param(
+                torch.zeros(*shapes[f"{pfx}_trellis_packed"], dtype=_i16)))
+            setattr(layer, f"{pfx}_trellis_packed2", _make_glq_param(
+                torch.zeros(*shapes[f"{pfx}_trellis_packed2"], dtype=_i16)))
+            setattr(layer, f"{pfx}_SU", _make_glq_param(
+                torch.ones(*shapes[f"{pfx}_SU"], dtype=torch.float16)))
+            setattr(layer, f"{pfx}_SV", _make_glq_param(
+                torch.ones(*shapes[f"{pfx}_SV"], dtype=torch.float16)))
+            setattr(layer, f"{pfx}_Wscale", _make_glq_param(
+                torch.ones(*shapes[f"{pfx}_Wscale"], dtype=torch.float32)))
+            setattr(layer, f"{pfx}_inv_resid_scale2", _make_glq_param(
+                torch.zeros(*shapes[f"{pfx}_inv_resid_scale2"], dtype=torch.float32)))
+
+    def _process_trellis(self, layer):
+        """Post-load: block-diagonal RHT metadata per shard + the load-time invariant.
+
+        The invariant mirrors ``linear_method._setup_trellis_weights``: vLLM has no dense
+        fallback, so a checkpoint whose stage layout disagrees with the recipe would serve
+        stage-1-only output at 4 bpw quality with no error. ``has_s2`` and ``inv_rs2``
+        resolve in ONE expression for the same reason they do there — the e8p stage-3/4
+        silent drop came from a flag and a scale resolved under different conditions.
+        """
+        from glq.hadamard import _block_decompose as _bd
+        from glq.quantized_linear import _pack_block_meta as _pbm
+        from glq.trellis import trellis_rvq_recipe
+
+        dev = layer.w13_trellis_packed.device
+        want_s2 = len(trellis_rvq_recipe(int(layer.glq_bpw))) > 1
+
+        meta = {}
+        for pfx in ("w13", "w2"):
+            packed2 = getattr(layer, f"{pfx}_trellis_packed2")
+            has_s2 = packed2.numel() > getattr(layer, "glq_num_experts")   # > sentinel
+            n_pad = getattr(layer, f"glq_n_pad_{pfx}")
+            m_pad = getattr(layer, f"glq_m_pad_{pfx}")
+            bn, bm = _bd(n_pad), _bd(m_pad)
+            meta[pfx] = {
+                'has_s2': has_s2,
+                'n_pad': n_pad, 'm_pad': m_pad,
+                # int64 on CPU: the C++ op reads block sizes host-side via data_ptr to pick
+                # grid/threads/smem, and the schema types them Long. int32 here fails with
+                # "expected scalar type Long but found Int" only once a real forward runs.
+                '_bn': torch.tensor(bn, dtype=torch.int64, device='cpu'),
+                '_bm': torch.tensor(bm, dtype=torch.int64, device='cpu'),
+                # _pack_block_meta builds on CPU; move after, as linear_method does.
+                '_bnm': _pbm(bn).to(dev), '_bmm': _pbm(bm).to(dev),
+            }
+            if want_s2 and not has_s2:
+                raise RuntimeError(
+                    f"GLQ trellis {layer.glq_bpw} bpw MoE {pfx}: trellis_packed2 is missing, "
+                    "so the residual stage would be dropped and every expert would serve "
+                    "4 bpw quality. Re-export with a glq that writes stacked-RVQ storage.")
+            if not want_s2 and has_s2:
+                raise RuntimeError(
+                    f"GLQ trellis {layer.glq_bpw} bpw MoE {pfx}: the checkpoint carries a "
+                    "trellis_packed2 the recipe has no stage for — quantization_config bpw "
+                    "and the stored stage layout disagree.")
+            if has_s2:
+                irs = getattr(layer, f"{pfx}_inv_resid_scale2")
+                if float(irs.abs().max().item()) == 0.0:
+                    raise RuntimeError(
+                        f"GLQ trellis {layer.glq_bpw} bpw MoE {pfx}: trellis_packed2 is "
+                        "present but every inv_resid_scale2 is 0.0 — the residual would "
+                        "decode to nothing. The checkpoint is half-written.")
+        layer._glq_trellis_moe_meta = meta
+
+        # Can the fused grouped op serve this layer? Everything here is a static property of
+        # the WEIGHTS, so resolve it once at load rather than per forward. Each clause is a
+        # hard requirement of glq_fused_moe_trellis_3inst_cuda, and failing the gate means
+        # the eager per-expert loop — correct, just not capturable. The gated-activation
+        # requirement is deliberately NOT folded in here: `layer.activation` is a runner
+        # attribute that need not be set at load time, and a missing one would read as the
+        # silu default. apply() checks it, as _apply_e8p's ladder does.
+        ok = True
+        for pfx in ("w13", "w2"):
+            m = meta[pfx]
+            ok = ok and m['m_pad'] % 32 == 0 and m['n_pad'] % 64 == 0
+            ok = ok and m['m_pad'] <= 16384 and m['n_pad'] <= 16384
+            # Stage-1 rate must be 2-4: the kernel's R ladder ends in a bare `else` that
+            # runs R=4, which over narrower data decodes a neighbour's bits into plausible
+            # garbage. R=1 is legal ONLY as the bpw-5 residual.
+            r1 = getattr(layer, f"{pfx}_trellis_packed").shape[-1] // 16
+            ok = ok and 2 <= r1 <= 4
+            if m['has_s2']:
+                r2 = getattr(layer, f"{pfx}_trellis_packed2").shape[-1] // 16
+                ok = ok and 1 <= r2 <= 4
+        layer.glq_trellis_fused_ok = bool(ok)
+
+    def _apply_trellis(self, layer, x, topk_weights, topk_ids):
+        """Trellis MoE **fallback**: per-expert loop reusing ``E8RHTLinear._trellis_linear_apply``
+        — the same staticmethod the single-linear vLLM path and HF both run, so all three
+        share one validated decode.
+
+        Eager and NOT cudagraph-capturable: the loop's `.unique()` and `.item()` are host
+        syncs. ``torch.ops.glq.fused_moe_trellis_3inst`` is the capturable path and the
+        default; this stays reachable for prefill (tokens > ``GLQ_MOE_BD_MAX_TOKENS``), for
+        layers the fused gate rejects, and via ``GLQ_MOE_FORCE_FALLBACK=1`` — which is what
+        makes it the A/B reference the fused path is validated against.
+        """
+        from glq.quantized_linear import E8RHTLinear
+        _apply = E8RHTLinear._trellis_linear_apply
+
+        dtype = x.dtype
+        meta = layer._glq_trellis_moe_meta
+        hidden, inter, w13_out = (layer.glq_hidden_size, layer.glq_intermediate_size,
+                                  layer.glq_w13_out)
+        activation = getattr(layer, 'activation', None)
+        _empty = torch.empty(0, dtype=torch.int16, device=x.device)
+
+        def _shard(pfx, xin, in_f, out_f, e):
+            m = meta[pfx]
+            p2 = getattr(layer, f"{pfx}_trellis_packed2")
+            return _apply(
+                xin, getattr(layer, f"{pfx}_SV"), getattr(layer, f"{pfx}_SU")[e],
+                getattr(layer, f"{pfx}_trellis_packed")[e],
+                None,                                   # tlut: 3INST only, never a tlut
+                m['_bn'], m['_bm'], m['_bnm'], m['_bmm'],
+                float(getattr(layer, f"{pfx}_Wscale")[e].item()),
+                in_f, out_f, m['n_pad'], m['m_pad'],
+                bias=None, out_dtype=torch.float16,
+                trellis_packed2=(p2[e] if m['has_s2'] else _empty),
+                inv_resid_scale2=(float(getattr(layer, f"{pfx}_inv_resid_scale2")[e].item())
+                                  if m['has_s2'] else 0.0))
+
+        out = torch.zeros(x.shape[0], hidden, dtype=dtype, device=x.device)
+        for et in topk_ids.unique():
+            e = int(et.item())
+            mask = (topk_ids == e)
+            token_mask = mask.any(dim=1)
+            ew = (topk_weights * mask.float()).sum(dim=1)[token_mask]
+            xt = x[token_mask].to(torch.float16)
+            h = _shard("w13", xt, hidden, w13_out, e)
+            h = _apply_activation(h, activation)
+            y = _shard("w2", h, inter, hidden, e)
+            out[token_mask] += y.to(dtype) * ew.unsqueeze(-1)
+        return out
+
     def _process_e8p(self, layer):
         """e8p MoE: cache grids + block-diag RHT tensors + per-expert scalars; collapse
         unused residual sentinels to numel-0. Mirrors linear_method._setup_e8p_weights."""
@@ -401,6 +572,9 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, 'glq_is_e8p', False):
             self._process_e8p(layer)
             return
+        if getattr(layer, 'glq_is_trellis', False):
+            self._process_trellis(layer)
+            return
         device = layer.w13_Qidxs.device
         bpw = getattr(self.quant_config, 'bpw', 2)
 
@@ -521,6 +695,50 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         GLQLinearMethod via the layer_bpw whitelist). ``**kwargs`` absorbs any
         further runner-only kwargs added by newer vLLM versions.
         """
+        if getattr(layer, 'glq_is_trellis', False):
+            import os as _os
+            from glq import inference_kernel as _ik
+            activation = getattr(layer, 'activation', None)
+            _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
+            # Fused grouped-trellis op: device-side expert dispatch with no host sync, so
+            # the whole MoE decode step is capturable under FULL cudagraph. That, not kernel
+            # throughput, is the reason it exists — the fallback loop's topk_ids.unique()
+            # forces --enforce-eager. GLQ_MOE_FORCE_FALLBACK=1 forces the loop (A/B
+            # isolation); tokens > cap (prefill) also take the loop, which is eager anyway
+            # and lets the per-expert dense path handle large batches.
+            if (getattr(layer, 'glq_trellis_fused_ok', False)
+                    and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
+                    and x.shape[0] <= _bd_cap
+                    and self._activation_type(activation) < 3
+                    and _ik._try_load_cuda_ext()
+                    and hasattr(_ik._glq_cuda, 'glq_fused_moe_trellis_3inst_cuda')
+                    and hasattr(torch.ops, 'glq')
+                    and hasattr(torch.ops.glq, 'fused_moe_trellis_3inst')):
+                dtype = x.dtype
+                meta = layer._glq_trellis_moe_meta
+                m13, m2 = meta['w13'], meta['w2']
+                output = torch.ops.glq.fused_moe_trellis_3inst(
+                    x.half().contiguous(),
+                    topk_ids.to(torch.int64),
+                    topk_weights.float().contiguous(),
+                    layer.w13_trellis_packed, layer.w13_trellis_packed2,
+                    layer.w13_SU, layer.w13_SV, layer.w13_Wscale,
+                    layer.w13_inv_resid_scale2,
+                    layer.w2_trellis_packed, layer.w2_trellis_packed2,
+                    layer.w2_SU, layer.w2_SV, layer.w2_Wscale,
+                    layer.w2_inv_resid_scale2,
+                    layer.glq_hidden_size, layer.glq_intermediate_size, layer.glq_w13_out,
+                    m13['n_pad'], m13['m_pad'], m2['n_pad'], m2['m_pad'],
+                    m13['_bn'], m13['_bm'], m13['_bnm'], m13['_bmm'],
+                    m2['_bn'], m2['_bm'], m2['_bnm'], m2['_bmm'],
+                    self._activation_type(activation),
+                )
+                if dtype != torch.float16:
+                    output = output.to(dtype)
+                return output
+            # Fallback: per-expert loop (Phase A baseline; eager, correct, compressed).
+            return self._apply_trellis(layer, x, topk_weights, topk_ids)
+
         if getattr(layer, 'glq_is_e8p', False):
             import os as _os
             from glq import inference_kernel as _ik

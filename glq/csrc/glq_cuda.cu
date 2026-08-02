@@ -5012,6 +5012,232 @@ torch::Tensor glq_fused_moe_e8p_cuda(
 }
 
 
+// Grouped 3INST trellis matmul launcher — defined in glq_trellis.cu (cross-TU).
+void launch_grouped_matmul_trellis_3inst(
+    float* y_out, const int16_t* packed, const int16_t* packed2, const half* x_grouped,
+    int R1, int R2, size_t stride1_u16, size_t stride2_u16,
+    int M_sum_max, int m, int k, const int* m_indices,
+    const float* wscale_dev, const float* inv_rs2_dev, cudaStream_t stream);
+
+// ─────────────────────────────────────────────────────────────────────
+// Fused grouped-MoE entry for the 3INST trellis codebook — the SAME ten-step scaffold as
+// glq_fused_moe_e8p_cuda with steps 4 & 8 (the per-expert matmul) swapped to the trellis
+// decode. Steps 1-3, 5-7 and 9-10 are codebook-agnostic and reused verbatim: shared input
+// RHT, device-side token grouping, row gather, grouped output RHT, gated activation, grouped
+// input RHT, deterministic weighted scatter-reduce.
+//
+// The point of this entry is not raw kernel speed: it is that the whole routed-expert step
+// becomes ONE host call with no .unique()/.item()/boolean-mask host sync, so vLLM can capture
+// the MoE decode in a CUDA graph. The Python per-expert loop it replaces
+// (GLQFusedMoEMethod._apply_trellis) cannot be captured at all.
+//
+// Simpler than the e8p entry in one respect: the trellis matmul kernel's in-block fixed-order
+// reduce is complete, so there is no split-K scratch plane and no reduce pass — which also
+// removes e8p's per-call raw_alloc/raw_delete, illegal under capture.
+//
+// Stacked RVQ (5-8 bpw) rides along as a second accumulate launch per shard. NOTE: no trellis
+// MoE checkpoint above 4 bpw exists yet, so that arm is gated by a synthetic parity fixture
+// only, never by real weights.
+// ─────────────────────────────────────────────────────────────────────
+torch::Tensor glq_fused_moe_trellis_3inst_cuda(
+    torch::Tensor x,                        // (num_tokens, hidden) fp16
+    torch::Tensor topk_ids,                 // (num_tokens, top_k) int64
+    torch::Tensor topk_weights,             // (num_tokens, top_k) fp32
+    torch::Tensor w13_trellis_packed,       // (E, (m/16)*(n/16), 16*R1) int16
+    torch::Tensor w13_trellis_packed2,      // stage 2, or numel-0/sentinel
+    torch::Tensor w13_SU,                   // (E, m_pad_w13) fp16
+    torch::Tensor w13_SV,                   // (n_pad_w13,) fp16 — shared across experts
+    torch::Tensor w13_Wscale,               // (E,) fp32
+    torch::Tensor w13_inv_resid_scale2,     // (E,) fp32
+    torch::Tensor w2_trellis_packed,
+    torch::Tensor w2_trellis_packed2,
+    torch::Tensor w2_SU,
+    torch::Tensor w2_SV,
+    torch::Tensor w2_Wscale,
+    torch::Tensor w2_inv_resid_scale2,
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2,
+    torch::Tensor blocks_n_w13, torch::Tensor blocks_m_w13,
+    torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
+    torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
+    torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
+    int activation_type
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(w13_trellis_packed);
+    CHECK_INPUT(w2_trellis_packed);
+    TORCH_CHECK(activation_type < 3,
+                "trellis MoE path supports gated activations (0/1/2) only, got ",
+                activation_type);
+    TORCH_CHECK(w13_trellis_packed.scalar_type() == torch::kInt16
+                    && w2_trellis_packed.scalar_type() == torch::kInt16,
+                "trellis_packed must be int16");
+    TORCH_CHECK(w13_trellis_packed.dim() == 3 && w2_trellis_packed.dim() == 3,
+                "trellis_packed must be (E, tiles, 16*R)");
+
+    const int num_tokens = x.size(0);
+    const int top_k = topk_ids.size(1);
+    const int E = w13_trellis_packed.size(0);
+
+    // Rates from the stored width (cols == 16*R), the same recovery tr_bits_from_packed does.
+    // Stage 1 keeps the R>=2 floor; R==1 is reachable only as the bpw-5 residual.
+    auto rate_of = [](const torch::Tensor& t) { return (int)(t.size(-1) / 16); };
+    const int w13_R1 = rate_of(w13_trellis_packed), w2_R1 = rate_of(w2_trellis_packed);
+    // A stage-2 buffer registered as the (E,1,1) sentinel is "absent"; numel > E is the same
+    // test _process_trellis uses on the Python side, so the two cannot disagree.
+    const bool w13_has_s2 = w13_trellis_packed2.numel() > (int64_t)E;
+    const bool w2_has_s2 = w2_trellis_packed2.numel() > (int64_t)E;
+    const int w13_R2 = w13_has_s2 ? rate_of(w13_trellis_packed2) : 0;
+    const int w2_R2 = w2_has_s2 ? rate_of(w2_trellis_packed2) : 0;
+
+    // Shape contract of the trellis kernel, asserted per shard where the dims can be named.
+    auto check_shard = [](const char* what, int m, int k, const torch::Tensor& p, int R) {
+        TORCH_CHECK(m % 32 == 0, "trellis MoE ", what, " needs m % 32 == 0, got ", m);
+        TORCH_CHECK(k % 64 == 0, "trellis MoE ", what, " needs k % 64 == 0, got ", k);
+        TORCH_CHECK(p.size(1) == (int64_t)(m / 16) * (k / 16),
+                    "trellis MoE ", what, " packed rows ", p.size(1), " != (m/16)*(k/16) = ",
+                    (int64_t)(m / 16) * (k / 16));
+        TORCH_CHECK(R >= 2 && R <= 4, "trellis MoE ", what, " stage-1 R must be 2-4, got ", R);
+    };
+    check_shard("w13", m_pad_w13, n_pad_w13, w13_trellis_packed, w13_R1);
+    check_shard("w2", m_pad_w2, n_pad_w2, w2_trellis_packed, w2_R1);
+    // Stage 2 walks the SAME tile grid at a narrower rate. A mismatched tile count would
+    // read past the buffer rather than fail, so pin it here.
+    if (w13_has_s2)
+        TORCH_CHECK(w13_trellis_packed2.size(1) == w13_trellis_packed.size(1),
+                    "trellis MoE w13 stage-2 tile count ", w13_trellis_packed2.size(1),
+                    " != stage-1 ", w13_trellis_packed.size(1));
+    if (w2_has_s2)
+        TORCH_CHECK(w2_trellis_packed2.size(1) == w2_trellis_packed.size(1),
+                    "trellis MoE w2 stage-2 tile count ", w2_trellis_packed2.size(1),
+                    " != stage-1 ", w2_trellis_packed.size(1));
+
+    at::DeviceGuard guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto opts_f32 = torch::dtype(torch::kFloat32).device(x.device());
+    auto opts_f16 = torch::dtype(torch::kFloat16).device(x.device());
+    auto opts_i32 = torch::dtype(torch::kInt32).device(x.device());
+
+    const int64_t* bn_w13 = blocks_n_w13.data_ptr<int64_t>(); int n_n_w13 = (int)blocks_n_w13.size(0);
+    const int4* bn_w13_meta = (const int4*)blocks_n_w13_meta.data_ptr<int32_t>();
+    const int64_t* bm_w13 = blocks_m_w13.data_ptr<int64_t>(); int n_m_w13 = (int)blocks_m_w13.size(0);
+    const int4* bm_w13_meta = (const int4*)blocks_m_w13_meta.data_ptr<int32_t>();
+    const int64_t* bn_w2 = blocks_n_w2.data_ptr<int64_t>(); int n_n_w2 = (int)blocks_n_w2.size(0);
+    const int4* bn_w2_meta = (const int4*)blocks_n_w2_meta.data_ptr<int32_t>();
+    const int64_t* bm_w2 = blocks_m_w2.data_ptr<int64_t>(); int n_m_w2 = (int)blocks_m_w2.size(0);
+    const int4* bm_w2_meta = (const int4*)blocks_m_w2_meta.data_ptr<int32_t>();
+
+    const float* topk_w_dev = topk_weights.data_ptr<float>();
+    const float* w13_ws_dev = w13_Wscale.data_ptr<float>();
+    const float* w2_ws_dev = w2_Wscale.data_ptr<float>();
+    const float* w13_irs2_dev = w13_has_s2 ? w13_inv_resid_scale2.data_ptr<float>() : nullptr;
+    const float* w2_irs2_dev = w2_has_s2 ? w2_inv_resid_scale2.data_ptr<float>() : nullptr;
+    const int16_t* w13_p1 = w13_trellis_packed.data_ptr<int16_t>();
+    const int16_t* w13_p2 = w13_has_s2 ? w13_trellis_packed2.data_ptr<int16_t>() : nullptr;
+    const int16_t* w2_p1 = w2_trellis_packed.data_ptr<int16_t>();
+    const int16_t* w2_p2 = w2_has_s2 ? w2_trellis_packed2.data_ptr<int16_t>() : nullptr;
+    // int16 elements per expert = tiles * 16R (stride(0) of the contiguous (E, tiles, 16R)).
+    const size_t w13_s1 = (size_t)w13_trellis_packed.stride(0);
+    const size_t w2_s1 = (size_t)w2_trellis_packed.stride(0);
+    const size_t w13_s2 = w13_has_s2 ? (size_t)w13_trellis_packed2.stride(0) : 0;
+    const size_t w2_s2 = w2_has_s2 ? (size_t)w2_trellis_packed2.stride(0) : 0;
+    const half* w13_su_base = (const half*)w13_SU.data_ptr<c10::Half>();
+    const half* w2_su_base = (const half*)w2_SU.data_ptr<c10::Half>();
+
+    const int TILE = GLQ_MOE_GROUP_TILE;
+    int R = num_tokens * top_k;
+    // Round up to a multiple of 8 so the 8-token mma tiles cover x_grouped/y_out exactly.
+    // Pad slots stay m_indices = -1, which every grouped kernel skips.
+    long M_sum_max = (((long)R + (long)E * TILE) + 7) / 8 * 8;
+
+    // 1. shared input RHT for w13 (per TOKEN, before grouping — one transform per token,
+    //    not one per (token, expert) routing).
+    auto x_rht = torch::empty({num_tokens, n_pad_w13}, opts_f32);
+    launch_input_rht_block_diag(
+        (const half*)x.data_ptr<c10::Half>(), (const half*)w13_SV.data_ptr<c10::Half>(),
+        x_rht.data_ptr<float>(), hidden_size, n_pad_w13, num_tokens,
+        bn_w13, n_n_w13, bn_w13_meta, true, stream);
+    auto x_rht_half = torch::empty({num_tokens, n_pad_w13}, opts_f16);
+    x_rht_half.copy_(x_rht);
+
+    // 2. token grouping (device, capturable).
+    auto expert_count = torch::zeros({E}, opts_i32);
+    auto expert_cursor = torch::zeros({E}, opts_i32);
+    auto expert_offset = torch::zeros({E + 1}, opts_i32);
+    auto m_indices = torch::full({M_sum_max}, -1, opts_i32);
+    auto sorted_tk = torch::full({M_sum_max}, -1, opts_i32);
+    auto inv_perm = torch::full({R}, -1, opts_i32);
+    const int64_t* tk_ptr = topk_ids.data_ptr<int64_t>();
+    int gthreads = 256, gblocks = (R + 255) / 256;
+    glq_moe_count_kernel<<<gblocks, gthreads, 0, stream>>>(tk_ptr, expert_count.data_ptr<int>(), R, E);
+    glq_moe_cumsum_kernel<<<1, E, E * sizeof(int), stream>>>(expert_count.data_ptr<int>(), expert_offset.data_ptr<int>(), E, TILE);
+    glq_moe_scatter_kernel<<<gblocks, gthreads, 0, stream>>>(tk_ptr, expert_offset.data_ptr<int>(), expert_cursor.data_ptr<int>(), m_indices.data_ptr<int>(), sorted_tk.data_ptr<int>(), R, E);
+    glq_moe_build_inv_perm_kernel<<<((int)M_sum_max + 255) / 256, 256, 0, stream>>>(sorted_tk.data_ptr<int>(), inv_perm.data_ptr<int>(), (int)M_sum_max);
+    const int* mi = m_indices.data_ptr<int>();
+
+    // 3. gather x_rht -> grouped (M_sum_max, n_pad_w13); pad rows zeroed.
+    auto x_grouped = torch::empty({M_sum_max, n_pad_w13}, opts_f16);
+    glq_moe_gather_rows_kernel<<<(int)M_sum_max, 256, 0, stream>>>(
+        (half*)x_grouped.data_ptr<c10::Half>(), (const half*)x_rht_half.data_ptr<c10::Half>(),
+        sorted_tk.data_ptr<int>(), top_k, n_pad_w13, (int)M_sum_max);
+
+    // 4. w13 grouped trellis matmul (stage 1 + optional stacked-RVQ stage 2). No scratch.
+    auto y_rht_w13 = torch::empty({M_sum_max, m_pad_w13}, opts_f32);
+    launch_grouped_matmul_trellis_3inst(
+        y_rht_w13.data_ptr<float>(), w13_p1, w13_p2,
+        (const half*)x_grouped.data_ptr<c10::Half>(), w13_R1, w13_R2, w13_s1, w13_s2,
+        (int)M_sum_max, m_pad_w13, n_pad_w13, mi, w13_ws_dev, w13_irs2_dev, stream);
+
+    // 5. w13 output RHT (grouped, per-expert SU).
+    auto h_w13 = torch::empty({M_sum_max, w13_out_features}, opts_f16);
+    launch_output_rht_grouped(y_rht_w13.data_ptr<float>(), w13_su_base,
+        (half*)h_w13.data_ptr<c10::Half>(), w13_out_features, m_pad_w13, (int)M_sum_max,
+        bm_w13, n_m_w13, bm_w13_meta, mi, (long)m_pad_w13, stream);
+
+    // 6. gated activation (batched).
+    auto h_act = torch::empty({M_sum_max, intermediate_size}, opts_f16);
+    {
+        long tot = M_sum_max * intermediate_size;
+        glq_moe_gated_activation_batched_kernel<<<(int)((tot + 255) / 256), 256, 0, stream>>>(
+            (const half*)h_w13.data_ptr<c10::Half>(), (half*)h_act.data_ptr<c10::Half>(),
+            (int)M_sum_max, intermediate_size, w13_out_features, activation_type);
+    }
+
+    // 7. w2 input RHT (grouped, shared SV).
+    auto h_rht = torch::empty({M_sum_max, n_pad_w2}, opts_f32);
+    launch_input_rht_grouped((const half*)h_act.data_ptr<c10::Half>(),
+        (const half*)w2_SV.data_ptr<c10::Half>(), h_rht.data_ptr<float>(),
+        intermediate_size, n_pad_w2, (int)M_sum_max, bn_w2, n_n_w2, bn_w2_meta, mi, stream);
+    auto h_rht_half = torch::empty({M_sum_max, n_pad_w2}, opts_f16);
+    h_rht_half.copy_(h_rht);
+
+    // 8. w2 grouped trellis matmul.
+    auto y_rht_w2 = torch::empty({M_sum_max, m_pad_w2}, opts_f32);
+    launch_grouped_matmul_trellis_3inst(
+        y_rht_w2.data_ptr<float>(), w2_p1, w2_p2,
+        (const half*)h_rht_half.data_ptr<c10::Half>(), w2_R1, w2_R2, w2_s1, w2_s2,
+        (int)M_sum_max, m_pad_w2, n_pad_w2, mi, w2_ws_dev, w2_irs2_dev, stream);
+
+    // 9. w2 output RHT (grouped, per-expert SU) -> per-slot expert output.
+    auto expert_out = torch::empty({M_sum_max, hidden_size}, opts_f16);
+    launch_output_rht_grouped(y_rht_w2.data_ptr<float>(), w2_su_base,
+        (half*)expert_out.data_ptr<c10::Half>(), hidden_size, m_pad_w2, (int)M_sum_max,
+        bm_w2, n_m_w2, bm_w2_meta, mi, (long)m_pad_w2, stream);
+
+    // 10. weighted scatter-reduce -> output (num_tokens, hidden). Fixed-order over top_k, so
+    //     the numeric result is deterministic even though slot PLACEMENT used atomics.
+    auto output = torch::empty({num_tokens, hidden_size}, opts_f16);
+    {
+        dim3 sr_block(256);
+        dim3 sr_grid(num_tokens, (hidden_size + 255) / 256);
+        glq_moe_weighted_scatter_reduce_kernel<<<sr_grid, sr_block, 0, stream>>>(
+            (half*)output.data_ptr<c10::Half>(), (const half*)expert_out.data_ptr<c10::Half>(),
+            inv_perm.data_ptr<int>(), topk_w_dev, num_tokens, top_k, hidden_size);
+    }
+    return output;
+}
+
+
 torch::Tensor glq_fused_moe_block_diag_cuda(
     torch::Tensor x,                    // (num_tokens, hidden) fp16
     torch::Tensor topk_ids,             // (num_tokens, top_k) int64
