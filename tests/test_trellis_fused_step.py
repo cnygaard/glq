@@ -73,6 +73,14 @@ def _both(cb, cost, thing):
 @pytest.mark.parametrize("B", [12, 20, 36, 60, 128, 256])
 @pytest.mark.parametrize("masked", [False, True])
 def test_fused_step_equiv(variant, K, B, masked):
+    if variant == "hyb" and K == 1:
+        # `variant` and `K` are independent axes, so widening K to 1 for the 3INST residual
+        # also generated HYB K=1 — a configuration the product forbids. K=1 arises ONLY as
+        # the stacked-RVQ residual, and stacked RVQ is 3INST-only: linear_method refuses HYB
+        # at bpw>=5 and `_trellis_linear_apply` raises on HYB+stage2. A native primary stage
+        # is 2-4. So _CFG has no (V=2, kv=2) entry by design, and asserting bit-exactness on
+        # a combination that cannot be quantized would pin behaviour nothing relies on.
+        pytest.skip("HYB K=1 is unreachable: K=1 is the RVQ residual and RVQ is 3INST-only")
     torch._dynamo.reset()                       # fresh inductor reference per combo
     cb = _cb(K, variant)
     torch.manual_seed(10_000 * K + B)

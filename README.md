@@ -158,6 +158,14 @@ Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
 automatically — the PLE table quantizes via the shell codebook (requires
 glq ≥ 0.7.2). Use `--streaming` for Gemma-4 family models.
 
+**Mixture-of-Experts** (Gemma-4 26B-A4B and similar) needs **glq ≥ 0.8.1**,
+which added the fused grouped trellis MoE decode. It serves under a full
+CUDA graph — on an RTX PRO 6000 Blackwell the 26B-A4B at 4 bpw decodes
+**91.6 tok/s at B=1** and 1341 tok/s at B=32, against 8.5 / 248 for the
+per-expert fallback loop that preceded it. The fallback is still there for
+prefill and for layer shapes the fused path declines, so a checkpoint that
+cannot take the fast path still serves, just eagerly.
+
 For how it actually works — the RHT bracket, the LDLQ + Viterbi encode, the
 packed-tile storage layout and the fused decode — see
 [docs/trellis-3inst.md](docs/trellis-3inst.md).
