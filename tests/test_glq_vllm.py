@@ -489,6 +489,89 @@ def test_trellis_setup_refuses_unexpected_stage2():
         _m._setup_trellis_weights(layer, torch.device('cpu'))
 
 
+def _fused_3inst_layer(shard_out, n=64, n_shards=2):
+    """A LOADED fused 3INST 4 bpw layer with the given per-shard output width, on CPU.
+
+    Only ``glq_shard_sizes`` drives what is under test here — S4b eligibility is decided by
+    the block decomposition of each shard's m_pad, not by any buffer's contents — so
+    trellis_packed carries a placeholder whose only job is ``numel() > 0`` (the 'loaded'
+    probe). SU is full-width because _setup_trellis_weights slices it to m_pad to build
+    su_cat. Nothing here calls apply(), so the packed bits are never decoded."""
+    import glq_vllm.linear_method as lm
+    _init_tp_once()
+    ldr = lambda *a, **k: None
+    outs = [shard_out] * n_shards
+
+    layer = torch.nn.Module()
+    layer.glq_is_fused = True
+    layer.glq_num_shards = n_shards
+    layer.glq_shard_sizes = outs
+    layer.glq_in_features = n
+    layer.glq_n_pad = n
+    layer.glq_bpw = 4                       # single-stage: no trellis_packed2 expected
+    layer.trellis_packed = lm.GLQShardedParameter(
+        outs, 1, torch.int16, weight_loader=ldr, sentinel=True)
+    layer.trellis_packed2 = lm.GLQShardedParameter(
+        outs, 1, torch.int16, weight_loader=ldr, sentinel=True)
+    layer.inv_resid_scale2 = lm.GLQShardedParameter(
+        [1] * n_shards, 0, torch.float32, weight_loader=ldr)
+    layer.tlut = lm.GLQShardedParameter(
+        outs, 1, torch.float16, weight_loader=ldr, sentinel=True)   # empty => 3INST
+    layer.SU = lm.GLQShardedParameter(outs, -1, torch.float16, weight_loader=ldr)
+    layer.SV = lm.GLQShardedParameter([n] * n_shards, -1, torch.float16, weight_loader=ldr)
+    layer.Wscale = lm.GLQShardedParameter([1] * n_shards, 0, torch.float32, weight_loader=ldr)
+
+    for i in range(n_shards):
+        layer.trellis_packed._shard_data[i] = torch.zeros(1, dtype=torch.int16)
+        layer.SU._shard_data[i] = torch.ones(shard_out, dtype=torch.float16)
+        layer.SV._shard_data[i] = torch.ones(n, dtype=torch.float16)
+        layer.Wscale._shard_data[i] = torch.tensor([1.0])
+    return lm.GLQLinearMethod(None, bpw=4, codebook_type="trellis", variant="3inst"), layer
+
+
+@requires_vllm
+@pytest.mark.parametrize("shard_out,blocks,eligible", [
+    (6144,  [4096, 2048],              True),    # gemma-4-E2B  ffn
+    (10240, [8192, 2048],              True),    # gemma-4-E4B  ffn — lands exactly AT the cap
+    (15360, [8192, 4096, 2048, 1024],  True),    # gemma-4-12B  ffn
+    (2112,  [2048, 64],                True),    # gemma-4-26B-A4B expert ffn
+    (8192,  [8192],                    True),    # the cap itself
+    (16384, [16384],                   False),   # one block over
+    (21504, [16384, 4096, 1024],       False),   # gemma-4-31B  ffn — the real failure
+])
+def test_s4b_declines_output_block_over_smem_cap(shard_out, blocks, eligible):
+    """S4b must DECLINE a layer whose largest output block exceeds the batched kernel's cap.
+
+    ``glq_output_rht_shards_cuda`` is a smem-resident double-buffered FHT (2*bs*4 B), so it
+    caps at bs=8192 → 64 KiB against the ~99 KiB per-block opt-in on sm_86/89/120, and it
+    enforces that with a TORCH_CHECK. A batched launch has ONE smem size and one algorithm
+    for every shard in its grid, so it cannot fall back per-shard the way
+    glq_output_rht_blockdiag_cuda does (that one selects an in-place single-buffer FHT and
+    handles 16384 today). Eligibility therefore has to be decided HERE, at setup.
+
+    Without this gate the refusal lands at engine init on a real checkpoint —
+    gemma-4-31B-it (ffn 21504 → [16384, 4096, 1024]) could not be served at all — and the
+    error surfaces from a cached inductor graph, far from its cause. Declining to build
+    _glq_s4b routes the layer to the per-shard path, which costs launches, not correctness:
+    the batched kernel was itself built to be bit-exact against that path.
+
+    Both directions are asserted because a gate that always declines would 'fix' the 31B by
+    silently dropping S4b for every model."""
+    from glq.hadamard import _block_decompose as _bd
+    assert _bd(shard_out) == blocks, "fixture drifted from the real decomposition"
+
+    _m, layer = _fused_3inst_layer(shard_out)
+    _m._setup_trellis_weights(layer, torch.device('cpu'))
+
+    if eligible:
+        assert layer._glq_s4b is not None, f"S4b wrongly declined for max_bs={max(blocks)}"
+        assert layer._glq_s4b['max_bs'] == max(blocks)
+    else:
+        assert layer._glq_s4b is None, (
+            f"S4b built with max_bs={max(blocks)} > 8192; the batched output-RHT kernel "
+            f"will TORCH_CHECK at the first forward")
+
+
 @requires_vllm
 def test_trellis_hyb_moe_refused():
     """HYB trellis MoE stays refused: the fused trellis entries take no tlut, so a HYB
