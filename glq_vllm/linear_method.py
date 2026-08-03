@@ -615,6 +615,13 @@ def _glq_apply_e8p(x, layer):
 
 _GLQ_BATCH_OUT_RHT = os.environ.get("GLQ_TRELLIS_BATCH_OUT_RHT", "1") != "0"
 
+# Largest output sub-block the SHARD-BATCHED output RHT can transform. Its kernel keeps the
+# whole block in shared memory with a ping-pong pair of buffers (2 * bs * 4 B), so bs=8192
+# is 64 KiB — inside the ~99 KiB per-block opt-in on sm_86 / sm_89 / sm_120, where the next
+# power of two would need 128 KiB and cannot be allocated at all. glq_output_rht_shards_cuda
+# enforces the same bound with a TORCH_CHECK; the two must stay in sync.
+_S4B_MAX_OUT_BLOCK = 8192
+
 
 def _trellis_yrht_rvq2_entry():
     """The stacked-RVQ (5-8 bpw) y_rht entry, or None on a build that predates it.
@@ -1420,9 +1427,18 @@ class GLQLinearMethod(LinearMethodBase):
             # own _rvq2 op and raises if that is missing too. (2b) has already made has_s2
             # uniform across the loaded shards, so any() is the layer's answer.
             has_s2 = any(m['has_s2'] for m in layer._glq_trellis_meta)
-            if not has_s2 or _trellis_yrht_rvq2_entry() is not None:
+            # A wide shard additionally needs its largest sub-block to fit the batched
+            # kernel's smem budget. One launch carries ONE smem size and one algorithm for
+            # every shard in its grid, so unlike glq_output_rht_blockdiag_cuda — which
+            # switches to an in-place single-buffer FHT and handles 16384 today — it cannot
+            # adapt per shard, and its TORCH_CHECK would fire at the first forward instead.
+            # gemma-4-31B is the first model to reach here: ffn 21504 decomposes to
+            # [16384, 4096, 1024]. Every other gemma-4 lands at 8192 or below.
+            shard_blocks = [_bd(meta['m_pad']) for meta in layer._glq_trellis_meta]
+            max_bs = max(max(b) for b in shard_blocks)
+            if (max_bs <= _S4B_MAX_OUT_BLOCK
+                    and (not has_s2 or _trellis_yrht_rvq2_entry() is not None)):
                 from glq.quantized_linear import _pack_shard_meta as _psm
-                shard_blocks = [_bd(meta['m_pad']) for meta in layer._glq_trellis_meta]
                 su_cat = torch.cat([
                     layer.SU.get_shard(i)[:meta['m_pad']].contiguous()
                     for i, meta in enumerate(layer._glq_trellis_meta)]).to(device)
@@ -1430,7 +1446,7 @@ class GLQLinearMethod(LinearMethodBase):
                     'shard_meta': _psm(shard_blocks).to(device),
                     'su_cat': su_cat,
                     'total_m': sum(meta['m_pad'] for meta in layer._glq_trellis_meta),
-                    'max_bs': max(max(b) for b in shard_blocks),
+                    'max_bs': max_bs,
                     'has_s2': has_s2,
                 }
 
