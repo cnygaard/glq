@@ -689,6 +689,100 @@ def trellis_ldlq(W, H, cb, Wscale=None, for_kernel=True):
 
 
 # ---------------------------------------------------------------------------
+# YAQA two-sided LDLQ (arXiv 2505.22988) — Kronecker-factored KL Hessian
+# ---------------------------------------------------------------------------
+def _antidiag_tile_order(M, N):
+    """Anti-diagonals of an M×N tile grid, in DECREASING ``d = jm + jn``.
+
+    Two-sided feedback for tile ``(jm, jn)`` reads the residual at rows ``>= jm`` and
+    columns ``>= jn``; every such tile has ``d' >= d``, so walking ``d`` downwards makes
+    each dependency already-quantized. Tiles sharing a ``d`` are mutually independent
+    (larger ``jm`` forces smaller ``jn``), so one diagonal is one batched codebook call.
+
+    Returns a list of diagonals, each a list of ``(jm, jn)``.
+
+    NB: YAQA's own ``starts`` list (``lib/algo/ldlq.py:23-27``) emits ``(0, N-1)`` twice —
+    it walks the last column up and then row 0 left, and those two ranges share a corner —
+    so it re-quantizes the ``d = N-1`` diagonal. We visit each tile exactly once; the
+    duplicate is redundant work whose second pass would silently use different feedback.
+    """
+    out = []
+    for d in range(M + N - 2, -1, -1):
+        lo, hi = max(0, d - (N - 1)), min(M - 1, d)
+        out.append([(jm, d - jm) for jm in range(lo, hi + 1)])
+    return out
+
+
+def trellis_ldlq_2hess(W, Hin, Hout, cb, Wscale=None, for_kernel=True):
+    """YAQA two-sided LDLQ with the trellis codebook.
+
+    Classic LDLQ feeds quantization error back along the input axis only. YAQA approximates
+    the full-model KL Hessian as a Kronecker product, yielding an input factor ``Lin`` (n×n)
+    and an output factor ``Lout`` (m×m), so error propagates along both axes.
+
+    ``Hout=None`` reduces this to classic LDLQ and is **bit-identical** to
+    :func:`trellis_ldlq` — the feedback values are the same, only the tile *grouping*
+    differs, and the codebook quantizes each 256-element tile independently.
+
+    Same returns as :func:`trellis_ldlq`: ``(hatWr (m,n), Qidxs (m, n//V), Wscale)``.
+
+    Slice convention follows GLQ's one-sided path: feedback reads from the *next* block
+    onward, which is why the diagonal-zeroing YAQA applies (``finetune.py:176,187``) is a
+    no-op here — block_LDL's diagonal block is identity.
+    """
+    dev = cb.device
+    W = W.float().to(dev)
+    Hin = Hin.float().to(dev)
+    m, n = W.shape
+    b = TD
+    assert n % b == 0 and m % b == 0, f"trellis needs m,n %16 (got {m}x{n})"
+    perm, inv_perm = _PERMUTE.to(dev), _INV_PERMUTE.to(dev)
+
+    damp = 0.01 * torch.diag(Hin).mean()
+    Lin, _ = block_LDL(Hin + damp * torch.eye(n, device=dev), block_size=b)
+
+    Lout = None
+    if Hout is not None:
+        Hout = Hout.float().to(dev)
+        damp_o = 0.01 * torch.diag(Hout).mean()
+        Lout, _ = block_LDL(Hout + damp_o * torch.eye(m, device=dev), block_size=b)
+
+    if Wscale is None:
+        Wscale = W.pow(2).mean().sqrt().item() * cb.opt_scale
+    Wr = W / Wscale
+    hatWr = torch.zeros_like(Wr)
+    Qidxs = torch.zeros(m, n // cb.V, dtype=torch.int32, device=dev)
+
+    for diag in _antidiag_tile_order(m // b, n // b):
+        targets = []
+        for jm, jn in diag:
+            r0, r1, c0, c1 = jm * b, (jm + 1) * b, jn * b, (jn + 1) * b
+            t = Wr[r0:r1, c0:c1].clone()
+            if c1 < n:                                   # input-side (classic LDLQ)
+                t = t + (Wr[r0:r1, c1:] - hatWr[r0:r1, c1:]) @ Lin[c1:, c0:c1]
+            if Lout is not None and r1 < m:
+                LoT = Lout[r1:, r0:r1].T
+                t = t + LoT @ (Wr[r1:, c0:c1] - hatWr[r1:, c0:c1])   # output-side
+                if c1 < n:                                            # cross term
+                    t = t + LoT @ (Wr[r1:, c1:] - hatWr[r1:, c1:]) @ Lin[c1:, c0:c1]
+            targets.append(t)
+
+        tiles = torch.stack(targets, dim=0).reshape(-1, b * b)
+        if for_kernel:
+            tiles = tiles[:, perm]
+        hatX, state = cb.quantize_tiles(tiles)
+        if for_kernel:
+            hatX = hatX[:, inv_perm]
+        hatX = hatX.reshape(-1, b, b)
+        state = state.reshape(-1, b, b // cb.V)
+        for j, (jm, jn) in enumerate(diag):
+            hatWr[jm * b:(jm + 1) * b, jn * b:(jn + 1) * b] = hatX[j].to(hatWr.dtype)
+            Qidxs[jm * b:(jm + 1) * b,
+                  (b // cb.V) * jn:(b // cb.V) * (jn + 1)] = state[j]
+    return hatWr, Qidxs, Wscale
+
+
+# ---------------------------------------------------------------------------
 # Trellis RVQ (stacked 5-8 bpw): recipe, N-stage LDLQ, N-stage decode
 # ---------------------------------------------------------------------------
 def trellis_rvq_recipe(bpw):
