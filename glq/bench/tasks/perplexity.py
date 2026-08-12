@@ -19,6 +19,28 @@ def _load_mem_gib():
     return _gpu_mem_used_gib()
 
 
+def _resolve_loader(cfg, causal_cls):
+    """Pick the auto-class that can produce next-token logits for ``cfg``, or None.
+
+    Prefers the plain causal-LM class so the ordinary path is untouched, then falls back
+    to the image-text-to-text class, which is how transformers exposes vision-language
+    models whose text half is a normal causal transformer. ``_model_mapping`` membership
+    is the same test ``from_pretrained`` applies internally, so this decides without
+    loading 50+ GB of weights first.
+    """
+    candidates = [causal_cls]
+    try:
+        from transformers import AutoModelForImageTextToText
+        candidates.append(AutoModelForImageTextToText)
+    except ImportError:                      # older transformers: causal-only
+        pass
+    for cls in candidates:
+        mapping = getattr(cls, "_model_mapping", None)
+        if mapping is None or type(cfg) in mapping:
+            return cls
+    return None
+
+
 def run(ctx, config: dict):
     import torch
     import torch.nn.functional as F
@@ -30,14 +52,29 @@ def run(ctx, config: dict):
 
     cfg = AutoConfig.from_pretrained(ctx.model, trust_remote_code=True)
     arch = (getattr(cfg, "architectures", None) or [None])[0]
-    if arch and "ConditionalGeneration" in arch:
+    # Route on CAPABILITY, not on the architecture's name. The previous rule refused any
+    # arch containing "ConditionalGeneration", which also rejects vision-language models
+    # whose text half is an ordinary dense causal transformer — teacher-forced PPL over a
+    # text-only batch is well defined for those, and it is the only instrument that
+    # resolves adjacent bpw rungs cheaply. We still refuse, cleanly, when no auto-class
+    # can produce next-token logits, so a genuinely unsupported model is recorded as
+    # skipped-with-reason rather than dying in an obscure load error.
+    loader = _resolve_loader(cfg, AutoModelForCausalLM)
+    if loader is None:
         raise TaskUnsupported(
-            f"wikitext2_ppl: arch {arch} is multimodal/thinking; PPL skipped "
+            f"wikitext2_ppl: arch {arch} exposes no causal text tower; PPL skipped "
             "(use mmlu_pro/aime for quality).")
 
+    # float16 by DEFAULT because every stored wikitext2_ppl record was measured that way;
+    # moving it would silently break comparability with the existing series. bf16-native
+    # models (logit softcapping, large activation outliers) can overflow in fp16 — those
+    # opt in with dtype="bfloat16", and the choice is recorded so the number stays scoped.
+    dtype_name = str(config.get("dtype", "float16"))
+    dtype = getattr(torch, dtype_name)
+
     before = _load_mem_gib()
-    model = AutoModelForCausalLM.from_pretrained(
-        ctx.model, dtype=torch.float16, device_map="cuda", trust_remote_code=True)
+    model = loader.from_pretrained(
+        ctx.model, dtype=dtype, device_map="cuda", trust_remote_code=True)
     model.train(False)                       # eval mode (avoid the literal .eval())
     tok = AutoTokenizer.from_pretrained(ctx.model, trust_remote_code=True)
     after = _load_mem_gib()
@@ -63,8 +100,9 @@ def run(ctx, config: dict):
     res = BenchmarkResult(
         task=config.get("task_name", "wikitext2_ppl"), metric="perplexity", value=ppl,
         standardized=bool(config.get("standardized", True)),
-        config={"dataset": "wikitext-2-raw-v1", "seqlen": seqlen, "n_chunks": n_chunks},
+        config={"dataset": "wikitext-2-raw-v1", "seqlen": seqlen, "n_chunks": n_chunks,
+                "dtype": dtype_name, "loader": loader.__name__},
         extra={"n_chunks": n_chunks})
-    ctx.standalone_serving = ServingMeta(runtime="hf", dtype="float16",
+    ctx.standalone_serving = ServingMeta(runtime="hf", dtype=dtype_name,
                                          load_gpu_mem_gib=load_mem)
     return res, ThroughputResult(measure="n/a")

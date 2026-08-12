@@ -25,29 +25,64 @@ def _latest(records: list[BenchRecord], key) -> dict:
 
 
 def model_perf(records: list[BenchRecord]) -> dict[str, dict]:
-    """Per-model efficiency + identity: quant, bpw, base, VRAM-at-load, tok/s."""
+    """Per-model efficiency + identity: quant, bpw, base, VRAM-at-load, tok/s, GPU.
+
+    tok/s and VRAM are GPU-specific and NOT by a constant factor — GLQ 4 bpw is 1.9x bf16
+    single-stream on an L4 and at parity on an RTX PRO 6000. So each is reported with the
+    GPU it came from, and ``gpu_mixed`` marks a model whose records span several GPUs
+    (where taking the max would quietly advertise the fastest card).
+    """
     out: dict[str, dict] = {}
     for r in records:
         e = out.setdefault(r.model.id, {
             "quant": r.model.quant_method, "bpw": r.model.bpw,
-            "base": r.model.base_model, "vram": None, "toks": None})
+            "base": r.model.base_model, "vram": None, "toks": None,
+            "vram_gpu": None, "toks_gpu": None, "gpus": set(), "gpu_mixed": False})
+        gpu = r.hardware.gpu_model if r.hardware else None
+        if gpu:
+            e["gpus"].add(gpu)
         if e["vram"] is None and r.serving and r.serving.load_gpu_mem_gib is not None:
             e["vram"] = r.serving.load_gpu_mem_gib
+            e["vram_gpu"] = gpu
         # prefer the dedicated throughput task; else the best in-run decode tok/s
         tps = r.throughput.output_tok_s if r.throughput else None
         if r.benchmark.task == "throughput" and r.benchmark.value is not None:
-            e["toks"] = r.benchmark.value
+            e["toks"], e["toks_gpu"] = r.benchmark.value, gpu
         elif tps is not None and (e["toks"] is None or e.get("_from") != "bench"):
-            e["toks"] = tps if e["toks"] is None else max(e["toks"], tps)
+            if e["toks"] is None or tps > e["toks"]:
+                e["toks"], e["toks_gpu"] = tps, gpu
         if r.benchmark.task == "throughput":
             e["_from"] = "bench"
     for e in out.values():
         e.pop("_from", None)
+        e["gpu_mixed"] = len(e["gpus"]) > 1
+        e["gpu"] = sorted(e["gpus"])[0] if len(e["gpus"]) == 1 else (
+            " / ".join(sorted(e["gpus"])) if e["gpus"] else None)
     return out
 
 
 def _pct(x: float | None) -> str:
     return "" if x is None else f"{x * 100:.1f}%"
+
+
+def _raw_and_retention(cell: dict) -> str:
+    """``93.3 (103.7%)`` — the score first, its ratio to bf16 in parentheses.
+
+    Retention alone is unreadable and flatters small gaps: 103.7% on aime_2026 was one
+    question at n=30. Showing the raw score lets the reader see that for themselves.
+    """
+    val, ret = cell.get("value"), cell.get("retention")
+    if val is None:
+        return _pct(ret)
+    # accuracy-style metrics are stored as fractions; perplexity etc. are absolute.
+    shown = f"{val * 100:.1f}" if 0.0 <= val <= 1.0 else f"{val:.4g}"
+    out = shown if ret is None else f"{shown} ({_pct(ret)})"
+    # One sample per problem has variance that swamps any quantization delta — the same
+    # checkpoint has reproduced at 43.3% and 41.7%. Mark those so they are not read as
+    # equals of an avg@8 cell; records too old to say leave avg_k None and get the mark too.
+    if (cell.get("avg_k") or 1) < 2:
+        out += " †"
+    return out
 
 
 def index_table(records: list[BenchRecord], *, weights: dict | None = None,
@@ -58,21 +93,42 @@ def index_table(records: list[BenchRecord], *, weights: dict | None = None,
     tasks = sorted({t for e in idx.values() for t in e["per_task"]})
 
     headers = (["Model", "Method", "bpw"] + tasks
-               + ["Index", "n", "VRAM(GiB)", "tok/s"])
+               + ["Index", "n", "VRAM(GiB)", "tok/s", "GPU"])
     ranked = sorted(idx.items(),
                     key=lambda kv: (kv[1].get("index") is None, -(kv[1].get("index") or 0)))
     rows = []
+    mixed = []
+    single_sample = False
     for model_id, e in ranked:
         p = perf.get(model_id, {})
         row = [model_id, p.get("quant") or "", p.get("bpw") if p.get("bpw") is not None else ""]
         for t in tasks:
-            row.append(_pct(e["per_task"].get(t, {}).get("retention")))
+            cell = e["per_task"].get(t, {})
+            if cell and (cell.get("avg_k") or 1) < 2:
+                single_sample = True
+            row.append(_raw_and_retention(cell))
+        gpu = p.get("gpu") or ""
+        if p.get("gpu_mixed"):
+            mixed.append((model_id, p.get("toks_gpu")))
         row += [_pct(e.get("index")), e.get("n_tasks", 0),
                 p.get("vram") if p.get("vram") is not None else "",
-                p.get("toks") if p.get("toks") is not None else ""]
+                p.get("toks") if p.get("toks") is not None else "",
+                gpu]
         rows.append(row)
 
-    out = ["# Quality index (% of bf16 baseline)", "", _md_table(headers, rows)]
+    out = ["# Quality index (% of bf16 baseline)", "",
+           "Quality cells are `raw (% of bf16)`. Quality is GPU-independent; **VRAM and "
+           "tok/s are not** — read them only against the GPU named in the last column.", "",
+           _md_table(headers, rows)]
+    if single_sample:
+        out += ["", "† **one sample per problem** (avg@1, or a record predating `avg_k` "
+                "capture). At n=30 that variance swamps any quantization delta — the same "
+                "checkpoint has reproduced at 43.3% and 41.7% on identical settings. Treat "
+                "these as indicative only; avg@8 is required before a cell is comparable."]
+    if mixed:
+        out += ["", "_Records span several GPUs; the tok/s shown is the fastest single "
+                "measurement, from:_"]
+        out += [f"- {m}: {g or 'unknown GPU'}" for m, g in sorted(mixed)]
     missing = {m: e["missing_baselines"] for m, e in idx.items() if e["missing_baselines"]}
     if missing:
         out += ["", "_Missing bf16 baseline (excluded from index):_"]
@@ -120,7 +176,7 @@ def compare_table(records: list[BenchRecord], *, models: list[str],
     if tasks is None:
         tasks = sorted({t for (_m, t) in latest})
     perf = model_perf(records)
-    headers = ["Model", "Method", "bpw"] + tasks + ["VRAM(GiB)", "tok/s"]
+    headers = ["Model", "Method", "bpw"] + tasks + ["VRAM(GiB)", "tok/s", "GPU"]
     rows = []
     for m in models:
         p = perf.get(m, {})
@@ -134,7 +190,8 @@ def compare_table(records: list[BenchRecord], *, models: list[str],
             else:
                 row.append(f"{r.benchmark.value:.4g}")
         row += [p.get("vram") if p.get("vram") is not None else "",
-                p.get("toks") if p.get("toks") is not None else ""]
+                p.get("toks") if p.get("toks") is not None else "",
+                p.get("gpu") or ""]
         rows.append(row)
     return _md_table(headers, rows)
 
@@ -152,9 +209,13 @@ def leaderboard(records: list[BenchRecord], *, weights: dict | None = None,
     else:
         head.append(f"_Auto-generated by `glq-bench` from {len(records)} records "
                     f"({n_models} models, {n_bases} base families)._")
-    head += ["", "Quality is reported as **% of the bf16 baseline of the same base "
-             "model**; tok/s and VRAM-at-load are shown beside it (GPU-dependent, not "
-             "folded into the index). `n` = number of standardized tasks averaged.", ""]
+    head += ["", "Quality cells in the index are **`raw score (% of that base model's "
+             "bf16)`** — the ratio alone flatters small gaps, so the raw number is shown "
+             "with it. `n` = number of standardized tasks averaged. **tok/s and "
+             "VRAM-at-load are GPU-specific** and are not folded into the index; each row "
+             "names the GPU it was measured on, and figures from different GPUs are not "
+             "comparable (GLQ 4 bpw is ~1.9x bf16 single-stream on an L4 and at parity on "
+             "an RTX PRO 6000).", ""]
 
     parts = ["\n".join(head), index_table(records, weights=weights)]
 

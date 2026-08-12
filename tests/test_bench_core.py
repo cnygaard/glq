@@ -6,6 +6,7 @@ No torch / vllm / GPU required — covers record (de)serialization, the
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -196,3 +197,37 @@ def test_provenance_env_and_hardware_do_not_raise():
     assert env.python and env.python.count(".") == 2     # always available
     hw = provenance.hardware_snapshot()
     assert isinstance(hw, HardwareMeta)                  # gpu fields may be None on CPU
+
+
+def test_provenance_captures_glq_env(monkeypatch):
+    """GLQ_* env vars change what was measured, so a record must carry them.
+
+    Without this, two decode_sweep runs of the SAME model on the SAME GPU — one with the
+    E8 KV cache on, one off — serialize identically apart from the number itself, and the
+    durable store ends up with two contradictory tok/s values and no way to tell them
+    apart. That is worse than having no record at all.
+    """
+    monkeypatch.setenv("GLQ_KV_QUANT", "e8_relaxed:2")
+    monkeypatch.setenv("GLQ_TRELLIS_VARIANT", "3inst")
+    monkeypatch.setenv("NOT_A_GLQ_VAR", "ignored")
+    env = provenance.env_snapshot()
+    assert env.glq_env == {"GLQ_KV_QUANT": "e8_relaxed:2",
+                           "GLQ_TRELLIS_VARIANT": "3inst"}
+
+
+def test_provenance_glq_env_is_none_when_unset(monkeypatch):
+    """Absent GLQ_* env must serialize as None, not {} — so pre-existing records (which
+    have no such key) and a clean run stay byte-comparable."""
+    for k in list(os.environ):
+        if k.startswith("GLQ_"):
+            monkeypatch.delenv(k)
+    assert provenance.env_snapshot().glq_env is None
+
+
+def test_provenance_glq_env_redacts_secrets(monkeypatch):
+    """Records are pushed to a PUBLIC repo, so never carry a credential-shaped value."""
+    monkeypatch.setenv("GLQ_KV_QUANT", "e8_relaxed:2")
+    monkeypatch.setenv("GLQ_HF_TOKEN", "hf_realsecret")
+    env = provenance.env_snapshot()
+    assert env.glq_env["GLQ_KV_QUANT"] == "e8_relaxed:2"
+    assert env.glq_env["GLQ_HF_TOKEN"] == "<redacted>"
