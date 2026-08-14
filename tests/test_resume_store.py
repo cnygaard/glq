@@ -27,6 +27,11 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Shards are safetensors files, and safetensors lives in the `quantize` extra — CI installs
+# only torch + glq[hub], so skip rather than fail. resume.py imports it lazily, so the
+# module below still imports fine; every test here writes a shard, so skip the whole file.
+pytest.importorskip("safetensors")  # noqa: E402
+
 from glq import resume as R  # noqa: E402
 
 
