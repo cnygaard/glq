@@ -31,6 +31,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from glq.bench.tasks import perplexity as P  # noqa: E402
 
+# CI installs torch + glq[hub] only, so skip the module rather than fail collection.
+transformers = pytest.importorskip("transformers")  # noqa: E402
+
 # run() does `import glq.hf_integration`, which needs the REAL transformers package
 # (transformers.quantizers.auto). Import it here, before any fixture swaps a fake
 # module into sys.modules, so the later import is a cached no-op.

@@ -26,6 +26,9 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# CI installs torch + glq[hub] only; quantize_model imports transformers.
+pytest.importorskip("transformers")  # noqa: E402
+
 from glq import quantize_model as QM  # noqa: E402
 
 
