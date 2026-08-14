@@ -84,12 +84,18 @@ def compute_index(records: list[BenchRecord], *,
         if ret is None:
             entry["missing_baselines"].append(task)
             continue
+        cfg = rec.benchmark.config or {}
         entry["per_task"][task] = {
             "value": rec.benchmark.value,
             "baseline": b.benchmark.value,
             "retention": ret,
             "weight": float(weights.get(task, 1.0)),
             "metric": metric,
+            # Sample size and samples-per-problem decide whether a gap is signal at all.
+            # Records written before these were captured leave them None, which the
+            # report renders as an explicit warning rather than passing over in silence.
+            "n": cfg.get("n"),
+            "avg_k": cfg.get("avg_k"),
         }
 
     for model_id, entry in out.items():

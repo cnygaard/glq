@@ -16,6 +16,7 @@ import argparse
 import gc
 import json
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
@@ -201,6 +202,31 @@ _MODEL_PROFILES = {
         'trust_remote_code': False,
         'forward_kwargs': 'gemma4',
     },
+    'MuseGlimmerForConditionalGeneration': {
+        # Muse-Glimmer-30B (model_type `muse_glimmer`): a vision+text multimodal
+        # wrapper around a DENSE causal decoder, same module layout as the
+        # Gemma-4 entries above (decoder at model.language_model.*). 52 layers,
+        # hidden 6656 / intermediate 19968 — non-power-of-2, which is exactly
+        # where trellis beats e8p (e8p's pow2 padding inflated the 31B by 2.1x).
+        # Every linear is 16-divisible on both axes, so the 16x16 trellis tiles fit.
+        #
+        # sd_prefix MUST be the language_model path: `model.layers.*` (the default)
+        # matches ZERO tensors here, and _load_layer_state would then find nothing
+        # per layer — an empty quantize rather than a clean error. The vision tower
+        # is 806 of 1436 tensors and stays bf16; the streaming branch already skips
+        # it by keying on "language_model".
+        #
+        # Note self_attn.gate_proj (4096x6656, one per layer) — an extra attention
+        # gating projection not present in the gemma-4 blocks. It is an ordinary
+        # nn.Linear so the quantizer picks it up, but serving must map it too.
+        'layers_attr': 'model.language_model.layers',
+        'embed_attr': 'model.language_model.embed_tokens',
+        'rotary_attr': 'model.language_model.rotary_emb',
+        'sd_prefix': 'model.language_model.layers',
+        'trust_remote_code': False,     # repo ships no auto_map, and policy forbids it
+        'forward_kwargs': 'default',
+        'multimodal_text': True,
+    },
     'SarvamMoEForCausalLM': {
         # sarvam-30b (model_type `sarvam_moe`, trust_remote_code): a dense-text
         # MoE. Standard `model.layers.*` layout; embeddings at
@@ -244,6 +270,59 @@ def _detect_profile(config):
     """Detect model profile from config architecture."""
     arch = (config.architectures or [""])[0] if hasattr(config, 'architectures') else ""
     return _MODEL_PROFILES.get(arch, _DEFAULT_PROFILE)
+
+
+def _is_multimodal_text(arch, profile=None):
+    """True when the decoder to quantize is nested under a multimodal wrapper.
+
+    Such checkpoints also carry vision/audio tower stacks with their own ``.layers.0.*``
+    keys, so the streaming branch must derive ``sd_prefix`` from a key containing
+    "language_model" instead of matching a bare ``.layers.0.``. Mistral3 and Gemma-4 were
+    detected by substring; new archs opt in with ``'multimodal_text': True`` in their
+    profile so the check stays declarative rather than accreting name patterns.
+    """
+    if profile and profile.get('multimodal_text'):
+        return True
+    if "Mistral3" in arch:
+        return True
+    return "Gemma4" in arch and "ForConditionalGeneration" in arch
+
+
+def _text_config(cfg, is_multimodal):
+    """The config describing the TEXT decoder — the wrapper itself if not multimodal.
+
+    Rotary classes read ``max_position_embeddings`` / ``rope_theta``, which on a
+    multimodal wrapper live on ``cfg.text_config``, not the top level — passing the
+    wrapper raises AttributeError *after* layer discovery has already succeeded. The
+    gemma-4 branch has always used ``cfg.text_config`` explicitly; this is the same rule
+    for the generic path. Falls back to the wrapper if there is no text_config.
+    """
+    if is_multimodal:
+        return getattr(cfg, 'text_config', None) or cfg
+    return cfg
+
+
+def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None):
+    """Instantiate a model from config, falling back to the multimodal auto-class.
+
+    ``AutoModelForCausalLM.from_config`` raises ValueError for a multimodal wrapper
+    (e.g. MuseGlimmerConfig), which killed the whole quantize run in ~2s. Vision-language
+    models whose text half is an ordinary causal transformer load fine through
+    ``AutoModelForImageTextToText``; the caller then descends to the text tower. If
+    neither class accepts the config the original error propagates — an arch nothing can
+    build must fail loudly, not yield a silently empty model.
+    """
+    from transformers import AutoModelForCausalLM
+    try:
+        return AutoModelForCausalLM.from_config(
+            cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+    except ValueError:
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:
+            raise
+        return AutoModelForImageTextToText.from_config(
+            cfg, trust_remote_code=trust_remote_code, dtype=dtype)
 
 
 def _resolve_attr(obj, dotted_path):
@@ -784,6 +863,9 @@ def quantize(
     workers: int = 0,
     codebook_size: int = None,
     codebook_type: str = "e8_shell",
+    resume: bool = False,
+    resume_bucket: str = None,
+    resume_prefix: str = None,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -912,6 +994,10 @@ def quantize(
     # only. Both share the same module layout; the only differences the
     # streaming path cares about are the model + rotary class names.
     is_gemma4 = "Gemma4" in arch and "ForConditionalGeneration" in arch
+    # Any multimodal wrapper whose decoder sits under model.language_model. Mistral3 and
+    # Gemma-4 keep their bespoke meta-instantiation branches below (they name the class
+    # directly); newer archs opt in via the profile and take the generic path.
+    is_mm_text = _is_multimodal_text(arch, profile)
     is_gemma4_unified = "Gemma4Unified" in arch
 
     if streaming:
@@ -938,7 +1024,7 @@ def quantize(
             sd_prefix = "model.language_model.layers"
         else:
             with torch.device("meta"):
-                _model = AutoModelForCausalLM.from_config(
+                _model = _meta_model_from_config(
                     cfg, trust_remote_code=trust_remote_code, dtype=dtype)
             if profile.get('layers_attr'):
                 _layers = _resolve_attr(_model, profile['layers_attr'])
@@ -1044,7 +1130,7 @@ def quantize(
         # ``language_model.model.*``; >=5.10 (and gemma4) use
         # ``model.language_model.*``. Deriving embed_key + sd_prefix from the
         # actual keys keeps streaming robust across both layouts.
-        if is_mistral3 or is_gemma4:
+        if is_mm_text:
             _ek = next((k for k in weight_map
                         if k.endswith("embed_tokens.weight")
                         and "vision" not in k and "per_layer" not in k), None)
@@ -1099,7 +1185,7 @@ def quantize(
             # from the class captured during meta discovery, so the calibration
             # forward can pass position_embeddings to attentions that require them
             # (sarvam attention hard-unpacks `cos, sin = position_embeddings`).
-            rotary_emb = _rotary_cls(config=cfg)
+            rotary_emb = _rotary_cls(config=_text_config(cfg, is_mm_text))
             if use_gpu:
                 rotary_emb.to(device)
     else:
@@ -1223,9 +1309,37 @@ def quantize(
         if use_gpu:
             torch.cuda.empty_cache()
 
+    # ---- resume store ------------------------------------------------------
+    # Checkpoint each layer as it completes so a spot reclaim costs one layer, not the
+    # whole run. run_key covers everything that changes the output, so a manifest from a
+    # different config is refused rather than silently blended into this checkpoint.
+    resume_store = None
+    if resume:
+        from . import resume as _resume
+        from . import __version__ as _glq_version
+        run_key = _resume.compute_run_key(
+            model=model_name, codebook=codebook_type, bpw=bpw, nsamples=nsamples,
+            seqlen=seqlen, variant=os.environ.get("GLQ_TRELLIS_VARIANT", ""),
+            sd_prefix=sd_prefix, version=_glq_version,
+            bpw_map=bpw_map if isinstance(bpw_map, dict) else None)
+        resume_store = _resume.ResumeStore(
+            local_dir=os.path.join(output_dir, "_resume"), run_key=run_key,
+            bucket=resume_bucket or os.environ.get("GLQ_RESUME_BUCKET") or None,
+            prefix=resume_prefix or f"{os.path.basename(output_dir)}/{run_key}")
+        _done = resume_store.completed_layers()
+        _start = resume_store.next_layer()
+        print(f"  resume: {len(_done)} layer(s) checkpointed, replaying to layer {_start}"
+              if _done else "  resume: no prior checkpoint, starting fresh")
+
     all_artifacts = {}  # layer_name -> {Qidxs, SU, SV, Wscale}
     all_sqnr = []
     all_proxy_losses = {}  # layer_prefix -> proxy_loss (for sensitivity profiling)
+    # layer_prefix -> full per-matrix metrics. Previously only avg SQNR survived a run
+    # (quantize_config.json) and proxy_loss was kept in memory purely to drive mixed-bpw
+    # allocation — so "which layers does 2 bpw actually hurt?" could not be answered
+    # afterwards without re-quantizing. Written to layer_metrics.json; costs a few KB and
+    # does not touch any weight tensor, so checkpoints stay byte-identical.
+    all_layer_metrics = {}
     # Gemma-4 MoE: original stacked expert tensors (experts.gate_up_proj /
     # experts.down_proj) are replaced by per-expert GLQ artifacts, so they must
     # NOT be re-streamed verbatim into the saved checkpoint (would double size +
@@ -1248,14 +1362,50 @@ def quantize(
         )
         print(f"  Using {n_workers} parallel workers for CPU quantization")
 
+    def _forward_calibration(layer, hidden_states, layer_idx):
+        """Push the calibration batch through ``layer`` and return the new activations.
+
+        Defined once and used by BOTH the main loop and resume-replay. Two copies would
+        drift, and the symptom would be a resumed run quantizing later layers against
+        subtly different activations — with nothing raising. Also repopulates
+        ``shared_kv_cache`` for Gemma-4 producer layers, which is why replay gets that
+        state back for free.
+        """
+        new_hidden = []
+        is_producer = (shared_kv_cache is not None
+                       and layer_idx in producer_layer_indices)
+        if is_producer and layer_idx not in shared_kv_cache:
+            shared_kv_cache[layer_idx] = []
+        with torch.no_grad():
+            for i in range(hidden_states.shape[0]):
+                h = hidden_states[i:i+1]
+                kwargs = _build_forward_kwargs(
+                    profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg,
+                    per_layer_inputs=per_layer_inputs, sample_idx=i,
+                    shared_kv_cache=shared_kv_cache)
+                out = layer(h, **kwargs)
+                new_hidden.append(out[0] if isinstance(out, tuple) else out)
+                # Capture K/V from a producer layer's post-quantization forward.
+                # transformers >=5.10 Gemma4TextAttention writes
+                # ``shared_kv_states[self.layer_type] = (K, V)`` for non-reader layers
+                # (store_full_length_kv), so the dict we passed in now holds that entry.
+                # Move to CPU to bound GPU memory.
+                if is_producer:
+                    producer_type = cfg.text_config.layer_types[layer_idx]
+                    if producer_type in kwargs['shared_kv_states']:
+                        K, V = kwargs['shared_kv_states'][producer_type]
+                        shared_kv_cache[layer_idx].append((K.cpu(), V.cpu()))
+        return torch.cat(new_hidden, dim=0)
+
     for layer_idx in range(n_layers):
         t_layer = time.perf_counter()
         print(f"\n--- Layer {layer_idx}/{n_layers-1} ---")
+        _prefixes_before = set(all_artifacts)
 
         if streaming:
             layer_state = _load_layer_state(
                 weight_map, shard_paths, layer_idx, sd_prefix)
-            layer_cfg = cfg.text_config if (is_mistral3 or is_gemma4) else cfg
+            layer_cfg = _text_config(cfg, is_mm_text)
             layer = BlockClass(layer_cfg, layer_idx)
             layer.load_state_dict(layer_state, strict=False)
             del layer_state
@@ -1266,6 +1416,43 @@ def quantize(
             layer = decoder_layers[layer_idx]
             if use_gpu:
                 layer.to(device)
+
+        # ---- resume replay -------------------------------------------------
+        # This layer was quantized by an earlier run. Restore its artifacts, put the
+        # DEQUANTIZED weights back, and advance hidden_states with the same forward the
+        # main loop uses. The forward is not optional: layer N's Hessians come from
+        # activations that passed through quantized layers 0..N-1, so skipping it would
+        # calibrate every remaining layer against a distribution the finished checkpoint
+        # never produces — silently, with no error anywhere.
+        if resume_store is not None and layer_idx in _done:
+            from .resume import dequantize_artifacts
+            arts_map, metrics_map, losses_map = resume_store.load_layer(layer_idx)
+            all_artifacts.update(arts_map)
+            all_layer_metrics.update(metrics_map)
+            all_proxy_losses.update(losses_map)
+            n_restored = 0
+            for name, mod in layer.named_modules():
+                if not isinstance(mod, nn.Linear):
+                    continue
+                arts = arts_map.get(f"{sd_prefix}.{layer_idx}.{name}")
+                if arts is None:
+                    continue                    # e.g. a whitelisted bf16-only linear
+                W_hat = dequantize_artifacts(
+                    arts, mod.in_features, mod.out_features, codebook_type,
+                    codebook=codebook)
+                mod.weight.data = W_hat.to(mod.weight.dtype).to(mod.weight.device)
+                n_restored += 1
+            hidden_states = _forward_calibration(layer, hidden_states, layer_idx)
+            print(f"  replayed from checkpoint ({n_restored} matrices restored) "
+                  f"{time.perf_counter() - t_layer:.1f}s")
+            if streaming:
+                del layer
+            elif use_gpu:
+                layer.to("cpu")
+            gc.collect()
+            if use_gpu:
+                torch.cuda.empty_cache()
+            continue
 
         # Collect linear sublayers
         linears = {}
@@ -1603,6 +1790,15 @@ def quantize(
                 _writeback(name, W_hat)
                 all_sqnr.append(metrics['sqnr'])
                 all_proxy_losses[layer_prefix] = metrics['proxy_loss']
+                rec = {k: (round(float(v), 6) if isinstance(v, (int, float)) else v)
+                       for k, v in metrics.items()}
+                # MoE expert call sites (:1676, :1701) pass names that are not in
+                # `linears`; a KeyError here would kill a 40-minute quantize run for the
+                # sake of a reporting field, so shape is best-effort.
+                mod = linears.get(name)
+                if mod is not None:
+                    rec['shape'] = list(mod.weight.shape)
+                all_layer_metrics[layer_prefix] = rec
 
             def _sub_bpw(name):
                 """Resolve a sublayer's target bpw (same logic as _quantize_one)."""
@@ -1697,33 +1893,8 @@ def quantize(
 
         del hessians
 
-        # Forward calibration through quantized layer
-        new_hidden = []
-        # Initialize this layer's slot in the cache if it's a Gemma-4 producer.
-        is_producer = (shared_kv_cache is not None
-                       and layer_idx in producer_layer_indices)
-        if is_producer and layer_idx not in shared_kv_cache:
-            shared_kv_cache[layer_idx] = []
-        with torch.no_grad():
-            for i in range(hidden_states.shape[0]):
-                h = hidden_states[i:i+1]
-                kwargs = _build_forward_kwargs(
-                    profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg,
-                    per_layer_inputs=per_layer_inputs, sample_idx=i,
-                    shared_kv_cache=shared_kv_cache)
-                out = layer(h, **kwargs)
-                new_hidden.append(out[0] if isinstance(out, tuple) else out)
-                # Capture K/V from a producer layer's post-quantization
-                # forward. transformers >=5.10 Gemma4TextAttention writes
-                # ``shared_kv_states[self.layer_type] = (K, V)`` for non-reader
-                # layers (store_full_length_kv), so the dict object we passed in
-                # now holds that entry. Move to CPU to bound GPU memory.
-                if is_producer:
-                    producer_type = cfg.text_config.layer_types[layer_idx]
-                    if producer_type in kwargs['shared_kv_states']:
-                        K, V = kwargs['shared_kv_states'][producer_type]
-                        shared_kv_cache[layer_idx].append((K.cpu(), V.cpu()))
-        hidden_states = torch.cat(new_hidden, dim=0)
+        # Forward calibration through quantized layer (shared with resume-replay)
+        hidden_states = _forward_calibration(layer, hidden_states, layer_idx)
 
         if streaming:
             del layer
@@ -1733,6 +1904,25 @@ def quantize(
         dt_layer = time.perf_counter() - t_layer
         elapsed = time.perf_counter() - t_start
         remaining = elapsed / (layer_idx + 1) * (n_layers - layer_idx - 1)
+        # Checkpoint this layer before moving on. Only the prefixes added by THIS
+        # iteration: _store_artifacts fans one linear out to several prefixes for fused
+        # gate/up and MoE experts, so a name-based filter would miss some.
+        if resume_store is not None:
+            _new = set(all_artifacts) - _prefixes_before
+            try:
+                resume_store.save_layer(
+                    layer_idx,
+                    {p: all_artifacts[p] for p in _new},
+                    metrics={p: all_layer_metrics[p] for p in _new
+                             if p in all_layer_metrics},
+                    proxy_losses={p: all_proxy_losses[p] for p in _new
+                                  if p in all_proxy_losses})
+            except Exception as e:
+                # A failed checkpoint must not abort a run that is otherwise fine — the
+                # layer simply stays not-done and is re-quantized on resume.
+                print(f"  WARNING: resume checkpoint for layer {layer_idx} failed: "
+                      f"{type(e).__name__}: {e}")
+
         print(f"  Layer time: {dt_layer:.0f}s  |  "
               f"Elapsed: {elapsed/60:.1f}m  |  "
               f"ETA: {remaining/60:.1f}m remaining")
@@ -2052,6 +2242,16 @@ def quantize(
     with open(os.path.join(output_dir, "quantize_config.json"), "w") as f:
         json.dump(quant_meta, f, indent=2)
 
+    # 4b. Per-layer quality breakdown (sqnr / Hessian-weighted proxy_loss / bpw / shape).
+    # The average alone hides which matrices a low bpw actually destroys — at 2 bpw the
+    # damage is very unevenly distributed, and that distribution is what decides whether
+    # mixed-bpw is worth trying. Written unconditionally: it is small and a run that
+    # didn't record it cannot be asked afterwards.
+    if all_layer_metrics:
+        with open(os.path.join(output_dir, "layer_metrics.json"), "w") as f:
+            json.dump(all_layer_metrics, f, indent=2, sort_keys=True)
+        print(f"  wrote layer_metrics.json ({len(all_layer_metrics)} matrices)")
+
     # 5a. Save processor for multimodal models (e.g. Gemma-4 needs
     # processor_config.json so vLLM/sglang can load via the gemma4_mm
     # path). AutoProcessor.from_pretrained raises for pure text models;
@@ -2126,6 +2326,18 @@ def quantize(
 # ---- CLI ----
 
 def main():
+    # Quantizing a 3B takes 30-40 min and its only progress signal is these prints. When
+    # stdout is a pipe (every box run redirects to a log) Python block-buffers at ~8 KB, so
+    # the log sits empty for many minutes and then dumps in bursts — indistinguishable from
+    # a hung job, which matters when spot boxes get reclaimed mid-run. `stdbuf -oL` does NOT
+    # fix this: it adjusts libc buffering, below Python's own layer. Line-buffering here
+    # fixes all 42 print() sites at once and works no matter how the caller invokes us.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):        # non-TextIO stdout (pytest capture etc.)
+        pass
+
     parser = argparse.ArgumentParser(description="Quantize a model with GLQ")
     parser.add_argument("--model", type=str, required=True,
                         help="HuggingFace model ID or local path")
@@ -2153,6 +2365,16 @@ def main():
                         choices=["cuda", "cpu"])
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="Allow custom model code from HF Hub")
+    parser.add_argument("-r", "--resume", action="store_true",
+                        help="Resume from per-layer checkpoints: skip layers already "
+                             "quantized, replaying the calibration forward through them. "
+                             "Refuses a checkpoint written with different settings.")
+    parser.add_argument("--resume-bucket", type=str, default=None,
+                        help="Private S3 bucket for per-layer checkpoints (default "
+                             "$GLQ_RESUME_BUCKET). Credentials come from the instance "
+                             "profile; never pass a key here. Omit for local-only.")
+    parser.add_argument("--resume-prefix", type=str, default=None,
+                        help="Key prefix within the bucket (default <output>/<run_key>).")
     parser.add_argument("--streaming", action="store_true",
                         help="Load weights layer-by-layer from safetensors "
                              "(for models exceeding system RAM)")
@@ -2198,6 +2420,9 @@ def main():
         workers=args.workers,
         codebook_size=args.codebook_size,
         codebook_type=args.codebook,
+        resume=args.resume,
+        resume_bucket=args.resume_bucket,
+        resume_prefix=args.resume_prefix,
     )
 
 

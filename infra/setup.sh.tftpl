@@ -45,14 +45,28 @@ source $VENV/bin/activate
 
 # Core deps. vLLM 0.19.0 pins torch==2.10.0 but NemotronH's custom cpp
 # extensions want torch >= 2.11, so we pin 2.11 and accept vllm-version drift.
-# Must match the host CUDA — the DLAMI ships cuda-12.9, so we use the cu128
-# wheel index (forward-compat within 12.x). Without +cu128 / --index-url pip
-# pulls the default cu130 wheel, which then fails with a cuda-version mismatch
-# when fast_hadamard_transform / mamba-ssm / causal-conv1d try to build
-# against it with CUDA_HOME=/usr/local/cuda-12.9.
+# Must match the toolkit the source-built extensions compile against. The DLAMI
+# now ships cuda-12.8, 12.9, 13.0 AND 13.2, and the driver (595.x) is new enough
+# for CUDA 13 — so cu130 is *possible*, it is just not yet *validated* here.
+# glq JIT-builds glq_cuda against CUDA_HOME, and fast_hadamard_transform /
+# mamba-ssm / causal-conv1d build from source; none has been compiled against
+# CUDA 13, and CLAUDE.md requires quantize-path changes to stay byte-identical
+# (benchmarks/_ckpt_bytecmp.py). So we stay on the cu128 wheel index (forward-
+# compat within 12.x) and keep CUDA_HOME on a 12.x toolkit.
+#
+# Without +cu128 / --index-url, pip pulls the default cu130 wheel and every
+# source build then fails on a cuda-version mismatch. vLLM is the usual vector:
+# `pip install --upgrade vllm` AFTER this line drags in torch+cu130 and leaves
+# torchaudio on cu128, which breaks *every* transformers modeling import
+# (transformers/audio_utils.py imports torchaudio at module scope). Re-run the
+# torch pin below after any such upgrade.
+#
+# To move to CUDA 13 deliberately: bump these pins, set
+# CUDA_HOME=/usr/local/cuda-13.0, rebuild the extension, and gate on the GPU
+# suites plus a byte-identical checkpoint comparison.
 pip install -q pip --upgrade
-pip install -q vllm==0.20.2
-pip install -q 'glq[quantize]==${glq_version}' ninja wheel
+pip install -q vllm==0.27.1
+pip install -q 'glq[quantize]==0.8.2' ninja wheel
 # mamba-ssm and causal-conv1d need CUDA_HOME for building
 export CUDA_HOME=/usr/local/cuda-12.9
 unset CUDA_HOME
@@ -60,7 +74,7 @@ unset CUDA_HOME
 pip install -q torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 pip install 'fast_hadamard_transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git' --no-build-isolation
 pip install "mistral-common[hf-hub]"
-pip install 'transformers==5.7.0' 'huggingface_hub>=0.30'
+pip install 'transformers==5.15.0' 'huggingface_hub>=0.30'
 #pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
 #pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
 pip install -q lm-eval langdetect immutabledict
@@ -68,6 +82,7 @@ pip install -q pypcre
 pip install -q py-spy
 pip install -q pytest
 pip install -q ray
+pip install -q harbor
 git clone https://github.com/ggml-org/llama.cpp
 #cmake llama.cpp -B llama.cpp/build \
 #    -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
@@ -76,7 +91,8 @@ git clone https://github.com/ggml-org/llama.cpp
 pip install -q gptqmodel --no-build-isolation
 pip install -q tenacity
 pip install -q optimum  # required by HF transformers to *load* GPTQ models
-pip install -q 'https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+python -c "import glq"
+#pip install -q 'https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
 # HF cache on NVMe. Symlink ~/.cache/huggingface to the NVMe location so
 # tooling that ignores HF_HOME (non-interactive ssh, services, any subprocess
 # that doesn't inherit an interactive shell env) still lands on the fast disk.
@@ -86,6 +102,7 @@ mkdir -p ~/.cache
 rm -rf ~/.cache/huggingface
 ln -s $HF_CACHE ~/.cache/huggingface
 echo "export HF_HOME=$HF_CACHE" >> ~/.bashrc
+echo "export GLQ_RESUME_BUCKET=${resume_bucket}" >> ~/.bashrc  # glq-quantize -r
 echo "source $VENV/bin/activate" >> ~/.bashrc
 
 echo "Setup complete" > /tmp/setup-done

@@ -53,6 +53,10 @@ class EnvMeta:
     driver: str | None = None                # nvidia driver
     glq: str | None = None
     glq_git_sha: str | None = None
+    # GLQ_* environment at run time. These select kernels and the KV-cache format, so two
+    # runs of one model on one GPU can differ several-fold with nothing else to tell them
+    # apart. None (not {}) when unset, so older records stay byte-comparable.
+    glq_env: dict[str, str] | None = None
 
 
 @dataclass

@@ -67,6 +67,17 @@ TASKS: dict[str, TaskSpec] = {
         "wikitext2_ppl", "glq.bench.tasks.perplexity", metric="perplexity",
         standardized=True, kind="hf",
         defaults={"seqlen": 2048, "max_chunks": 128}),
+    # Same quantity, measured through vLLM instead of HF. Needed because some quantized
+    # formats only load in one of the two runtimes: Firworks/SmolLM3-3B-nvfp4 ships no
+    # `input_scale`, so transformers newly-initializes 252 of them and the forward dies,
+    # while vLLM serves it weight-only via Marlin. Same seqlen/max_chunks as the HF entry
+    # so the two differ ONLY by runtime.
+    # standardized=False: a different runtime's PPL must not share an index column with
+    # the HF series. Compare vLLM-PPL only against vLLM-PPL.
+    "wikitext2_ppl_vllm": TaskSpec(
+        "wikitext2_ppl_vllm", "glq.bench.tasks.perplexity_vllm", metric="perplexity",
+        standardized=False, kind="quality",
+        defaults={"seqlen": 2048, "max_chunks": 128}),
     "throughput": TaskSpec(
         "throughput", "glq.bench.tasks.throughput", metric="tokens_per_s",
         standardized=False, kind="throughput",

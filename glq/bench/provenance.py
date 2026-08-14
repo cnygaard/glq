@@ -75,6 +75,19 @@ def _glq_git_sha() -> str | None:
         return None
 
 
+# Substrings that mark a value as credential-shaped. Records are pushed to a public repo,
+# so a GLQ_* var carrying a token must never be serialized verbatim.
+_SECRETISH = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "CRED")
+
+
+def _glq_env() -> dict[str, str] | None:
+    """GLQ_* environment, redacted. None when unset so old records stay comparable."""
+    import os
+    out = {k: ("<redacted>" if any(s in k.upper() for s in _SECRETISH) else v)
+           for k, v in sorted(os.environ.items()) if k.startswith("GLQ_")}
+    return out or None
+
+
 def env_snapshot() -> EnvMeta:
     """Versions of the libraries that determine a run's behaviour."""
     import sys
@@ -90,6 +103,7 @@ def env_snapshot() -> EnvMeta:
         driver=_driver_version(),
         glq=_pkg_version("glq"),
         glq_git_sha=_glq_git_sha(),
+        glq_env=_glq_env(),
     )
 
 

@@ -100,10 +100,23 @@ def run(ctx, config: dict):
     timeout = int(config.get("timeout", 7200))
     port = int(config.get("port", 8321))
 
+    # vLLM's default gpu_memory_utilization (0.9) sizes the KV cache to fill the card AFTER
+    # weights, which leaves nothing for the warm-up lm_head logits GEMM on a small GPU. On a
+    # 22 GiB L4 a 1.8 GiB SmolLM3-3B checkpoint allocated 260,848 KV tokens (~20 GiB) and
+    # then OOMed asking for 64 MiB — the sweep reported only "terminated early", because the
+    # server's own stderr never surfaces. Expose the knob so 24-32 GB cards (the ones GLQ
+    # exists for) are benchmarkable at all; None keeps vLLM's default.
+    gpu_mem = config.get("gpu_memory_utilization")
+    serve_extra = config.get("serve_extra", "")
+
     vllm = _resolve_vllm()
     serve_flags = f"--max-model-len {max_model_len} --port {port}"
     if ctx.quant and ctx.quant not in ("none", "bf16"):
         serve_flags += f" --quantization {ctx.quant}"
+    if gpu_mem is not None:
+        serve_flags += f" --gpu-memory-utilization {float(gpu_mem)}"
+    if serve_extra:
+        serve_flags += f" {serve_extra}"
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = os.path.join(tmp, "bench_params.json")
@@ -145,6 +158,10 @@ def run(ctx, config: dict):
         config={"concurrencies": concurrencies, "num_runs": num_runs,
                 "input_len": _INPUT_LEN, "output_len": _OUTPUT_LEN, "seed": _SEED,
                 "max_model_len": max_model_len,
+                # Recorded because they change the KV-cache size, hence scheduling, hence
+                # the number: two records at different settings must not look identical.
+                "gpu_memory_utilization": gpu_mem,
+                "serve_extra": serve_extra or None,
                 "measure": "vllm_bench_sweep_serve/1000-over-mean_tpot_ms",
                 "tool": "vllm bench sweep serve"},
         extra={"rc": proc.returncode, "headline_concurrency": head_c,
