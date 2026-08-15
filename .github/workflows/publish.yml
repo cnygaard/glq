@@ -113,6 +113,13 @@ jobs:
     # Both, so a partial matrix never publishes. PyPI files are immutable: a release missing
     # cp313 cannot be repaired by re-running, only by burning a version number.
     needs: [sdist, wheels]
+    # Tags only. `workflow_dispatch` exists so the matrix can be exercised on real runners
+    # without cutting a release — and without this guard that dry run would *publish*: PyPI
+    # accepts NEW FILES for an EXISTING version, so dispatching from a branch at 0.8.5 would
+    # quietly attach binary wheels to the already-released 0.8.5, changing what users get
+    # from a version that shipped weeks earlier. Rejecting a duplicate is not the protection
+    # it looks like; the wheels are not duplicates.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
