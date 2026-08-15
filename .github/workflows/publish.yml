@@ -1,45 +1,130 @@
 name: Publish to PyPI
 
+# Do NOT rename this file. PyPI trusted publishing is bound to (repository, workflow
+# filename, environment); a new filename needs a new publisher configured on PyPI first, and
+# the release then fails at the last step with an opaque OIDC error.
+
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
 
+env:
+  # One place to bump. A compiled extension links torch's C++ ABI, so this must agree with
+  # the torch range the wheel declares in pyproject.toml.
+  GLQ_TORCH_VERSION: "2.13.0"
+  # sm_80 A100 · sm_86 3090/A10G · sm_89 4090/L4/L40S · sm_90 H100 · sm_120 5090/RTX PRO 6000.
+  # +PTX on the newest so a future arch JITs from PTX instead of failing outright.
+  TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0;12.0+PTX"
+
 jobs:
-  build:
+  sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      # No CUDA here on purpose: setup.py must degrade to a source distribution rather than
+      # fail, because that is what a user on an unsupported platform or arch installs.
+      - run: python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+  wheels:
+    runs-on: ubuntu-latest
+    strategy:
+      # One runner per CPython, all at once: the wheels are independent, so wall-clock is one
+      # wheel's build (~3 min on a 4-core runner, plus a torch download) rather than the sum
+      # of five. abi3 would collapse this to a single wheel, but it is blocked —
+      # glq_bindings.cpp is one PYBIND11_MODULE with 39 m.def()s and pybind11 has no
+      # limited-API support.
+      fail-fast: false
+      matrix:
+        python: [cp310, cp311, cp312, cp313, cp314]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install build tools
-        run: pip install build
+      - run: pip install cibuildwheel==4.2.0
 
-      - name: Build sdist and wheel
-        run: python -m build
+      - name: Build ${{ matrix.python }} wheel
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: "${{ matrix.python }}-manylinux_x86_64"
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_BEFORE_BUILD_LINUX: bash {project}/ci/cibw_before_build.sh
+          # setup.py needs torch at build time, but putting torch in
+          # build-system.requires would make every sdist build download ~2 GB even on a
+          # CPU-only box. Instead BEFORE_BUILD installs it into the build environment and
+          # the build runs without isolation, so it is actually visible.
+          CIBW_BUILD_FRONTEND: "build; args: --no-isolation"
+          # GLQ_BUILD_EXT=1 turns "no toolchain" into a hard error. A wheel that shipped
+          # without its kernels looks healthy until the first forward pass, which is the
+          # exact failure this whole route exists to remove.
+          # MAX_JOBS: GitHub standard runners are 4-core.
+          # TORCH_CUDA_ARCH_LIST must stay quoted: CIBW_ENVIRONMENT is shell-parsed, and the
+          # `;` separators otherwise read as command separators — cibuildwheel rejects the
+          # whole option with "Malformed environment option" before any build starts.
+          CIBW_ENVIRONMENT: >-
+            GLQ_BUILD_EXT=1
+            GLQ_TORCH_VERSION=${{ env.GLQ_TORCH_VERSION }}
+            TORCH_CUDA_ARCH_LIST="${{ env.TORCH_CUDA_ARCH_LIST }}"
+            MAX_JOBS=4
+          # auditwheel vendors every shared library it cannot account for. Left alone it
+          # copies libtorch (~2 GB) into each wheel, and at runtime a second torch loads
+          # alongside the user's. Exclude them: the wheel depends on torch, so they are
+          # guaranteed present.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_cuda.so
+            --exclude libtorch_python.so --exclude libc10.so --exclude libc10_cuda.so
+            --exclude libcudart.so.12 --exclude libcudart.so.13
+          # `import glq._C` needs torch in the test env — another ~2 GB per matrix entry, for
+          # a check that needs a GPU to mean anything. The artifact check below covers what
+          # can be verified here; tests/test_installer_distros.py covers "does it decode".
+          CIBW_TEST_SKIP: "*"
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - name: The wheel must contain a compiled extension
+        # Without this a green build can still ship a pure-Python wheel: setup.py skips the
+        # extension when it finds no toolchain, and GLQ_BUILD_EXT=1 is the only thing between
+        # that and a silent no-kernel release. Assert the artifact, not the intent.
+        run: |
+          set -euo pipefail
+          for whl in wheelhouse/*.whl; do
+            echo "== $whl"
+            python -m zipfile -l "$whl" | grep -E 'glq/_C\..*\.so' \
+              || { echo "no glq/_C*.so in $whl"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/
+          # Artifact names must be unique across a matrix; publish globs them back together.
+          name: dist-${{ matrix.python }}
+          path: wheelhouse/*.whl
 
   publish:
-    needs: build
+    # Both, so a partial matrix never publishes. PyPI files are immutable: a release missing
+    # cp313 cannot be repaired by re-running, only by burning a version number.
+    needs: [sdist, wheels]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
+
+      - run: ls -la dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

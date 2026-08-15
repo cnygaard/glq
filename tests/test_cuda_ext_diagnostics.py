@@ -694,3 +694,40 @@ def test_an_explicit_root_is_still_honoured_outside_a_venv(tmp_path, monkeypatch
     ik.repair_cuda_wheel_layout([str(tmp_path)])
 
     assert (root / "lib" / "libcudart.so").exists()
+
+
+# ------------------------------------------------- step 1 of the ladder: a prebuilt wheel
+#
+# The wheel ships `glq._C`, compiled in CI for every arch we support. When it is present the
+# user must never pay a JIT compile, and must never be exposed to the five ways that compile
+# fails — the whole point of shipping binaries. JIT stays as step 2 for torch/arch
+# combinations no wheel matches.
+
+def test_a_prebuilt_extension_is_used_and_nothing_is_compiled(monkeypatch):
+    import sys as sys_mod
+    import types
+    import torch.utils.cpp_extension as cpp
+
+    prebuilt = types.ModuleType("glq._C")
+    monkeypatch.setitem(sys_mod.modules, "glq._C", prebuilt)
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("JIT-compiled despite a prebuilt glq._C being importable")
+
+    monkeypatch.setattr(cpp, "load", _must_not_run)
+
+    assert ik._try_load_cuda_ext() is True
+    assert ik._glq_cuda is prebuilt
+    available, error = ik.cuda_ext_status()
+    assert available is True and error is None
+
+
+def test_the_jit_still_runs_when_there_is_no_prebuilt_extension(monkeypatch):
+    """sdist installs, unmatched torch minors and unmatched arches all land here."""
+    import sys as sys_mod
+
+    monkeypatch.setitem(sys_mod.modules, "glq._C", None)   # import raises ImportError
+    sentinel = _make_build_succeed(monkeypatch)
+
+    assert ik._try_load_cuda_ext() is True
+    assert ik._glq_cuda is sentinel
