@@ -25,6 +25,7 @@ umask 077
 GLQ_HOME="${GLQ_HOME:-$HOME/.glq}"
 GLQ_VENV="$GLQ_HOME/venv"
 GLQ_VERSION="${GLQ_VERSION:-}"          # empty = latest on PyPI
+GLQ_SOURCE="${GLQ_SOURCE:-}"            # empty = PyPI; else any pip spec (wheel/path/VCS)
 DRY_RUN=0
 ALLOW_ROOT=0
 PREFLIGHT_ONLY=0
@@ -42,6 +43,10 @@ warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 
 run() {
+    # This file runs under IFS=$'\n\t', which makes "$*" join with newlines and prints one
+    # argument per line — unreadable, and it defeats the point of --dry-run. Restore a
+    # space for the display expansion only; "$@" is unaffected.
+    local IFS=' '
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '  [dry-run] %s\n' "$*"
     else
@@ -58,6 +63,7 @@ GLQ installer
   --model REPO_ID     checkpoint to serve     (default: chosen interactively)
   --chat WHICH        gradio | openwebui | none
   --glq-version VER   pin glq (default: latest release)
+  --glq-source SPEC   install glq from a wheel, path or VCS ref instead of PyPI
   --yes               accept defaults, never prompt
   --list              list available checkpoints and exit
   --preflight         check prerequisites and exit (changes nothing)
@@ -78,6 +84,8 @@ parse_args() {
             --allow-root)   ALLOW_ROOT=1; shift ;;
             --glq-version)  [ $# -ge 2 ] || die "--glq-version needs a value"
                             GLQ_VERSION="$2"; shift 2 ;;
+            --glq-source)   [ $# -ge 2 ] || die "--glq-source needs a value"
+                            GLQ_SOURCE="$2"; shift 2 ;;
             -h|--help)      usage; exit 0 ;;
             *)              PASSTHRU+=("$1"); shift ;;
         esac
@@ -236,12 +244,43 @@ create_venv() {
     run "$py" -m venv "$GLQ_VENV"
 }
 
+install_cuda_toolchain() {
+    # nvcc + the CCCL headers NVIDIA's cuda_fp16.h includes, at the version torch already
+    # chose. Deliberately a SEPARATE pip call: resolved alongside glq, pip picks the newest
+    # cuda-toolkit, finds it incompatible with torch's exact pin, backtracks, and silently
+    # downgrades torch (measured: 2.13.0 -> 2.10.0, after which CUDA_HOME stops resolving).
+    # Naming the version already installed cannot move torch, and hardcodes nothing.
+    say "== installing the CUDA build toolchain"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "  [dry-run] would install cuda-toolkit[nvcc,cccl] at torch's own pinned version"
+        return 0
+    fi
+    local ver
+    ver=$("$GLQ_VENV/bin/python" -c \
+        'import importlib.metadata as m; print(m.version("cuda-toolkit"))' 2>/dev/null || true)
+    if [ -z "$ver" ]; then
+        warn "torch did not pin cuda-toolkit here; skipping nvcc/cccl."
+        warn "  GLQ compiles its kernels on first use — if that fails it will say why."
+        return 0
+    fi
+    run "$GLQ_VENV/bin/pip" install --upgrade "cuda-toolkit[nvcc,cccl]==$ver"
+}
+
 install_glq() {
+    # --glq-source takes any pip spec: a built wheel, a checkout, a VCS ref. install.sh is
+    # a bootstrap that pip-installs glq from PyPI, so without this an install can never be
+    # newer than the last release — a fork, an RC, or a fix under test cannot be installed
+    # by its own installer, and a container cannot validate one.
     local spec="glq"
     [ -n "$GLQ_VERSION" ] && spec="glq==$GLQ_VERSION"
-    say "== installing $spec (this pulls PyTorch and takes a few minutes)"
+    [ -n "$GLQ_SOURCE" ] && spec="$GLQ_SOURCE"
+    # GLQ compiles its CUDA kernels on first use, so the build toolchain is a runtime
+    # requirement: ninja (torch's extension builder), plus nvcc and the CCCL headers that
+    # NVIDIA's own cuda_fp16.h includes. ninja rides along with glq — it constrains nothing.
+    say "== installing $spec + build toolchain (this pulls PyTorch and takes a few minutes)"
     run "$GLQ_VENV/bin/pip" install --upgrade pip
-    run "$GLQ_VENV/bin/pip" install --upgrade "$spec"
+    run "$GLQ_VENV/bin/pip" install --upgrade "$spec" ninja
+    install_cuda_toolchain
 }
 
 hand_over() {
@@ -255,6 +294,13 @@ hand_over() {
 
 main() {
     parse_args "$@"
+
+    # Both decide which glq gets installed; letting one silently win installs a version the
+    # user did not ask for.
+    if [ -n "$GLQ_SOURCE" ] && [ -n "$GLQ_VERSION" ]; then
+        die "--glq-source and --glq-version are mutually exclusive: --glq-source already
+    names exactly what to install."
+    fi
 
     # --preflight comes BEFORE the root check on purpose. It changes nothing, and the
     # people most likely to run it as root are the ones who need it most: anyone inside a

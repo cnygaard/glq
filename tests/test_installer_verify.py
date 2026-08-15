@@ -21,13 +21,64 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from glq.installer import verify as V  # noqa: E402
 
 
-def _probes(glq=True, glq_vllm=True, plugin=True, cuda=True):
+def _probes(glq=True, glq_vllm=True, plugin=True, cuda=True, kernels=(True, None)):
     return {
         "glq_importable": lambda: ("0.8.3" if glq else None),
         "glq_vllm_importable": lambda: glq_vllm,
         "plugin_registered": lambda: plugin,
         "cuda_available": lambda: cuda,
+        "kernels_available": lambda: kernels,
     }
+
+
+# --------------------------------------------------- the check that was missing
+#
+# Measured in an ubuntu:24.04 container (2026-08-15): `glq-setup --verify` reported
+#
+#     [ok  ] cuda available: GPU visible to torch
+#
+# and the very next command died in a forward pass, because the CUDA extension had never
+# built. `torch.cuda.is_available()` answers "is there a GPU", which is not the question —
+# GLQ compiles its kernels on the user's machine, so the question is "did that work".
+
+BUILD_ERROR = "fatal error: nv/target: No such file or directory"
+
+
+def test_a_gpu_with_unbuilt_kernels_is_a_failure_not_a_pass():
+    checks = V.run_checks(("core", "vllm"),
+                          **_probes(cuda=True, kernels=(False, BUILD_ERROR)))
+    kernel = [c for c in checks if "kernel" in c.name.lower()]
+    assert kernel, f"no kernel check at all: {[c.name for c in checks]}"
+    kernel = kernel[0]
+
+    assert kernel.ok is False
+    assert kernel.warning_only is False, (
+        "a GPU box whose kernels cannot build is broken for GLQ's purpose — reporting it as "
+        "a warning is how this shipped green while the install was unusable")
+    assert not V.all_ok(checks)
+
+
+def test_the_kernel_failure_carries_the_build_reason():
+    """The reason is the actionable part; recovering it by hand cost three container
+    re-runs this morning."""
+    checks = V.run_checks(("core",), **_probes(cuda=True, kernels=(False, BUILD_ERROR)))
+    kernel = [c for c in checks if "kernel" in c.name.lower()][0]
+    assert BUILD_ERROR in kernel.detail
+
+
+def test_kernels_are_not_failed_on_a_cpu_only_box():
+    """CPU-only is supported (dequantize-then-matmul). Without a GPU there is nothing to
+    build against, so an unbuilt kernel is expected, not a fault."""
+    checks = V.run_checks(("core",), **_probes(cuda=False, kernels=(False, BUILD_ERROR)))
+    kernel = [c for c in checks if "kernel" in c.name.lower()][0]
+    assert kernel.warning_only is True
+    assert V.all_ok(checks)
+
+
+def test_built_kernels_report_ok():
+    checks = V.run_checks(("core",), **_probes(cuda=True, kernels=(True, None)))
+    kernel = [c for c in checks if "kernel" in c.name.lower()][0]
+    assert kernel.ok is True
 
 
 def test_a_healthy_install_reports_all_ok():

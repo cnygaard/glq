@@ -668,8 +668,12 @@ def _glq_apply_trellis(x, layer):
                 _shards_rht = torch.ops.glq.output_rht_shards
             else:
                 from glq import inference_kernel as _ik
-                _yrht = _ik._glq_cuda.glq_fused_linear_trellis_3inst_yrht_cuda
-                _shards_rht = _ik._glq_cuda.glq_output_rht_shards_cuda
+                # require_cuda_ext, not a bare attribute reach: with the build failed this
+                # is None, and the user's first sign of it was an AttributeError here rather
+                # than the compiler error that actually explains it.
+                _ext = _ik.require_cuda_ext("glq_fused_linear_trellis_3inst_yrht_cuda")
+                _yrht = _ext.glq_fused_linear_trellis_3inst_yrht_cuda
+                _shards_rht = _ext.glq_output_rht_shards_cuda
             # Stacked RVQ (5-8 bpw) deposits into the SAME y_rht buffer through the _rvq2
             # entry, so S4b's one batched output RHT covers both stages of every shard.
             # _setup_trellis_weights already refused to build s4b if this entry is missing.
