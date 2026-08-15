@@ -1,147 +1,131 @@
 # syntax=docker/dockerfile:1.6
 #
-# GLQ runtime + dev environment.
+# GLQ runtime + eval environment.
 #
-# Reproduces the cloud-init setup at infra/setup.sh.tftpl in a portable
-# container so contributors can replicate eval results without AWS, and so
-# our AMIs can be baked from the same source of truth.
+# Built by running the project's own installer, so this file cannot drift from what users
+# actually execute. The previous version reimplemented the venv, the torch pin, the CUDA
+# toolchain and the pip ordering by hand, and went stale: it shipped glq 0.5.3 / vLLM 0.20.2
+# against a current 0.8.x, and nothing here would have noticed.
 #
-# Base: NVIDIA CUDA 12.9 cuDNN devel on Ubuntu 24.04
-# - CUDA 12.9 is the minimum for Blackwell (sm_120 — RTX PRO 6000 / RTX 5090):
-#   on 12.8 torch warns "SM 12.x requires CUDA >= 12.9" and falls back, with
-#   very slow / incomplete startup. 12.9 still covers sm_75/86/89
-#   (T4 / A10G / L4 / L40S). Matches torch 2.11+cu129 binary wheels.
-# - Ubuntu 24.04 ships Python 3.12 — same minor we use in the venv
-# - cudnn-devel includes nvcc, headers, and libs needed for JIT-compiling
-#   our CUDA C extension and for building mamba-ssm / causal-conv1d
+# Base: CUDA *runtime*, not devel. install.sh installs nvcc and the CCCL headers from pip
+# into the venv, which is the path a user's machine takes, so a ~4 GB devel base buys
+# nothing but a second, divergent toolchain. Note the runtime image still ships
+# /usr/local/cuda (include/ + lib64/, no compiler) — torch's `_find_cuda_home()` resolves
+# that directory on sight, so glq checks for `bin/nvcc` before believing it. Plain
+# `ubuntu:24.04` also works and is what tests/test_installer_distros.py exercises; the CUDA
+# runtime base is kept because the eval tooling below links against it.
 #
-# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.2.18 .
+# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.6 .
+#          docker build --build-arg GLQ_VERSION=0.8.6 .
 # Run:     docker run --gpus all -it --rm \
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
-#              ghcr.io/cnygaard/glq-env:0.2.18
+#              ghcr.io/cnygaard/glq-env:0.8.6
 ARG CUDA_VERSION=12.9.1
 ARG UBUNTU_VERSION=24.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
-# Build args (re-declared after FROM so they're in scope).
-ARG GLQ_VERSION=0.5.3
-ARG VLLM_VERSION=0.20.2
+# Which glq to install. Everything else — torch, vLLM, transformers, the CUDA build
+# toolchain — is resolved by the installer, so there is exactly one pin to bump here.
+ARG GLQ_VERSION=0.8.5
 
-# Locale + non-interactive apt.
 ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
     LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=0
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System packages — split into stable and rebuild-likely groups so layer
-# caching is effective across small changes.
-#
-# - build-essential, ninja-build, cmake: needed for JIT cpp_extension loads
-#   and for compiling causal-conv1d / mamba-ssm wheels
-# - libnuma-dev, protobuf-compiler: dependencies of sgl-kernel (optional)
-# - git: for fetching the GLQ source if the user mounts it / clones it
-# - curl: for hf download fallback and general debugging
-# - python3-venv: lets us create a clean isolated venv inside /opt/venv
-# - python3-dev: headers required by some pip-installed C extensions
+# Exactly the package set install.sh's own pre-flight prints for Debian-family, plus git.
+# If this list and `pkg_hint()` disagree, the pre-flight is wrong for real users too — which
+# is the point of installing what it asks for rather than what we think it needs.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        ninja-build \
-        git \
-        curl \
-        ca-certificates \
-        libnuma-dev \
-        protobuf-compiler \
         python3 \
         python3-venv \
         python3-dev \
-        python3-pip \
-        && rm -rf /var/lib/apt/lists/*
+        build-essential \
+        curl \
+        ca-certificates \
+        git
 
-# Python venv at /opt/venv. Activated by prepending to PATH.
-RUN python3 -m venv --system-site-packages /opt/venv
-ENV PATH=/opt/venv/bin:$PATH \
-    VIRTUAL_ENV=/opt/venv
-
-# Pin pip + base build tooling first (these rarely change).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip setuptools wheel ninja
-
-# torch + torchvision from the cu129 wheel index FIRST. Blackwell (sm_120)
-# needs CUDA >= 12.9, and the default-PyPI torchvision is a cu130 build that
-# mismatches torch's 12.9 ("PyTorch and torchvision compiled with different
-# CUDA major versions"), so pin BOTH from cu129 here. vLLM 0.20.2 then accepts
-# the already-present torch==2.11.0 / torchvision==0.26.0 and does NOT
-# re-pull them. (vLLM's vllm._C is a cu12 build → libcudart.so.12 → loads
-# against cu128 or cu129 alike; the old `:0.5.0/:0.5.1` libcudart.so.13 break
-# was the cu13 BASE image, since reverted.) Verified on an RTX PRO 6000
-# (sm_120): no "SM 12.x" warning, clean startup, coherent output.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch==2.11.0 torchvision==0.26.0 \
-        --index-url https://download.pytorch.org/whl/cu129
-
-# vLLM — uses the cu129 torch/torchvision installed above (it also pulls
-# transformers, huggingface_hub, flashinfer…).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "vllm==${VLLM_VERSION}"
-
-# transformers/HF — pin the major to keep the chat-template thinking-mode
-# behaviour predictable.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "transformers>=5.0,<6.0" "huggingface_hub>=0.30"
-
-# CUDA_HOME is needed by mamba-ssm and causal-conv1d setup.py builds.
-ENV CUDA_HOME=/usr/local/cuda
-
-# Mamba/SSM and causal-conv1d are compiled against the installed torch.
-# --no-build-isolation reuses the venv's torch instead of pulling a fresh
-# copy into a sandboxed build env (which would mismatch ABI).
+# A dedicated unprivileged user. install.sh refuses to run as root on purpose — nothing it
+# does needs privileges, and a root-owned venv in /root is a habit worth not teaching — so
+# running it under `--allow-root` here would be defeating our own guard rather than honouring
+# it. This is also the path tests/test_installer_distros.py exercises.
 #
-# These take ~10-15 min wall on a 8-core build. Allow it to fail silently
-# (matching our setup.sh.tftpl behavior) so the rest of the image still
-# builds; users who don't need Mamba/SSM models can ignore the warning.
-# RUN --mount=type=cache,target=/root/.cache/pip \
-#     pip install causal-conv1d --no-build-isolation \
-#         || echo "WARN: causal-conv1d build failed — Mamba models will be unavailable" && \
-#     pip install mamba-ssm --no-build-isolation \
-#         || echo "WARN: mamba-ssm build failed — Mamba models will be unavailable"
+# High UID/GID to avoid colliding with the `ubuntu` user (1000) that ships in the base image.
+# Override to match the host when bind-mounting a cache you also write to from outside:
+#   docker build --build-arg GLQ_UID=$(id -u) --build-arg GLQ_GID=$(id -g) .
+ARG GLQ_UID=10001
+ARG GLQ_GID=10001
+RUN groupadd -g ${GLQ_GID} glq && \
+    useradd -m -u ${GLQ_UID} -g ${GLQ_GID} -s /bin/bash glq && \
+    mkdir -p /cache/hf /workspace && \
+    chown -R glq:glq /cache/hf /workspace
 
-# Eval + auxiliary tooling.
-# - lm-eval: gsm8k, mmlu, hellaswag, etc.
-# - langdetect, immutabledict: ifeval task deps
-# - pypcre + gptqmodel: GPTQ baseline comparison
-# - optimum: HF transformers GPTQ loader
-RUN --mount=type=cache,target=/root/.cache/pip \
+USER glq
+
+# The venv the installer creates, on PATH so `vllm`/`glq-*` resolve without activation.
+# (That PATH entry is also what lets torch's `_find_cuda_home()` locate the venv's nvcc via
+# `shutil.which` — see the bake step below.)
+ENV GLQ_HOME=/home/glq/.glq \
+    PATH=/home/glq/.glq/venv/bin:$PATH
+
+# One source of truth for the install.
+#
+# COPY rather than `curl -fsSL …/main/install.sh | bash`: the published one-liner fetches
+# whatever `main` says at build time, and Docker cannot see that the remote file moved — so
+# the layer cache serves a stale image, and two builds of the same tag can differ with
+# nothing recording why. Copying invalidates the layer exactly when the installer changes,
+# and builds the installer from this commit rather than from a moving branch.
+COPY --chown=glq:glq install.sh /tmp/install.sh
+# No --mount=type=cache here: BuildKit's cache mounts are root-owned by default, and the
+# uid=/gid= options do not take build args, so the one thing that would make them writable
+# by this user cannot be expressed. Layer caching still covers the common rebuild.
+RUN bash /tmp/install.sh --yes \
+        --components core,vllm \
+        --glq-version "${GLQ_VERSION}"
+
+# Bake the fused CUDA kernels for every architecture we support, so the first request in a
+# container is not paying a ~1 min JIT compile. There is no GPU during `docker build`, so
+# the arch list has to be explicit — torch cannot probe for it.
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX"
+
+# Assert, do not swallow. This used to end in `|| true`, which meant an image could ship
+# with no kernels at all and say nothing — the same silent-downgrade failure the runtime
+# diagnostics exist to prevent. `cuda_ext_status()` returns the compiler's own words.
+RUN python -c "\
+import sys; import glq.inference_kernel as ik; \
+ok, err = ik.cuda_ext_status(); \
+print('glq CUDA ext:', ik._glq_cuda.__file__ if ok else 'FAILED'); \
+sys.stderr.write((err or '') + '\n'); \
+sys.exit(0 if ok else 1)"
+
+# Eval + baseline-comparison tooling, into the same venv.
+#
+# CUDA_HOME comes from the venv's pip toolchain — these packages run their own setup.py
+# builds and, unlike glq, have no idea the compiler lives in site-packages. gptqmodel is
+# allowed to fail: it is a comparison baseline, not part of GLQ.
+RUN export CUDA_HOME="$(python -c 'import glq.inference_kernel as ik; print(ik._venv_cuda_home() or "")')" && \
     pip install lm-eval langdetect immutabledict pypcre optimum && \
-    pip install gptqmodel --no-build-isolation \
-        || echo "WARN: gptqmodel build failed — GPTQ baseline unavailable"
+    { pip install gptqmodel --no-build-isolation \
+        || echo "WARN: gptqmodel build failed — GPTQ baseline unavailable"; }
 
-# GLQ itself, last because it's the most-frequently-bumped package.
-# `[quantize]` extra includes calibration-time deps (datasets, tqdm extras).
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "glq[quantize]==${GLQ_VERSION}"
+# Record what actually got installed. The versions are resolved by the installer, not pinned
+# here, so the image must carry its own provenance or a result cannot be attributed.
+RUN pip list --format=freeze \
+      | grep -Ei '^(glq|torch|vllm|transformers|triton|cuda-toolkit|nvidia-cuda-nvcc)=' \
+      | tee /home/glq/glq-image-versions
 
-# Pre-warm the GLQ CUDA C extension JIT compile so the first inference call
-# is fast. Build environment has nvcc + headers so this should succeed.
-# Skipped when CUDA isn't available in the build runner; the kernel will
-# still JIT at first import.
-RUN python -c "from glq import inference_kernel as ik; ok = ik._try_load_cuda_ext(); print(f'glq CUDA ext: {\"baked\" if ok else \"will JIT at runtime\"}')" || true
-
-# HuggingFace cache lives on a writable volume so model downloads survive
-# container restarts. Mount via -v $HOME/.cache/huggingface:/cache/hf.
+# HuggingFace cache on a writable volume so downloads survive container restarts.
 ENV HF_HOME=/cache/hf
 VOLUME ["/cache/hf"]
 
-# NVIDIA Container Toolkit handoff — these env vars are read by the runtime
-# at `docker run --gpus all` to expose the host GPU(s).
+# NVIDIA Container Toolkit handoff — read at `docker run --gpus all` to expose host GPUs.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 

@@ -264,6 +264,47 @@ install_cuda_toolchain() {
         return 0
     fi
     run "$GLQ_VENV/bin/pip" install --upgrade "cuda-toolkit[nvcc,cccl]==$ver"
+    repair_cuda_wheel_layout
+}
+
+repair_cuda_wheel_layout() {
+    # Give the wheels the layout every CUDA build system expects. They install
+    #
+    #     nvidia/cu13/lib/libcudart.so.13
+    #
+    # with no unversioned `libcudart.so` (the only name `-lcudart` resolves through) and no
+    # `lib64/` (the directory build systems pass to -L). glq works around this for its own
+    # build, but it is not the only thing compiling CUDA in here: vLLM JIT-builds flashinfer
+    # at engine start and dies on the same link line. Measured in a container — GLQ's kernels
+    # baked, `--verify` green, and vLLM still could not start.
+    #
+    # Done here rather than delegated to `glq.installer`, because that is whatever glq got
+    # installed: every published release predates this, so a new installer would depend on a
+    # new glq to fix the venv it just created.
+    #
+    # Scope: the venv this script created, nothing else. Symlinks only, beside files pip
+    # just wrote, never over an existing name — so a wheel that starts shipping them, or a
+    # real system toolkit, is untouched.
+    [ -x "$GLQ_VENV/bin/python" ] || {
+        warn "not a venv at $GLQ_VENV — skipping the CUDA layout repair"
+        return 0
+    }
+    say "== normalising the CUDA wheel layout in the venv (lib64/, libcudart.so)"
+    local libdir real base made=0
+    for libdir in "$GLQ_VENV"/lib/python*/site-packages/nvidia/*/lib; do
+        [ -d "$libdir" ] || continue
+        for real in "$libdir"/lib*.so.*; do
+            [ -e "$real" ] || continue
+            base="${real%%.so.*}.so"
+            if [ ! -e "$base" ] && [ ! -L "$base" ]; then
+                ln -s "$(basename "$real")" "$base" 2>/dev/null && made=$((made+1))
+            fi
+        done
+        if [ ! -e "${libdir%/lib}/lib64" ] && [ ! -L "${libdir%/lib}/lib64" ]; then
+            ln -s lib "${libdir%/lib}/lib64" 2>/dev/null && made=$((made+1))
+        fi
+    done
+    say "   $made symlink(s) created under $GLQ_VENV"
 }
 
 install_glq() {

@@ -122,6 +122,35 @@ def test_it_offers_a_way_to_check_the_server_is_up():
     assert "/v1/models" in t
 
 
+def test_it_shows_a_request_that_actually_generates_text():
+    """`/v1/models` proves the port is open, not that the stack can decode a token.
+
+    Those are different failures and only the second one is the interesting one: GLQ builds
+    its CUDA kernels on the user's machine, so a server can start, list the model, and still
+    be unable to run a forward pass. Someone who arrived via `curl … | bash` has no repo and
+    no client wired up, so without a generation request printed here their first real
+    inference is whenever they get round to writing one — and any failure lands far away
+    from the install that caused it.
+
+    The distro suite gates on exactly this completion ("The capital of France is" -> Paris);
+    the text handed to the user should let them run the same check.
+    """
+    t = _text()
+    assert "/v1/completions" in t or "/v1/chat/completions" in t, (
+        "next_steps never shows a request that returns generated text")
+    assert "prompt" in t or "messages" in t, "the request carries no prompt"
+
+
+def test_the_generation_request_names_the_installed_model():
+    """A copy-pasted body with a placeholder model id comes back 404 from vLLM, which reads
+    as a broken install rather than a wrong argument."""
+    t = _text(model="xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel")
+    body = [ln for ln in t.splitlines()
+            if "/v1/completions" in ln or "/v1/chat/completions" in ln or '"model"' in ln]
+    assert any("xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel" in ln for ln in body), (
+        f"the generation request does not name the model:\n" + "\n".join(body))
+
+
 def test_it_records_where_the_config_went():
     assert "config.json" in _text()
 
