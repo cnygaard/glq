@@ -229,6 +229,22 @@ def _try_load_cuda_ext():
         return _cuda_ext_available
     try:
         import os, shutil, sys
+
+        # Step 1 of the ladder: the extension compiled in CI and shipped in the wheel. When
+        # it is here, none of the toolchain machinery below runs — no nvcc, no ninja, no
+        # ~1 min first-use compile, and none of the ways that compile fails on a machine
+        # that has never built CUDA before. Step 2 (JIT) remains for torch/arch combinations
+        # no wheel matches, and for sdist installs.
+        try:
+            from glq import _C as _prebuilt          # noqa: F401
+        except Exception:                            # noqa: BLE001 - absent is the norm
+            _prebuilt = None
+        if _prebuilt is not None:
+            _glq_cuda = _prebuilt
+            _cuda_ext_available = True
+            globals()['_cuda_ext_error'] = None
+            return True
+
         # Ensure ninja is in PATH (venv bin may not be in subprocess PATH)
         if shutil.which('ninja') is None:
             venv_bin = os.path.join(sys.prefix, 'bin')
