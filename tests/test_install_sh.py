@@ -111,6 +111,26 @@ def test_dry_run_prints_the_commands_it_would_have_run(tmp_path):
     assert "venv" in proc.stdout and "pip" in proc.stdout
 
 
+def test_each_printed_command_is_on_one_line(tmp_path):
+    """`--dry-run` exists so a cautious user can read what will happen. That only works if
+    a command reads as a command.
+
+    install.sh runs under the strict-mode idiom `IFS=$'\\n\\t'`, which makes `"$*"` join
+    with newlines — so `run()` printed one argument per line:
+
+          [dry-run] /home/u/.glq/venv/bin/pip
+        install
+        --upgrade
+        glq
+
+    Unreadable, and it silently defeats any test that greps for a command as a phrase.
+    """
+    proc = _run(["--dry-run", "--yes"], env={"GLQ_HOME": str(tmp_path / "h")})
+    assert "pip install" in proc.stdout, (
+        "arguments are being split across lines; commands are unreadable:\n"
+        + proc.stdout)
+
+
 @pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare(1) not available")
 def test_it_refuses_to_run_as_root(tmp_path):
     """Genuinely runs as uid 0 via a user namespace rather than faking $EUID (which bash
@@ -195,6 +215,126 @@ def test_glq_version_flag_requires_a_value(tmp_path):
     proc = _run(["--glq-version"], env={"GLQ_HOME": str(tmp_path / "h")})
     assert proc.returncode != 0
     assert "needs a value" in proc.stderr
+
+
+# ------------------------------------------- installing something other than a PyPI release
+
+def test_glq_source_installs_the_given_spec_instead_of_pypi(tmp_path):
+    """`--glq-source` hands pip an arbitrary spec: a wheel, a path, a VCS ref.
+
+    install.sh is a *bootstrap* — it makes the venv, installs glq from PyPI, and hands over
+    to `python -m glq.installer`. So an install can never be newer than the last release,
+    and a fork, a release candidate or an unmerged branch cannot be installed by its own
+    installer at all.
+
+    That is not hypothetical. The cross-distro matrix mounts this branch and runs its
+    install.sh, which dutifully fetched glq 0.8.3 from PyPI — a release predating
+    `glq.installer` — and died with `No module named glq.installer`. The same wall blocks
+    validating any installer fix in a container: the container would install the released
+    glq, not the one under test.
+    """
+    proc = _run(["--dry-run", "--yes", "--glq-source", "/wheels/glq-9.9.9.whl"],
+                env={"GLQ_HOME": str(tmp_path / "h")})
+    assert proc.returncode == 0, proc.stderr
+
+    # Match the *command*, not merely the string anywhere in the output — the spec also
+    # appears in the passthrough line, and pytest's tmp dir is named after the test, so a
+    # loose `"install" in line` check matches the venv path and passes for the wrong
+    # reason. (It did, on the first run of this test.)
+    installs = [ln for ln in proc.stdout.splitlines() if "pip install --upgrade" in ln]
+    assert installs, f"no pip install command printed:\n{proc.stdout}"
+
+    glq_installs = [ln for ln in installs if ln.rstrip().split()[-1] != "pip"]
+    assert glq_installs, f"no glq install command printed:\n{proc.stdout}"
+    assert all("/wheels/glq-9.9.9.whl" in ln for ln in glq_installs), (
+        f"still installing glq from PyPI despite --glq-source: {glq_installs}")
+
+
+def test_core_installs_the_build_toolchain_glq_compiles_with(tmp_path):
+    """GLQ JIT-compiles its CUDA kernels on first use, so the toolchain is a hard runtime
+    requirement — not an optional extra.
+
+    Measured in an ubuntu:24.04 container with a GPU attached, each of these was discovered
+    only by removing the previous one (2026-08-15):
+
+        ninja                  RuntimeError: Ninja is required to load C++ extensions
+        cuda-toolkit[nvcc]     no nvcc at all -> nothing to compile with
+        cuda-toolkit[cccl]     fatal error: nv/target: No such file or directory
+
+    Without them `curl … | bash` produces an install that looks healthy — glq imports, the
+    plugin registers, torch sees the GPU — and dies on the first forward pass.
+
+    They go in the *same* pip invocation as glq deliberately. torch already constrains
+    `cuda-toolkit==<major.minor>`; resolving in one transaction lets pip apply the extras to
+    that pin instead of us hardcoding a CUDA version that rots on every torch release.
+    """
+    proc = _run(["--dry-run", "--yes"], env={"GLQ_HOME": str(tmp_path / "h")})
+    assert proc.returncode == 0, proc.stderr
+
+    installs = [ln for ln in proc.stdout.splitlines()
+                if "pip install --upgrade" in ln and ln.rstrip().split()[-1] != "pip"]
+    assert installs, f"no glq install command printed:\n{proc.stdout}"
+    line = installs[0]
+
+    # ninja is safe to resolve alongside glq: it constrains nothing.
+    assert "ninja" in line, f"ninja not installed; the JIT build cannot run: {line}"
+    assert "glq" in line
+
+    # The CUDA compiler/headers must still be installed, just not here — see below.
+    assert "cuda-toolkit" in proc.stdout, (
+        f"no CUDA compiler/headers installed at all; the kernels cannot build:\n{proc.stdout}")
+
+
+def test_the_cuda_toolchain_is_resolved_apart_from_torch(tmp_path):
+    """`cuda-toolkit[nvcc,cccl]` must NOT share a pip transaction with glq/torch.
+
+    Measured in a container, 2026-08-15 — resolving them together does not, as one might
+    hope, apply the extras to torch's own `cuda-toolkit==13.0.3` pin. pip instead picks
+    cuda-toolkit 13.3.1, finds it incompatible, backtracks, and **silently downgrades torch
+    2.13.0 -> 2.10.0**:
+
+        glq-0.8.4  ninja-1.13.0  torch-2.10.0  cuda-toolkit-13.3.1  cuda-toolkit-13.0.3.0
+
+    torch 2.10 then cannot resolve CUDA_HOME from the venv wheels, so the build fails
+    earlier than before. A silent major-dependency downgrade is worse than the conflict it
+    was meant to avoid; installing the extras separately, at the version already present,
+    cannot move torch at all.
+    """
+    proc = _run(["--dry-run", "--yes"], env={"GLQ_HOME": str(tmp_path / "h")})
+    for line in proc.stdout.splitlines():
+        if "cuda-toolkit" in line and "glq" in line:
+            raise AssertionError(
+                f"cuda-toolkit shares a transaction with glq; pip will backtrack torch: {line}")
+
+
+def test_no_cuda_version_is_hardcoded_in_the_installer():
+    """The version comes from whatever torch pinned, read at install time.
+
+    A literal would have to be updated in lockstep with every torch release, across every
+    distro the installer supports — the maintenance burden this design exists to avoid.
+    """
+    src = open(INSTALL_SH).read()
+    hardcoded = re.findall(r"cuda-toolkit\[[^\]]*\]==[0-9]", src)
+    assert not hardcoded, f"hardcoded CUDA version in install.sh: {hardcoded}"
+
+
+def test_glq_source_requires_a_value(tmp_path):
+    proc = _run(["--glq-source"], env={"GLQ_HOME": str(tmp_path / "h")})
+    assert proc.returncode != 0
+    assert "needs a value" in proc.stderr
+
+
+def test_glq_source_and_glq_version_are_mutually_exclusive(tmp_path):
+    """Both decide which glq gets installed. Letting one silently win installs a version
+    the user did not ask for — precisely the confusion this flag exists to remove."""
+    proc = _run(["--dry-run", "--yes", "--glq-source", "/w/x.whl", "--glq-version", "0.8.4"],
+                env={"GLQ_HOME": str(tmp_path / "h")})
+    assert proc.returncode != 0
+    assert "--glq-source" in proc.stderr and "--glq-version" in proc.stderr
+
+
+def test_glq_source_is_documented_in_help():
+    assert "--glq-source" in _run(["--help"]).stdout
 
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")

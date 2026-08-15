@@ -26,6 +26,137 @@ except ImportError:
 # CUDA C extension: loaded lazily on first B=1 call to avoid 30s JIT penalty on import
 _glq_cuda = None
 _cuda_ext_available = None  # None = not tried, True/False = result
+_cuda_ext_error = None      # why the build failed, verbatim — see cuda_ext_status()
+
+
+#: Where to send someone whose bundled CUDA wheels turn out not to be enough. The landing
+#: page rather than a versioned .run URL — that one rots on every CUDA release.
+CUDA_DOWNLOADS_URL = "https://developer.nvidia.com/cuda-downloads"
+
+
+def _venv_cuda_home(search_roots=None):
+    """The CUDA root inside the venv, or None if the wheels are not installed.
+
+    `cuda-toolkit[nvcc,cccl]` puts the compiler at `<site-packages>/nvidia/cu13/bin/nvcc` —
+    not on PATH, and not anywhere torch looks. Without pointing torch at it the build dies
+    with `OSError: CUDA_HOME environment variable is not set` before reaching a compiler,
+    which makes installing the toolchain at all pointless. Measured in a clean container.
+
+    The CUDA major is torch's choice, so glob `cu*` rather than naming one.
+    """
+    import glob
+    import os
+    import site
+
+    if search_roots is None:
+        search_roots = list(site.getsitepackages())
+    for root in search_roots:
+        for nvcc in sorted(glob.glob(os.path.join(root, "nvidia", "*", "bin", "nvcc"))):
+            return os.path.dirname(os.path.dirname(nvcc))
+    return None
+
+
+def _cudart_link_dir(search_roots=None, cache_dir=None):
+    """Return a directory that makes `-lcudart` resolvable, or None if it already is.
+
+    The pip CUDA wheels install
+
+        nvidia/cu13/lib/libcudart.so.13
+
+    with no bare `libcudart.so` and no `lib64/`. torch's cpp_extension emits
+    `-L$CUDA_HOME/lib64 -lcudart`, and `-lcudart` only ever matches `libcudart.so`, so the
+    link fails with `cannot find -lcudart` even though the library is right there. A system
+    CUDA install (`/usr/local/cuda/lib64/libcudart.so`) ships the symlink and needs none of
+    this — hence the early return, so we never shadow a real toolkit.
+
+    Measured in an ubuntu:24.04 container, 2026-08-15.
+    """
+    import glob
+    import os
+    import site
+
+    if search_roots is None:
+        search_roots = list(site.getsitepackages())
+    if cache_dir is None:
+        cache_dir = os.path.join(
+            os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+            "glq", "cudalibs")
+
+    # A real toolkit already satisfies `-lcudart`; injecting the wheels' copy ahead of it
+    # would mix CUDA minors (the box: system 13.2 + wheel 13.0). Leave it alone.
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME as _torch_cuda_home
+    except Exception:                                 # pragma: no cover - torch always has it
+        _torch_cuda_home = None
+    if _torch_cuda_home:
+        for libdir in ("lib64", "lib"):
+            if os.path.exists(os.path.join(_torch_cuda_home, libdir, "libcudart.so")):
+                return None
+
+    versioned = []
+    for root in search_roots:
+        # nvidia/<cu13|cu14|…>/lib/libcudart.so.<major> — the CUDA major is torch's choice,
+        # so glob it rather than naming one.
+        versioned += glob.glob(os.path.join(root, "nvidia", "*", "lib", "libcudart.so.*"))
+    if not versioned:
+        return None                                   # system CUDA, or no CUDA at all
+
+    real = sorted(versioned)[0]
+    if os.path.exists(os.path.join(os.path.dirname(real), "libcudart.so")):
+        return None                                   # dev symlink already present
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        link = os.path.join(cache_dir, "libcudart.so")
+        if os.path.islink(link) or os.path.exists(link):
+            if os.path.realpath(link) == os.path.realpath(real):
+                return cache_dir                      # idempotent: already correct
+            os.remove(link)                           # stale, e.g. after a torch upgrade
+        os.symlink(real, link)
+        return cache_dir
+    except OSError:
+        return None                                   # read-only HOME: fall through to fail
+
+
+def cuda_ext_status():
+    """(available, error) for the fused CUDA extension, resolving the lazy build first.
+
+    `error` is the verbatim build failure — the compiler's own words — or None on success.
+    Without it a failed JIT build is indistinguishable from one that was never attempted,
+    and the first thing the user sees is an AttributeError on a `None` handle several
+    layers downstream. Used by `glq-setup --verify`, which cannot tell from
+    `torch.cuda.is_available()` whether GLQ's kernels can actually run here.
+    """
+    _try_load_cuda_ext()
+    return _cuda_ext_available, _cuda_ext_error
+
+
+def require_cuda_ext(symbol=None):
+    """Return the loaded extension, raising a *named* error if it cannot serve `symbol`.
+
+    Call sites used to reach straight through — `_ik._glq_cuda.<entry>` — so a failed build
+    surfaced as `AttributeError: 'NoneType' object has no attribute …` deep inside a forward
+    pass, with the actual cause (a missing header, no nvcc, no ninja) discarded far earlier.
+
+    Two distinct failures, two distinct messages:
+      * the extension never built  -> the recorded build error + where to get a toolkit
+      * it built but lacks `symbol` -> a stale build; the JIT does not hash headers, so it
+        has to be cleared by hand (CLAUDE.md).
+    """
+    available, error = cuda_ext_status()
+    if not available:
+        raise RuntimeError(
+            "GLQ CUDA extension is not available, so this kernel cannot run.\n"
+            f"{error}"
+            "GLQ compiles its kernels on first use and needs a CUDA toolchain matching the "
+            f"torch build. Install the full toolkit from {CUDA_DOWNLOADS_URL}, or use a "
+            "release that ships prebuilt kernels.")
+    if symbol is not None and not hasattr(_glq_cuda, symbol):
+        raise RuntimeError(
+            f"GLQ CUDA extension is loaded but has no '{symbol}' — it predates this kernel. "
+            "The JIT build does not hash headers, so a stale build survives a source change; "
+            "clear it with:  rm -rf ~/.cache/torch_extensions/*/glq_cuda")
+    return _glq_cuda
 
 
 def _try_load_cuda_ext():
@@ -40,6 +171,16 @@ def _try_load_cuda_ext():
             venv_bin = os.path.join(sys.prefix, 'bin')
             if os.path.exists(os.path.join(venv_bin, 'ninja')):
                 os.environ['PATH'] = venv_bin + ':' + os.environ.get('PATH', '')
+        # Point torch at the venv-local CUDA if nothing else has. An existing CUDA_HOME —
+        # a system install, or one the user set — always wins: mixing a wheel's CUDA minor
+        # with the toolkit torch was built against is how you get subtle link errors.
+        if not os.environ.get('CUDA_HOME'):
+            _cuda_home = _venv_cuda_home()
+            if _cuda_home:
+                os.environ['CUDA_HOME'] = _cuda_home
+                os.environ['PATH'] = (os.path.join(_cuda_home, 'bin') + ':'
+                                      + os.environ.get('PATH', ''))
+
         from torch.utils.cpp_extension import load as _load_ext
         _csrc = os.path.join(os.path.dirname(__file__), 'csrc')
         cu_file = os.path.join(_csrc, 'glq_cuda.cu')
@@ -52,15 +193,41 @@ def _try_load_cuda_ext():
         sources = ([cu_file, cpp_file]
                    + ([e8p_file] if os.path.exists(e8p_file) else [])
                    + ([trellis_file] if os.path.exists(trellis_file) else []))
+        # The pip CUDA wheels ship libcudart.so.<major> but no `libcudart.so`, so torch's
+        # implicit `-lcudart` cannot resolve. Supply the missing symlink; a no-op when a
+        # system CUDA is in use.
+        _ldflags = []
+        _link_dir = _cudart_link_dir()
+        if _link_dir:
+            _ldflags.append(f'-L{_link_dir}')
+
         _glq_cuda = _load_ext(
             'glq_cuda',
             sources=sources,
             extra_cuda_cflags=['-O3', '--use_fast_math'],
+            extra_ldflags=_ldflags,
             verbose=False,
         )
         _cuda_ext_available = True
+        globals()['_cuda_ext_error'] = None   # never report available-with-a-stale-error
     except Exception:
+        # Keep the reason. A bare `except: available = False` discards the one piece of
+        # information that makes this fixable — the compiler said exactly what was missing
+        # (a header, a library, nvcc itself), and the user is otherwise left with a
+        # NoneType AttributeError from a call site that has no idea why.
+        global _cuda_ext_error
+        import traceback
+        _cuda_ext_error = traceback.format_exc()
         _cuda_ext_available = False
+        import warnings
+        warnings.warn(
+            "GLQ CUDA extension failed to build — falling back to the slower path, and "
+            "kernel-only features (trellis serving under vLLM) will not work.\n"
+            f"{_cuda_ext_error}"
+            "GLQ compiles its kernels on first use and needs a CUDA toolchain matching "
+            "the torch build. The bundled CUDA wheels were not sufficient here; install "
+            f"the full toolkit from {CUDA_DOWNLOADS_URL} and try again.",
+            RuntimeWarning, stacklevel=2)
     return _cuda_ext_available
 
 

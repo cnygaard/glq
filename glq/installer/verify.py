@@ -63,6 +63,22 @@ def _cuda_available() -> bool:
         return False
 
 
+def _kernels_available():
+    """(built, reason) for GLQ's fused CUDA kernels.
+
+    `torch.cuda.is_available()` answers "is there a GPU", which is not the question that
+    decides whether GLQ works: the kernels are compiled on this machine, and that compile
+    has its own prerequisites. Measured in a container — a box can report a healthy GPU and
+    still have no usable kernels, which is how a broken install passed this self-check and
+    then died in the first forward pass.
+    """
+    try:
+        from glq import inference_kernel as ik
+        return ik.cuda_ext_status()
+    except Exception as exc:                                      # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def _safe(probe, on_error):
     """Run a probe; a self-check that crashes the installer is worse than none."""
     try:
@@ -74,7 +90,8 @@ def _safe(probe, on_error):
 def run_checks(components, *, glq_importable=_glq_importable,
                glq_vllm_importable=_glq_vllm_importable,
                plugin_registered=_plugin_registered,
-               cuda_available=_cuda_available) -> list[Check]:
+               cuda_available=_cuda_available,
+               kernels_available=_kernels_available) -> list[Check]:
     """Assert the install can actually do what the next-steps text is about to promise."""
     checks: list[Check] = []
 
@@ -107,6 +124,18 @@ def run_checks(components, *, glq_importable=_glq_importable,
         "no CUDA GPU visible — GLQ falls back to dequantize-then-matmul on CPU, which "
         "works but is slow" + (f" ({err})" if err else ""),
         warning_only=True))
+
+    # The check that matters on a GPU box: the kernels are compiled here, so a healthy GPU
+    # does not imply a working GLQ. Only a real failure when a GPU *is* present — with no
+    # GPU there is nothing to build against and CPU-only is a supported configuration.
+    (built, reason), err = _safe(kernels_available, (False, None))
+    checks.append(Check(
+        "glq cuda kernels", bool(built),
+        "fused kernels ready" if built else
+        "the CUDA kernels are not built, so GLQ cannot run its fast path"
+        + (f":\n{reason}" if reason else "")
+        + (f" ({err})" if err else ""),
+        warning_only=not bool(cuda)))
 
     return checks
 
