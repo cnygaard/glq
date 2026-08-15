@@ -28,7 +28,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
 # Which glq to install. Everything else — torch, vLLM, transformers, the CUDA build
 # toolchain — is resolved by the installer, so there is exactly one pin to bump here.
-ARG GLQ_VERSION=0.8.5
+ARG GLQ_VERSION=0.8.6
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
