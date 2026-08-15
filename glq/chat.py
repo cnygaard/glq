@@ -25,7 +25,6 @@ import json
 import os
 from pathlib import Path
 
-import gradio as gr
 from openai import OpenAI
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -51,9 +50,17 @@ def _served_models(client: OpenAI) -> list[str]:
         return []
 
 
-def build_ui(base_url: str, models: list[str], api_key: str = "glq"):
-    client = OpenAI(base_url=base_url, api_key=api_key)
+def make_responder(client):
+    """Build the streaming reply generator the chat UI calls.
 
+    Separate from `build_ui` (and free of any gradio import) for two reasons: it is the part
+    with behaviour worth testing — see tests/test_chat_streaming.py — and a UI that blocks
+    until the whole reply is ready looks hung, which on a reasoning model at a 32k budget
+    means a minute of blank screen.
+
+    Yields are **cumulative**, not deltas: Gradio 6 renders the newest yield, so emitting
+    deltas would leave the user looking at the last token by itself.
+    """
     def respond(message, history, model, temperature, max_tokens):
         messages = []
         for turn in history or []:
@@ -68,20 +75,38 @@ def build_ui(base_url: str, models: list[str], api_key: str = "glq"):
 
         out = ""
         for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            out += delta
+            # vLLM emits role-only and finish-reason chunks whose delta.content is None.
+            out += chunk.choices[0].delta.content or ""
             yield out
 
+    return respond
+
+
+def build_ui(base_url: str, models: list[str], api_key: str = "glq"):
+    import gradio as gr                                   # noqa: PLC0415 - UI-only dep
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    respond = make_responder(client)
+
+    # elem_id on the pieces a browser test needs to find. Gradio's own class names are
+    # generated and churn between releases, so a selector like `.svelte-1x2y3z` breaks on
+    # the next bump and trains everyone to ignore the test. These ids are ours and stable.
     with gr.Blocks(title="GLQ chat") as demo:
         gr.Markdown(f"### GLQ chat\nServing endpoint: `{base_url}`")
         model = gr.Dropdown(choices=models, value=models[0] if models else None,
-                            label="GLQ checkpoint", allow_custom_value=True)
-        temperature = gr.Slider(0.0, 2.0, value=0.7, step=0.05, label="temperature")
-        max_tokens = gr.Slider(64, 8192, value=1024, step=64, label="max tokens")
+                            label="GLQ checkpoint", allow_custom_value=True,
+                            elem_id="glq-model")
+        temperature = gr.Slider(0.0, 2.0, value=0.7, step=0.05, label="temperature",
+                                elem_id="glq-temperature")
+        max_tokens = gr.Slider(64, 8192, value=1024, step=64, label="max tokens",
+                               elem_id="glq-max-tokens")
         # No `type=` argument: Gradio 6 removed it and made the messages format the only
         # one (it was required in 5.x). `respond` therefore always receives history as a
         # list of {"role", "content"} dicts — see the `gradio>=6` pin in pyproject.
         gr.ChatInterface(respond,
+                         chatbot=gr.Chatbot(elem_id="glq-chatbot", height=420),
+                         textbox=gr.Textbox(elem_id="glq-input",
+                                            placeholder="Ask the GLQ model something…"),
                          additional_inputs=[model, temperature, max_tokens])
     return demo
 
