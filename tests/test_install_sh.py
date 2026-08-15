@@ -12,6 +12,7 @@ commented-out line.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,12 +54,35 @@ def test_strict_mode_is_on():
     assert "set -euo pipefail" in src
 
 
-def test_curl_pins_https_and_tls():
-    """A plain `curl -fsSL` would follow a redirect to http://; pinning the proto means a
-    downgrade fails instead of silently fetching over cleartext."""
-    src = open(INSTALL_SH).read()
-    assert "--proto '=https'" in src
-    assert "--tlsv1.2" in src
+def test_every_curl_invocation_pins_https_and_tls():
+    """Any fetch the installer makes must refuse a cleartext downgrade.
+
+    `curl -fsSL` follows a redirect to http:// silently; `--proto '=https'` makes that fail
+    instead. Scans the whole shipped installer, because install.sh itself fetches nothing —
+    pip does the downloading — and the only real fetch is the nvm bootstrap in
+    glq/installer/__main__.py. An earlier version asserted these flags lived in install.sh,
+    where they sat in an unused variable; shellcheck SC2034 caught that the test was pinning
+    dead code.
+
+    "Invocation" means `curl` followed by a flag. A bare `curl` is a package name in a
+    pkg_hint line or `command -v curl`, neither of which fetches anything.
+    """
+    invoke = re.compile(r"\bcurl\s+-")
+    loopback = re.compile(r"127\.0\.0\.1|localhost")
+    checked = 0
+    for path in (INSTALL_SH, os.path.join(ROOT, "glq", "installer", "__main__.py")):
+        for line in open(path).read().splitlines():
+            if line.strip().startswith("#") or not invoke.search(line):
+                continue
+            # Loopback is exempt, and deliberately: the printed "is it up?" check hits the
+            # user's own vLLM on http://127.0.0.1, where plaintext is correct and https
+            # would simply fail. The downgrade risk this guards only exists off-host.
+            if loopback.search(line):
+                continue
+            checked += 1
+            assert "--proto '=https'" in line and "--tlsv1.2" in line, (
+                f"unpinned curl in {os.path.basename(path)}: {line.strip()}")
+    assert checked, "expected at least one curl invocation (the nvm bootstrap)"
 
 
 def test_umask_is_restrictive():
@@ -104,6 +128,29 @@ def test_it_refuses_to_run_as_root(tmp_path):
     assert "root" in proc.stderr.lower()
     assert "--allow-root" in proc.stderr
     assert not (tmp_path / "h").exists(), "must refuse before creating anything"
+
+
+@pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare(1) not available")
+def test_preflight_works_as_root(tmp_path):
+    """Diagnosis must not be gated on the root check.
+
+    Pre-flight is read-only, and the people most likely to run it as root are exactly the
+    ones who need it: anyone inside a container (Docker defaults to uid 0). Refusing to even
+    *report* what is missing, because of a guard that exists to protect the install, is
+    unhelpful — and it makes the whole cross-distro matrix untestable, since every container
+    runs as root."""
+    probe = subprocess.run(["unshare", "-r", "id", "-u"], capture_output=True, text=True)
+    if probe.returncode != 0 or probe.stdout.strip() != "0":
+        pytest.skip("user namespaces unavailable in this environment")
+
+    proc = subprocess.run(
+        ["unshare", "-r", "bash", INSTALL_SH, "--preflight"],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "GLQ_HOME": str(tmp_path / "h")})
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"pre-flight should run as root, got {proc.returncode}: {out}"
+    assert "Pre-flight checks" in out
+    assert not (tmp_path / "h").exists(), "still read-only"
 
 
 @pytest.mark.skipif(shutil.which("unshare") is None, reason="unshare(1) not available")

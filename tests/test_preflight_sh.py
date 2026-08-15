@@ -17,6 +17,7 @@ there is no CUDA and GLQ runs its CPU fallback.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 import pytest
@@ -31,6 +32,7 @@ OS_RELEASE = {
     "fedora": 'ID=fedora\nVERSION_ID=44\nPRETTY_NAME="Fedora Linux 44"\n',
     "rhel": 'ID="rhel"\nID_LIKE="fedora"\nVERSION_ID="9.4"\nPRETTY_NAME="Red Hat Enterprise Linux 9.4"\n',
     "rocky": 'ID="rocky"\nID_LIKE="rhel centos fedora"\nVERSION_ID="9.4"\n',
+    "almalinux": 'ID="almalinux"\nID_LIKE="rhel centos fedora"\nVERSION_ID="9.4"\n',
     "arch": 'ID=arch\nPRETTY_NAME="Arch Linux"\n',
     "manjaro": 'ID=manjaro\nID_LIKE=arch\n',
     "amzn": 'ID="amzn"\nVERSION_ID="2023"\nPRETTY_NAME="Amazon Linux 2023"\n',
@@ -143,3 +145,111 @@ def test_preflight_is_documented_in_help():
     proc = subprocess.run(["bash", INSTALL_SH, "--help"],
                           capture_output=True, text=True, timeout=30)
     assert "--preflight" in proc.stdout
+
+
+# ------------------------------------------------- the python floor on RHEL 9
+
+# Measured in containers on 2026-08-15, not assumed:
+#
+#   UBI9 / AlmaLinux 9 / Amazon Linux 2023   ->  default python3 is **3.9**
+#   glq needs >= 3.10, so `dnf install python3-devel` installs 3.9 headers and
+#   pre-flight still refuses afterwards — advice that leads nowhere.
+#
+#   `dnf install -y python3.12`  ->  exit 0, Python 3.12.13, venv available
+#   (3.11 and 3.14 are in AppStream too; the hint just has to name >= 3.12.)
+#
+# The assertion is a floor rather than an exact string so that moving the hint to 3.14
+# later stays green.
+
+_PY_RE = re.compile(r"python3\.(\d+)")
+
+
+def _hint_line(distro, tmp_path):
+    out = _out(_preflight(distro, tmp_path))
+    lines = [ln for ln in out.splitlines() if "packages on this distro" in ln]
+    assert lines, f"no package hint printed for {distro}:\n{out}"
+    return lines[0]
+
+
+def _newest_python_named(hint):
+    minors = [int(m) for m in _PY_RE.findall(hint)]
+    return max(minors) if minors else None
+
+
+@pytest.mark.parametrize("distro", ["rhel", "rocky", "almalinux", "amzn"])
+def test_rhel_family_hint_names_python_312_or_newer(distro, tmp_path):
+    """RHEL 9 and Amazon Linux 2023 default to python3.9. Unless the hint names an
+    explicit >= 3.12 interpreter, following it leaves the user exactly where they started:
+    pre-flight refuses again, having told them they were done."""
+    hint = _hint_line(distro, tmp_path)
+    newest = _newest_python_named(hint)
+    assert newest is not None, f"{distro}: hint names no explicit python version: {hint}"
+    assert newest >= 12, (
+        f"{distro}: hint offers python3.{newest}, but the distro default is 3.9 and glq "
+        f"needs >= 3.10 — name 3.12 or newer explicitly: {hint}")
+
+
+@pytest.mark.parametrize("distro", ["rhel", "rocky", "almalinux", "amzn"])
+def test_rhel_family_hint_does_not_ask_for_curl(distro, tmp_path):
+    """These images preinstall `curl-minimal`, which *conflicts* with `curl`:
+
+        package curl-minimal-7.76.1-40.el9 conflicts with curl provided by curl-7.76.1-40.el9
+
+    so asking for it does not merely add nothing — it fails the whole dnf transaction and
+    takes gcc down with it, leaving the user worse off than doing nothing. Measured on UBI9.
+    """
+    hint = _hint_line(distro, tmp_path)
+    assert not re.search(r"\bcurl\b", hint), (
+        f"{distro}: hint asks for curl, which conflicts with the preinstalled "
+        f"curl-minimal and aborts the transaction: {hint}")
+
+
+@pytest.mark.parametrize("distro", ["ubuntu", "debian", "arch", "opensuse"])
+def test_other_families_still_install_curl(distro, tmp_path):
+    """Regression: the curl removal is specific to the RHEL family, where curl-minimal is
+    preinstalled. Everywhere else curl is genuinely needed and genuinely absent."""
+    assert re.search(r"\bcurl\b", _hint_line(distro, tmp_path)), \
+        f"{distro}: curl is not preinstalled here; the hint must still name it"
+
+
+# --------------------------------------------------- the pacman database refresh
+
+@pytest.mark.parametrize("distro", ["arch", "manjaro", "steamos"])
+def test_arch_family_refreshes_the_package_database(distro, tmp_path):
+    """`pacman -S` does not sync the package database; `-Sy` does.
+
+    Measured in a container 2026-08-15: the archlinux image ships with no synced database,
+    so a bare `pacman -S python gcc curl` cannot resolve any package name at all —
+
+        warning: database file for 'core' does not exist (use '-Sy' to download)
+        error: target not found: python
+
+    which reads as "Arch has no python" rather than "pacman has no package list". `-Syu` is
+    the form Arch documents; `-Sy` alone is a partial upgrade, which they discourage.
+
+    The apt branch already pairs `apt-get update &&` with the install, and dnf/zypper/tdnf
+    refresh implicitly — Arch is the only family where this must be explicit.
+    """
+    hint = _hint_line(distro, tmp_path)
+    assert "-Syu" in hint, (
+        f"{distro}: `pacman -S` without a database sync cannot resolve packages on a fresh "
+        f"system: {hint}")
+
+
+@pytest.mark.parametrize("distro", ["ubuntu", "debian", "fedora", "rhel", "almalinux",
+                                    "amzn", "arch", "manjaro", "steamos", "azurelinux",
+                                    "opensuse"])
+def test_every_hint_is_non_interactive(distro, tmp_path):
+    """Each hint must complete without a prompt.
+
+    apt/dnf/tdnf/zypper already carry `-y`; pacman needs `--noconfirm` or it stops at
+
+        :: Proceed with installation? [Y/n]
+
+    which hangs anything scripted and leaves an interactive user staring at a half-finished
+    install if they walked away. Measured in the arch container: the command resolved the
+    packages and then stalled on the prompt.
+    """
+    hint = _hint_line(distro, tmp_path)
+    assert (" -y" in hint or "--noconfirm" in hint), \
+        f"{distro}: hint needs a non-interactive flag: {hint}"
