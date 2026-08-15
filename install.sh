@@ -14,7 +14,9 @@
 # functions and does nothing.
 #
 # It does not use sudo. If a system package is missing it tells you the apt line and stops,
-# rather than escalating on your behalf.
+# rather than escalating on your behalf. It also fetches nothing itself — pip does all the
+# downloading — so the only curl in the installer is the nvm bootstrap in glq/installer,
+# which pins the transport (see test_every_curl_pins_https_and_tls).
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -34,9 +36,6 @@ GLQ_OS_RELEASE="${GLQ_OS_RELEASE:-/etc/os-release}"
 
 # Disk needed for torch + vLLM + one small checkpoint, measured on a clean box.
 MIN_FREE_GB=25
-
-# curl with the transport pinned: https only, TLS >= 1.2, fail on HTTP errors.
-CURL=(curl --proto '=https' --tlsv1.2 -fsSL)
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
@@ -103,11 +102,20 @@ pkg_hint() {
     local id="$DISTRO_ID $DISTRO_LIKE"
     case " $id " in
         *ubuntu*|*debian*)          echo "sudo apt-get update && sudo apt-get install -y python3-venv python3-dev build-essential curl" ;;
-        *fedora*|*rhel*|*centos*|*rocky*|*almalinux*|*amzn*)
-                                    echo "sudo dnf install -y python3-devel gcc curl" ;;
-        *steamos*)                  echo "sudo steamos-readonly disable && sudo pacman -S --needed python gcc curl   # or use distrobox" ;;
+        # RHEL 9 family BEFORE fedora: RHEL sets ID_LIKE=fedora, so a fedora-first pattern
+        # would swallow it and hand out advice that does not work here. Two differences,
+        # both measured in containers rather than assumed:
+        #   * the default python3 is 3.9 — below glq's 3.10 floor — so an explicit
+        #     python3.12 (in AppStream on UBI9/Alma/Amazon 2023) is required, otherwise
+        #     pre-flight refuses again after the user has "fixed" it;
+        #   * `curl` CONFLICTS with the preinstalled curl-minimal and aborts the whole dnf
+        #     transaction, taking gcc with it. Asking for it is worse than omitting it.
+        *rhel*|*centos*|*rocky*|*almalinux*|*amzn*)
+                                    echo "sudo dnf install -y python3.12 python3.12-devel gcc" ;;
+        *fedora*)                   echo "sudo dnf install -y python3-devel gcc curl" ;;
+        *steamos*)                  echo "sudo steamos-readonly disable && sudo pacman -Syu --needed --noconfirm python gcc curl   # or use distrobox" ;;
         *arch*|*manjaro*|*endeavouros*)
-                                    echo "sudo pacman -S --needed python gcc curl" ;;
+                                    echo "sudo pacman -Syu --needed --noconfirm python gcc curl" ;;
         *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc curl" ;;
         *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc curl" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
@@ -247,13 +255,18 @@ hand_over() {
 
 main() {
     parse_args "$@"
-    check_not_root
 
+    # --preflight comes BEFORE the root check on purpose. It changes nothing, and the
+    # people most likely to run it as root are the ones who need it most: anyone inside a
+    # container, where uid 0 is the default. Refusing to even report what is missing, on
+    # account of a guard that exists to protect the *install*, helps nobody.
     if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
         preflight || die "pre-flight failed — install the packages above and re-run"
         say "Pre-flight OK. Run without --preflight to install."
         exit 0
     fi
+
+    check_not_root
     preflight || die "pre-flight failed — install the packages above and re-run"
 
     say "GLQ installer"
