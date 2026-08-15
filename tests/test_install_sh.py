@@ -349,3 +349,52 @@ def test_readme_advertises_the_raw_url():
     github.com/<org>/<repo>/install.sh is a 404."""
     readme = open(os.path.join(ROOT, "README.md")).read()
     assert "raw.githubusercontent.com/cnygaard/glq/main/install.sh" in readme
+
+
+# ------------------------------------------------ the venv must be usable by other builders
+#
+# glq is not the only thing that compiles CUDA in this venv. vLLM JIT-builds flashinfer at
+# engine start, and on a machine whose only CUDA is the pip wheels it dies exactly where glq
+# used to (measured in a container, 2026-08-15):
+#
+#     c++ … -L …/nvidia/cu13/lib64 -lcudart … /usr/bin/ld: cannot find -lcudart
+#
+# The repair therefore belongs to the *installer*, not to the installed glq: a new install.sh
+# must be able to fix the venv it just created without depending on a new glq being released
+# first. Measured with the rewritten Dockerfile — installer from this branch, glq 0.8.5 from
+# PyPI — GLQ's kernels baked fine and vLLM still could not start.
+
+def test_the_installer_repairs_the_cuda_wheel_layout_itself(tmp_path):
+    """Not delegated to `python -m glq.installer`: that is whatever glq version got installed,
+    which on any published release predates this fix."""
+    src = open(INSTALL_SH).read()
+    body = src.split("install_cuda_toolchain()", 1)[-1].split("\ninstall_glq()", 1)[0]
+    assert "lib64" in body, (
+        "install.sh never creates the lib64/ that CUDA build systems pass to -L; the pip "
+        "wheels ship lib/ only")
+    assert "libcudart.so" in body, (
+        "install.sh never creates the unversioned libcudart.so that -lcudart resolves through")
+
+
+def test_the_layout_repair_is_reported_not_silent(tmp_path):
+    """It mutates site-packages. Doing that without saying so is how an installer earns
+    distrust — and if it ever goes wrong, the log is the only evidence."""
+    body = open(INSTALL_SH).read()
+    repair = body.split("install_cuda_toolchain()", 1)[-1].split("\ninstall_glq()", 1)[0]
+    assert re.search(r'say\s|warn\s', repair), "the repair step prints nothing"
+
+
+def test_the_layout_repair_is_confined_to_the_installer_own_venv(tmp_path):
+    """The hazard in a shell glob is an empty variable: `$GLQ_VENV/lib/python*/…` becomes
+    `/lib/python*/…` — a system path — if GLQ_VENV is ever blank. Every path in the repair
+    must be anchored to the variable, and the function must refuse to run when that variable
+    does not point at a venv it created."""
+    src = open(INSTALL_SH).read()
+    repair = src.split("repair_cuda_wheel_layout() {", 1)[-1].split("\n}", 1)[0]
+
+    assert '[ -x "$GLQ_VENV/bin/python" ]' in repair, (
+        "no guard that $GLQ_VENV is actually a venv before globbing under it")
+    for line in repair.splitlines():
+        if "site-packages" in line:
+            assert '"$GLQ_VENV"' in line, f"unanchored path in the repair loop: {line.strip()}"
+    assert "/usr" not in repair, "the repair references a system path"

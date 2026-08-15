@@ -392,6 +392,116 @@ def test_an_existing_cuda_home_is_never_overridden(monkeypatch, tmp_path):
     assert os.environ["CUDA_HOME"] == "/usr/local/cuda-13.2"
 
 
+# -------------------------------------------- the environment is not what torch reads
+#
+# Setting os.environ['CUDA_HOME'] is necessary but NOT sufficient, and the difference cost a
+# full container round trip. torch resolves the variable **once, at import time**, into a
+# module-level constant, and that constant is what the build consults:
+#
+#     torch/utils/cpp_extension.py
+#         CUDA_HOME = _find_cuda_home()                 # import time, ONE shot
+#         def _join_cuda_home(*paths):
+#             if CUDA_HOME is None:
+#                 raise OSError('CUDA_HOME environment variable is not set. …')
+#
+# So by the time glq runs, the answer is already cached and no amount of os.environ writing
+# changes it. Measured on the real `curl … | bash` path against released 0.8.5, in an
+# ubuntu:24.04 container: the toolchain landed correctly (cuda-toolkit 13.0.3.0,
+# nvidia-cuda-nvcc 13.0.88, nvcc present at
+# `…/site-packages/nvidia/cu13/bin/nvcc` — exactly where `_venv_cuda_home()` globs) and the
+# build still died with `OSError: CUDA_HOME environment variable is not set`.
+#
+# The earlier probe that "proved" this worked had exported CUDA_HOME in the shell, before
+# python started — so torch picked it up at import and glq's code was never under test.
+# These assert the mechanism that actually decides the build.
+
+def test_torch_sees_the_cuda_home_the_build_sets(monkeypatch, tmp_path):
+    import torch.utils.cpp_extension as cpp
+
+    root = tmp_path / "nvidia" / "cu13"
+    (root / "bin").mkdir(parents=True)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.setattr(cpp, "CUDA_HOME", None, raising=False)
+    monkeypatch.setattr(ik, "_venv_cuda_home", lambda *_a, **_k: str(root))
+    _make_build_succeed(monkeypatch)
+
+    ik._try_load_cuda_ext()
+
+    assert cpp.CUDA_HOME == str(root), (
+        "os.environ['CUDA_HOME'] is not what torch reads — it caches the value at import "
+        "time, so the variable must be pushed into the module constant as well")
+
+
+def test_a_cuda_home_torch_already_resolved_is_not_replaced(monkeypatch, tmp_path):
+    """The wheels must never shadow a real toolkit: torch was *compiled* against that one.
+
+    "Real" means it has a compiler in it — see the runtime-image test below for why the
+    directory merely existing is not enough.
+    """
+    import torch.utils.cpp_extension as cpp
+
+    system = tmp_path / "usr" / "local" / "cuda"
+    (system / "bin").mkdir(parents=True)
+    (system / "bin" / "nvcc").write_bytes(b"")
+    monkeypatch.setattr(cpp, "CUDA_HOME", str(system), raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.setattr(ik, "_venv_cuda_home", lambda *_a, **_k: str(tmp_path / "wheels"))
+    _make_build_succeed(monkeypatch)
+
+    ik._try_load_cuda_ext()
+
+    assert cpp.CUDA_HOME == str(system)
+
+
+def test_a_cuda_home_with_no_compiler_in_it_is_replaced(monkeypatch, tmp_path):
+    """A CUDA *runtime* install is not a toolchain, and torch cannot tell the difference.
+
+        def _find_cuda_home():
+            …
+            cuda_home = '/usr/local/cuda'
+            if not os.path.exists(cuda_home):   # <- existence, not usability
+                cuda_home = None
+
+    Measured in `nvidia/cuda:12.9.1-runtime-ubuntu24.04`: `/usr/local/cuda` is present with
+    `include/` and `lib64/`, `nvcc` is MISSING, and there is no `libcudart.so`. So torch
+    resolves a CUDA_HOME that cannot compile anything, and a guard keyed on `is None` sits
+    there while the perfectly good nvcc in site-packages goes unused. Same on any host with
+    the CUDA runtime but no toolkit — a very common shape.
+    """
+    import torch.utils.cpp_extension as cpp
+
+    runtime_only = tmp_path / "usr" / "local" / "cuda"
+    (runtime_only / "lib64").mkdir(parents=True)          # libs, but no bin/nvcc
+    wheels = tmp_path / "nvidia" / "cu13"
+    (wheels / "bin").mkdir(parents=True)
+
+    monkeypatch.setattr(cpp, "CUDA_HOME", str(runtime_only), raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.setattr(ik, "_venv_cuda_home", lambda *_a, **_k: str(wheels))
+    _make_build_succeed(monkeypatch)
+
+    ik._try_load_cuda_ext()
+
+    assert cpp.CUDA_HOME == str(wheels), (
+        "torch resolved a toolkit-less /usr/local/cuda and glq left it there, so the build "
+        "has no compiler even though the venv ships one")
+
+
+def test_a_cuda_home_exported_after_torch_imported_still_reaches_torch(monkeypatch):
+    """`os.environ['CUDA_HOME'] = …` in a notebook, or any import ordering that puts torch
+    first, lands in the same trap — the export is real and torch never sees it."""
+    import torch.utils.cpp_extension as cpp
+
+    monkeypatch.setattr(cpp, "CUDA_HOME", None, raising=False)
+    monkeypatch.setenv("CUDA_HOME", "/usr/local/cuda-13.2")
+    monkeypatch.setattr(ik, "_venv_cuda_home", lambda *_a, **_k: None)
+    _make_build_succeed(monkeypatch)
+
+    ik._try_load_cuda_ext()
+
+    assert cpp.CUDA_HOME == "/usr/local/cuda-13.2"
+
+
 # ------------------------------------------- asking for a symbol that may not be there
 #
 # `glq_vllm/linear_method.py:671` reached straight into the extension:
@@ -459,3 +569,128 @@ def test_status_before_any_attempt_does_not_lie(monkeypatch):
     assert available is True, "status() must resolve the lazy build rather than guess"
     assert error is None
     assert ik._glq_cuda is sentinel
+
+
+# ------------------------------------- making the pip CUDA wheels look like a real toolkit
+#
+# `_cudart_link_dir()` fixes GLQ's *own* link line. It cannot fix anybody else's, and on a
+# machine whose only CUDA is the pip wheels, everybody else has the same problem. Measured
+# in an ubuntu:24.04 container (2026-08-15): GLQ installed, GLQ's kernels built, the
+# self-check passed — and vLLM then failed to start, because it JIT-compiles flashinfer:
+#
+#     c++ … -L …/nvidia/cu13/lib64 -L …/nvidia/cu13/lib64/stubs -lcudart -lcuda
+#     /usr/bin/ld: cannot find -lcudart: No such file or directory
+#
+# Two independent gaps in the wheels' layout, both of which a real CUDA install has:
+#   * `lib/libcudart.so`  — the dev symlink `-lcudart` resolves through
+#   * `lib64/`            — the directory every CUDA build system passes to -L
+#
+# Repairing the venv once covers GLQ, flashinfer, and anything else compiled later; shimming
+# per-consumer does not scale past the consumer you happen to control.
+
+def _wheel_layout(tmp_path, major="13"):
+    lib = tmp_path / "nvidia" / f"cu{major}" / "lib"
+    lib.mkdir(parents=True)
+    (lib / f"libcudart.so.{major}").write_bytes(b"")
+    return tmp_path / "nvidia" / f"cu{major}"
+
+
+def test_the_dev_symlink_is_created_so_lcudart_resolves(tmp_path):
+    root = _wheel_layout(tmp_path)
+    ik.repair_cuda_wheel_layout([str(tmp_path)])
+    link = root / "lib" / "libcudart.so"
+    assert link.is_symlink() or link.exists()
+    assert os.path.realpath(link) == os.path.realpath(root / "lib" / "libcudart.so.13")
+
+
+def test_lib64_is_created_because_build_systems_pass_it(tmp_path):
+    """flashinfer's link line is `-L$CUDA_HOME/lib64`, and the wheels have no lib64 at all."""
+    root = _wheel_layout(tmp_path)
+    ik.repair_cuda_wheel_layout([str(tmp_path)])
+    lib64 = root / "lib64"
+    assert lib64.exists(), "no lib64 — every -L$CUDA_HOME/lib64 consumer still fails"
+    assert (lib64 / "libcudart.so").exists()
+
+
+def test_repairing_twice_changes_nothing(tmp_path):
+    """It runs on every install and every lazy load; it must not thrash or raise."""
+    root = _wheel_layout(tmp_path)
+    ik.repair_cuda_wheel_layout([str(tmp_path)])
+    before = sorted(p.name for p in (root / "lib").iterdir())
+    ik.repair_cuda_wheel_layout([str(tmp_path)])
+    assert sorted(p.name for p in (root / "lib").iterdir()) == before
+
+
+def test_a_real_toolkit_layout_is_left_alone(tmp_path):
+    """If the wheels already ship the symlink, do not replace it — and never touch a system
+    CUDA, which glq does not own."""
+    root = _wheel_layout(tmp_path)
+    real = root / "lib" / "libcudart.so"
+    real.write_bytes(b"not-a-symlink")
+    ik.repair_cuda_wheel_layout([str(tmp_path)])
+    assert real.read_bytes() == b"not-a-symlink"
+
+
+def test_no_cuda_wheels_is_not_an_error(tmp_path):
+    ik.repair_cuda_wheel_layout([str(tmp_path)])          # must not raise
+
+
+def test_a_read_only_venv_is_not_an_error(tmp_path):
+    """Some deployments run from a read-only site-packages. Degrade, do not crash."""
+    root = _wheel_layout(tmp_path)
+    os.chmod(root / "lib", 0o555)
+    try:
+        ik.repair_cuda_wheel_layout([str(tmp_path)])      # must not raise
+    finally:
+        os.chmod(root / "lib", 0o755)
+
+
+def test_the_repair_refuses_to_touch_a_system_prefix(tmp_path, monkeypatch):
+    """glq must not write into a system site-packages just because it was imported there.
+
+    Under `sudo pip install glq`, or root in a container, `site.getsitepackages()` is
+    /usr/lib/python3/dist-packages — not a directory an inference library should be creating
+    symlinks in unasked. The venv case is the one install.sh creates and therefore owns.
+    """
+    import site as site_mod
+    import sys as sys_mod
+
+    root = _wheel_layout(tmp_path)
+    monkeypatch.setattr(sys_mod, "prefix", "/usr", raising=False)
+    monkeypatch.setattr(sys_mod, "base_prefix", "/usr", raising=False)   # i.e. not a venv
+    monkeypatch.setattr(site_mod, "getsitepackages", lambda: [str(tmp_path)])
+
+    ik.repair_cuda_wheel_layout()
+
+    assert not (root / "lib" / "libcudart.so").exists(), "wrote into a system prefix"
+    assert not (root / "lib64").exists(), "wrote into a system prefix"
+
+
+def test_the_repair_runs_inside_a_venv(tmp_path, monkeypatch):
+    """The case install.sh creates, and the only one glq owns."""
+    import site as site_mod
+    import sys as sys_mod
+
+    root = _wheel_layout(tmp_path)
+    monkeypatch.setattr(sys_mod, "prefix", "/home/u/.glq/venv", raising=False)
+    monkeypatch.setattr(sys_mod, "base_prefix", "/usr", raising=False)   # venv
+    monkeypatch.setattr(site_mod, "getsitepackages", lambda: [str(tmp_path)])
+
+    ik.repair_cuda_wheel_layout()
+
+    assert (root / "lib" / "libcudart.so").exists()
+    assert (root / "lib64").exists()
+
+
+def test_an_explicit_root_is_still_honoured_outside_a_venv(tmp_path, monkeypatch):
+    """The guard is about the *default*. install.sh and the tests name a tree deliberately,
+    and that intent should not be second-guessed."""
+    import sys as sys_mod
+
+    root = _wheel_layout(tmp_path)
+    monkeypatch.setattr(sys_mod, "prefix", "/usr", raising=False)
+    monkeypatch.setattr(sys_mod, "base_prefix", "/usr", raising=False)
+
+    ik.repair_cuda_wheel_layout([str(tmp_path)])
+
+    assert (root / "lib" / "libcudart.so").exists()

@@ -122,8 +122,13 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     # just wants to chat should not silently get them.
     tools = (" --enable-auto-tool-choice --tool-call-parser hermes"
              if "picode" in components else "")
+    # "~30 s" was a guess copied from a source comment. Measured in a container on 8 cores,
+    # cold cache, one arch: 38.3 s — and the build parallelises over MAX_JOBS, so a 4-core
+    # machine is proportionally slower. Quote the range rather than the best case; someone
+    # who was promised 30 s and waits 90 reasonably concludes it has hung.
     step(f"Serve the model. The first run {first_run}JIT-builds the CUDA"
-         f"\n   extension (~30 s), so it is slow to start; later runs are not.",
+         f"\n   extension (about a minute, longer on fewer cores), so it is slow to start;"
+         f"\n   later runs are not.",
          f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq --port {port}{tools}")
     if tools:
         out.insert(len(out) - 1,
@@ -133,6 +138,20 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
 
     step("Check it is up (from another terminal):",
          f"curl -s http://127.0.0.1:{port}/v1/models")
+
+    # /v1/models answers "is the port open", which is not the question that matters here.
+    # GLQ compiles its CUDA kernels on this machine, so the server can start and list the
+    # model while still being unable to run a forward pass — and someone who arrived via
+    # `curl … | bash` has no client wired up, so without this their first real inference is
+    # whenever they write one, far from the install that caused the failure. Same completion
+    # the distro suite gates on, so "Paris" means the whole stack works.
+    step("Generate a token — the check that the model actually decodes:",
+         f"curl -s http://127.0.0.1:{port}/v1/completions \\",
+         "       -H 'Content-Type: application/json' \\",
+         f"       -d '{{\"model\": \"{model}\", \"prompt\": \"The capital of France is\", "
+         f"\"max_tokens\": 8, \"temperature\": 0}}'",
+         "",
+         "   A working install completes it with Paris.")
 
     if "chat" in components:
         step(f"Chat in a browser — then open http://localhost:7860",
@@ -240,6 +259,18 @@ def main(argv=None) -> int:
                 [chosen.repo_id])
     else:
         print(f"  [dry-run] would write {GLQ_HOME / 'config.json'}")
+
+    # Make the pip CUDA wheels usable by every compiler that will meet them, not just GLQ's.
+    # They ship no `libcudart.so` and no `lib64/`, so `-lcudart` cannot resolve — measured in
+    # a container, this stops **vLLM** dead (it JIT-builds flashinfer) long after GLQ's own
+    # kernels have built and the self-check has gone green. Runs once, here, because this is
+    # the point where the toolchain is known to be installed.
+    if not args.dry_run:
+        try:
+            from glq import inference_kernel as _ik
+            _ik.repair_cuda_wheel_layout()
+        except Exception as exc:                                      # noqa: BLE001
+            print(f"  note: could not normalise the CUDA wheel layout ({exc})")
 
     # Assert the install can do what next_steps is about to promise. Printing
     # "GLQ is installed." over a venv whose plugin does not resolve sends the user to

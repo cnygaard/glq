@@ -118,6 +118,69 @@ def _cudart_link_dir(search_roots=None, cache_dir=None):
         return None                                   # read-only HOME: fall through to fail
 
 
+def repair_cuda_wheel_layout(search_roots=None):
+    """Give the pip CUDA wheels the on-disk layout every CUDA build system expects.
+
+    `_cudart_link_dir()` repairs GLQ's own link line. It cannot repair anyone else's, and on
+    a machine whose only CUDA is the pip wheels, everyone else has the identical problem.
+    Measured in an ubuntu:24.04 container: glq installed, GLQ's kernels built, `--verify`
+    green — and then vLLM refused to start, because it JIT-compiles flashinfer:
+
+        c++ … -L …/nvidia/cu13/lib64 -L …/nvidia/cu13/lib64/stubs -lcudart -lcuda
+        /usr/bin/ld: cannot find -lcudart: No such file or directory
+
+    Two things a real CUDA install has and the wheels do not:
+
+      * `lib/libcudart.so` — the unversioned dev symlink, the only name `-lcudart` matches
+      * `lib64/`          — the directory build systems pass to `-L`; the wheels use `lib/`
+
+    Both are created here, once, in the venv: symlinks beside files pip already installed.
+    Shimming per-consumer does not scale past the consumers we happen to control.
+
+    Idempotent, and it never replaces something that already exists — if a wheel starts
+    shipping the symlink, or the root is a real toolkit, this is a no-op. A read-only
+    site-packages is a degrade, not a failure.
+    """
+    import glob
+    import os
+    import site
+    import sys
+
+    if search_roots is None:
+        # Only ever a venv, and only by default. Under `sudo pip install glq`, or root in a
+        # container, `site.getsitepackages()` is a system prefix — /usr/lib/python3/
+        # dist-packages — which glq has no business creating symlinks in unasked. The venv
+        # is the thing install.sh creates and therefore owns. An explicit `search_roots` is
+        # a deliberate instruction and is honoured either way.
+        if sys.prefix == sys.base_prefix:
+            return
+        search_roots = list(site.getsitepackages())
+
+    for root in search_roots:
+        for libdir in sorted(glob.glob(os.path.join(root, "nvidia", "*", "lib"))):
+            # libcudart.so.13 and libcudart.so.13.0.96 both map to libcudart.so; link the
+            # shortest, which is the soname the versioned files themselves chain to.
+            by_base = {}
+            for path in glob.glob(os.path.join(libdir, "lib*.so.*")):
+                base = path.split(".so.")[0] + ".so"
+                if len(path) < len(by_base.get(base, path * 2)):
+                    by_base[base] = path
+            for base, real in sorted(by_base.items()):
+                if os.path.lexists(base):
+                    continue                      # already correct, or not ours to replace
+                try:
+                    os.symlink(os.path.basename(real), base)
+                except OSError:
+                    pass                          # read-only venv: nothing more we can do
+
+            lib64 = os.path.join(os.path.dirname(libdir), "lib64")
+            if not os.path.lexists(lib64):
+                try:
+                    os.symlink("lib", lib64)
+                except OSError:
+                    pass
+
+
 def cuda_ext_status():
     """(available, error) for the fused CUDA extension, resolving the lazy build first.
 
@@ -171,17 +234,40 @@ def _try_load_cuda_ext():
             venv_bin = os.path.join(sys.prefix, 'bin')
             if os.path.exists(os.path.join(venv_bin, 'ninja')):
                 os.environ['PATH'] = venv_bin + ':' + os.environ.get('PATH', '')
-        # Point torch at the venv-local CUDA if nothing else has. An existing CUDA_HOME —
-        # a system install, or one the user set — always wins: mixing a wheel's CUDA minor
-        # with the toolkit torch was built against is how you get subtle link errors.
-        if not os.environ.get('CUDA_HOME'):
-            _cuda_home = _venv_cuda_home()
+        # Point torch at the venv-local CUDA if nothing else has. Precedence: a toolkit torch
+        # already resolved (a system install) outranks the wheels, then an explicit
+        # CUDA_HOME, then the pip toolchain — mixing a wheel's CUDA minor with the toolkit
+        # torch was built against is how you get subtle link errors.
+        #
+        # `cpp.CUDA_HOME` is resolved **once, when torch is imported**, and `_join_cuda_home`
+        # reads that constant rather than the environment. So assigning os.environ here is
+        # necessary (nvcc's own subprocesses read it) but not sufficient: without also
+        # updating the constant, torch still raises `CUDA_HOME environment variable is not
+        # set` with the compiler sitting right there in site-packages.
+        # Self-heal the wheel layout before building: a venv that predates this, or one glq
+        # was pip-installed into without install.sh, still has the missing symlinks.
+        try:
+            repair_cuda_wheel_layout()
+        except Exception:                                 # noqa: BLE001 - never fatal
+            pass
+
+        # The test is "can this CUDA_HOME compile", not "is it set". torch's
+        # `_find_cuda_home()` falls back to `/usr/local/cuda` whenever that path merely
+        # *exists*, and on a CUDA **runtime** install it does exist — with include/ and
+        # lib64/ but no nvcc. Measured in nvidia/cuda:12.9.1-runtime-ubuntu24.04, and true of
+        # any host carrying the runtime without the toolkit. Keyed on `is None`, glq would
+        # leave that toolchain-less path in place and never reach the nvcc in site-packages.
+        import torch.utils.cpp_extension as _cpp
+        if not _cpp.CUDA_HOME or not os.path.exists(
+                os.path.join(_cpp.CUDA_HOME, 'bin', 'nvcc')):
+            _cuda_home = os.environ.get('CUDA_HOME') or _venv_cuda_home()
             if _cuda_home:
                 os.environ['CUDA_HOME'] = _cuda_home
                 os.environ['PATH'] = (os.path.join(_cuda_home, 'bin') + ':'
                                       + os.environ.get('PATH', ''))
+                _cpp.CUDA_HOME = _cuda_home
 
-        from torch.utils.cpp_extension import load as _load_ext
+        _load_ext = _cpp.load
         _csrc = os.path.join(os.path.dirname(__file__), 'csrc')
         cu_file = os.path.join(_csrc, 'glq_cuda.cu')
         cpp_file = os.path.join(_csrc, 'glq_bindings.cpp')
