@@ -731,3 +731,41 @@ def test_the_jit_still_runs_when_there_is_no_prebuilt_extension(monkeypatch):
 
     assert ik._try_load_cuda_ext() is True
     assert ik._glq_cuda is sentinel
+
+
+# ------------------------------- why the *prebuilt* extension did not load, when it exists
+#
+# The ladder's first step originally did `except Exception: _prebuilt = None`, which is the
+# same silent discard the JIT path was fixed for. It matters more here, not less: a wheel
+# that ships a `_C.so` which cannot load — wrong torch ABI, a missing runtime library — is
+# indistinguishable from a wheel that ships no extension at all, and the fallback JIT then
+# fails for an unrelated reason and reports only that. Measured while validating a wheel on
+# fedora:44, where exactly this happened and the first diagnosis was wrong.
+
+def test_a_prebuilt_that_cannot_load_records_why(monkeypatch):
+    import sys as sys_mod
+
+    monkeypatch.setitem(sys_mod.modules, "glq._C", None)   # import raises
+    _make_build_fail(monkeypatch)
+
+    available, error = ik.cuda_ext_status()
+
+    assert available is False
+    assert "glq._C" in error, (
+        f"the prebuilt extension failed to import and the reason was discarded; "
+        f"error only says: {error!r}")
+    assert BOOM in error, "the JIT reason must survive too — both failed, say both"
+
+
+def test_a_working_jit_does_not_report_the_missing_prebuilt(monkeypatch):
+    """Absent is the normal case (sdist installs, unmatched arches). Reporting it as an
+    error every time would train people to ignore the field that matters."""
+    import sys as sys_mod
+
+    monkeypatch.setitem(sys_mod.modules, "glq._C", None)
+    _make_build_succeed(monkeypatch)
+
+    available, error = ik.cuda_ext_status()
+
+    assert available is True
+    assert error is None

@@ -196,10 +196,32 @@ set -u
 CMD=$(bash /glq/install.sh --preflight 2>&1 | sed -n 's/^  packages on this distro: //p' | head -1)
 bash -c "$(printf '%s' "$CMD" | sed 's/sudo //g')" >/tmp/pkg.log 2>&1
 
+# `useradd` and `su` are the TEST's prerequisites, not glq's, so they are installed
+# separately from the pre-flight set above — which must stay exactly what `pkg_hint` printed,
+# or the claim that pre-flight's advice is sufficient stops being testable.
+#
+# Minimal RPM images ship neither. Measured on fedora:44: every stage returned 127 with
+# `su: command not found`, and the `|| true` that used to sit on the useradd line swallowed
+# the real cause, so a missing harness dependency read as a glq failure three stages later.
+if ! command -v useradd >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
+    {   if   command -v dnf     >/dev/null 2>&1; then dnf install -y shadow-utils util-linux
+        elif command -v apt-get >/dev/null 2>&1; then apt-get install -y passwd login
+        elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm shadow util-linux
+        elif command -v tdnf    >/dev/null 2>&1; then tdnf install -y shadow-utils util-linux
+        elif command -v zypper  >/dev/null 2>&1; then zypper -n install shadow util-linux
+        fi
+    } >/tmp/harness_prereq.log 2>&1 || true
+fi
+for tool in useradd su; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "HARNESS_PREREQ_MISSING=$tool"; tail -5 /tmp/harness_prereq.log; exit 90; }
+done
+
 # -s /bin/bash explicitly: useradd inherits the distro default, which is dash on
 # Debian-family, and install.sh is a bash script (arrays, `local`). Everything below runs
-# under bash, never sh.
-id tester >/dev/null 2>&1 || useradd -m -s /bin/bash tester || true
+# under bash, never sh. No `|| true`: a user we cannot create is a harness failure to report,
+# not one to continue past.
+id tester >/dev/null 2>&1 || useradd -m -s /bin/bash tester
 chmod 0777 /pipcache /hf 2>/dev/null || true
 
 echo "===D install as non-root (core + vllm)"
@@ -257,6 +279,13 @@ grep -aq "GEN_TEXT:" /tmp/gen.log || cat /tmp/gen.log
 """
     proc = _sh(distro, script.replace("$GLQ_SMOKE_MODEL", SMOKE_MODEL), timeout=9000)
     out = _out(proc)
+
+    # Distinguish "this test cannot run here" from "glq is broken here". Without this the
+    # two are indistinguishable in the output, and a missing `su` reads as an install
+    # failure — which is exactly how the first fedora:44 run was misdiagnosed.
+    assert "HARNESS_PREREQ_MISSING" not in out, (
+        f"{distro.name}: the harness could not create or switch to a non-root user, so "
+        f"nothing about glq was tested here.\n{out[-2000:]}")
 
     assert "D_EXIT=0" in out, f"{distro.name}: install failed\n{out[-4000:]}"
     assert "E_EXIT=0" in out, f"{distro.name}: self-check failed\n{out[-3000:]}"

@@ -27,6 +27,7 @@ except ImportError:
 _glq_cuda = None
 _cuda_ext_available = None  # None = not tried, True/False = result
 _cuda_ext_error = None      # why the build failed, verbatim — see cuda_ext_status()
+_prebuilt_ext_error = None  # why the wheel's glq._C did not load, if one was shipped
 
 
 #: Where to send someone whose bundled CUDA wheels turn out not to be enough. The landing
@@ -237,8 +238,17 @@ def _try_load_cuda_ext():
         # no wheel matches, and for sdist installs.
         try:
             from glq import _C as _prebuilt          # noqa: F401
-        except Exception:                            # noqa: BLE001 - absent is the norm
+        except Exception as _exc:                    # noqa: BLE001 - absent is the norm
             _prebuilt = None
+            # Absent is normal (sdist installs, unmatched arches) so this is not an error on
+            # its own — but a wheel that *ships* a _C.so which cannot load, because the torch
+            # ABI moved or a runtime library is missing, is otherwise indistinguishable from
+            # one that ships nothing. Keep the reason; it is reported only if the JIT
+            # fallback also fails, and is what makes a broken wheel diagnosable.
+            _prebuilt_error = f"prebuilt glq._C did not load: {type(_exc).__name__}: {_exc}\n"
+        else:
+            _prebuilt_error = ""
+        globals()['_prebuilt_ext_error'] = _prebuilt_error or None
         if _prebuilt is not None:
             _glq_cuda = _prebuilt
             _cuda_ext_available = True
@@ -319,7 +329,10 @@ def _try_load_cuda_ext():
         # NoneType AttributeError from a call site that has no idea why.
         global _cuda_ext_error
         import traceback
-        _cuda_ext_error = traceback.format_exc()
+        # Both halves of the ladder, when both failed: the shipped extension's reason first,
+        # then the compiler's. Reporting only the compile error sends a user with a broken
+        # wheel off to fix a toolchain that was never the problem.
+        _cuda_ext_error = (globals().get('_prebuilt_ext_error') or "") + traceback.format_exc()
         _cuda_ext_available = False
         import warnings
         warnings.warn(
