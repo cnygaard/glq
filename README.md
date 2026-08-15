@@ -39,15 +39,26 @@ architecture fallbacks dequantize instead).
 
 ## Quickstart
 
+### Installer command (venv, glq, vLLM, chat UI, optional pi agent)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash
+```
+
+Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
+them against your GPU and offers the ones that fit. `--dry-run` prints every
+command without running it; `--list` shows the checkpoints and exits;
+`--components core,vllm,picode,chat` skips the prompt. It refuses to run as root
+and never calls `sudo`.
+
+
+The rest of this section document the manual path.
+
 ### Run a pre-quantized model
 
 ```bash
-pip install glq         # requires PyTorch ≥ 2.0
+pip install 'glq[hf]'   # glq + transformers + accelerate; requires PyTorch ≥ 2.0
 ```
-
-Python ≥ 3.10. Triton ships with PyTorch on CUDA and is used
-automatically. The CUDA C extension JIT-builds on first run
-(~30 s); CPU falls back to dequantize-then-matmul.
 
 ```python
 import glq.hf_integration  # registers GLQ with transformers

@@ -18,11 +18,19 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# The HF-transformers inference path: `import glq.hf_integration` needs transformers,
+# and the README's device_map="auto" needs accelerate. Verified on a clean Ubuntu 24.04
+# box: `pip install glq` alone fails that snippet on both, in that order.
+hf = ["transformers", "accelerate"]
 cuda = ["triton"]
 dev = ["pytest"]
 quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepiece"]
 # card generation + HF upload for the batch quantizer (scripts/batch_quantization.py)
 hub = ["jinja2", "huggingface_hub", "pyyaml"]
+# examples/chat — Gradio UI talking to vLLM's OpenAI-compatible endpoint
+# gradio>=6: ChatInterface dropped `type=` and made the messages history
+# format the only one, which is what glq/chat.py builds against.
+chat = ["gradio>=6", "openai"]
 # model-performance benchmarking toolkit (glq-bench)
 bench = ["vllm", "datasets", "huggingface_hub", "jinja2", "pyyaml", "matplotlib", "pandas"]
 
@@ -30,6 +38,8 @@ bench = ["vllm", "datasets", "huggingface_hub", "jinja2", "pyyaml", "matplotlib"
 glq-quantize = "glq.quantize_model:main"
 glq-quantize-kv = "glq.quantize_kv:main"
 glq-bench = "glq.bench.cli:main"
+glq-setup = "glq.installer.__main__:main"
+glq-chat = "glq.chat:main"
 
 [project.entry-points."vllm.general_plugins"]
 glq = "glq_vllm:register"
