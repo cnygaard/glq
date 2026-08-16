@@ -64,7 +64,8 @@ GLQ installer
   --chat WHICH        gradio | openwebui | none
   --glq-version VER   pin glq (default: latest release)
   --glq-source SPEC   install glq from a wheel, path or VCS ref instead of PyPI
-  --yes               accept defaults, never prompt
+  --yes               accept defaults, never prompt (and never start GLQ)
+  --start/--no-start  start GLQ + the chat when done, or never offer to
   --list              list available checkpoints and exit
   --preflight         check prerequisites and exit (changes nothing)
   --dry-run           print every command, change nothing

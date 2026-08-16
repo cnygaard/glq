@@ -163,3 +163,99 @@ def test_every_venv_command_is_absolute():
         for cmd in ("vllm ", "glq-chat", "glq-setup", "glq-quantize"):
             if stripped.startswith(cmd):
                 raise AssertionError(f"non-absolute command in summary: {stripped!r}")
+
+
+# The handoff. `glq-chat` now starts vLLM itself, waits for it, opens a browser and stops
+# the server again on exit — so it is the one command a new user needs, and printing
+# `vllm serve` above it sends them to a blocking terminal and a second window instead.
+
+def test_the_chat_command_is_the_first_step_when_it_is_installed():
+    first = [ln for ln in _text().splitlines() if ln.startswith("1. ")]
+    assert first, "the summary has no numbered steps"
+    assert "chat" in first[0].lower(), f"step 1 is not the chat: {first[0]!r}"
+
+
+def test_the_chat_step_says_it_starts_the_server_itself():
+    """Otherwise the user starts `vllm serve` first out of habit and wonders why the second
+    one fails on a port collision."""
+    t = _text()
+    chat_block = t.split("1. ", 1)[1].split("\n2. ", 1)[0]
+    assert "glq-chat" in chat_block
+    assert "start" in chat_block.lower()
+    assert "vllm" in chat_block.lower()
+
+
+def test_the_first_run_warning_sits_on_the_step_the_user_runs_first():
+    """The weight download and the kernel build happen on whichever command they run first;
+    a warning attached to a command they never type does not warn anyone."""
+    t = _text(size_gib=22.4)
+    first_block = t.split("1. ", 1)[1].split("\n2. ", 1)[0]
+    assert "glq-chat" in first_block, "step 1 is not the command they will actually run"
+    assert "22.4" in first_block
+
+
+def test_serving_by_hand_is_still_documented_for_headless_use():
+    """`--no-serve`, remote boxes, and anything that is not the Gradio UI still need it."""
+    t = _text()
+    assert f"{VENV}/bin/vllm serve {MODEL}" in t
+
+
+def test_serving_is_step_one_when_the_chat_was_not_installed():
+    first = [ln for ln in _text(components=("core", "vllm")).splitlines()
+             if ln.startswith("1. ")]
+    assert "serve" in first[0].lower()
+
+
+def test_the_summary_is_closed_off_by_its_separator():
+    """A missing comma in the closing list once concatenated the sign-off with the rule,
+    producing one 1000-character line and no visible end to the output."""
+    lines = _text().splitlines()
+    assert lines[-1].strip() == "=" * 74, f"summary does not end with a rule: {lines[-1]!r}"
+    longest = max(lines, key=len)
+    assert len(longest) < 200, f"runaway line in the summary ({len(longest)} chars)"
+
+
+def test_the_chat_step_mentions_the_shareable_link():
+    """The chat publishes a public gradio.live URL by default. Someone reading only this
+    summary should learn that from the summary, not from a surprise line in the log."""
+    t = _text()
+    chat_block = t.split("1. ", 1)[1].split("\n2. ", 1)[0]
+    assert "gradio.live" in chat_block or "share" in chat_block.lower()
+
+
+# KV compression is a serving-time choice, so every way the summary tells someone to serve
+# has to carry it — the `vllm serve` line and the picode line alike. It is set through the
+# environment, which means a user who copies the plain command silently gets fp16.
+
+def test_the_serve_line_shows_how_to_turn_the_fp8_cache_on():
+    t = next_steps(venv=VENV, model=MODEL, components=ALL, port=8000, size_gib=1.8,
+                   fp8_kv=True)
+    assert "--kv-cache-dtype fp8" in t
+    assert "--kv-cache-dtype-skip-layers sliding_window" in t
+    assert f"{VENV}/bin/vllm serve" in t
+
+
+def test_the_picode_line_carries_it_too():
+    t = next_steps(venv=VENV, model=MODEL, components=ALL, port=8000, size_gib=1.8,
+                   fp8_kv=True)
+    pi_block = [ln for ln in t.splitlines() if "pi --provider" in ln]
+    assert pi_block, "no picode line at all"
+
+
+def test_the_summary_says_what_it_costs():
+    """Someone reading only the summary should learn it is a trade, not a free win."""
+    t = next_steps(venv=VENV, model=MODEL, components=ALL, port=8000, size_gib=1.8,
+                   fp8_kv=True)
+    assert "precision" in t.lower() or "context" in t.lower()
+
+
+def test_nothing_about_it_appears_when_it_was_not_chosen():
+    assert "--kv-cache-dtype" not in _text()
+
+
+def test_the_e8_cache_is_never_printed_as_an_instruction():
+    """It does not serve on vLLM 0.27.1, so no copyable command may suggest it."""
+    for chosen in (True, False):
+        t = next_steps(venv=VENV, model=MODEL, components=ALL, port=8000, size_gib=1.8,
+                       fp8_kv=chosen)
+        assert "GLQ_KV_QUANT" not in t

@@ -15,6 +15,8 @@ import io
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from glq.installer import prompt as P  # noqa: E402
@@ -161,3 +163,59 @@ def test_no_recommendation_and_no_tty_falls_back_to_the_smallest():
     unranked = [Ranked(r.checkpoint, None, False) for r in _ranked()]
     picked = P.select_model(unranked, tty=None)
     assert picked.repo_id == "xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel"
+
+
+# ------------------------------------------------- the offer to start GLQ straight away
+#
+# The installer ends by asking whether to start serving and open the chat. That question is
+# the difference between "install finished, now read four steps" and "install finished, here
+# is your model" — the gap between GLQ and Ollama or LM Studio for a first-time user.
+#
+# It has to obey the same contract as every other prompt here: under `curl … | bash` stdin is
+# the *script*, so the question goes to /dev/tty, and where there is no terminal (CI, docker
+# build, --yes) it must answer from the default without blocking.
+
+def test_confirm_with_no_tty_takes_the_default_without_blocking():
+    assert P.confirm("Start GLQ now?", default=True, tty=None) is True
+    assert P.confirm("Start GLQ now?", default=False, tty=None) is False
+
+
+def test_enter_accepts_the_default():
+    assert P.confirm("Start GLQ now?", default=True, tty=_Tty("\n")) is True
+    assert P.confirm("Start GLQ now?", default=False, tty=_Tty("\n")) is False
+
+
+@pytest.mark.parametrize("keys", ["y\n", "Y\n", "yes\n", " y \n"])
+def test_yes_in_its_usual_spellings(keys):
+    assert P.confirm("Start GLQ now?", default=False, tty=_Tty(keys)) is True
+
+
+@pytest.mark.parametrize("keys", ["n\n", "N\n", "no\n"])
+def test_no_in_its_usual_spellings(keys):
+    assert P.confirm("Start GLQ now?", default=True, tty=_Tty(keys)) is False
+
+
+def test_confirm_on_eof_falls_back_to_the_default():
+    """A closed terminal must not hang the installer or silently start a GPU server."""
+    assert P.confirm("Start GLQ now?", default=True, tty=_Tty("")) is True
+
+
+def test_an_unrecognised_answer_is_asked_again():
+    """Same contract as `select_model`: a typo re-asks rather than deciding for the user.
+    Guessing here either starts a GPU server nobody asked for or skips the whole point of
+    the prompt."""
+    tty = _Tty("maybe\ny\n")
+
+    assert P.confirm("Start GLQ now?", default=False, tty=tty) is True
+    assert tty.screen.count("Start GLQ now?") >= 1
+    assert "y or n" in tty.screen
+
+
+def test_the_default_is_visible_in_the_question():
+    """[Y/n] vs [y/N] is the only cue for what Enter does."""
+    tty = _Tty("\n")
+    P.confirm("Start GLQ now?", default=True, tty=tty)
+    assert "[Y/n]" in tty.screen
+    tty = _Tty("\n")
+    P.confirm("Start GLQ now?", default=False, tty=tty)
+    assert "[y/N]" in tty.screen
