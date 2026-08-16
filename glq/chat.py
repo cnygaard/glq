@@ -30,6 +30,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -199,6 +200,27 @@ def build_ui(base_url: str, models: list[str], api_key: str = "glq",
     return demo
 
 
+def writable_workdir() -> Path:
+    """A directory gradio can write into, since it puts `.gradio` in the *current* one.
+
+    Measured on ubuntu:26.04 with the repo mounted read-only: launching from there gives
+    "Could not create share link. [Errno 13] Permission denied: '.gradio'" — so where the
+    user happened to be standing decided whether the public link worked.
+
+    `~/.glq` already holds config.json and vllm.log, so it is where this belongs. Falls back
+    to the temp directory rather than raising: losing the share link is a nuisance, refusing
+    to start the chat at all is worse.
+    """
+    home = Path(os.environ.get("GLQ_HOME", Path.home() / ".glq"))
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        if os.access(home, os.W_OK):
+            return home
+    except OSError:
+        pass
+    return Path(tempfile.gettempdir())
+
+
 def _server_port(base_url: str, default: int = 8000) -> int:
     """The port vLLM should listen on, taken from the URL the client will call.
 
@@ -345,6 +367,9 @@ def main(argv=None) -> int:
             sys.stdout.reconfigure(line_buffering=True)
         except (AttributeError, ValueError):        # not a real stream (tests, pipes)
             pass
+        # gradio writes `.gradio` into the current directory; stand somewhere writable
+        # first, or the share tunnel dies wherever the user happened to launch from.
+        os.chdir(writable_workdir())
         build_ui(args.base_url, models, max_model_len=args.max_model_len).launch(
             server_port=args.port, share=args.share,
             inbrowser=args.browser and _display_available())
