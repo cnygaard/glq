@@ -25,7 +25,13 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy
-          pip install -e ".[hub]"   # jinja2 + huggingface_hub + pyyaml: the model-card feature's deps
+          # hub: jinja2 + huggingface_hub + pyyaml, the model-card feature's deps.
+          # chat: gradio + openai. Not for the supervisor tests — those stub both, so they
+          # run anywhere — but for tests/test_chat_ui.py, which is skipped without gradio
+          # and is the only thing that builds the real UI. It was written after a gradio 6
+          # API change crashed glq-chat on a box, and until now it skipped in CI too, so the
+          # regression it exists to catch was caught by nobody.
+          pip install -e ".[hub,chat]"
           pip install pytest
 
       - name: Run tests
