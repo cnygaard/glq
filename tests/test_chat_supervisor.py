@@ -247,6 +247,12 @@ def _run_chat(monkeypatch, argv, *, display=None, cfg=None, launch=None, models=
 
     monkeypatch.setattr(chat, "_installed_config", lambda: dict(cfg or {}))
     monkeypatch.setattr(chat, "_served_models", lambda _c: list(models))
+    # These tests are about the supervisor's process lifetime, not about HTTP. Both of the
+    # `chat` extra's packages are stubbed out so the suite runs on an install that has
+    # neither — which is exactly what CI has (`pip install .[hub]`), and what made twenty of
+    # these tests fail there while passing on a development venv that happened to have them.
+    monkeypatch.setattr(chat, "missing_chat_deps", lambda: [])
+    monkeypatch.setattr(chat, "_openai_client", lambda *_a, **_kw: object())
 
     def sup(**kw):
         made.append(kw)
@@ -879,3 +885,51 @@ def test_top_k_disabled_is_not_sent_at_all():
     kwargs = completion_kwargs(model="org/ckpt", messages=[], temperature=0.6,
                                top_p=0.95, top_k=0, max_tokens=512)
     assert not kwargs.get("extra_body"), "top_k=0 should send nothing, not top_k=0"
+
+
+# ============================================================ missing chat dependencies
+#
+# `gradio` and `openai` live in the `chat` extra, and both are imported lazily so the rest of
+# glq works without them. But main() only reached them *inside* `with supervisor:` — after
+# vLLM had loaded the weights. On a plain `pip install glq` that means several minutes of
+# model load, then a bare ModuleNotFoundError, then the teardown throwing the load away.
+#
+# CI found it before a user did: the test job installs `.[hub]`, not `.[chat]`, so twenty
+# supervisor tests died on `No module named 'openai'` — they were only passing locally
+# because a development venv happens to have it.
+
+def test_missing_deps_are_named(monkeypatch):
+    import glq.chat as chat
+    monkeypatch.setattr(chat.importlib.util, "find_spec",
+                        lambda name: None if name == "openai" else object())
+    assert chat.missing_chat_deps() == ["openai"]
+
+
+def test_nothing_missing_is_an_empty_list(monkeypatch):
+    import glq.chat as chat
+    monkeypatch.setattr(chat.importlib.util, "find_spec", lambda _name: object())
+    assert chat.missing_chat_deps() == []
+
+
+def test_the_check_happens_before_the_gpu_is_touched(monkeypatch, capsys):
+    """The whole point: fail in a second, not after a six-minute load."""
+    chat, events, _made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
+    monkeypatch.setattr(chat, "missing_chat_deps", lambda: ["gradio", "openai"])
+
+    rc = chat.main(["--model", "org/ckpt"])
+
+    assert rc != 0
+    assert events == [], f"vLLM must not be started: {events}"
+
+
+def test_the_message_says_how_to_fix_it(monkeypatch, capsys):
+    chat, _events, _made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
+    monkeypatch.setattr(chat, "missing_chat_deps", lambda: ["gradio"])
+
+    chat.main(["--model", "org/ckpt"])
+
+    # One call: readouterr() drains the buffer, so a second call returns empty strings.
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "gradio" in out
+    assert "glq[chat]" in out

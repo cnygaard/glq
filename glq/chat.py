@@ -25,6 +25,7 @@ install.sh.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import signal
@@ -44,6 +45,23 @@ def _installed_config() -> dict:
         return json.loads(GLQ_CONFIG.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+#: The `chat` extra. Both are imported lazily — `openai` costs ~1.0 s of import time and
+#: gradio far more — so nothing here fails at module scope, and the rest of glq works
+#: without either.
+CHAT_DEPS = ("gradio", "openai")
+
+
+def missing_chat_deps() -> list[str]:
+    """Which of the `chat` extra's packages are not installed.
+
+    Checked up front, because both imports used to sit *inside* the block that owns the
+    running server: on a plain `pip install glq` the user waited out a multi-minute weight
+    load and was then handed a bare ModuleNotFoundError, with the load thrown away on
+    teardown. `find_spec` answers the question without paying the import.
+    """
+    return [name for name in CHAT_DEPS if importlib.util.find_spec(name) is None]
 
 
 def _openai_client(base_url: str, api_key: str = "glq"):
@@ -262,6 +280,17 @@ def main(argv=None) -> int:
               "       or use --no-serve to attach to a server you started yourself.\n"
               "       Published checkpoints: https://huggingface.co/xv0y5ncu")
         return 2
+
+    # Before the supervisor, deliberately: starting vLLM first would spend minutes loading
+    # weights only to discard them when the UI cannot be built.
+    missing = missing_chat_deps()
+    if missing:
+        print(f"error: the chat UI needs {', '.join(missing)}, which "
+              f"{'is' if len(missing) == 1 else 'are'} not installed.\n"
+              f"       pip install 'glq[chat]'\n"
+              f"       (glq itself does not need {'it' if len(missing) == 1 else 'them'}; "
+              f"they ship as an extra so a serving-only install stays small.)")
+        return 3
 
     supervisor = VllmSupervisor(
         model=args.model,
