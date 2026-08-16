@@ -787,3 +787,95 @@ def test_no_fp8_kv_cache_overrides_the_installer_s_choice(monkeypatch):
     chat, _, made, _ = _run_chat(monkeypatch, [], cfg={"model": "org/ckpt", "fp8_kv": True})
     chat.main(["--no-fp8-kv-cache"])
     assert made[0]["fp8_kv"] is False
+
+
+# ==================================================================== the chat layout
+
+# The controls — checkpoint dropdown, temperature, max tokens — sat above the conversation,
+# taking permanent vertical space on every screen. Two fixes: fold them away, and drop the
+# dropdown entirely when there is nothing to pick between, which is the normal case because
+# `glq-chat` starts exactly one server with exactly one model.
+
+def test_the_model_picker_is_hidden_when_there_is_one_model():
+    from glq.chat import show_model_picker
+    assert show_model_picker(["org/only-one"]) is False
+    assert show_model_picker([]) is False
+
+
+def test_the_model_picker_appears_when_a_server_offers_a_choice():
+    from glq.chat import show_model_picker
+    assert show_model_picker(["org/a", "org/b"]) is True
+
+
+def test_the_controls_are_folded_away_rather_than_stacked_above_the_chat():
+    """A chat window should be mostly chat. Gradio renders `additional_inputs` where they
+    are created, so creating them in the open layout is what put them on screen."""
+    import glq.chat as chat
+    src = inspect.getsource(chat.build_ui)
+    accordion = src.index("gr.Accordion")
+    for control in ("gr.Slider", "gr.Dropdown"):
+        assert control in src
+        assert src.index(control) > accordion, (
+            f"{control} is created before the accordion, so it renders in the open layout")
+
+
+# The slider's ceiling has to come from the server's context window. `max_tokens` caps the
+# *output*, but the window holds prompt + history + output — so offering the whole window as
+# output is offering a setting that cannot succeed once anything is typed.
+
+def test_the_output_cap_leaves_room_for_the_conversation():
+    from glq.chat import max_tokens_ceiling
+    for window in (2048, 8192, 32768):
+        assert max_tokens_ceiling(window) < window, (
+            f"a {window}-token window offers {max_tokens_ceiling(window)} tokens of output, "
+            f"leaving nothing for the prompt")
+
+
+def test_the_ceiling_tracks_the_window_it_was_given():
+    from glq.chat import max_tokens_ceiling
+    assert max_tokens_ceiling(32768) > max_tokens_ceiling(8192)
+
+
+def test_a_tiny_window_still_allows_a_usable_answer():
+    from glq.chat import max_tokens_ceiling
+    assert max_tokens_ceiling(512) >= 256
+
+
+# ==================================================================== sampling defaults
+
+# gemma-4's card specifies temperature 1.0, top_p 0.95, top_k 64 across all use cases. The
+# chat was sending temperature=0.7 and omitting the other two — overriding the model's own
+# recommendation on one axis while deferring to it on the others, which is the worst of both.
+
+def test_the_recommended_sampling_is_the_cards_numbers():
+    from glq.chat import RECOMMENDED_SAMPLING
+    assert RECOMMENDED_SAMPLING == {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+
+
+def test_top_k_travels_in_extra_body_because_it_is_not_an_openai_field():
+    """`top_k` is not part of the OpenAI schema; the client drops unknown kwargs unless they
+    go through extra_body, so a top_k passed the obvious way silently does nothing."""
+    from glq.chat import completion_kwargs
+    kwargs = completion_kwargs(model="org/ckpt", messages=[], temperature=1.0,
+                               top_p=0.95, top_k=64, max_tokens=512)
+    assert kwargs["extra_body"]["top_k"] == 64
+    assert "top_k" not in kwargs
+
+
+def test_the_standard_fields_stay_where_the_api_expects_them():
+    from glq.chat import completion_kwargs
+    kwargs = completion_kwargs(model="org/ckpt", messages=[], temperature=1.0,
+                               top_p=0.95, top_k=64, max_tokens=512)
+    assert kwargs["temperature"] == 1.0
+    assert kwargs["top_p"] == 0.95
+    assert kwargs["max_tokens"] == 512
+    assert kwargs["stream"] is True
+
+
+def test_top_k_disabled_is_not_sent_at_all():
+    """vLLM reads the model's own generation_config for anything the request omits, so
+    "no top_k" has to mean absent, not 0."""
+    from glq.chat import completion_kwargs
+    kwargs = completion_kwargs(model="org/ckpt", messages=[], temperature=0.6,
+                               top_p=0.95, top_k=0, max_tokens=512)
+    assert not kwargs.get("extra_body"), "top_k=0 should send nothing, not top_k=0"
