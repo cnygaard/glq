@@ -253,3 +253,36 @@ def test_every_hint_is_non_interactive(distro, tmp_path):
     hint = _hint_line(distro, tmp_path)
     assert (" -y" in hint or "--noconfirm" in hint), \
         f"{distro}: hint needs a non-interactive flag: {hint}"
+
+
+# ----------------------------------------- the advice has to be enough to COMPILE, not just
+#                                            enough to satisfy pre-flight's own checks
+#
+# GLQ's extension is C++ (glq_bindings.cpp) plus CUDA, and nvcc drives a C++ host compiler.
+# On RPM distros the `gcc` package is the C compiler only — `cc1plus` lives in `gcc-c++`.
+# Measured in fedora:43 after installing exactly what pkg_hint printed:
+#
+#     gcc: /usr/sbin/gcc        c++: MISSING        g++: command not found
+#
+# and the build died with `gcc: fatal error: cannot execute 'cc1plus'`. Debian-family hides
+# this because build-essential pulls g++, which is why ubuntu never showed it.
+
+RPM_FAMILY = ["fedora", "rhel", "almalinux", "amzn", "azurelinux", "suse"]
+
+
+@pytest.mark.parametrize("distro", [d for d in RPM_FAMILY if d in OS_RELEASE])
+def test_the_hint_installs_a_cxx_compiler_not_only_a_c_one(distro, tmp_path):
+    """`gcc` alone cannot build glq on these distros, and pre-flight's `cc` check does not
+    notice — so the user is told they are ready and then hits a compiler error."""
+    hint = _hint_line(distro, tmp_path)
+    assert any(pkg in hint for pkg in ("gcc-c++", "g++", "build-essential")), (
+        f"{distro} hint installs no C++ compiler, so the CUDA extension cannot build: {hint!r}")
+
+
+def test_preflight_checks_for_a_cxx_compiler(tmp_path):
+    """A C-only toolchain satisfies `command -v gcc` and tells the user they are ready.
+    The check has to ask for what the build actually needs."""
+    src = open(INSTALL_SH).read()
+    block = src.split("# A C compiler is needed", 1)[-1].split("# GPU", 1)[0]
+    assert "c++" in block or "g++" in block, (
+        "pre-flight's compiler check accepts a C-only toolchain; glq needs C++")

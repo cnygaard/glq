@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 
 import pytest
 
@@ -77,6 +78,11 @@ class Distro:
 DISTROS = [
     Distro("ubuntu",     "ubuntu:24.04",                                   "apt-get"),
     Distro("debian",     "debian:12",                                      "apt-get"),
+    # Both current Fedoras, because they differ in the one way that decides whether GLQ can
+    # compile at all: 43 ships gcc 15.3.1, 44 ships gcc 16.1.1, and CUDA 13.0's
+    # crt/host_config.h refuses anything past 15. 44 is therefore the distro where the
+    # prebuilt wheel is not a convenience but the only thing that works.
+    Distro("fedora43",   "fedora:43",                                      "dnf"),
     Distro("fedora",     "fedora:44",                                      "dnf"),
     Distro("ubi9",       "registry.access.redhat.com/ubi9/ubi:latest",     "dnf"),
     Distro("almalinux",  "almalinux:9",                                    "dnf"),
@@ -96,19 +102,43 @@ def _sh(distro: Distro, script: str, timeout=3600) -> subprocess.CompletedProces
     for d in (PIP_CACHE, HF_CACHE):
         os.makedirs(d, exist_ok=True)
         os.chmod(d, 0o777)              # containers install as several different uids
-    return subprocess.run(
+    cmd = [
         # --shm-size: vLLM needs far more than docker's 64 MB default and fails obscurely
         # without it. The torch_extensions cache is deliberately NOT shared — the CUDA
         # extension's JIT build against each distro's toolchain is part of what we test.
-        ["docker", "run", "--rm", "--gpus", "all", "--shm-size=8g",
-         "-v", f"{ROOT}:/glq:ro",
-         "-v", f"{PIP_CACHE}:/pipcache",
-         "-v", f"{HF_CACHE}:/hf",
-         "-e", "PIP_CACHE_DIR=/pipcache",
-         "-e", "HF_HOME=/hf",
-         "-e", "GLQ_HOME=/root/.glq",
-         distro.image, "bash", "-c", script],
-        capture_output=True, text=True, timeout=timeout)
+        "docker", "run", "--rm", "--gpus", "all", "--shm-size=8g",
+        "-v", f"{ROOT}:/glq:ro",
+        "-v", f"{PIP_CACHE}:/pipcache",
+        "-v", f"{HF_CACHE}:/hf",
+        "-e", "PIP_CACHE_DIR=/pipcache",
+        "-e", "HF_HOME=/hf",
+        "-e", "GLQ_HOME=/root/.glq",
+        # Python block-buffers when stdout is a pipe, which every container process here
+        # has. Without this its output arrives in 4-8 KB chunks *after* the shell `echo`s
+        # that were meant to label it, so stages appear interleaved — and if a process dies
+        # the unflushed tail, i.e. the part naming the failure, is simply gone.
+        "-e", "PYTHONUNBUFFERED=1",
+        distro.image, "bash", "-c", script,
+    ]
+    # Stream instead of `capture_output=True`. A leg runs for minutes; capture shows nothing
+    # until the container exits, so a hang is indistinguishable from slow progress and an
+    # interrupted pytest loses the entire log. Printing as lines arrive makes `-s` a live
+    # view, still returns the whole text for the assertions, and means a tee'd run has the
+    # output on disk as it happens rather than only at the end.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    killer = threading.Timer(timeout, proc.kill)
+    killer.start()
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            print(line, end="", flush=True)
+        proc.wait()
+    finally:
+        killer.cancel()
+    # stderr is folded into stdout above so ordering is preserved; _out() still works.
+    return subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "")
 
 
 def _out(p) -> str:
@@ -173,8 +203,23 @@ def test_gpu_is_visible_inside_the_container(distro):
 
 # ------------------------------------------------------------ the real install
 
+#: Where glq comes from. Both matter, and they answer different questions.
+#:
+#:   wheel  — no --glq-source, so install.sh pip-installs from PyPI. Since 0.8.6 that is a
+#:            prebuilt cp3XX manylinux wheel, which is what a real user gets and the only
+#:            path that works on a distro whose compiler CUDA rejects (fedora:44, gcc 16).
+#:            It cannot validate an unreleased fix — it tests the last release.
+#:   source — --glq-source, installing the mounted tree, exercising the JIT build. This is
+#:            what lets a fix be validated *before* it ships; running only the wheel arm is
+#:            how 0.8.5 went out with kernels that could not build.
+#:
+#: Neither subsumes the other, so the leg runs both rather than picking one.
+INSTALL_MODES = ("wheel", "source")
+
+
+@pytest.mark.parametrize("install_from", INSTALL_MODES)
 @pytest.mark.parametrize("distro", DISTROS, ids=lambda d: d.name)
-def test_full_install_and_coherent_generation(distro):
+def test_full_install_and_coherent_generation(distro, install_from):
     """venv + glq + vLLM + the self-check + **a real token from a real checkpoint**.
 
     The generation stage is the one that can fail where everything else passes. GLQ's fused
@@ -196,23 +241,33 @@ set -u
 CMD=$(bash /glq/install.sh --preflight 2>&1 | sed -n 's/^  packages on this distro: //p' | head -1)
 bash -c "$(printf '%s' "$CMD" | sed 's/sudo //g')" >/tmp/pkg.log 2>&1
 
-# `useradd` and `su` are the TEST's prerequisites, not glq's, so they are installed
-# separately from the pre-flight set above — which must stay exactly what `pkg_hint` printed,
-# or the claim that pre-flight's advice is sufficient stops being testable.
+# `useradd`, `su` and `which` are prerequisites of the TEST and of the stack it drives —
+# not of glq — so they are installed separately from the pre-flight set above, which must
+# stay exactly what `pkg_hint` printed or the claim that pre-flight's advice is sufficient
+# stops being testable.
 #
-# Minimal RPM images ship neither. Measured on fedora:44: every stage returned 127 with
-# `su: command not found`, and the `|| true` that used to sit on the useradd line swallowed
-# the real cause, so a missing harness dependency read as a glq failure three stages later.
-if ! command -v useradd >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
-    {   if   command -v dnf     >/dev/null 2>&1; then dnf install -y shadow-utils util-linux
-        elif command -v apt-get >/dev/null 2>&1; then apt-get install -y passwd login
-        elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm shadow util-linux
-        elif command -v tdnf    >/dev/null 2>&1; then tdnf install -y shadow-utils util-linux
-        elif command -v zypper  >/dev/null 2>&1; then zypper -n install shadow util-linux
+# Minimal RPM images ship none of them. Two separate measurements:
+#
+#   * fedora:44 — every stage returned 127 with `su: command not found`, and the `|| true`
+#     that used to sit on the useradd line swallowed it, so a missing harness dependency
+#     read as a glq failure three stages later.
+#   * fedora:43 AND :44, in wheel mode — install clean (D_EXIT=0), then vLLM's engine core
+#     died with `FileNotFoundError: [Errno 2] No such file or directory: 'which'`. Something
+#     in vLLM's startup shells out to /usr/bin/which rather than using shutil.which, and
+#     `which` is its own package on RPM distros. Debian-family images ship it, which is why
+#     ubuntu never hit this. It fails before the gcc-version question is even reached, so
+#     without this it masks the thing fedora:43 exists to test.
+if ! command -v useradd >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1 \
+   || ! command -v which >/dev/null 2>&1; then
+    {   if   command -v dnf     >/dev/null 2>&1; then dnf install -y shadow-utils util-linux which
+        elif command -v apt-get >/dev/null 2>&1; then apt-get install -y passwd login debianutils
+        elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm shadow util-linux which
+        elif command -v tdnf    >/dev/null 2>&1; then tdnf install -y shadow-utils util-linux which
+        elif command -v zypper  >/dev/null 2>&1; then zypper -n install shadow util-linux which
         fi
     } >/tmp/harness_prereq.log 2>&1 || true
 fi
-for tool in useradd su; do
+for tool in useradd su which; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "HARNESS_PREREQ_MISSING=$tool"; tail -5 /tmp/harness_prereq.log; exit 90; }
 done
@@ -236,7 +291,7 @@ echo "===D install as non-root (core + vllm)"
 # the only end-to-end check ran against 0.8.4.
 cp -a /glq /home/tester/src && chown -R tester:tester /home/tester/src
 su tester -c 'GLQ_HOME=$HOME/.glq PIP_CACHE_DIR=/pipcache HF_HOME=/hf \
-    bash /glq/install.sh --yes --components core,vllm --glq-source /home/tester/src' \
+    bash /glq/install.sh --yes --components core,vllm __GLQ_SOURCE_FLAG__' \
     >/tmp/install.log 2>&1
 echo "D_EXIT=$?"
 tail -15 /tmp/install.log
@@ -277,6 +332,9 @@ grep -a "EXT_OK:\|EXT_ERR:\|GEN_TEXT:" /tmp/gen.log
 # separate times before this comment existed.
 grep -aq "GEN_TEXT:" /tmp/gen.log || cat /tmp/gen.log
 """
+    script = script.replace(
+        "__GLQ_SOURCE_FLAG__",
+        "--glq-source /home/tester/src" if install_from == "source" else "")
     proc = _sh(distro, script.replace("$GLQ_SMOKE_MODEL", SMOKE_MODEL), timeout=9000)
     out = _out(proc)
 
