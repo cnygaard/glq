@@ -119,13 +119,13 @@ pkg_hint() {
         #   * `curl` CONFLICTS with the preinstalled curl-minimal and aborts the whole dnf
         #     transaction, taking gcc with it. Asking for it is worse than omitting it.
         *rhel*|*centos*|*rocky*|*almalinux*|*amzn*)
-                                    echo "sudo dnf install -y python3.12 python3.12-devel gcc" ;;
-        *fedora*)                   echo "sudo dnf install -y python3-devel gcc curl" ;;
+                                    echo "sudo dnf install -y python3.12 python3.12-devel gcc-c++" ;;
+        *fedora*)                   echo "sudo dnf install -y python3-devel gcc-c++ curl" ;;
         *steamos*)                  echo "sudo steamos-readonly disable && sudo pacman -Syu --needed --noconfirm python gcc curl   # or use distrobox" ;;
         *arch*|*manjaro*|*endeavouros*)
                                     echo "sudo pacman -Syu --needed --noconfirm python gcc curl" ;;
-        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc curl" ;;
-        *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc curl" ;;
+        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ curl" ;;
+        *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
     esac
 }
@@ -167,10 +167,20 @@ preflight() {
         warn "  curl:    MISSING"; blockers=$((blockers+1)); }
 
     # A C compiler is needed for the CUDA extension's first-run JIT build.
-    if command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1; then
-        say "  cc:      present (needed to JIT-build the CUDA extension)"
+    #
+    # Specifically a C++ one: glq_bindings.cpp is C++, and nvcc drives a C++ host compiler.
+    # This used to accept `gcc || cc`, which a C-only toolchain satisfies — so on RPM distros,
+    # where the `gcc` package is the C compiler alone and `cc1plus` ships in `gcc-c++`,
+    # pre-flight reported the machine ready and the build then died with
+    # `gcc: fatal error: cannot execute 'cc1plus'`. Measured on fedora:43. Debian-family hid
+    # it because build-essential pulls g++ along with gcc.
+    if command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1; then
+        say "  c++:     present (needed to JIT-build the CUDA extension)"
+    elif command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1; then
+        warn "  c++:     MISSING (a C compiler is present, but the extension is C++)"
+        warn "           install it with:  $(pkg_hint)"
     else
-        warn "  cc:      MISSING — the fused CUDA kernel cannot be built; GLQ falls back to CPU"
+        warn "  c++:     MISSING — the fused CUDA kernel cannot be built; GLQ falls back to CPU"
     fi
 
     # GPU. Absent is a warning, never a blocker: CPU dequantize-then-matmul is supported.
