@@ -17,6 +17,7 @@ process factory, the health probe and the clock are all injected.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -99,6 +100,69 @@ def server_up(base_url: str, timeout: float = 1.5) -> bool:
             return 200 <= r.status < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+def _nvcc_present(which=shutil.which) -> bool:
+    """Is the NVIDIA CUDA Toolkit's compiler on PATH (or under CUDA_HOME)?
+
+    `nvcc` is the component that decides this: FlashInfer shells out to it. The toolkit is
+    what the user installs; nvcc is how we detect it.
+    """
+    if which("nvcc"):
+        return True
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    return bool(home) and os.path.exists(os.path.join(home, "bin", "nvcc"))
+
+
+def _compute_cap(run=subprocess.run):
+    """The GPU's compute capability as reported by nvidia-smi, e.g. "12.0", or None."""
+    try:
+        out = run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                  capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = (out.stdout or "").strip().splitlines()
+    return line[0].strip() if line else None
+
+
+#: Below this, FlashInfer ships prebuilt kernels and needs no toolkit.
+_FLASHINFER_PREBUILT_BELOW = 12.0
+
+
+def flashinfer_env(compute_cap=None, have_nvcc=None) -> dict:
+    """Environment overrides needed for vLLM to start on this machine.
+
+    Measured on an RTX PRO 6000 (sm_120), vLLM 0.27.1, no CUDA Toolkit: GLQ's own prebuilt
+    kernel loads and decodes fine, but EngineCore dies before generating a token because
+    vLLM's sampler backend JIT-compiles for `120f` and cannot find nvcc. The same container
+    with VLLM_USE_FLASHINFER_SAMPLER=0 answered "Paris".
+
+    Scoped deliberately to new architectures: FlashInfer ships prebuilt kernels for sm_86
+    and sm_89, so switching samplers there would trade speed away to fix nothing. Unknown
+    capability changes nothing either — a silent sampler swap on a guess is worse than the
+    error, which at least names its own cause.
+    """
+    if compute_cap is None:
+        compute_cap = _compute_cap()
+    if have_nvcc is None:
+        have_nvcc = _nvcc_present()
+    if have_nvcc or not compute_cap:
+        return {}
+    try:
+        cap = float(compute_cap)
+    except (TypeError, ValueError):
+        return {}
+    return {"VLLM_USE_FLASHINFER_SAMPLER": "0"} if cap >= _FLASHINFER_PREBUILT_BELOW else {}
+
+
+def child_env() -> dict:
+    """The environment `vllm serve` is started with.
+
+    PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
+    explaining a failure arrive long after we have given up — or never, if it dies with them
+    unflushed.
+    """
+    return {**os.environ, "PYTHONUNBUFFERED": "1", **flashinfer_env()}
 
 
 class VllmSupervisor:
@@ -189,7 +253,13 @@ class VllmSupervisor:
         # with them unflushed.
         if self.fp8_kv:
             self._say("  KV cache in fp8 (vLLM's own) — about twice the context per GiB")
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        env = child_env()
+        if "VLLM_USE_FLASHINFER_SAMPLER" in env:
+            self._say("  the NVIDIA CUDA Toolkit is not installed, and FlashInfer ships no "
+                      "prebuilt sampler for this GPU, so it")
+            self._say("  cannot build one — falling back to vLLM's built-in sampler. "
+                      "Please install the CUDA Toolkit for the faster path:")
+            self._say("  https://developer.nvidia.com/cuda-downloads")
         self.proc = self._spawn(self.argv(), stdout=log,
                                 stderr=subprocess.STDOUT, env=env)
         try:
