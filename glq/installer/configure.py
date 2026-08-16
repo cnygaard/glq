@@ -67,7 +67,8 @@ def write_pi_models(path, base_url: str, model_ids) -> None:
     _write_private_json(path, doc)
 
 
-def write_glq_config(path, *, model: str, base_url: str, components, available) -> None:
+def write_glq_config(path, *, model: str, base_url: str, components, available,
+                     fp8_kv: bool = False) -> None:
     """Record what the installer chose.
 
     `examples/chat/app.py` reads this to populate its model dropdown, and it is the only
@@ -79,4 +80,7 @@ def write_glq_config(path, *, model: str, base_url: str, components, available) 
         "base_url": base_url,
         "components": list(components),
         "available": list(available),
+        # `glq-chat` reads this back as its default, so the KV question is asked once at
+        # install time rather than on every start.
+        "fp8_kv": bool(fp8_kv),
     })

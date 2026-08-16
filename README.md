@@ -2,7 +2,7 @@
 
 **E8-lattice post-training quantization** for LLM weights: **2–8 bits/weight**,
 served on **vLLM · HuggingFace Transformers**, with **deterministic**
-fused CUDA kernels and opt-in **KV-cache compression (up to ~4×)**. Validated
+fused CUDA kernels. Validated
 from 24 GB 3090-class GPUs (A10G, sm_86) to a 96 GB RTX PRO 6000 Blackwell
 (sm_120).
 
@@ -20,15 +20,13 @@ architecture fallbacks dequantize instead).
   memory**, and good quality at 2–3 bpw. See
   [Trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq).
 - **2–8 bpw**, **no group-size constraint**, optional **per-layer mixed precision**.
-- **Serve anywhere** — a vLLM plugin (weight + MoE + embedding + KV cache) and an
+- **Serve anywhere** — a vLLM plugin (weight + MoE + embedding) and an
   HF Transformers integration. `pip install glq`, load, run.
 - **Small footprint** — smallest of the ~4-bit quantizers we measured (vs AWQ /
   NVFP4 on a 26B); a 31B fits ≈16.5 GiB at 5 bpw where bf16 needs ≈58 GiB, with
   quality within noise of bf16 on our paired reasoning evals.
 - **Deterministic kernels** — bit-identical logits across runs (reproducible
   lm-eval scoring / on-policy RL rollouts).
-- **Long context** — opt-in E8 KV-cache compression (up to ~4× smaller KV → more
-  context in the same VRAM).
 
 **Pick your path** → [run a model](#run-a-pre-quantized-model) ·
 [fit a bigger model on your card](#available-pre-quantized-checkpoints) ·
@@ -46,10 +44,29 @@ curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash
 ```
 
 Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
-them against your GPU and offers the ones that fit. `--dry-run` prints every
-command without running it; `--list` shows the checkpoints and exits;
-`--components core,vllm,picode,chat` skips the prompt. It refuses to run as root
-and never calls `sudo`.
+them against your GPU and offers the ones that fit. When it finishes it offers to
+start GLQ and open the chat; answer no and it just prints the steps. `--dry-run`
+prints every command without running it; `--list` shows the checkpoints and exits;
+`--components core,vllm,picode,chat` skips the prompt; `--start` / `--no-start`
+decide the handoff without being asked. It refuses to run as root and never calls
+`sudo`.
+
+`~/.glq/venv/bin/glq-chat` is the one command afterwards: it starts vLLM, waits for
+it, serves the Gradio UI on <http://localhost:7860>, and stops the server again when
+you press Ctrl-C — vLLM has no idle unload, so a server left running keeps its share
+of the card. It sizes the VRAM reservation from the checkpoint — weights, runtime
+overhead and a usable cache — and serves an 8192-token context
+(`--gpu-memory-utilization` / `--max-model-len` to change either, `--no-serve` to
+attach to a server you started yourself).
+
+The first start takes minutes — weights download, model load, CUDA-graph capture —
+so it reports progress in vLLM's own words while it waits and writes the full server
+log to `~/.glq/vllm.log`. `--verbose` streams that log instead of summarising it.
+
+It also publishes a public `https://….gradio.live` link by default, so the chat can be
+opened from a phone or another machine with no port forwarding. That link is
+**unauthenticated for as long as the chat runs — anyone holding it can use your GPU**;
+`--no-share` keeps everything on localhost.
 
 
 The rest of this section document the manual path.
@@ -111,9 +128,7 @@ each model card and in [How GLQ compares](#how-glq-compares) and
 
 <sub>¹ **Footprint** = resident weight memory after load (vLLM's `Model loading took … GiB`)
 — the figure that decides whether a model fits a 24/32 GB card. For current (block-diagonal)
-checkpoints it tracks the bpw budget — that is what lets a 31B fit one GPU. E8-KV compression
-doesn't change it; its payoff is an up-to-~4× smaller KV cache → more context / concurrency in
-the same VRAM.</sub>
+checkpoints it tracks the bpw budget — that is what lets a 31B fit one GPU.</sub>
 
 <sub>² Quantized before block-diagonal FHT became the quantizer default: power-of-2 FHT padding
 is stored as real bits, so the checkpoint holds more bits per weight than its nominal rate and
@@ -290,9 +305,6 @@ for the full tool-calling / reasoning reference.
 > gets the newest release. The pip package is the source of truth; the image just
 > saves you assembling a matching CUDA + vLLM + transformers stack.
 
-For the long-context E8 KV-cache flags (`GLQ_KV_*`), pass them with
-`-e` and see [E8 lattice cache](#e8-lattice-cache-vllm-v030) /
-[Inline-dequant E8 KV](#inline-dequant-e8-kv-default-in-v051).
 The image's default command is a shell (`docker run --rm -it --gpus all
 ghcr.io/cnygaard/glq-env:latest`) if you'd rather poke around interactively.
 
@@ -310,7 +322,6 @@ different things; here is the honest layout.
 | Footprint at ~4-bit | **smallest** (no per-group scales/zeros) | + group scales/zeros | + group scales/zeros | + FP8 scales | varies |
 | Speed on Blackwell | W4A16; **single-stream at bf16 parity** (trellis 3INST, 3B measured) | W4A16 (Marlin) | W4A16 (Marlin) | **fastest at batch** (native FP4) | n/a (GGUF) |
 | Serving stack | **vLLM · HF** | vLLM · HF · TRT | vLLM · HF · TRT | vLLM · TRT-LLM | **llama.cpp / Ollama** (GGUF) |
-| KV-cache compression | **built-in (~4×)** | — | — | fp8 KV | (llama.cpp KV) |
 | Bit-exact deterministic kernels | **yes** | — | — | — | — |
 | Fine-tuning (QLoRA) | — | — | — | — | **yes** |
 
@@ -502,129 +513,6 @@ parity, bf16 ahead at batch (measured numbers there).
    L2-cached 1 MB codebook, and accumulate the matmul directly — the
    dense weight matrix is never materialized. GPU memory savings scale
    with the compression ratio.
-
-## KV cache compression
-
-GLQ ships two KV cache compressors. Either is opt-in — default
-behaviour is unchanged.
-
-### INT8 cache (HF transformers)
-
-Per-channel absmax INT8 plus a small fp16 residual window for recent
-tokens — KIVI-style. Halves the KV memory at long context.
-
-```python
-import glq.hf_integration
-from glq.kv_cache import GLQQuantizedCache
-
-cache = GLQQuantizedCache(model.config)
-output = model.generate(**inputs, max_new_tokens=200,
-                         past_key_values=cache)
-```
-
-Requires `transformers >= 4.45`. No external dependencies.
-
-### E8 lattice cache (vLLM, v0.3.0+)
-
-Drops vLLM's paged KV cache to **as little as ~25 % of fp16 footprint**
-(recipe-dependent) using the same E8 lattice quantizer used for weights. Two fused Triton kernels
-(read-side dequant-gather, write-side scatter) keep decode within
-~20 % of un-fused throughput.
-
-Measured on Gemma-4-E4B-it, RTX PRO 6000 Blackwell, vLLM 0.20:
-
-| | fp16 baseline | E8 lattice |
-|---|---|---|
-| KV cache capacity @ 27.9 GiB | 303,984 tokens | **1,221,232 (4.02×)** at `e8_relaxed:1` |
-| mmlu_pro n=240 accuracy | 71.25 % | **71.25 % (bit-identical)** at `e8_relaxed:2` |
-| NIAH passkey @ ctx=16k / 32k / 64k / 130k | — | **40/40** at `e8_relaxed:2` (full 128k window) |
-| `cudaLaunchKernel` per decode | 110,659 | **71,619 (−35 %)** at `e8_relaxed:2` |
-
-Note the capacity row was measured with the `e8_relaxed:1` recipe and the
-quality rows with `e8_relaxed:2` — the recipes trade capacity for fidelity,
-so pick one and measure both for your model.
-
-Activation:
-
-```bash
-GLQ_KV_QUANT=e8_relaxed:2 \
-GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 \
-GLQ_KV_E8_COMPRESSED_ALLOC=1 \
-GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
-vllm serve google/gemma-4-E4B-it
-```
-
-The envs above use the **workspace path**: GLQ pre-decompresses the
-referenced K/V into a scratch buffer, then calls vLLM's stock
-attention. Because that buffer is built with a data-dependent
-`block_table.unique()`, glq auto-forces `cudagraph_mode=PIECEWISE`
-for this path (you'll see `[glq_vllm] E8 KV active → cudagraph_mode
-forced ... to PIECEWISE` at startup; `--enforce-eager` is no longer
-required as of v0.3.5). Weight-only GLQ still uses the default
-`FULL_AND_PIECEWISE`. The v0.5 **inline-dequant path below** lifts
-the PIECEWISE restriction and is the recommended path for
-long-context / KV-bound serving.
-
-Validated end-to-end on Gemma-4-E4B-it / Gemma-4-31B-it on vLLM
-0.20.x.
-
-### Inline-dequant E8 KV (default in v0.5.1)
-
-The workspace path above pre-decompresses K/V into a scratch buffer
-that vLLM's attention then re-reads — pure overhead, since each K/V
-vector is read exactly once. The **inline-dequant path** instead
-dequantizes the compressed E8 K/V *inside* a forked Triton attention
-kernel (an 8-point FHT butterfly for the inverse Hadamard, plus
-flash-decoding KV-split for long-context occupancy). There is no
-workspace, and — because the read/write hooks are host-sync-clean —
-the **FULL CUDA graph captures the whole decode**, eliminating the
-per-token eager-dispatch overhead that dominated E8-KV decode.
-
-**As of v0.5.1 this is the default** for the E8-KV path — the standard
-bundle is all you need (no extra flag):
-
-```bash
-GLQ_KV_QUANT=e8_relaxed:2 \
-GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 \
-GLQ_KV_E8_COMPRESSED_ALLOC=1 \
-GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
-vllm serve xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
-```
-
-Opt out with `GLQ_KV_E8_INLINE_DEQUANT_V3=0` (reverts to the 65 K
-workspace path) or `GLQ_KV_E8_FORCE_PIECEWISE=1` (keeps inline but
-disables the FULL decode graph).
-
-Decode throughput, SmolLM3-3B-GLQ-3.5bpw, RTX PRO 6000 Blackwell,
-vLLM 0.20.2 — inline vs the pre-v0.5 E8-KV path (workspace,
-PIECEWISE):
-
-| | E8 KV before v0.5 | inline (v0.5) |
-|---|---:|---:|
-| decode B=1 | ~15 tok/s | **38 (2.5×)** |
-| decode B=4 | ~37 | **127 (3.4×)** |
-| decode @ ctx=16k, B=1 | ~15 | **36 (2.4×)** |
-
-The speedup is the FULL-graph capture the inline path unlocks; it
-brings E8-KV decode to roughly weight-only parity. On Gemma-4-E4B-it
-(large heads, already compute-bound) decode is roughly unchanged,
-but quality and long-context behaviour match.
-
-**Quality is neutral.** On SmolLM3 the inline-FULL path is
-*bit-identical* to PIECEWISE (MMLU-Pro n=120 and NIAH-16k match
-exactly). On Gemma-4 it lands within vLLM's own run-to-run greedy
-non-determinism — MMLU-Pro n=120, thinking, 16384-token budget:
-PIECEWISE 0.742 vs inline-FULL 0.750 (a smaller gap than two
-PIECEWISE runs differ from each other), NIAH-16k 10/10 both.
-
-**Scope.** It covers the **4 bpw** KV recipe (`e8_relaxed:2`); other
-recipes automatically fall back to the workspace path. It requires the
-Triton attention backend (auto-forced when E8 KV is active). Validated
-across the consumer GPU lineup — A10G (`sm_86`, 3090-class, 24 GB),
-L40S (`sm_89`, 4090-class), and RTX PRO 6000 Blackwell (`sm_120`,
-5090-class): the kernels compile and NIAH-16k + MMLU are correct on all
-three, and FULL-vs-PIECEWISE is quality-neutral on Blackwell (the
-consumer-card runs are shorter FULL-only smokes). Opt out per above.
 
 ## Advanced
 

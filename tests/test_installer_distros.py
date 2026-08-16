@@ -10,7 +10,9 @@ ready*. This suite tests the promise, per distro:
 
     pre-flight on a pristine image  ->  run the command it printed  ->  pre-flight passes
 
-then goes on to a real venv, a real `pip install glq`, and the self-check.
+then goes on to a real venv, a real `pip install glq`, the self-check, a real token from a
+real checkpoint, and finally `glq-chat` — which starts vLLM itself and has to give the card
+back when it stops.
 
 **Run with `--gpus all`**, deliberately. The NVIDIA container toolkit injects `nvidia-smi`
 and the driver libraries into the image, and that depends on the image's loader and
@@ -331,6 +333,65 @@ grep -a "EXT_OK:\|EXT_ERR:\|GEN_TEXT:" /tmp/gen.log
 # thousands of lines above the end, and truncating it discarded the root cause three
 # separate times before this comment existed.
 grep -aq "GEN_TEXT:" /tmp/gen.log || cat /tmp/gen.log
+
+echo "===H glq-chat owns the server (starts vLLM, serves the UI, frees the GPU on exit)"
+# The chat extra is installed here rather than folded into stage D so that a gradio problem
+# is diagnosed as one — the stages above stay about the kernel.
+su tester -c "PIP_CACHE_DIR=/pipcache \$HOME/.glq/venv/bin/pip install -q 'gradio>=6'" \
+    >/tmp/gradio.log 2>&1; echo "H_PIP_EXIT=$?"
+tail -5 /tmp/gradio.log
+
+# --no-browser because there is no display; everything else is what a user gets. No
+# `vllm serve` anywhere in this stage: starting it is the behaviour under test.
+su tester -c "HF_HOME=/hf nohup \$HOME/.glq/venv/bin/glq-chat --no-browser \
+    --model $GLQ_SMOKE_MODEL --gpu-memory-utilization 0.35 --port 7861 \
+    >/tmp/chat.log 2>&1 & echo \$! >/tmp/chat.pid"
+CHAT_PID=$(cat /tmp/chat.pid 2>/dev/null || echo 0)
+echo "CHAT_PID:$CHAT_PID"
+
+READY=False
+for _ in $(seq 1 120); do
+    curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && { READY=True; break; }
+    kill -0 "$CHAT_PID" 2>/dev/null || break        # it died; no point waiting out the clock
+    sleep 5
+done
+echo "CHAT_READY:$READY"
+
+curl -sf http://127.0.0.1:7861/ >/dev/null 2>&1 && echo "UI_OK:True" || echo "UI_OK:False"
+
+curl -s http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
+    -d "{\"model\": \"$GLQ_SMOKE_MODEL\", \"prompt\": \"The capital of France is\", \
+         \"max_tokens\": 8, \"temperature\": 0}" >/tmp/chat_gen.json 2>/dev/null
+cat >/tmp/chat_text.py <<'PYEOF'
+import json
+d = json.load(open("/tmp/chat_gen.json"))
+print("CHAT_TEXT:" + d["choices"][0]["text"].strip().replace("\n", " "))
+PYEOF
+chmod 0644 /tmp/chat_text.py
+su tester -c "\$HOME/.glq/venv/bin/python /tmp/chat_text.py" 2>/dev/null || echo "CHAT_TEXT:"
+
+# The point of the whole design: stopping the chat must free the card. vLLM has no idle
+# unload, so a server that outlives its client holds its share of VRAM until something
+# kills it. Ctrl-C is SIGINT, so that is what gets sent — and the assertion is that every
+# vLLM process it started is gone afterwards, not merely that the chat exited.
+pgrep -f 'vllm|VLLM' >/tmp/vllm.pids 2>/dev/null || true
+echo "VLLM_PIDS:$(tr '\n' ' ' </tmp/vllm.pids)"
+kill -INT "$CHAT_PID" 2>/dev/null || true
+GONE=False
+for _ in $(seq 1 45); do
+    alive=0
+    for p in $(cat /tmp/vllm.pids 2>/dev/null); do
+        kill -0 "$p" 2>/dev/null && alive=$((alive+1))
+    done
+    kill -0 "$CHAT_PID" 2>/dev/null && alive=$((alive+1))
+    [ "$alive" -eq 0 ] && { GONE=True; break; }
+    sleep 2
+done
+echo "VLLM_GONE:$GONE"
+echo "GPU_APPS_AFTER:$(nvidia-smi --query-compute-apps=pid,used_memory \
+    --format=csv,noheader 2>/dev/null | tr '\n' ';')"
+grep -a "attaching\|starting vLLM\|reserving\|ready —\|stopping vLLM" /tmp/chat.log || true
+[ "$READY" = True ] && [ "$GONE" = True ] || tail -40 /tmp/chat.log
 """
     script = script.replace(
         "__GLQ_SOURCE_FLAG__",
@@ -374,8 +435,35 @@ grep -aq "GEN_TEXT:" /tmp/gen.log || cat /tmp/gen.log
         f"That points at the CUDA extension's JIT build against this distro's toolchain, "
         f"not at the packaging (install and self-check both passed).")
 
+    # ---- stage H: the one command a new user runs -----------------------------------
+    #
+    # `glq-chat` starts vLLM, waits for it, serves the UI and stops the server again on
+    # Ctrl-C. Each half is asserted separately because they fail for different reasons: a
+    # chat that never becomes ready is a startup bug, and a chat that leaves vLLM running
+    # is a VRAM leak the user only discovers when their next program cannot allocate.
+    assert "H_PIP_EXIT=0" in out, f"{distro.name}: the chat extra would not install\n{out[-2000:]}"
+
+    assert "CHAT_READY:True" in out, (
+        f"{distro.name}: glq-chat never got a server answering on /v1/models, so it did "
+        f"not start vLLM (or vLLM died starting).\n{out[-3000:]}")
+
+    assert "UI_OK:True" in out, f"{distro.name}: the chat UI did not come up\n{out[-2000:]}"
+
+    chat = [ln for ln in out.splitlines() if ln.startswith("CHAT_TEXT:")]
+    chat_text = chat[0][len("CHAT_TEXT:"):].strip() if chat else ""
+    assert "paris" in chat_text.lower(), (
+        f"{distro.name}: the server glq-chat started does not decode coherently — "
+        f"expected Paris, got {chat_text!r}\n{out[-2000:]}")
+
+    # The mechanism, not the output: SIGINT must take vLLM down with the chat. A test that
+    # only checked "the chat exited" would pass with the server still holding the card.
+    assert "VLLM_GONE:True" in out, (
+        f"{distro.name}: vLLM survived Ctrl-C, so the GPU is still reserved with nothing "
+        f"driving it.\n{out[-3000:]}")
+
     # Print the evidence on SUCCESS too. `_sh` captures the container's output, and until
     # this existed it was only ever surfaced inside an assertion message — so a green run
     # left nothing to look at, and "the model generated Paris" was a claim backed by an
     # assertion nobody could see. Needs `-s`; the log is the artifact for this suite.
-    print(f"\n[{distro.name}] kernels_built=True  generated={text!r}")
+    print(f"\n[{distro.name}] kernels_built=True  generated={text!r}"
+          f"  chat_started_and_stopped_vllm=True")

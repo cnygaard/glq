@@ -44,6 +44,36 @@ def _ask(tty, question: str) -> str | None:
     return line.strip()
 
 
+#: Spellings people actually type. Anything else re-asks rather than being guessed at.
+_YES = {"y", "yes"}
+_NO = {"n", "no"}
+
+
+def confirm(question: str, default: bool = True, tty=None) -> bool:
+    """Ask a yes/no question. Without a terminal, answer `default` without blocking.
+
+    That last part is the whole contract: this runs at the end of `curl … | bash`, where a
+    blocking read would hang CI and `docker build` forever, and where guessing wrong either
+    starts a GPU server nobody asked for or skips the handoff the prompt exists to make.
+    """
+    if tty is None:
+        return default
+
+    suffix = "[Y/n]" if default else "[y/N]"
+    prompt = f"{question} {suffix} "
+
+    while True:
+        answer = _ask(tty, prompt)
+        if answer is None or answer == "":       # EOF, or Enter
+            return default
+        answer = answer.strip().lower()
+        if answer in _YES:
+            return True
+        if answer in _NO:
+            return False
+        prompt = f"  please answer y or n {suffix} "
+
+
 def select_components(default=DEFAULT_COMPONENTS, tty=None) -> tuple[str, ...]:
     """Let the user toggle components by number. Returns the chosen set.
 
