@@ -56,8 +56,14 @@ def _random_kv(seed: int, num_tokens: int, num_kv_heads: int,
     return key, value
 
 
+# head_size=64 is gemma-4's VISION tower (vision_config.head_dim=64), which the E8-KV
+# monkey-patch intercepts alongside the text layers even when vLLM reports "text-only mode"
+# — the vision modules are still in the tree. It was absent from every parametrize list
+# here, and serving gemma-4-E4B at e8_relaxed:1 faults with a device-side assert / illegal
+# memory access that traces back to this geometry. Text sizes: head_dim=256,
+# global_head_dim=512.
 @pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
-@pytest.mark.parametrize("head_size", [128, 256, 512])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
 def test_fused_gather_full_matches_slow_path(relaxed_cuda, bpw, head_size):
     """Decompressing the entire cache via the fused kernel must match
     the slow Python path within tolerance for every bpw rung."""
@@ -93,12 +99,18 @@ def test_fused_gather_full_matches_slow_path(relaxed_cuda, bpw, head_size):
 
 
 @pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
-def test_fused_gather_scoped_matches_slow_path(relaxed_cuda, bpw):
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
+def test_fused_gather_scoped_matches_slow_path(relaxed_cuda, bpw, head_size):
     """Scoped decompression (only ``block_indices`` subset) must match
-    the same subset of a full-cache decompression."""
+    the same subset of a full-cache decompression.
+
+    head_size was hardcoded to 256 here while the full-gather test above parametrized over
+    three sizes — so the SCOPED path (block_indices + remap_block_table) had exactly one
+    geometry of coverage. That is the path `_patched_unified_attention` takes on every
+    non-captured call, and the one that faults on gemma-4-E4B."""
     from glq_vllm.e8_paged_cache import gather_kv_to_paged_fp16_fused
 
-    block_size, num_kv_heads, head_size, num_blocks = 16, 2, 256, 12
+    block_size, num_kv_heads, num_blocks = 16, 2, 12
     dtype = torch.bfloat16
     cache = E8PagedKVCache.alloc(
         num_blocks=num_blocks, block_size=block_size,

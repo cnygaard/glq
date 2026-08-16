@@ -66,7 +66,7 @@ source $VENV/bin/activate
 # suites plus a byte-identical checkpoint comparison.
 pip install -q pip --upgrade
 pip install -q vllm==0.27.1
-pip install -q 'glq[quantize]==0.8.2' ninja wheel
+pip install -q 'glq[quantize]==0.8.6' ninja wheel
 # mamba-ssm and causal-conv1d need CUDA_HOME for building
 export CUDA_HOME=/usr/local/cuda-12.9
 unset CUDA_HOME
@@ -74,7 +74,12 @@ unset CUDA_HOME
 pip install -q torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 pip install 'fast_hadamard_transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git' --no-build-isolation
 pip install "mistral-common[hf-hub]"
-pip install 'transformers==5.15.0' 'huggingface_hub>=0.30'
+# <5.15: 5.15.0 moved gemma-4 to a per-layer config and made the global `config.head_dim`
+# raise AmbiguousGlobalPerLayerAttributeError, which vLLM 0.27.1 reads while building its
+# ModelConfig — every gemma-4 checkpoint then dies before a weight is loaded, GLQ or bf16
+# alike. Bisected on an L4; 5.14.1 serves gemma-4-E2B coherently. See GEMMA4_TRANSFORMERS
+# in glq/installer/__main__.py, and lift both together.
+pip install 'transformers>=5.13.1,<5.15' 'huggingface_hub>=0.30'
 #pip install -q causal-conv1d --no-build-isolation || echo "WARNING: causal-conv1d failed"
 #pip install -q mamba-ssm --no-build-isolation || echo "WARNING: mamba-ssm failed — Nemotron models unavailable"
 pip install -q lm-eval langdetect immutabledict

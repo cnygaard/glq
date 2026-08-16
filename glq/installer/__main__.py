@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from glq import kv_compression as kv_env
+
 from . import configure, discovery, hardware, prompt, verify
 from .recommend import rank
 
@@ -41,11 +43,30 @@ class Runner:
         return subprocess.call([str(c) for c in cmd], **kw)
 
 
+#: Both ends of this range exist because of gemma-4, and vLLM declares only
+#: `transformers>=5.5.3`, so without it pip resolves the newest and every gemma-4 checkpoint
+#: dies before a weight is loaded.
+#:
+#:   floor   5.13.1 — earlier transformers has no gemma-4 at all.
+#:   ceiling <5.15  — 5.15.0 moved gemma-4 to a per-layer config and made the global
+#:                    `config.head_dim` raise AmbiguousGlobalPerLayerAttributeError, which
+#:                    vLLM 0.27.1 reads while building its ModelConfig. Bisected on an L4:
+#:                    5.15.0 fails, 5.14.1 / 5.13.1 / 5.12.1 / 5.11.0 / 5.10.4 all give
+#:                    head_size=512 and load.
+#:
+#: Not a GLQ bug — stock bf16 google/gemma-4-E2B-it fails the same way with no GLQ in the
+#: process — and not fixable from the config: forcing the documented
+#: `allow_global_per_layer_attribute_access` yields head_size=256 for a model whose layers
+#: are 256 *and* 512, and the weight loader dies on a size assert. Lift the ceiling when
+#: vLLM builds gemma-4 from per-layer configs.
+GEMMA4_TRANSFORMERS = "transformers>=5.13.1,<5.15"
+
+
 def _install_python_extras(run: Runner, venv: Path, components) -> None:
     pip = _venv_bin(venv, "pip")
     wanted = []
     if "vllm" in components:
-        wanted.append("vllm")
+        wanted += ["vllm", GEMMA4_TRANSFORMERS]
     if "chat" in components:
         wanted += ["gradio", "openai"]
     if wanted:
@@ -92,7 +113,26 @@ def _install_picode(run: Runner) -> None:
          "npm install -g --force @earendil-works/pi-coding-agent"])
 
 
-def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0) -> str:
+def _start_chat(venv) -> None:
+    """Hand the terminal over to `glq-chat`, replacing this process.
+
+    `exec` rather than a subprocess so Ctrl-C reaches the chat directly and there is no
+    installer left sitting in the process tree waiting on it. Everything the user needs to
+    read has already been printed by the time this runs — nothing after it happens.
+    """
+    chat = str(_venv_bin(Path(venv), "glq-chat"))
+    print(f"\nStarting GLQ — {chat}\n")
+    try:
+        os.execv(chat, [chat])
+    except OSError as exc:
+        # "GLQ is installed." is already on screen, so a traceback here would read as a
+        # failed install when only the handoff failed. Say what broke and stop.
+        print(f"could not start {chat}: {exc}\n"
+              f"Everything is installed — run it yourself when you are ready.")
+
+
+def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0,
+               fp8_kv: bool = False) -> str:
     """The whole user manual for someone who arrived via `curl … | bash`.
 
     They have no repo checkout and no docs open, so every command must be copy-pasteable
@@ -122,14 +162,34 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     # just wants to chat should not silently get them.
     tools = (" --enable-auto-tool-choice --tool-call-parser hermes"
              if "picode" in components else "")
+    # A serving-time choice, so it belongs on the command the user copies — vLLM's own
+    # flags, which is why they can simply be appended.
+    kv_flags = kv_env.shell_suffix(fp8_kv)
     # "~30 s" was a guess copied from a source comment. Measured in a container on 8 cores,
     # cold cache, one arch: 38.3 s — and the build parallelises over MAX_JOBS, so a 4-core
     # machine is proportionally slower. Quote the range rather than the best case; someone
-    # who was promised 30 s and waits 90 reasonably concludes it has hung.
-    step(f"Serve the model. The first run {first_run}JIT-builds the CUDA"
-         f"\n   extension (about a minute, longer on fewer cores), so it is slow to start;"
-         f"\n   later runs are not.",
-         f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq --port {port}{tools}")
+    # who was promised 30 s and waits 90 reasonably concludes it has hung. Whichever command
+    # they run first pays this, so the warning goes on step 1 wherever step 1 lands.
+    slow_start = (f"The first run {first_run}JIT-builds the CUDA"
+                  f"\n   extension if no prebuilt kernel matches this Python (about a minute,"
+                  f"\n   longer on fewer cores), so it is slow to start; later runs are not.")
+
+    if "chat" in components:
+        # One command, one terminal. glq-chat starts vLLM itself, waits for it, opens the
+        # browser, and stops the server again when the chat is closed — which is the part
+        # that matters on a desktop, because vLLM never releases VRAM on its own.
+        step(f"Chat in a browser. This starts vLLM for you, opens "
+             f"http://localhost:7860,\n   and stops the server again when you press Ctrl-C."
+             f"\n   It also prints a public https://….gradio.live link so you can use it "
+             f"from\n   a phone or another machine — anyone with that link can use this GPU,"
+             f"\n   so pass --no-share to keep it on this machine."
+             f"\n   {slow_start}",
+             f"{_venv_bin(venv, 'glq-chat')}")
+
+    step(("Serve it by hand instead — for a headless box, another client, or picode."
+          if "chat" in components else f"Serve the model. {slow_start}"),
+         f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
+         f"--port {port}{kv_flags}{tools}")
     if tools:
         out.insert(len(out) - 1,
                    "   (the tool-choice flags are what pi needs; `hermes` matches "
@@ -153,15 +213,16 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
          "",
          "   A working install completes it with Paris.")
 
-    if "chat" in components:
-        step(f"Chat in a browser — then open http://localhost:7860",
-             f"{_venv_bin(venv, 'glq-chat')}")
-
     if "picode" in components:
         # nvm is a shell function and is NOT on a non-login shell's PATH; a bare `pi`
         # gives command-not-found. Same trap as benchmarks/harbor_pi_glq.py.
         step("Use the pi coding agent against it (nvm must be sourced first):",
              f". ~/.nvm/nvm.sh && pi --provider glq --model {model}")
+
+    if fp8_kv:
+        out += ["   KV cache: fp8 (vLLM's own) — about twice the context per GiB, at lower",
+                "   attention precision; sliding-window layers are left alone.",
+                "   `glq-chat --no-fp8-kv-cache` serves it at full precision.", ""]
 
     step("Serve a different checkpoint (--list shows all of them):",
          f"{_venv_bin(venv, 'glq-setup')} --list",
@@ -175,6 +236,7 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     out += [f"Python in this venv: {py}",
             f"Config written to:   {GLQ_HOME / 'config.json'}",
             "Docs: https://github.com/cnygaard/glq",
+            "🐚🐬🤿 GLQ READY",
             "=" * 74]
     return "\n".join(out)
 
@@ -188,6 +250,14 @@ def main(argv=None) -> int:
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--venv", default=str(GLQ_HOME / "venv"))
     p.add_argument("--yes", action="store_true", help="accept defaults, never prompt")
+    p.add_argument("--fp8-kv-cache", dest="fp8_kv", action="store_true", default=None,
+                   help="vLLM's fp8 KV cache: about twice the context per GiB")
+    p.add_argument("--no-fp8-kv-cache", dest="fp8_kv", action="store_false",
+                   help="keep the KV cache at full precision")
+    p.add_argument("--start", dest="start", action="store_true", default=None,
+                   help="start GLQ and open the chat when the install succeeds")
+    p.add_argument("--no-start", dest="start", action="store_false",
+                   help="never start GLQ, just print the steps")
     p.add_argument("--list", action="store_true", help="list checkpoints and exit")
     p.add_argument("--verify", action="store_true",
                    help="self-check an existing install and exit (no network)")
@@ -229,6 +299,14 @@ def main(argv=None) -> int:
         else:
             components = prompt.select_components(prompt.DEFAULT_COMPONENTS, tty=tty)
 
+        kv_on = args.fp8_kv
+        if kv_on is None:
+            kv_on = prompt.confirm(
+                "\nUse vLLM's fp8 KV cache? The cache holds 8 bits per element instead of "
+                "16, so about twice the context fits in the same VRAM, at lower attention "
+                "precision. Sliding-window layers are left alone",
+                default=False, tty=tty)
+
         if args.model:
             chosen = next((c for c in checkpoints if c.repo_id == args.model), None)
             if chosen is None:                      # not in the collection: still allowed
@@ -252,7 +330,8 @@ def main(argv=None) -> int:
     if not args.dry_run:
         configure.write_glq_config(
             GLQ_HOME / "config.json", model=chosen.repo_id, base_url=base_url,
-            components=components, available=[c.repo_id for c in checkpoints])
+            components=components, available=[c.repo_id for c in checkpoints],
+            fp8_kv=bool(kv_on))
         if "picode" in components:
             configure.write_pi_models(
                 Path.home() / ".pi" / "agent" / "models.json", base_url,
@@ -287,7 +366,34 @@ def main(argv=None) -> int:
             return 1
 
     print(next_steps(venv=venv, model=chosen.repo_id, components=components,
-                     port=args.port, size_gib=chosen.size_gib))
+                     port=args.port, size_gib=chosen.size_gib, fp8_kv=bool(kv_on)))
+
+    # The handoff. `glq-chat` starts vLLM, opens the browser and stops the server again on
+    # exit, so this turns "installed, now read four steps" into "installed, here is your
+    # model" — which is where Ollama and LM Studio have been all along.
+    #
+    # It is deliberately hard to trigger by accident: only after a green self-check, only
+    # when the chat was installed, and never from a non-interactive run. `--yes` is what
+    # CI and `docker build` use, and an installer that seizes a GPU there is worse than one
+    # that prints instructions.
+    if "chat" in components and not args.dry_run and args.start is not False:
+        start = args.start
+        if start is None:
+            # `confirm`'s default answers for a *user* who pressed Enter. With no terminal
+            # there is no user, and defaulting to yes there would start a server in CI and
+            # in `docker build` — so absence of a terminal means no, not the default.
+            tty = None if args.yes else prompt.open_tty()
+            if tty is None:
+                start = False
+            else:
+                try:
+                    start = prompt.confirm(
+                        "\nStart GLQ now and open the chat? "
+                        "(Ctrl-C stops it and frees the GPU)", default=True, tty=tty)
+                finally:
+                    tty.close()
+        if start:
+            _start_chat(venv)               # replaces this process
     return 0
 
 

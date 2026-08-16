@@ -35,26 +35,41 @@ pip install glq
 > (MMA-fragment) layout that the lookup-free 3INST CUDA kernels consume.
 {% endif %}
 
+{% if trust_remote_code %}
+> ⚠️ **This model ships custom modeling code** (`auto_map` in `config.json`), so
+> transformers/vLLM will not load it without `trust_remote_code=True`. That flag executes
+> Python from the repository on your machine. The snippets below deliberately omit it —
+> read the repo's `*.py` files first, then add the flag yourself if you're satisfied.
+{% endif %}
+
 ## Use with vLLM (recommended)
 
 ```python
 from vllm import LLM, SamplingParams
 
-llm = LLM(
-    model="{{ repo_id }}",
-    quantization="glq",
-{% if trust_remote_code %}
-    trust_remote_code=True,
-{% endif %}
-    dtype="bfloat16",
-    max_model_len=4096,
+
+def main():
+    llm = LLM(
+        model="{{ repo_id }}",
+        quantization="glq",
+        dtype="bfloat16",
+        max_model_len=4096,
 {% if multimodal %}
-    limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},  # text-only serving
+        limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},  # text-only serving
 {% endif %}
-)
-out = llm.generate(["The capital city of New Zealand is"],
-                   SamplingParams(max_tokens=64, temperature=0))
-print(out[0].outputs[0].text)
+    )
+    out = llm.generate(["The capital city of New Zealand is"],
+                       SamplingParams(max_tokens=64, temperature=0))
+    print(out[0].outputs[0].text)
+
+
+# The __main__ guard is REQUIRED when running this as a script. vLLM switches to the
+# "spawn" multiprocessing start method once CUDA is initialised, so its worker processes
+# re-import this file; without the guard the script spawns itself recursively and dies
+# with "An attempt has been made to start a new process before the current process has
+# finished its bootstrapping phase" — before the model ever loads.
+if __name__ == "__main__":
+    main()
 ```
 
 `glq` registers with vLLM automatically via its plugin entry point — no extra import needed.
@@ -67,8 +82,8 @@ from transformers import {{ auto_cls }}, AutoTokenizer
 import torch
 
 model = {{ auto_cls }}.from_pretrained(
-    "{{ repo_id }}", device_map="cuda", dtype=torch.bfloat16{% if trust_remote_code %}, trust_remote_code=True{% endif %})
-tok = AutoTokenizer.from_pretrained("{{ repo_id }}"{% if trust_remote_code %}, trust_remote_code=True{% endif %})
+    "{{ repo_id }}", device_map="cuda", dtype=torch.bfloat16)
+tok = AutoTokenizer.from_pretrained("{{ repo_id }}")
 
 msgs = [{"role": "user", "content": "What is the capital city of New Zealand?"}]
 ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to("cuda")
@@ -84,7 +99,7 @@ print(tok.decode(model.generate(ids, max_new_tokens=64)[0][ids.shape[1]:], skip_
 Serve an OpenAI-compatible endpoint, then point your agent at it:
 
 ```bash
-vllm serve {{ repo_id }} --port 8000{% if trust_remote_code %} --trust-remote-code{% endif +%}
+vllm serve {{ repo_id }} --port 8000
 ```
 
 **pi-code** — `~/.pi/agent/models.json`:
