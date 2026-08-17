@@ -397,11 +397,17 @@ su tester -c "\$HOME/.glq/venv/bin/python /tmp/chat_text.py" 2>/dev/null || echo
 
 # The point of the whole design: stopping the chat must free the card. vLLM has no idle
 # unload, so a server that outlives its client holds its share of VRAM until something
-# kills it. Ctrl-C is SIGINT, so that is what gets sent — and the assertion is that every
-# vLLM process it started is gone afterwards, not merely that the chat exited.
+# kills it. The assertion is that every vLLM process it started is gone afterwards, not
+# merely that the chat exited.
 pgrep -f 'vllm|VLLM' >/tmp/vllm.pids 2>/dev/null || true
 echo "VLLM_PIDS:$(tr '\n' ' ' </tmp/vllm.pids)"
-kill -INT "$CHAT_PID" 2>/dev/null || true
+# SIGTERM, not SIGINT. A non-interactive shell sets SIGINT to SIG_IGN for background
+# jobs and the child inherits that disposition — CPython preserves an inherited SIG_IGN
+# rather than installing its own handler — so `kill -INT` on a nohup'd job is a no-op and
+# this stage asserted nothing. Measured: vLLM survived, reported as VLLM_GONE:False, which
+# read as a teardown defect. glq-chat handles SIGTERM and SIGHUP explicitly, and SIGTERM is
+# also what a service manager sends, so it is both testable here and a real path.
+kill -TERM "$CHAT_PID" 2>/dev/null || true
 GONE=False
 for _ in $(seq 1 45); do
     alive=0
