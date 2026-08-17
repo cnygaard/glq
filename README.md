@@ -1,13 +1,23 @@
 # GLQ — fit larger LLMs on smaller GPUs
 
-**E8-lattice post-training quantization** for LLM weights: **2–8 bits/weight**,
+**Lattice and trellis-coded post-training quantization** for LLM weights: **2–8 bits/weight**,
 served on **vLLM · HuggingFace Transformers**, with **deterministic**
 fused CUDA kernels. Validated
 from 24 GB 3090-class GPUs (A10G, sm_86) to a 96 GB RTX PRO 6000 Blackwell
 (sm_120).
 
-GLQ encodes each group of 8 weights as a 16-bit index into a 65,536-entry E8
-lattice codebook; a Randomized Hadamard Transform makes the weights incoherent
+The recommended codebook is **trellis-coded quantization** (QTIP-derived TCQ, `--codebook
+trellis`, since v0.7): it reaches an effective quantization dimension of 256 with a
+lookup-free decode, which is why it wins where the bits are scarcest — 2 bpw on SmolLM3-3B
+gives PPL **11.94** against **13.79** for the lattice path (bf16 9.12). It takes uniform
+integer bit-rates, 2–8.
+
+The **E8 lattice** codebooks — each group of 8 weights as a 16-bit index into a
+65,536-entry codebook — remain, and not only for the checkpoints published before v0.7:
+they are what fractional and per-layer mixed bit-rates run on, which trellis refuses.
+
+Both share the rest of the pipeline. A Randomized Hadamard Transform makes the weights
+incoherent
 so Euclidean nearest-neighbour rounding is near-optimal under the Hessian-weighted
 proxy loss, and a fused CUDA kernel matmuls **directly against the compressed
 indices** — on the GPU serving path the dense weight is never materialized, so
