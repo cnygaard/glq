@@ -7,19 +7,30 @@ name: Build & publish Docker image
 #   push of tag v*    → latest, <tag>, <major>.<minor>, sha-<short>
 #   workflow_dispatch → sha-<short> only
 #
-# Tags-only (NOT every main push): the image installs the matching
-# ``glq==<version>`` wheel from PyPI, which doesn't exist until the tag's
-# Publish-to-PyPI workflow runs — a main-push build would always fail with
-# "No matching distribution found". Restricting to tag pushes keeps this
-# workflow reliably green and means the image is only built for releases.
+# Triggered by Publish-to-PyPI *finishing*, not by the tag. The image installs
+# ``glq==<version>`` from PyPI, so it cannot be built until that version exists.
+#
+# This used to be `on: push: tags` with a comment claiming that kept it green. It
+# did not: a tag fires BOTH workflows at the same instant, so the build raced the
+# upload and lost. v0.8.6 and v0.8.7 both failed this way —
+#
+#   ERROR: Could not find a version that satisfies the requirement glq==0.8.7
+#          (from versions: ..., 0.8.5, 0.8.6)
+#
+# — 3 minutes into a build that started in the same second as the wheel matrix.
+# Neither release got an image, and nobody noticed until the third one.
+#
+# `workflow_run` also outlives the tag: `head_branch` carries the tag name, which
+# is what the checkout and the image tags key off.
 #
 # Security note: the only ``run:`` step reads from a checked-in file
 # (pyproject.toml). No untrusted github.event.* inputs are interpolated
 # into shell, so injection risk is nil.
 
 on:
-  push:
-    tags: ['v*']
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
   workflow_dispatch:
 
 env:
@@ -29,12 +40,22 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # Only when publish actually succeeded, and only for a tag. A failed or
+    # partial publish must not produce an image claiming that version.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     permissions:
       contents: read
       packages: write   # needed to push to ghcr.io
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # workflow_run defaults to the default branch; take the tag that was
+          # published so the Dockerfile and install.sh match the wheel.
+          ref: ${{ github.event.workflow_run.head_branch || github.ref }}
 
       # Standard ubuntu-latest only has ~14 GB free; the CUDA base image
       # plus pip's torch/vllm wheels easily exceed that. Free up ~30 GB by
@@ -72,6 +93,28 @@ jobs:
           v=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "GLQ_VERSION=$v"
+
+      # The simple index is what pip resolves against, and it is CDN-served: it
+      # lags the upload even after Publish-to-PyPI reports success. Measured on
+      # 0.8.6 — a container started 2m16s after publish installed 0.8.5 and
+      # produced a green log proving the PREVIOUS release's behaviour. Waiting
+      # here costs minutes; not waiting costs a release with no image, or worse,
+      # an image built from the wrong version.
+      - name: Wait for the version to appear on the PyPI simple index
+        env:
+          V: ${{ steps.glq_ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -sf "https://pypi.org/simple/glq/" | grep -q "glq-${V}"; then
+              echo "glq==${V} is resolvable after $(( i * 10 ))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::glq==${V} never appeared on the simple index (10 min)."
+          echo "Publish-to-PyPI reported success, so check the upload rather than this build."
+          exit 1
 
       - name: Extract image tags & labels
         id: meta
