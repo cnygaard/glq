@@ -933,3 +933,101 @@ def test_the_message_says_how_to_fix_it(monkeypatch, capsys):
     out = captured.out + captured.err
     assert "gradio" in out
     assert "glq[chat]" in out
+
+
+# ==================================================== flashinfer on Blackwell without nvcc
+#
+# Measured on an RTX PRO 6000 (sm_120), vLLM 0.27.1, in a container with no CUDA toolkit:
+# GLQ's own prebuilt kernel loads (EXT_OK:True) and decodes correctly, but EngineCore dies
+# before generating because vLLM's sampler backend JIT-compiles for `120f` and cannot:
+#
+#     flashinfer/jit/cpp_ext.py: RuntimeError: Could not find nvcc and default
+#     cuda_home='/usr/local/cuda' doesn't exist
+#
+# Setting VLLM_USE_FLASHINFER_SAMPLER=0 in the same container produced "Paris. Paris is the
+# most visited city". FlashInfer ships prebuilt kernels for older archs, which is why this
+# never appeared on sm_86/sm_89 — and why the fallback must NOT fire there, since disabling
+# a working fast sampler would be a silent regression for everyone else.
+
+def test_blackwell_without_a_toolkit_falls_back():
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="12.0", have_nvcc=False) == {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"}
+
+
+def test_blackwell_with_a_toolkit_is_left_alone():
+    """nvcc present: flashinfer can build, so keep the faster sampler."""
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="12.0", have_nvcc=True) == {}
+
+
+def test_older_cards_are_left_alone_even_without_nvcc():
+    """sm_89 ships prebuilt flashinfer kernels; disabling the sampler there would cost
+    speed to fix a problem that does not exist."""
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="8.9", have_nvcc=False) == {}
+
+
+def test_unknown_capability_changes_nothing():
+    """No driver, no nvidia-smi, or an unparseable answer: do not silently alter vLLM's
+    sampler on a guess."""
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap=None, have_nvcc=False) == {}
+    assert flashinfer_env(compute_cap="banana", have_nvcc=False) == {}
+
+
+def test_newer_than_blackwell_also_falls_back():
+    """The bound is >=12.0, not ==12.0: the next arch will have the same gap."""
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="13.0", have_nvcc=False) == {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"}
+
+
+def test_the_child_env_carries_the_fallback(monkeypatch):
+    """The mechanism, not just the helper: what the supervisor hands to `vllm serve`."""
+    import glq.supervisor as S
+    monkeypatch.setattr(S, "flashinfer_env", lambda: {"VLLM_USE_FLASHINFER_SAMPLER": "0"})
+    env = S.child_env()
+    assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+    assert env["PYTHONUNBUFFERED"] == "1"
+
+
+# ============================================================ gradio needs a writable CWD
+#
+# Measured in the distro matrix on ubuntu:26.04, with the repo mounted read-only at /glq:
+#
+#     Could not create share link. [Errno 13] Permission denied: '.gradio'.
+#     This can happen when the current working directory is read-only.
+#
+# gradio writes a `.gradio` directory into the *current* directory, so where the user
+# happened to be standing decides whether the share tunnel works. `~/.glq` already holds
+# config.json and vllm.log, so it is the obvious place to stand.
+
+def test_the_glq_home_is_used_when_writable(tmp_path, monkeypatch):
+    import glq.chat as chat
+    monkeypatch.setenv("GLQ_HOME", str(tmp_path / "home"))
+    assert chat.writable_workdir() == tmp_path / "home"
+    assert (tmp_path / "home").is_dir(), "must be created, not merely named"
+
+
+def test_an_unwritable_home_falls_back_to_tmp(tmp_path, monkeypatch):
+    """A read-only or un-creatable GLQ_HOME must not stop the chat starting: losing the
+    share link is bad, refusing to run at all is worse."""
+    import glq.chat as chat
+    blocked = tmp_path / "blocked"
+    blocked.write_text("i am a file, not a directory")
+    monkeypatch.setenv("GLQ_HOME", str(blocked / "under-a-file"))
+    assert chat.writable_workdir() == Path(tempfile.gettempdir())
+
+
+def test_the_chat_stands_in_that_directory_before_launching(monkeypatch, tmp_path):
+    """The mechanism: gradio only sees the CWD at launch time."""
+    chat, events, _made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
+    monkeypatch.setenv("GLQ_HOME", str(tmp_path / "h"))
+    seen = []
+    monkeypatch.setattr(chat.os, "chdir", lambda p: seen.append(str(p)))
+
+    chat.main(["--model", "org/ckpt"])
+
+    assert seen, "never moved out of whatever directory the user was standing in"
+    assert seen[-1] == str(tmp_path / "h")

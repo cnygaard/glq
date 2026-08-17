@@ -40,6 +40,14 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PIP_CACHE = os.environ.get("GLQ_DISTRO_PIP_CACHE", "/opt/dlami/nvme/pipcache")
 HF_CACHE = os.environ.get("GLQ_DISTRO_HF_CACHE", "/opt/dlami/nvme/hf_cache_distro")
 
+#: Fraction of the card each container's vLLM may reserve. 0.35 suits a 24 GB card running
+#: one leg at a time; it is also what caps parallelism, because N legs need N × this.
+#: The smoke model is 1.8 GiB, so on a large card a much smaller slice is ample and lets
+#: `pytest -n` actually overlap — on a 96 GB Blackwell, 0.10 is ~9.8 GiB per leg and eight
+#: legs still fit. Too small and vLLM refuses to start with "No available memory for the
+#: cache blocks", which is a harness misconfiguration, not a glq bug.
+GPU_UTIL = os.environ.get("GLQ_DISTRO_GPU_UTIL", "0.35")
+
 #: Smallest trellis checkpoint (1.8 GiB) — the format the recommender prefers, and quick
 #: enough to pull once and reuse from the shared cache across all nine containers.
 SMOKE_MODEL = "xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel"
@@ -79,6 +87,10 @@ class Distro:
 
 DISTROS = [
     Distro("ubuntu",     "ubuntu:24.04",                                   "apt-get"),
+    # 26.04 LTS ships no python3 at all in the base image, so pre-flight's advice is the
+    # only thing standing between a user and a dead install — a stronger test of it than
+    # 24.04, which comes with a usable interpreter.
+    Distro("ubuntu2604", "ubuntu:26.04",                                   "apt-get"),
     Distro("debian",     "debian:12",                                      "apt-get"),
     # Both current Fedoras, because they differ in the one way that decides whether GLQ can
     # compile at all: 43 ships gcc 15.3.1, 44 ships gcc 16.1.1, and CUDA 13.0's
@@ -319,14 +331,20 @@ if __name__ == "__main__":
 
     from vllm import LLM, SamplingParams
     llm = LLM(model="__MODEL__", quantization="glq",
-              gpu_memory_utilization=0.35, max_model_len=2048, enforce_eager=True)
+              gpu_memory_utilization=__GPU_UTIL__, max_model_len=2048, enforce_eager=True)
     out = llm.generate(["The capital of France is"],
                        SamplingParams(temperature=0.0, max_tokens=8))
     print("GEN_TEXT:" + out[0].outputs[0].text.strip().replace("\n", " "))
 PYEOF
 sed -i "s|__MODEL__|$GLQ_SMOKE_MODEL|" /tmp/gen.py
 chmod 0644 /tmp/gen.py
-su tester -c "HF_HOME=/hf \$HOME/.glq/venv/bin/python /tmp/gen.py" >/tmp/gen.log 2>&1
+# VLLM_USE_FLASHINFER_SAMPLER=0 because this stage drives vLLM's Python API directly and
+# therefore bypasses glq-chat, which sets it itself when the CUDA Toolkit is absent.
+# Measured on sm_120 with no toolkit: FlashInfer ships no prebuilt sampler for that arch,
+# JIT-compiles at engine start, cannot find nvcc, and EngineCore dies before a token —
+# with GLQ's own kernel having loaded fine. Without this the leg re-measures FlashInfer
+# rather than glq. It is a no-op on sm_86/sm_89, where FlashInfer ships prebuilt.
+su tester -c "HF_HOME=/hf VLLM_USE_FLASHINFER_SAMPLER=0 \$HOME/.glq/venv/bin/python /tmp/gen.py" >/tmp/gen.log 2>&1
 echo "G_EXIT=$?"
 grep -a "EXT_OK:\|EXT_ERR:\|GEN_TEXT:" /tmp/gen.log
 # The whole log, never a tail. The engine-core traceback that explains a failure here is
@@ -335,6 +353,13 @@ grep -a "EXT_OK:\|EXT_ERR:\|GEN_TEXT:" /tmp/gen.log
 grep -aq "GEN_TEXT:" /tmp/gen.log || cat /tmp/gen.log
 
 echo "===H glq-chat owns the server (starts vLLM, serves the UI, frees the GPU on exit)"
+# Capability probe, not a version comparison. In wheel mode install.sh takes glq from PyPI,
+# so this stage runs against the LAST RELEASE — and the supervisor arrived after 0.8.6, whose
+# glq-chat accepts only --base-url/--port/--share. Passing --model there is an argparse error
+# before anything starts, which would fail this leg for a feature that is not published yet.
+if ! su tester -c "\$HOME/.glq/venv/bin/glq-chat --help" 2>&1 | grep -q -- "--model"; then
+    echo "H_SKIP: installed glq-chat has no supervisor (pre-0.8.7); stage H not applicable"
+else
 # The chat extra is installed here rather than folded into stage D so that a gradio problem
 # is diagnosed as one — the stages above stay about the kernel.
 su tester -c "PIP_CACHE_DIR=/pipcache \$HOME/.glq/venv/bin/pip install -q 'gradio>=6'" \
@@ -344,7 +369,7 @@ tail -5 /tmp/gradio.log
 # --no-browser because there is no display; everything else is what a user gets. No
 # `vllm serve` anywhere in this stage: starting it is the behaviour under test.
 su tester -c "HF_HOME=/hf nohup \$HOME/.glq/venv/bin/glq-chat --no-browser \
-    --model $GLQ_SMOKE_MODEL --gpu-memory-utilization 0.35 --port 7861 \
+    --model $GLQ_SMOKE_MODEL --gpu-memory-utilization __GPU_UTIL__ --port 7861 \
     >/tmp/chat.log 2>&1 & echo \$! >/tmp/chat.pid"
 CHAT_PID=$(cat /tmp/chat.pid 2>/dev/null || echo 0)
 echo "CHAT_PID:$CHAT_PID"
@@ -392,10 +417,13 @@ echo "GPU_APPS_AFTER:$(nvidia-smi --query-compute-apps=pid,used_memory \
     --format=csv,noheader 2>/dev/null | tr '\n' ';')"
 grep -a "attaching\|starting vLLM\|reserving\|ready —\|stopping vLLM" /tmp/chat.log || true
 [ "$READY" = True ] && [ "$GONE" = True ] || tail -40 /tmp/chat.log
+__GLQ_CHAT_STAGE_END__
 """
     script = script.replace(
         "__GLQ_SOURCE_FLAG__",
         "--glq-source /home/tester/src" if install_from == "source" else "")
+    script = script.replace("__GLQ_CHAT_STAGE_END__", "fi")
+    script = script.replace("__GPU_UTIL__", GPU_UTIL)
     proc = _sh(distro, script.replace("$GLQ_SMOKE_MODEL", SMOKE_MODEL), timeout=9000)
     out = _out(proc)
 
@@ -441,6 +469,14 @@ grep -a "attaching\|starting vLLM\|reserving\|ready —\|stopping vLLM" /tmp/cha
     # Ctrl-C. Each half is asserted separately because they fail for different reasons: a
     # chat that never becomes ready is a startup bug, and a chat that leaves vLLM running
     # is a VRAM leak the user only discovers when their next program cannot allocate.
+    if "H_SKIP:" in out:
+        # Not a pass and not a failure: the published release under test predates the
+        # supervisor. Printed rather than swallowed, so a green run cannot be mistaken for
+        # evidence that glq-chat manages vLLM here.
+        why = [ln for ln in out.splitlines() if "H_SKIP:" in ln][0].strip()
+        print(f"\n[{distro.name}] stage H SKIPPED — {why}")
+        return
+
     assert "H_PIP_EXIT=0" in out, f"{distro.name}: the chat extra would not install\n{out[-2000:]}"
 
     assert "CHAT_READY:True" in out, (
