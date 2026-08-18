@@ -299,8 +299,11 @@ def _shared_flags(job: QuantJob, device: str) -> list[str]:
         f += ["--tune-iters", str(job.tune_iters)]
     if job.codebook_size is not None:
         f += ["--codebook-size", str(job.codebook_size)]
-    if job.codebook != "e8_shell":
-        f += ["--codebook", job.codebook]
+    # Always explicit, never "omit when it matches the default". glq-quantize's default
+    # moved from e8_shell to trellis; a job that declared e8_shell and sent no flag would
+    # have silently switched codebook, and any fractional-bpw job would then fail outright
+    # because trellis takes uniform integers only. The declared codebook is the contract.
+    f += ["--codebook", job.codebook]
     if job.streaming:
         f += ["--streaming"]
     if job.trust_remote_code:
