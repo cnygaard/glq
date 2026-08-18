@@ -382,7 +382,17 @@ for _ in $(seq 1 120); do
 done
 echo "CHAT_READY:$READY"
 
-curl -sf http://127.0.0.1:7861/ >/dev/null 2>&1 && echo "UI_OK:True" || echo "UI_OK:False"
+# Poll, do not curl once. The readiness loop above waits for vLLM's /v1/models, but
+# glq-chat only starts gradio *after* the server answers — so there is a window where the
+# API is up and the UI is not. A single curl wins or loses that race by luck: it passed on
+# 2026-08-17 and failed on 2026-08-18 with the same code.
+UI_OK=False
+for _ in $(seq 1 30); do
+    curl -sf http://127.0.0.1:7861/ >/dev/null 2>&1 && { UI_OK=True; break; }
+    kill -0 "$CHAT_PID" 2>/dev/null || break
+    sleep 2
+done
+echo "UI_OK:$UI_OK"
 
 curl -s http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
     -d "{\"model\": \"$GLQ_SMOKE_MODEL\", \"prompt\": \"The capital of France is\", \
@@ -399,7 +409,13 @@ su tester -c "\$HOME/.glq/venv/bin/python /tmp/chat_text.py" 2>/dev/null || echo
 # unload, so a server that outlives its client holds its share of VRAM until something
 # kills it. The assertion is that every vLLM process it started is gone afterwards, not
 # merely that the chat exited.
-pgrep -f 'vllm|VLLM' >/tmp/vllm.pids 2>/dev/null || true
+# Exclude PID 1 and this shell. In a container PID 1 is the `bash -c <script>` running
+# this very test, and the script text contains "vllm" (--components core,vllm, and this
+# pattern itself), so `pgrep -f` matches it. PID 1 never exits while the script runs, which
+# made VLLM_GONE:False a foregone conclusion — it reported a teardown failure on a run whose
+# own log said "stopping vLLM — the GPU is free again" and whose nvidia-smi showed the card
+# empty. Two releases' worth of teardown evidence was this artifact.
+pgrep -f 'vllm|VLLM' 2>/dev/null | grep -vx -e 1 -e "$$" >/tmp/vllm.pids || true
 echo "VLLM_PIDS:$(tr '\n' ' ' </tmp/vllm.pids)"
 # SIGTERM, not SIGINT. A non-interactive shell sets SIGINT to SIG_IGN for background
 # jobs and the child inherits that disposition — CPython preserves an inherited SIG_IGN
@@ -499,6 +515,14 @@ __GLQ_CHAT_STAGE_END__
 
     # The mechanism, not the output: SIGINT must take vLLM down with the chat. A test that
     # only checked "the chat exited" would pass with the server still holding the card.
+    # nvidia-smi is the ground truth for "the card is free": process bookkeeping can be
+    # fooled (see the PID 1 comment in the script), an empty compute-apps list cannot.
+    apps = [ln.split(":", 1)[1].strip() for ln in out.splitlines()
+            if ln.startswith("GPU_APPS_AFTER:")]
+    assert apps and apps[0] == "", (
+        f"{distro.name}: the GPU still has compute apps after the chat stopped: "
+        f"{apps[0] if apps else '(not reported)'}\n{out[-2000:]}")
+
     assert "VLLM_GONE:True" in out, (
         f"{distro.name}: vLLM survived Ctrl-C, so the GPU is still reserved with nothing "
         f"driving it.\n{out[-3000:]}")
