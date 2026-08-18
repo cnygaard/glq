@@ -931,14 +931,8 @@ def quantize(
     # integer K and the layer dispatch to thread ``sub_bpw`` through. Until then,
     # a refusal beats a checkpoint that decodes to garbage.
     if codebook_type == "trellis":
-        if mixed_precision:
-            raise ValueError(
-                "--codebook trellis requires a uniform integer bpw (2-8); got "
-                f"{'bpw_map' if bpw_map is not None else repr(bpw)}"
-                f"{' with min/max range' if has_range else ''}. Mixed-bpw trellis is "
-                "not implemented: every layer would be encoded at a single K while "
-                "config.json advertised the per-layer map, which fails to load."
-            )
+        _reject_mixed_trellis(codebook_type=codebook_type, mixed_precision=mixed_precision,
+                              bpw=bpw, bpw_map=bpw_map, has_range=has_range)
         # 2-4 is a single native-rate trellis; 5-8 stacks a K=4 primary with a
         # K=(bpw-4) residual (``trellis_rvq_recipe``). Every stage stays at R<=4 because
         # the CUDA kernel packs each decode chunk into a uint32 of width 8*R, so a native
@@ -1103,7 +1097,7 @@ def quantize(
         codebook = E8PCodebook(device=device)         # QuIP# padded-D̂8, TC-GEMV decode (2-8 bpw RVQ)
     elif codebook_type == "trellis":
         from .trellis import TrellisCodebook, trellis_rvq_recipe  # QTIP TCQ — dim-256 trellis
-        _variant = os.environ.get("GLQ_TRELLIS_VARIANT", "hyb")
+        _variant = default_trellis_variant()
         # The mixed-precision guard above pins bpw to a uniform int here. 2-4 is one
         # native-rate codebook (the shipped, byte-identical path); 5-8 stacks [K=4, K=bpw-4].
         # The residual stage rides on the PRIMARY codebook as `.rvq_stages` rather than
@@ -1319,7 +1313,7 @@ def quantize(
         from . import __version__ as _glq_version
         run_key = _resume.compute_run_key(
             model=model_name, codebook=codebook_type, bpw=bpw, nsamples=nsamples,
-            seqlen=seqlen, variant=os.environ.get("GLQ_TRELLIS_VARIANT", ""),
+            seqlen=seqlen, variant=default_trellis_variant(),
             sd_prefix=sd_prefix, version=_glq_version,
             bpw_map=bpw_map if isinstance(bpw_map, dict) else None)
         resume_store = _resume.ResumeStore(
@@ -2325,19 +2319,49 @@ def quantize(
 
 # ---- CLI ----
 
-def main():
-    # Quantizing a 3B takes 30-40 min and its only progress signal is these prints. When
-    # stdout is a pipe (every box run redirects to a log) Python block-buffers at ~8 KB, so
-    # the log sits empty for many minutes and then dumps in bursts — indistinguishable from
-    # a hung job, which matters when spot boxes get reclaimed mid-run. `stdbuf -oL` does NOT
-    # fix this: it adjusts libc buffering, below Python's own layer. Line-buffering here
-    # fixes all 42 print() sites at once and works no matter how the caller invokes us.
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-        sys.stderr.reconfigure(line_buffering=True)
-    except (AttributeError, ValueError):        # non-TextIO stdout (pytest capture etc.)
-        pass
+#: What `glq-quantize` produces when the user names no codebook. Trellis (QTIP TCQ) has been
+#: the recommended path since v0.7 and is stronger where bits are scarcest — SmolLM3-3B at
+#: 2 bpw is PPL 11.94 against 13.79 for the lattice. It takes uniform integer bit-rates only;
+#: fractional and per-layer mixed precision remain an e8_shell/e8p feature.
+DEFAULT_CODEBOOK = "trellis"
 
+#: 3INST, not `hyb`. The fused CUDA kernels consume a 3INST checkpoint; a hyb one serves
+#: through the pure-torch decode — "correct but materially slower" — so defaulting to hyb
+#: while defaulting to trellis would ship checkpoints with no fast path. Quality is a wash:
+#: 3INST-4 matches HYB-4 on SQNR and PPL.
+DEFAULT_TRELLIS_VARIANT = "3inst"
+
+
+def default_trellis_variant() -> str:
+    """The trellis variant to encode with. `GLQ_TRELLIS_VARIANT` still overrides."""
+    return os.environ.get("GLQ_TRELLIS_VARIANT") or DEFAULT_TRELLIS_VARIANT
+
+
+def _reject_mixed_trellis(*, codebook_type, mixed_precision, bpw, bpw_map, has_range):
+    """Trellis cannot do mixed precision; say so, and say what can.
+
+    This matters more now that trellis is the default: `--bpw 3.5` used to work without any
+    flag, so the refusal has to name the codebook that still supports it or it reads as a
+    lost feature.
+    """
+    if codebook_type != "trellis" or not mixed_precision:
+        return
+    raise ValueError(
+        "--codebook trellis requires a uniform integer bpw (2-8); got "
+        f"{'bpw_map' if bpw_map is not None else repr(bpw)}"
+        f"{' with min/max range' if has_range else ''}. Mixed-bpw trellis is "
+        "not implemented: every layer would be encoded at a single K while "
+        "config.json advertised the per-layer map, which fails to load. "
+        "Use --codebook e8_shell (or e8p) for fractional and per-layer mixed bit-rates."
+    )
+
+
+def build_parser():
+    """The `glq-quantize` CLI.
+
+    Split out of main() so the defaults can be asserted without running a
+    quantization — which is how the codebook default is pinned in tests.
+    """
     parser = argparse.ArgumentParser(description="Quantize a model with GLQ")
     parser.add_argument("--model", type=str, required=True,
                         help="HuggingFace model ID or local path")
@@ -2381,12 +2405,14 @@ def main():
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers for CPU quantization "
                              "(0=auto, 1=sequential, ignored on GPU)")
-    parser.add_argument("--codebook", type=str, default="e8_shell",
+    parser.add_argument("--codebook", type=str, default=DEFAULT_CODEBOOK,
                         choices=["e8_shell", "e8_relaxed", "e8p", "trellis"],
-                        help="Codebook variant: e8_shell (default, optimal ball), "
+                        help="Codebook variant: e8_shell (optimal ball; the only path for "
+                             "fractional/mixed bpw), "
                              "e8_relaxed (D~8 for KV), e8p (QuIP# padded-D̂8 + RVQ, "
                              "tensor-core decode, bpw 2-8), trellis (QTIP TCQ — dim-256 "
-                             "trellis, best low-bpw quality; GLQ_TRELLIS_VARIANT=hyb|3inst).")
+                             "trellis, THE DEFAULT, best low-bpw quality, uniform integer bpw only; "
+                             "GLQ_TRELLIS_VARIANT=hyb|3inst, default 3inst).")
     parser.add_argument("--codebook-size", type=int, default=None,
                         help="E8 codebook entry count. Default 65 536 "
                              "(shells 0-5 in full + 8 655 from shell 6). "
@@ -2394,6 +2420,23 @@ def main():
                              "attention kernel (64 KB fp16 fits Blackwell "
                              "per-CTA smem). Truncation is shell-sorted "
                              "(smaller values drop high-norm vectors).")
+    return parser
+
+
+def main():
+    # Quantizing a 3B takes 30-40 min and its only progress signal is these prints. When
+    # stdout is a pipe (every box run redirects to a log) Python block-buffers at ~8 KB, so
+    # the log sits empty for many minutes and then dumps in bursts — indistinguishable from
+    # a hung job, which matters when spot boxes get reclaimed mid-run. `stdbuf -oL` does NOT
+    # fix this: it adjusts libc buffering, below Python's own layer. Line-buffering here
+    # fixes all 42 print() sites at once and works no matter how the caller invokes us.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):        # non-TextIO stdout (pytest capture etc.)
+        pass
+
+    parser = build_parser()
     args = parser.parse_args()
 
     # Determine bpw: explicit map, fractional target, or uniform int

@@ -167,9 +167,12 @@ def test_e8p_job_forwards_codebook_flag():
     assert "--codebook" in argv and argv[argv.index("--codebook") + 1] == "e8p"
 
 
-def test_default_codebook_omits_flag():
-    # e8_shell is the default -> no --codebook flag (keeps existing commands unchanged)
-    assert "--codebook" not in _uniform_argv(batchq.QuantJob(model="m", bpw=4))
+def test_the_codebook_is_always_explicit():
+    """Never rely on glq-quantize's default. It moved from e8_shell to trellis, so a job
+    that declared e8_shell and omitted the flag would have silently changed codebook — and
+    a fractional-bpw job would then fail, since trellis takes uniform integers only."""
+    argv = _uniform_argv(batchq.QuantJob(model="m", bpw=4))
+    assert argv[argv.index("--codebook") + 1] == "e8_shell"
 
 
 def test_e8p_output_name_tagged():

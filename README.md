@@ -115,6 +115,13 @@ pip install glq vllm      # glq ≥ 0.7.0 (trellis kernel storage layout)
 vllm serve xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel --quantization glq
 ```
 
+> **Blackwell (sm_120 — RTX 5090, RTX PRO 6000):** vLLM's FlashInfer sampler ships no
+> prebuilt kernel for this architecture and compiles one at startup. Without the NVIDIA
+> CUDA Toolkit that build fails and takes the engine down *before the first token* — GLQ's
+> own kernels are fine and load normally. Either install the toolkit, or run with
+> `VLLM_USE_FLASHINFER_SAMPLER=0`. `glq-chat` detects this and falls back on its own;
+> `vllm serve` and the `LLM(...)` API do not.
+
 ### Available pre-quantized checkpoints
 
 A few popular checkpoints (all on the [**`xv0y5ncu`** HF org](https://huggingface.co/xv0y5ncu)):
@@ -158,10 +165,13 @@ glq-quantize \
     --device cuda
 ```
 
-Other bit-widths: pass `--bpw 2` through `--bpw 8` (fractional like
-`2.5` also works). `glq-quantize --help` lists every flag. For models
-that don't fit in system RAM use `--streaming` (loads one layer at a
-time from safetensors).
+This produces a **trellis** checkpoint: `--codebook` defaults to `trellis` (3INST
+variant), the recommended format since v0.7. Other bit-widths: `--bpw 2` through
+`--bpw 8`, **uniform integers only** — trellis has no mixed-precision encoding. For
+fractional rates like `2.5`, and for per-layer mixed precision, add `--codebook e8_shell`
+(or `e8p`); the refusal names them if you forget. `glq-quantize --help` lists every flag.
+For models that don't fit in system RAM use `--streaming` (loads one layer at a time from
+safetensors).
 
 For **mixed-precision** allocation, run a two-pass flow: a profile
 pass writes a per-layer `bpw_allocation.json`, then a quantize pass
