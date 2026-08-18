@@ -38,6 +38,12 @@ GLQ_OS_RELEASE="${GLQ_OS_RELEASE:-/etc/os-release}"
 # Disk needed for torch + vLLM + one small checkpoint, measured on a clean box.
 MIN_FREE_GB=25
 
+# CUDA's crt/host_config.h refuses a host gcc newer than this. Verified against BOTH the real
+# toolkit (13.3.1, a 4.1 GB install) and the pip nvidia/cu13 headers: both cap at 15, so
+# installing the full toolkit does NOT raise it. fedora:44 ships gcc 16, which is why a source
+# build there dies with "unsupported GNU version" on every .cu file.
+MAX_NVCC_GCC=15
+
 say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -131,6 +137,21 @@ pkg_hint() {
     esac
 }
 
+# Where to get a gcc old enough for nvcc, per distro. Only the Fedora line is measured:
+# `dnf install gcc15 gcc15-c++` on fedora:44 provides /usr/bin/g++-15, and pointing nvcc at it
+# removed every "unsupported GNU version" error (6 -> 0). The others follow each distro's
+# usual naming and are NOT verified — they are a starting point, not a promise.
+compat_gcc_hint() {
+    case " $DISTRO_ID $DISTRO_LIKE " in
+        *fedora*)                   echo "sudo dnf install -y gcc${MAX_NVCC_GCC} gcc${MAX_NVCC_GCC}-c++" ;;
+        *ubuntu*|*debian*)          echo "sudo apt-get install -y g++-${MAX_NVCC_GCC}   # unverified" ;;
+        *arch*|*manjaro*|*endeavouros*)
+                                    echo "sudo pacman -S --needed gcc${MAX_NVCC_GCC}   # unverified" ;;
+        *suse*|*sles*)              echo "sudo zypper install -y gcc${MAX_NVCC_GCC}-c++   # unverified" ;;
+        *)                          echo "install a gcc <= ${MAX_NVCC_GCC} with your package manager" ;;
+    esac
+}
+
 preflight() {
     local blockers=0
     detect_distro
@@ -182,6 +203,26 @@ preflight() {
         warn "           install it with:  $(pkg_hint)"
     else
         warn "  c++:     MISSING — the fused CUDA kernel cannot be built; GLQ falls back to CPU"
+    fi
+
+    # A host gcc newer than CUDA accepts. Deliberately NOT a blocker: since 0.8.6 the prebuilt
+    # wheels cover cp310-cp314, so the common path compiles nothing and is unaffected. Only a
+    # source install (--glq-source) reaches nvcc, and for that the fix is a compat compiler
+    # plus NVCC_CCBIN — measured to remove the error entirely on fedora:44.
+    #
+    # On a pristine image there is no gcc yet, so this says nothing on the FIRST pre-flight
+    # run and appears on the second, once the package advice above has been followed. That is
+    # the order the installer is used in (pre-flight -> install packages -> pre-flight), and
+    # guessing the version of a compiler that is not installed would be worse than silence.
+    local gccmaj=""
+    if command -v gcc >/dev/null 2>&1; then
+        gccmaj=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
+    fi
+    if [ -n "$gccmaj" ] && [ "$gccmaj" -gt "$MAX_NVCC_GCC" ] 2>/dev/null; then
+        say "  nvcc:    host gcc is $gccmaj; CUDA supports <= $MAX_NVCC_GCC"
+        say "           prebuilt wheels are unaffected — they compile nothing"
+        say "           to build from source:  $(compat_gcc_hint)"
+        say "           then:  export NVCC_CCBIN=/usr/bin/g++-$MAX_NVCC_GCC"
     fi
 
     # GPU. Absent is a warning, never a blocker: CPU dequantize-then-matmul is supported.
