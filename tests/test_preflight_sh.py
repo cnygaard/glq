@@ -44,14 +44,24 @@ OS_RELEASE = {
 }
 
 
-def _preflight(distro, tmp_path, extra=()):
+def _preflight(distro, tmp_path, extra=(), gcc_version=None):
     osr = tmp_path / f"os-release-{distro}"
     osr.write_text(OS_RELEASE[distro])
+    env = {**os.environ, "GLQ_OS_RELEASE": str(osr),
+           "GLQ_HOME": str(tmp_path / "glqhome")}
+    if gcc_version is not None:
+        # A PATH shim rather than an env override: the check reads `gcc -dumpversion`, and
+        # faking the answer at that seam tests the real detection instead of a test-only
+        # back door. Same spirit as fabricating /etc/os-release.
+        shim = tmp_path / f"shim-gcc-{gcc_version}"
+        shim.mkdir(exist_ok=True)
+        (shim / "gcc").write_text(
+            f'#!/bin/sh\n[ "$1" = "-dumpversion" ] && echo {gcc_version} && exit 0\nexit 0\n')
+        (shim / "gcc").chmod(0o755)
+        env["PATH"] = f"{shim}:{env['PATH']}"
     return subprocess.run(
         ["bash", INSTALL_SH, "--preflight", *extra],
-        capture_output=True, text=True, timeout=60,
-        env={**os.environ, "GLQ_OS_RELEASE": str(osr),
-             "GLQ_HOME": str(tmp_path / "glqhome")})
+        capture_output=True, text=True, timeout=60, env=env)
 
 
 def _out(proc):
@@ -286,3 +296,44 @@ def test_preflight_checks_for_a_cxx_compiler(tmp_path):
     block = src.split("# A C compiler is needed", 1)[-1].split("# GPU", 1)[0]
     assert "c++" in block or "g++" in block, (
         "pre-flight's compiler check accepts a C-only toolchain; glq needs C++")
+
+
+# ------------------------------------------- host compiler vs what CUDA will accept
+#
+# CUDA's crt/host_config.h refuses a host gcc newer than 15. fedora:44 ships gcc 16, so a
+# source build there dies with "unsupported GNU version" on every .cu file. Measured against
+# both the real toolkit (13.3.1) and the pip nvidia/cu13 headers — installing the full 4.1 GB
+# toolkit does NOT raise the cap.
+#
+# The fix is a compat compiler plus NVCC_CCBIN, which was verified to remove the error
+# entirely: 6 "unsupported GNU version" errors with the default gcc 16, 0 with
+# NVCC_CCBIN=/usr/bin/g++-15.
+#
+# It must stay a NOTE. Since 0.8.6 the prebuilt wheels cover cp310-cp314, so a fedora:44 user
+# compiles nothing and is unaffected; blocking them would refuse an install that works.
+
+def test_a_too_new_gcc_is_reported(tmp_path):
+    out = _out(_preflight("fedora", tmp_path, gcc_version=16))
+    assert "16" in out
+    assert "NVCC_CCBIN" in out, "the fix has to be named, not just the problem"
+
+
+def test_the_compat_compiler_package_is_named_for_the_distro(tmp_path):
+    """Measured on fedora:44: `dnf install gcc15 gcc15-c++` provides /usr/bin/g++-15."""
+    out = _out(_preflight("fedora", tmp_path, gcc_version=16))
+    assert "gcc15" in out
+
+
+def test_a_supported_gcc_says_nothing(tmp_path):
+    """No advice when there is nothing to fix — pre-flight output is read, so noise costs."""
+    out = _out(_preflight("fedora", tmp_path, gcc_version=15))
+    assert "NVCC_CCBIN" not in out
+
+
+def test_it_never_blocks_the_install(tmp_path):
+    """The prebuilt wheels need no compiler at all. A gcc too new for nvcc must not stop an
+    install that will never invoke nvcc."""
+    proc = _preflight("fedora", tmp_path, gcc_version=16)
+    assert proc.returncode == 0, (
+        "a too-new gcc is a note, not a blocker — the wheel path is unaffected\n"
+        + _out(proc))
