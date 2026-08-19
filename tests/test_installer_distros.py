@@ -48,6 +48,11 @@ HF_CACHE = os.environ.get("GLQ_DISTRO_HF_CACHE", "/opt/dlami/nvme/hf_cache_distr
 #: cache blocks", which is a harness misconfiguration, not a glq bug.
 GPU_UTIL = os.environ.get("GLQ_DISTRO_GPU_UTIL", "0.35")
 
+#: Seconds to wait for vLLM to answer, passed to glq-chat AND used by this
+#: suite's own readiness loop. 1200 rather than the supervisor's 900 default
+#: because concurrent legs make startup much slower than a solo run.
+READY_TIMEOUT = os.environ.get("GLQ_DISTRO_READY_TIMEOUT", "1200")
+
 #: Smallest trellis checkpoint (1.8 GiB) — the format the recommender prefers, and quick
 #: enough to pull once and reuse from the shared cache across all nine containers.
 SMOKE_MODEL = "xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel"
@@ -370,12 +375,19 @@ tail -5 /tmp/gradio.log
 # `vllm serve` anywhere in this stage: starting it is the behaviour under test.
 su tester -c "HF_HOME=/hf nohup \$HOME/.glq/venv/bin/glq-chat --no-browser \
     --model $GLQ_SMOKE_MODEL --gpu-memory-utilization __GPU_UTIL__ --port 7861 \
+    --ready-timeout __READY_TIMEOUT__ \
     >/tmp/chat.log 2>&1 & echo \$! >/tmp/chat.pid"
 CHAT_PID=$(cat /tmp/chat.pid 2>/dev/null || echo 0)
 echo "CHAT_PID:$CHAT_PID"
 
 READY=False
-for _ in $(seq 1 120); do
+# 240 x 5s = 20 minutes, and glq-chat is given the same budget via --ready-timeout. Both
+# halves matter: the harness used to wait 10 minutes while the chat gave up at its own
+# hardcoded 15, so raising either alone just moves which one fires first. Measured at 5-way
+# concurrency on 16 cores — 12 legs of 44 failed with "never got a server", not because
+# anything was broken but because five simultaneous weight loads and CUDA-graph captures
+# outran the window.
+for _ in $(seq 1 240); do
     curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && { READY=True; break; }
     kill -0 "$CHAT_PID" 2>/dev/null || break        # it died; no point waiting out the clock
     sleep 5
@@ -446,6 +458,7 @@ __GLQ_CHAT_STAGE_END__
         "--glq-source /home/tester/src" if install_from == "source" else "")
     script = script.replace("__GLQ_CHAT_STAGE_END__", "fi")
     script = script.replace("__GPU_UTIL__", GPU_UTIL)
+    script = script.replace("__READY_TIMEOUT__", READY_TIMEOUT)
     proc = _sh(distro, script.replace("$GLQ_SMOKE_MODEL", SMOKE_MODEL), timeout=9000)
     out = _out(proc)
 
