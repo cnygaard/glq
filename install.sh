@@ -131,7 +131,12 @@ pkg_hint() {
         *steamos*)                  echo "sudo steamos-readonly disable && sudo pacman -Syu --needed --noconfirm python gcc curl   # or use distrobox" ;;
         *arch*|*manjaro*|*endeavouros*)
                                     echo "sudo pacman -Syu --needed --noconfirm python gcc curl" ;;
-        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ curl" ;;
+        # glibc-devel explicitly: on the minimal Azure Linux core image `gcc-c++` does NOT
+        # pull the libc headers, unlike Fedora/RHEL's gcc-c++ or Debian's build-essential.
+        # Without it pre-flight passes and the kernel build then dies on
+        # `features.h: No such file or directory` — 16 times in one distro-matrix run.
+        # Verified in the container: `tdnf install -y glibc-devel` provides /usr/include/features.h.
+        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel curl" ;;
         *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
     esac

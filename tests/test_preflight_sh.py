@@ -337,3 +337,34 @@ def test_it_never_blocks_the_install(tmp_path):
     assert proc.returncode == 0, (
         "a too-new gcc is a note, not a blocker — the wheel path is unaffected\n"
         + _out(proc))
+
+
+# ------------------------------------------------------- Azure Linux needs the libc headers
+#
+# Found by the distro matrix, and it is the failure mode this suite exists for: pre-flight
+# followed its own advice, reported OK, and the JIT build then died with
+#
+#     nvidia/cu13/include/crt/host_config.h:208: fatal error: features.h: No such file
+#
+# 16 times in one run. `features.h` is glibc's, not CUDA's — on the minimal Azure Linux core
+# image `gcc-c++` does not pull `glibc-devel`, whereas Fedora/RHEL's does and Debian's
+# build-essential brings libc6-dev. Verified in the container: `tdnf install -y glibc-devel`
+# succeeds and produces /usr/include/features.h.
+
+def test_azure_linux_is_told_to_install_the_libc_headers(tmp_path):
+    out = _out(_preflight("azurelinux", tmp_path))
+    assert "glibc-devel" in out, (
+        "azurelinux's gcc-c++ does not pull the libc headers, so the advice must name them; "
+        "without it pre-flight passes and the kernel build fails later")
+
+
+def test_mariner_gets_the_same_advice(tmp_path):
+    """CBL-Mariner is Azure Linux's previous name and shares the package set."""
+    assert "glibc-devel" in _out(_preflight("mariner", tmp_path))
+
+
+def test_the_other_rpm_distros_are_not_changed(tmp_path):
+    """Fedora and RHEL pull glibc-devel via gcc-c++, so adding it there would be noise in a
+    command the user is asked to paste."""
+    for distro in ("fedora", "rhel"):
+        assert "glibc-devel" not in _out(_preflight(distro, tmp_path))
