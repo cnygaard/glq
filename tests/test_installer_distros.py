@@ -373,9 +373,18 @@ tail -5 /tmp/gradio.log
 
 # --no-browser because there is no display; everything else is what a user gets. No
 # `vllm serve` anywhere in this stage: starting it is the behaviour under test.
+# --ready-timeout only exists from 0.8.8. In wheel mode this stage runs against whatever is
+# published, so passing it unconditionally would be an argparse error on older releases —
+# the same trap that made stage H fail for a feature that had not shipped yet. Probe, do not
+# assume.
+RT_FLAG=""
+if su tester -c "\$HOME/.glq/venv/bin/glq-chat --help" 2>&1 | grep -q -- "--ready-timeout"; then
+    RT_FLAG="--ready-timeout __READY_TIMEOUT__"
+else
+    echo "NOTE: installed glq-chat has no --ready-timeout; using its built-in default"
+fi
 su tester -c "HF_HOME=/hf nohup \$HOME/.glq/venv/bin/glq-chat --no-browser \
-    --model $GLQ_SMOKE_MODEL --gpu-memory-utilization __GPU_UTIL__ --port 7861 \
-    --ready-timeout __READY_TIMEOUT__ \
+    --model $GLQ_SMOKE_MODEL --gpu-memory-utilization __GPU_UTIL__ --port 7861 $RT_FLAG \
     >/tmp/chat.log 2>&1 & echo \$! >/tmp/chat.pid"
 CHAT_PID=$(cat /tmp/chat.pid 2>/dev/null || echo 0)
 echo "CHAT_PID:$CHAT_PID"
