@@ -1031,3 +1031,32 @@ def test_the_chat_stands_in_that_directory_before_launching(monkeypatch, tmp_pat
 
     assert seen, "never moved out of whatever directory the user was standing in"
     assert seen[-1] == str(tmp_path / "h")
+
+
+# ================================================================== how long to wait for vLLM
+#
+# The supervisor gave up after a hardcoded 900 s. That is generous for a 1.8 GiB checkpoint on
+# an idle box and too short in two real cases: a large MoE loading from cold storage, and the
+# distro matrix, where several containers start vLLM at once — measured, 12 legs of a 44-leg
+# run failed with "never got a server" purely from contention, at 5-way concurrency on 16
+# cores. Neither is a bug to fix by waiting silently; both need the waiting to be the caller's
+# choice.
+
+def test_the_default_is_unchanged(monkeypatch):
+    chat, _events, made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
+    chat.main(["--model", "org/ckpt"])
+    assert made[0]["timeout"] == chat.DEFAULT_READY_TIMEOUT
+
+
+def test_the_flag_reaches_the_supervisor(monkeypatch):
+    chat, _events, made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
+    chat.main(["--model", "org/ckpt", "--ready-timeout", "1200"])
+    assert made[0]["timeout"] == 1200.0
+
+
+def test_a_nonsense_timeout_is_refused(monkeypatch):
+    """Zero or negative would mean 'give up before asking', which reads as an instant,
+    inexplicable startup failure."""
+    chat, _events, _made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
+    with pytest.raises(SystemExit):
+        chat.main(["--model", "org/ckpt", "--ready-timeout", "0"])

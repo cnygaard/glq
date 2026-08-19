@@ -35,7 +35,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
-                            DEFAULT_MAX_MODEL_LEN, VllmSupervisor)
+                            DEFAULT_MAX_MODEL_LEN, DEFAULT_READY_TIMEOUT,
+                            VllmSupervisor)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 GLQ_CONFIG = Path(os.environ.get("GLQ_HOME", Path.home() / ".glq")) / "config.json"
@@ -200,6 +201,22 @@ def build_ui(base_url: str, models: list[str], api_key: str = "glq",
     return demo
 
 
+
+def positive_seconds(text: str) -> float:
+    """An argparse type for a wait that must actually wait.
+
+    Zero or negative would mean "give up before asking", which surfaces as an instant and
+    inexplicable startup failure rather than as the configuration error it is.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value:g}")
+    return value
+
+
 def writable_workdir() -> Path:
     """A directory gradio can write into, since it puts `.gradio` in the *current* one.
 
@@ -281,6 +298,14 @@ def main(argv=None) -> int:
                         "attention precision. Default from the installer's choice")
     p.add_argument("--no-fp8-kv-cache", dest="fp8_kv", action="store_false",
                    help="keep the KV cache at full precision")
+    # Weight load plus CUDA-graph capture, and both scale with the model and the disk. The
+    # default suits one checkpoint on an idle card; a large MoE from cold storage, or several
+    # servers starting at once, legitimately need longer. Measured in the distro matrix: at
+    # 5-way concurrency, 12 legs of 44 failed purely because startup outran this window.
+    p.add_argument("--ready-timeout", type=positive_seconds, default=DEFAULT_READY_TIMEOUT,
+                   metavar="SECONDS",
+                   help=f"how long to wait for vLLM to answer before giving up "
+                        f"(default {DEFAULT_READY_TIMEOUT:g})")
     p.add_argument("--no-serve", dest="serve", action="store_false",
                    help="do not start vLLM; attach to a server you started yourself")
     p.add_argument("--no-browser", dest="browser", action="store_false",
@@ -323,6 +348,7 @@ def main(argv=None) -> int:
         verbose=args.verbose,
         max_model_len=args.max_model_len,
         fp8_kv=args.fp8_kv,
+        timeout=args.ready_timeout,
         # Size the KV pool for this checkpoint. Skipped entirely when the user named a
         # fraction themselves, so `--gpu-memory-utilization` costs no network round trip.
         weights_bytes=(None if args.gpu_memory_utilization is not None or not args.model
