@@ -1243,3 +1243,118 @@ def test_trellis_fused_unloaded_shard_zero_columns():
         assert torch.equal(y[:, :m0], ref), f"{name}: loaded shard must be unaffected"
         assert torch.equal(y[:, m0:], zeros), \
             f"{name}: unloaded shard must contribute exact zeros"
+
+
+# ── Qwen3.5 GDN fused in_proj_qkvz (hybrid linear-attention) ───────────
+#
+# vLLM's Qwen3_5 GDN block is a MergedColumnParallelLinear with FOUR output partitions
+# [key, key, value, value] and its weights-mapper attaches tuple shard ids: in_proj_qkv's
+# buffers arrive with shard_id=(0, 1, 2) and in_proj_z's with shard_id=3. GLQ's checkpoint
+# holds TWO jointly-quantized matrices (qkv spans partitions 0-2 under one row-RHT), so the
+# method must coalesce partitions into shard GROUPS and normalize the exotic shard ids —
+# BasevLLMParameter._shard_id_as_int asserts on a tuple.
+
+@requires_vllm
+def test_lookup_bpw_in_proj_qkvz():
+    """The merge map must resolve vLLM's fused GDN name from the checkpoint-form part
+    names, and leave .in_proj_ba (quantizer-skipped, bf16) unresolved so it loads plain."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 4,
+        "layer_bpw": {
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": 4,
+            "model.language_model.layers.0.linear_attn.in_proj_z": 4,
+            "model.language_model.layers.0.linear_attn.out_proj": 4,
+        },
+    })
+    assert cfg._lookup_bpw(
+        "language_model.model.layers.0.linear_attn.in_proj_qkvz") == 4
+    assert cfg._lookup_bpw(
+        "model.language_model.layers.0.linear_attn.in_proj_qkvz") == 4
+    # b/a were skipped at quantize time -> fused ba resolves to nothing -> Unquantized
+    assert cfg._lookup_bpw(
+        "language_model.model.layers.0.linear_attn.in_proj_ba") is None
+    # in_proj_qkvz is NOT a direct layer_bpw entry -> per-shard fused path, not pre_fused
+    assert cfg._is_prefused(
+        "language_model.model.layers.0.linear_attn.in_proj_qkvz") is False
+
+
+@requires_vllm
+def test_get_quant_method_passes_shard_groups_for_qkvz():
+    """The config must hand the group structure to the method — without it create_weights
+    would build four shards for two checkpoint matrices."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 4, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel",
+        "layer_bpw": {
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": 4,
+            "model.language_model.layers.0.linear_attn.in_proj_z": 4,
+        },
+    })
+
+    from vllm.model_executor.layers.linear import LinearBase
+    layer = LinearBase.__new__(LinearBase)
+    m = cfg.get_quant_method(
+        layer, "language_model.model.layers.0.linear_attn.in_proj_qkvz")
+    assert getattr(m, "shard_groups", None) == ((0, 1, 2), (3,))
+    # ...and a plain qkv_proj (string shard ids, one part each) keeps no groups
+    cfg2 = GLQvLLMConfig.from_config({
+        "bpw": 4, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel",
+        "layer_bpw": {"model.language_model.layers.0.self_attn.q_proj": 4},
+    })
+    m3 = cfg2.get_quant_method(
+        LinearBase.__new__(LinearBase),
+        "language_model.model.layers.0.self_attn.qkv_proj")
+    assert getattr(m3, "shard_groups", None) is None
+
+
+@requires_vllm
+def test_trellis_fused_shard_groups_coalesce():
+    """[2048]*4 partitions + groups ((0,1,2),(3,)) -> TWO GLQ shards [6144, 2048], with
+    the id map attached to every sharded buffer."""
+    from glq_vllm.linear_method import GLQLinearMethod, GLQShardedParameter
+    _init_tp_once()
+    m = GLQLinearMethod(None, bpw=4, codebook_type="trellis", variant="3inst",
+                        shard_groups=((0, 1, 2), (3,)))
+    layer = torch.nn.Module()
+    m.create_weights(layer, 1024, [2048, 2048, 2048, 2048], 1024, 8192, torch.float16,
+                     weight_loader=lambda *a, **k: None)
+
+    assert layer.glq_is_fused is True
+    assert layer.glq_num_shards == 2
+    assert list(layer.glq_shard_sizes) == [6144, 2048]
+    for p in (layer.trellis_packed, layer.SU, layer.Wscale):
+        assert isinstance(p, GLQShardedParameter)
+        assert p.num_shards == 2
+        assert p._shard_id_map == {(0, 1, 2): 0, 3: 1}
+
+
+@requires_vllm
+def test_glq_shard_loader_normalizes_group_shard_ids():
+    """A tuple shard id (0,1,2) must land in shard 0 and the int 3 in shard 1 — without
+    normalization BasevLLMParameter._shard_id_as_int asserts on the tuple."""
+    from glq_vllm.linear_method import GLQLinearMethod
+    _init_tp_once()
+    m = GLQLinearMethod(None, bpw=4, codebook_type="trellis", variant="3inst",
+                        shard_groups=((0, 1, 2), (3,)))
+    layer = torch.nn.Module()
+    m.create_weights(layer, 1024, [2048, 2048, 2048, 2048], 1024, 8192, torch.float16,
+                     weight_loader=lambda *a, **k: None)
+
+    qkv = torch.arange(6144 * 4, dtype=torch.int16).reshape(-1, 16)
+    z = torch.ones(2048, 16, dtype=torch.int16)
+    p = layer.trellis_packed
+    p._glq_shard_loader(p, qkv, shard_id=(0, 1, 2))
+    p._glq_shard_loader(p, z, shard_id=3)
+    assert torch.equal(p.get_shard(0), qkv)
+    assert torch.equal(p.get_shard(1), z)
+    # unmapped string ids keep their existing routing (q/k/v path untouched)
+    m2 = GLQLinearMethod(None, bpw=4, codebook_type="trellis", variant="3inst")
+    layer2 = torch.nn.Module()
+    m2.create_weights(layer2, 1024, [512, 256, 256], 1024, 1024, torch.float16,
+                      weight_loader=lambda *a, **k: None)
+    q = torch.zeros(4, 16, dtype=torch.int16)
+    layer2.trellis_packed._glq_shard_loader(layer2.trellis_packed, q, shard_id="q")
+    assert torch.equal(layer2.trellis_packed.get_shard(0), q)

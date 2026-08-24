@@ -165,6 +165,14 @@ class TestModelProfiles:
         profile = _detect_profile(Cfg())
         assert profile == _DEFAULT_PROFILE
 
+    def test_detect_qwen3_5(self):
+        class Cfg:
+            architectures = ["Qwen3_5ForConditionalGeneration"]
+        profile = _detect_profile(Cfg())
+        assert profile['sd_prefix'] == 'model.language_model.layers'
+        assert profile['multimodal_text'] is True
+        assert profile['skip_linears'] == ('.in_proj_b', '.in_proj_a')
+
     def test_detect_no_architectures(self):
         class Cfg:
             pass
