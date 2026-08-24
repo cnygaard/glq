@@ -135,9 +135,10 @@ def _fake_transformers(monkeypatch, causal_exc):
 
 
 def test_meta_loader_falls_back_on_attribute_error(monkeypatch):
-    """The qwen3_5 case: the CausalLM auto-mapping resolves (to Qwen3_5ForCausalLM) and
-    then raises AttributeError reading vocab_size off the wrapper config — a different
-    exception class than muse-glimmer's ValueError, same required outcome."""
+    """The qwen3_5 case on transformers 5.2: the CausalLM auto-mapping resolves (to
+    Qwen3_5ForCausalLM) and then raises AttributeError reading vocab_size off the wrapper
+    config — a different exception class than muse-glimmer's ValueError, same required
+    outcome."""
     used = _fake_transformers(
         monkeypatch, AttributeError("'Qwen3_5Config' object has no attribute 'vocab_size'"))
     m = QM._meta_model_from_config(_Cfg(QWEN), trust_remote_code=False, dtype=None)
@@ -145,16 +146,48 @@ def test_meta_loader_falls_back_on_attribute_error(monkeypatch):
     assert used["cls"] == "itt"
 
 
+def test_meta_loader_never_trusts_causal_lm_for_a_multimodal_profile(monkeypatch):
+    """transformers 5.14 makes Qwen3_5ForCausalLM.from_config SUCCEED on the wrapper
+    config, returning the bare text tower — no language_model/visual, wrong state-dict
+    prefix — so an exception-based fallback silently builds the wrong module tree. When
+    the profile says multimodal, ask for the wrapper class directly; the causal mapping
+    must not even be probed."""
+    calls = []
+
+    class _Causal:
+        @staticmethod
+        def from_config(cfg, **kw):
+            calls.append("causal")
+            return types.SimpleNamespace(kind="causal-text-only")
+
+    class _ITT:
+        @staticmethod
+        def from_config(cfg, **kw):
+            calls.append("itt")
+            return types.SimpleNamespace(kind="itt")
+
+    mod = types.ModuleType("transformers")
+    mod.AutoModelForCausalLM = _Causal
+    mod.AutoModelForImageTextToText = _ITT
+    monkeypatch.setitem(sys.modules, "transformers", mod)
+    m = QM._meta_model_from_config(_Cfg(QWEN), trust_remote_code=False, dtype=None,
+                                   multimodal=True)
+    assert m.kind == "itt"
+    assert calls == ["itt"]
+
+
 def test_real_meta_build_reaches_the_language_model():
-    """With real transformers (>=5.2 ships qwen3_5): the wrapper builds on meta via the
-    fallback, and the profile's dotted paths resolve."""
+    """With real transformers (>=5.2 ships qwen3_5): the wrapper builds on meta and the
+    profile's dotted paths resolve. multimodal=True is what the streaming call site
+    passes — without it, 5.14's causal mapping hands back the bare text tower."""
     pytest.importorskip("transformers.models.qwen3_5")
     import torch
     from transformers import AutoConfig
     cfg = AutoConfig.for_model("qwen3_5")
     cfg.architectures = [QWEN]
     with torch.device("meta"):
-        model = QM._meta_model_from_config(cfg, trust_remote_code=False, dtype=None)
+        model = QM._meta_model_from_config(cfg, trust_remote_code=False, dtype=None,
+                                           multimodal=True)
     prof = QM._detect_profile(_Cfg(QWEN))
     layers = QM._resolve_attr(model, prof["layers_attr"])
     assert len(layers) > 0

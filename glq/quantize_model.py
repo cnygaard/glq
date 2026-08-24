@@ -332,7 +332,7 @@ def _text_config(cfg, is_multimodal):
     return cfg
 
 
-def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None):
+def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None, multimodal=False):
     """Instantiate a model from config, falling back to the multimodal auto-class.
 
     ``AutoModelForCausalLM.from_config`` raises ValueError for a multimodal wrapper
@@ -341,14 +341,26 @@ def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None):
     ``AutoModelForImageTextToText``; the caller then descends to the text tower. If
     neither class accepts the config the original error propagates — an arch nothing can
     build must fail loudly, not yield a silently empty model.
+
+    ``multimodal=True`` skips the CausalLM probe entirely: what that mapping does with a
+    wrapper config varies by transformers version — 5.2 raises AttributeError, 5.14
+    SUCCEEDS and returns the bare text tower (no language_model/visual, wrong state-dict
+    prefix), which an exception-based fallback cannot distinguish from the real thing.
     """
     from transformers import AutoModelForCausalLM
+    if multimodal:
+        try:
+            from transformers import AutoModelForImageTextToText
+            return AutoModelForImageTextToText.from_config(
+                cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+        except (ImportError, ValueError):
+            pass  # safety net below: the historical CausalLM-then-fallback path
     try:
         return AutoModelForCausalLM.from_config(
             cfg, trust_remote_code=trust_remote_code, dtype=dtype)
     # ValueError: the auto-mapping rejects the config outright (MuseGlimmer).
     # AttributeError: the mapping RESOLVES — qwen3_5 maps to Qwen3_5ForCausalLM
-    # "for VLM compatibility" — and then dies reading text-only attributes
+    # "for VLM compatibility" — and then fails reading text-only attributes
     # (config.vocab_size) off the multimodal wrapper. Same required outcome.
     except (ValueError, AttributeError):
         try:
@@ -1090,7 +1102,8 @@ def quantize(
         else:
             with torch.device("meta"):
                 _model = _meta_model_from_config(
-                    cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+                    cfg, trust_remote_code=trust_remote_code, dtype=dtype,
+                    multimodal=is_mm_text)
             if profile.get('layers_attr'):
                 _layers = _resolve_attr(_model, profile['layers_attr'])
             else:
