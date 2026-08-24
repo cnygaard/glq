@@ -227,6 +227,36 @@ _MODEL_PROFILES = {
         'forward_kwargs': 'default',
         'multimodal_text': True,
     },
+    'Qwen3_5ForConditionalGeneration': {
+        # Qwen3.5 (model_type `qwen3_5`, e.g. Qwen/Qwen3.5-0.8B): a vision+text
+        # multimodal wrapper around a HYBRID text tower — per 4 layers, 3
+        # GatedDeltaNet (linear-attention) blocks + 1 full-attention block —
+        # plus an MTP head and tied embeddings over a 248k vocab. Decoder at
+        # model.language_model.* like the entries above; vision tower, mtp.*
+        # and embeddings stream through bf16 verbatim and the layer_bpw
+        # whitelist keeps them unquantized at serve time.
+        #
+        # skip_linears: the GDN blocks carry two 16-row projections
+        # (in_proj_b / in_proj_a) that parameterize the delta-rule dynamics.
+        # 16 rows is below the trellis kernel's out%32 floor, so a quantized
+        # b/a could never serve — and they are the likeliest place to wreck
+        # the recurrence. ~0.03M params total; kept bf16. conv1d is not an
+        # nn.Linear and never enters the walk.
+        #
+        # STREAMING IS MANDATORY for this arch: the non-streaming save
+        # iterates named_parameters() on a class that has no mtp.* modules
+        # (transformers drops them via _keys_to_ignore_on_load_unexpected),
+        # silently losing the MTP head. _require_streaming_for_wrapper
+        # enforces this with a clear error.
+        'layers_attr': 'model.language_model.layers',
+        'embed_attr': 'model.language_model.embed_tokens',
+        'rotary_attr': 'model.language_model.rotary_emb',
+        'sd_prefix': 'model.language_model.layers',
+        'trust_remote_code': False,
+        'forward_kwargs': 'default',
+        'multimodal_text': True,
+        'skip_linears': ('.in_proj_b', '.in_proj_a'),
+    },
     'SarvamMoEForCausalLM': {
         # sarvam-30b (model_type `sarvam_moe`, trust_remote_code): a dense-text
         # MoE. Standard `model.layers.*` layout; embeddings at
@@ -316,13 +346,53 @@ def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None):
     try:
         return AutoModelForCausalLM.from_config(
             cfg, trust_remote_code=trust_remote_code, dtype=dtype)
-    except ValueError:
+    # ValueError: the auto-mapping rejects the config outright (MuseGlimmer).
+    # AttributeError: the mapping RESOLVES — qwen3_5 maps to Qwen3_5ForCausalLM
+    # "for VLM compatibility" — and then dies reading text-only attributes
+    # (config.vocab_size) off the multimodal wrapper. Same required outcome.
+    except (ValueError, AttributeError):
         try:
             from transformers import AutoModelForImageTextToText
         except ImportError:
             raise
         return AutoModelForImageTextToText.from_config(
             cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+
+
+def _collect_linears(layer, profile):
+    """Every nn.Linear in the block, minus the profile's ``skip_linears`` suffixes.
+
+    The walk itself is the historical rule — isinstance(nn.Linear), nothing name-based —
+    so unknown archs keep flowing through untouched. ``skip_linears`` exists for layers
+    that must never be quantized AND cannot be (Qwen3.5's 16-row GDN b/a projections fail
+    the trellis out%32 serving gate); skipped layers simply have no artifacts, so the
+    save path copies their plain weights and the serve-side whitelist loads them bf16.
+    """
+    linears = {}
+    for name, mod in layer.named_modules():
+        if isinstance(mod, nn.Linear):
+            linears[name] = mod
+    skip = tuple(profile.get('skip_linears') or ())
+    if skip:
+        for name in [n for n in linears if n.endswith(skip)]:
+            del linears[name]
+    return linears
+
+
+def _require_streaming_for_wrapper(arch, profile, streaming):
+    """Multimodal wrappers must quantize with --streaming.
+
+    The non-streaming save iterates ``named_parameters()`` on the instantiated class;
+    for a wrapper that drops auxiliary weights at load (qwen3_5 ignores ``mtp.*``), the
+    checkpoint would silently lose them. The streaming save copies every non-quantized
+    source key byte-for-byte, which is exactly what vision towers and MTP heads need.
+    """
+    if streaming or not _is_multimodal_text(arch, profile):
+        return
+    raise ValueError(
+        f"{arch} is a multimodal wrapper; quantize it with --streaming. The "
+        f"non-streaming save would silently drop auxiliary weights (vision tower / "
+        f"MTP head) that only the streaming byte-for-byte copy preserves.")
 
 
 def _resolve_attr(obj, dotted_path):
@@ -992,6 +1062,7 @@ def quantize(
     # Gemma-4 keep their bespoke meta-instantiation branches below (they name the class
     # directly); newer archs opt in via the profile and take the generic path.
     is_mm_text = _is_multimodal_text(arch, profile)
+    _require_streaming_for_wrapper(arch, profile, streaming)
     is_gemma4_unified = "Gemma4Unified" in arch
 
     if streaming:
@@ -1127,7 +1198,8 @@ def quantize(
         if is_mm_text:
             _ek = next((k for k in weight_map
                         if k.endswith("embed_tokens.weight")
-                        and "vision" not in k and "per_layer" not in k), None)
+                        and "vision" not in k and "per_layer" not in k
+                        and not k.startswith("mtp")), None)
             embed_key = _ek or (
                 "model.language_model.embed_tokens.weight" if is_gemma4
                 else "language_model.model.embed_tokens.weight")
@@ -1403,8 +1475,11 @@ def quantize(
             layer = BlockClass(layer_cfg, layer_idx)
             layer.load_state_dict(layer_state, strict=False)
             del layer_state
-            if use_gpu:
-                layer.to(device, dtype=dtype)
+            # The dtype cast must happen on CPU too: BlockClass() builds fp32 params,
+            # load_state_dict casts the bf16 checkpoint UP into them, and the calibration
+            # hidden states are bf16 — F.linear then dies on the dtype mismatch. Only the
+            # device move is GPU-conditional.
+            layer.to(device if use_gpu else "cpu", dtype=dtype)
             layer.eval()
         else:
             layer = decoder_layers[layer_idx]
@@ -1448,11 +1523,8 @@ def quantize(
                 torch.cuda.empty_cache()
             continue
 
-        # Collect linear sublayers
-        linears = {}
-        for name, mod in layer.named_modules():
-            if isinstance(mod, nn.Linear):
-                linears[name] = mod
+        # Collect linear sublayers (minus the profile's skip_linears, if any)
+        linears = _collect_linears(layer, profile)
 
         # Gemma-4 MoE: the routed experts live in a Gemma4TextExperts module as
         # stacked 3D nn.Parameters (gate_up_proj [E,2I,H], down_proj [E,H,I]), so

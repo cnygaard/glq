@@ -14,6 +14,26 @@ from .linear_method import GLQLinearMethod
 from .embedding_method import GLQEmbeddingMethod
 
 
+#: Load-time stacked merges: vLLM's fused layer name -> the per-part checkpoint names
+#: the whitelist actually stores. qkv/gate_up are the classic Llama-family pair;
+#: in_proj_qkvz is Qwen3.5's GatedDeltaNet input projection (the checkpoint holds the
+#: HF-side in_proj_qkv and in_proj_z matrices, quantized separately). in_proj_ba is
+#: deliberately ABSENT: the quantizer skips b/a (16 rows — under the trellis out%32
+#: floor), so the fused ba layer must resolve to nothing and load bf16.
+_MERGE_MAP = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
+              ".gate_up_proj": (".gate_proj", ".up_proj"),
+              ".in_proj_qkvz": (".in_proj_qkv", ".in_proj_z")}
+
+#: Fused layers whose vLLM partition structure differs from the checkpoint's matrix
+#: structure. Qwen3.5's in_proj_qkvz is a MergedColumnParallelLinear with FOUR output
+#: partitions [key, key, value, value] whose weights-mapper attaches shard_id=(0, 1, 2)
+#: to in_proj_qkv's buffers and shard_id=3 to in_proj_z's — but the checkpoint holds TWO
+#: jointly-quantized matrices (qkv spans partitions 0-2 under one row-RHT and cannot be
+#: split). Each group of vLLM partitions becomes one GLQ shard; GLQLinearMethod coalesces
+#: sizes and normalizes the exotic shard ids through this structure.
+_SHARD_GROUPS = {".in_proj_qkvz": ((0, 1, 2), (3,))}
+
+
 class GLQvLLMConfig(QuantizationConfig):
     """vLLM quantization config for GLQ (E8 lattice codebook + RHT)."""
 
@@ -96,8 +116,7 @@ class GLQvLLMConfig(QuantizationConfig):
         if prefix.startswith("language_model.model."):
             forms.add("model.language_model."
                       + prefix[len("language_model.model."):])
-        merge_map = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
-                     ".gate_up_proj": (".gate_proj", ".up_proj")}
+        merge_map = _MERGE_MAP
         best = None
         for f in forms:
             for merged, parts in merge_map.items():
@@ -136,12 +155,15 @@ class GLQvLLMConfig(QuantizationConfig):
                 # Layer is bf16 in the checkpoint — return default so
                 # vLLM loads `.weight` instead of expecting GLQ buffers.
                 return UnquantizedLinearMethod()
+            shard_groups = next(
+                (g for sfx, g in _SHARD_GROUPS.items() if prefix.endswith(sfx)), None)
             return GLQLinearMethod(
                 self, bpw=bpw if bpw is not None else self.bpw,
                 pre_fused=self._is_prefused(prefix),
                 codebook_type=self.codebook,
                 block_diagonal=self.block_diagonal,
-                variant=self.variant)
+                variant=self.variant,
+                shard_groups=shard_groups)
 
         # VocabParallelEmbedding (and subclasses, e.g. ParallelLMHead).
         # Quantized embeddings — currently only Gemma-4's PLE — appear in

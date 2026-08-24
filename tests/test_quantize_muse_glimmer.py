@@ -64,6 +64,7 @@ def test_profile_marks_it_multimodal_so_streaming_derives_the_prefix():
     ("Mistral3ForConditionalGeneration", True),
     ("SmolLM3ForCausalLM", False),
     ("SarvamMoEForCausalLM", False),
+    ("Qwen3_5ForConditionalGeneration", True),
 ])
 def test_multimodal_gate_is_unchanged_for_existing_archs(arch, expected):
     """Regression: generalising the gate must not change routing for anything already

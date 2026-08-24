@@ -130,6 +130,11 @@ JOBS: dict[str, dict] = {
                             "codebook": "trellis", "streaming": True},
     "gemma4-26b@trellis5": {"model": "google/gemma-4-26B-A4B-it", "bpw": 5,
                             "codebook": "trellis", "streaming": True},
+    # Qwen3.5-0.8B: multimodal wrapper around a hybrid GDN + full-attention tower.
+    # streaming is MANDATORY (the non-streaming save drops the MTP head); the
+    # Qwen3_5 profile skips the 16-row GDN b/a projections automatically.
+    "qwen35-08b@trellis4": {"model": "Qwen/Qwen3.5-0.8B", "bpw": 4,
+                            "codebook": "trellis", "streaming": True},
 }
 
 

@@ -365,6 +365,14 @@ class GLQShardedParameter(BasevLLMParameter):
     def _glq_shard_loader(self, param, loaded_weight, *args, **kwargs):
         """Route to load_qkv_weight or load_merged_column_weight."""
         shard_id = kwargs.get('shard_id') or (args[0] if args else None)
+        # Group-coalesced fusions attach _shard_id_map in create_weights: vLLM's
+        # weights-mapper hands a TUPLE shard id for a checkpoint matrix spanning
+        # several partitions (Qwen3.5 in_proj_qkv -> (0, 1, 2)); normalize it to the
+        # GLQ shard index before the int/str routing below.
+        id_map = getattr(self, '_shard_id_map', None)
+        if id_map is not None and shard_id is not None:
+            key = tuple(shard_id) if isinstance(shard_id, (tuple, list)) else shard_id
+            shard_id = id_map.get(key, shard_id)
         if shard_id is not None:
             self.load_qkv_weight(loaded_weight, shard_id=shard_id, **{k: v for k, v in kwargs.items() if k != 'shard_id'})
         else:
@@ -750,7 +758,7 @@ class GLQLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config, bpw: int = 2, pre_fused: bool = False,
                  codebook_type: str = "e8_shell", block_diagonal: bool = True,
-                 variant: str = "hyb"):
+                 variant: str = "hyb", shard_groups=None):
         self.quant_config = quant_config
         self.bpw = bpw
         self.codebook_type = codebook_type
@@ -772,6 +780,12 @@ class GLQLinearMethod(LinearMethodBase):
         # shards. Load it as a single (non-sharded) GLQ matrix; its dequant
         # output [q;k;v] is exactly what QKVParallelLinear consumes.
         self.pre_fused = pre_fused
+        # ``shard_groups``: vLLM partition indices grouped per checkpoint matrix, for
+        # fused layers whose partition structure differs from the checkpoint's (Qwen3.5's
+        # in_proj_qkvz: four [2048] partitions but two quantized matrices [6144, 2048] —
+        # the qkv matrix has ONE row-RHT spanning partitions 0-2 and cannot be split).
+        # None for every classic fusion; qkv_proj / gate_up_proj map 1:1.
+        self.shard_groups = tuple(tuple(g) for g in shard_groups) if shard_groups else None
 
     def create_weights(
         self,
@@ -783,6 +797,18 @@ class GLQLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Coalesce vLLM partitions into checkpoint-matrix shards where the two
+        # structures differ (see shard_groups in __init__). Everything downstream —
+        # the trellis %32/%64 gate, per-shard buffer sizing, dequant metadata — must
+        # see the checkpoint's shard shapes.
+        shard_id_map = None
+        if self.shard_groups and len(output_partition_sizes) > 1:
+            shard_id_map = {
+                (g if len(g) > 1 else g[0]): gi
+                for gi, g in enumerate(self.shard_groups)}
+            output_partition_sizes = [
+                sum(output_partition_sizes[i] for i in g) for g in self.shard_groups]
+
         # A pre-fused checkpoint matrix (e.g. ``query_key_value``) is loaded as a
         # single non-sharded GLQ matrix even though vLLM's layer reports
         # multiple output partitions — see GLQLinearMethod.pre_fused.
@@ -1027,6 +1053,15 @@ class GLQLinearMethod(LinearMethodBase):
                     layer, '', out_sz, input_size_per_partition)
             layer.glq_m_pad = m_pad
             layer.glq_n_pad = n_pad
+
+        # Group-coalesced fusions: hand every sharded buffer the id map so the loader
+        # can normalize vLLM's shard ids — the GDN mapper sends a TUPLE (0, 1, 2) for
+        # in_proj_qkv and the int 3 for in_proj_z, and BasevLLMParameter's
+        # _shard_id_as_int asserts on a tuple.
+        if shard_id_map is not None:
+            for _p in layer._parameters.values():
+                if isinstance(_p, GLQShardedParameter):
+                    _p._shard_id_map = shard_id_map
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Set up codebook and cache scalars. Dequant Mamba layers to dense."""
