@@ -30,6 +30,7 @@ DRY_RUN=0
 ALLOW_ROOT=0
 PREFLIGHT_ONLY=0
 ASSUME_NO_GPU=0
+MODIFY_PATH=1
 PASSTHRU=()
 
 # Overridable like GLQ_HOME so the distro mapping can be exercised without seven machines.
@@ -74,6 +75,7 @@ GLQ installer
   --start/--no-start  start GLQ + the chat when done, or never offer to
   --list              list available checkpoints and exit
   --preflight         check prerequisites and exit (changes nothing)
+  --no-modify-path    don't append the venv bin dir to PATH in ~/.bashrc
   --dry-run           print every command, change nothing
   --allow-root        permit running as root (not recommended)
   -h, --help          this message
@@ -87,6 +89,7 @@ parse_args() {
         case "$1" in
             --preflight)    PREFLIGHT_ONLY=1; shift ;;
             --assume-no-gpu) ASSUME_NO_GPU=1; shift ;;
+            --no-modify-path) MODIFY_PATH=0; shift ;;
             --dry-run)      DRY_RUN=1; PASSTHRU+=("$1"); shift ;;
             --allow-root)   ALLOW_ROOT=1; shift ;;
             --glq-version)  [ $# -ge 2 ] || die "--glq-version needs a value"
@@ -381,6 +384,40 @@ install_glq() {
     install_cuda_toolchain
 }
 
+ensure_venv_on_path() {
+    # Every instruction this installer prints, and every model-card snippet, uses the venv
+    # by absolute path — so nothing ever puts $GLQ_VENV/bin on PATH. That is fine until a
+    # tool inside the venv is invoked by bare name from another tool: FlashInfer JIT-builds
+    # its sm_120 sampler at engine start and runs `ninja` via subprocess, which resolves
+    # through PATH and kills EngineCore with FileNotFoundError on an otherwise perfect
+    # install. Appending (not prepending) keeps the system python/pip winning; only names
+    # the system lacks — ninja, vllm, glq-* — fall through to the venv.
+    #
+    # ~/.bashrc rather than ~/.profile: Ubuntu's stock .bashrc returns early for
+    # non-interactive shells, and the interactive-ssh session is exactly where users type
+    # the bare commands. Non-interactive invocations should keep passing explicit env.
+    if [ "$MODIFY_PATH" -eq 0 ]; then
+        say "== leaving PATH alone (--no-modify-path)"
+        return 0
+    fi
+    case ":$PATH:" in *":$GLQ_VENV/bin:"*)
+        say "== $GLQ_VENV/bin is already on PATH — not touching ~/.bashrc"
+        return 0 ;;
+    esac
+    local rc="$HOME/.bashrc"
+    if [ -f "$rc" ] && grep -qF "$GLQ_VENV/bin" "$rc"; then
+        say "== ~/.bashrc already references $GLQ_VENV/bin — leaving it as is"
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '  [dry-run] append to %s: export PATH="$PATH:%s/bin"\n' "$rc" "$GLQ_VENV"
+        return 0
+    fi
+    say "== appending $GLQ_VENV/bin to PATH in ~/.bashrc (opt out: --no-modify-path)"
+    printf '\n# added by glq install.sh — lets ninja/vllm/glq-* resolve by name (remove with the export)\nexport PATH="$PATH:%s/bin"\n' "$GLQ_VENV" >> "$rc"
+    say "   takes effect in new shells; for this one: source ~/.bashrc"
+}
+
 hand_over() {
     say "== configuring"
     if [ "$DRY_RUN" -eq 1 ] && [ ! -x "$GLQ_VENV/bin/python" ]; then
@@ -424,6 +461,7 @@ main() {
 
     create_venv "$py"
     install_glq
+    ensure_venv_on_path
     hand_over
 }
 
