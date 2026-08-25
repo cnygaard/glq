@@ -398,3 +398,88 @@ def test_the_layout_repair_is_confined_to_the_installer_own_venv(tmp_path):
         if "site-packages" in line:
             assert '"$GLQ_VENV"' in line, f"unanchored path in the repair loop: {line.strip()}"
     assert "/usr" not in repair, "the repair references a system path"
+
+
+# ---------------------------------------------------------------- PATH in ~/.bashrc
+
+def _run_home(args, home, extra_env=None, path=None):
+    """Run with HOME pointed at a sandbox so the rc files are inspectable. SHELL is pinned
+    to bash so the rc-file choice is deterministic regardless of the developer's shell."""
+    env = {"HOME": str(home), "GLQ_HOME": str(home / ".glq"), "SHELL": "/bin/bash"}
+    if path is not None:
+        env["PATH"] = path
+    env.update(extra_env or {})
+    return _run(args, env=env)
+
+
+def test_dry_run_announces_the_bashrc_path_export(tmp_path):
+    """The venv is used by absolute path in every printed instruction, so nothing ever puts
+    its bin/ on PATH — and FlashInfer's sm_120 sampler JIT invokes `ninja` by bare name,
+    which then fails on a box where the install itself was flawless. The installer now
+    offers the fix by default; dry-run must show it without touching the file."""
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _run_home(["--dry-run", "--yes"], home)
+    assert proc.returncode == 0, proc.stderr
+    assert ".bashrc" in proc.stdout
+    assert 'export PATH="$PATH:' in proc.stdout, proc.stdout
+    assert not (home / ".bashrc").exists(), "dry-run must not write the rc file"
+
+
+def test_no_modify_path_opts_out(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _run_home(["--dry-run", "--yes", "--no-modify-path"], home)
+    assert proc.returncode == 0, proc.stderr
+    assert "export PATH" not in proc.stdout
+
+
+def test_path_export_skipped_when_venv_bin_already_on_path(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    venv_bin = str(home / ".glq" / "venv" / "bin")
+    proc = _run_home(["--dry-run", "--yes"], home,
+                     path=os.environ["PATH"] + ":" + venv_bin)
+    assert proc.returncode == 0, proc.stderr
+    assert "already on PATH" in proc.stdout
+    assert "export PATH" not in proc.stdout
+
+
+def test_path_export_skipped_when_bashrc_already_has_it(tmp_path):
+    """Idempotent across re-runs: the one-liner is documented as safe to run again, and a
+    second copy of the export per run would grow the rc file forever."""
+    home = tmp_path / "h"
+    home.mkdir()
+    venv_bin = str(home / ".glq" / "venv" / "bin")
+    (home / ".bashrc").write_text(f'export PATH="$PATH:{venv_bin}"\n')
+    proc = _run_home(["--dry-run", "--yes"], home)
+    assert proc.returncode == 0, proc.stderr
+    assert "already" in proc.stdout.lower()
+    assert proc.stdout.count("export PATH") == 0, proc.stdout
+
+
+def test_help_documents_no_modify_path():
+    proc = _run(["--help"])
+    assert "--no-modify-path" in proc.stdout
+
+
+def test_zsh_users_get_zshrc(tmp_path):
+    """The rc file follows the LOGIN shell, not the shell running the installer — the
+    one-liner always executes under bash, so $SHELL is the only signal a zsh user emits."""
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _run_home(["--dry-run", "--yes"], home, extra_env={"SHELL": "/usr/bin/zsh"})
+    assert proc.returncode == 0, proc.stderr
+    assert ".zshrc" in proc.stdout
+    assert ".bashrc" not in proc.stdout
+
+
+def test_unknown_shell_prints_the_line_instead_of_guessing(tmp_path):
+    """fish does not speak POSIX export; writing bash syntax into its config would break
+    every new shell. Print the line, let the user place it."""
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _run_home(["--dry-run", "--yes"], home, extra_env={"SHELL": "/usr/bin/fish"})
+    assert proc.returncode == 0, proc.stderr
+    assert "add this yourself" in proc.stdout
+    assert ".bashrc" not in proc.stdout and ".zshrc" not in proc.stdout
