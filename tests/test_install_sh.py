@@ -403,8 +403,9 @@ def test_the_layout_repair_is_confined_to_the_installer_own_venv(tmp_path):
 # ---------------------------------------------------------------- PATH in ~/.bashrc
 
 def _run_home(args, home, extra_env=None, path=None):
-    """Run with HOME pointed at a sandbox so ~/.bashrc is inspectable."""
-    env = {"HOME": str(home), "GLQ_HOME": str(home / ".glq")}
+    """Run with HOME pointed at a sandbox so the rc files are inspectable. SHELL is pinned
+    to bash so the rc-file choice is deterministic regardless of the developer's shell."""
+    env = {"HOME": str(home), "GLQ_HOME": str(home / ".glq"), "SHELL": "/bin/bash"}
     if path is not None:
         env["PATH"] = path
     env.update(extra_env or {})
@@ -460,3 +461,25 @@ def test_path_export_skipped_when_bashrc_already_has_it(tmp_path):
 def test_help_documents_no_modify_path():
     proc = _run(["--help"])
     assert "--no-modify-path" in proc.stdout
+
+
+def test_zsh_users_get_zshrc(tmp_path):
+    """The rc file follows the LOGIN shell, not the shell running the installer — the
+    one-liner always executes under bash, so $SHELL is the only signal a zsh user emits."""
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _run_home(["--dry-run", "--yes"], home, extra_env={"SHELL": "/usr/bin/zsh"})
+    assert proc.returncode == 0, proc.stderr
+    assert ".zshrc" in proc.stdout
+    assert ".bashrc" not in proc.stdout
+
+
+def test_unknown_shell_prints_the_line_instead_of_guessing(tmp_path):
+    """fish does not speak POSIX export; writing bash syntax into its config would break
+    every new shell. Print the line, let the user place it."""
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _run_home(["--dry-run", "--yes"], home, extra_env={"SHELL": "/usr/bin/fish"})
+    assert proc.returncode == 0, proc.stderr
+    assert "add this yourself" in proc.stdout
+    assert ".bashrc" not in proc.stdout and ".zshrc" not in proc.stdout

@@ -75,7 +75,7 @@ GLQ installer
   --start/--no-start  start GLQ + the chat when done, or never offer to
   --list              list available checkpoints and exit
   --preflight         check prerequisites and exit (changes nothing)
-  --no-modify-path    don't append the venv bin dir to PATH in ~/.bashrc
+  --no-modify-path    don't append the venv bin dir to PATH in ~/.bashrc / ~/.zshrc
   --dry-run           print every command, change nothing
   --allow-root        permit running as root (not recommended)
   -h, --help          this message
@@ -393,29 +393,43 @@ ensure_venv_on_path() {
     # install. Appending (not prepending) keeps the system python/pip winning; only names
     # the system lacks — ninja, vllm, glq-* — fall through to the venv.
     #
-    # ~/.bashrc rather than ~/.profile: Ubuntu's stock .bashrc returns early for
-    # non-interactive shells, and the interactive-ssh session is exactly where users type
-    # the bare commands. Non-interactive invocations should keep passing explicit env.
+    # The interactive rc file (.bashrc / .zshrc) rather than ~/.profile: Ubuntu's stock
+    # .bashrc returns early for non-interactive shells, and the interactive-ssh session is
+    # exactly where users type the bare commands. Non-interactive invocations should keep
+    # passing explicit env. The file follows the LOGIN shell ($SHELL), not the shell
+    # running this script — the one-liner always executes under bash, so $SHELL is the
+    # only signal a zsh user emits.
     if [ "$MODIFY_PATH" -eq 0 ]; then
         say "== leaving PATH alone (--no-modify-path)"
         return 0
     fi
     case ":$PATH:" in *":$GLQ_VENV/bin:"*)
-        say "== $GLQ_VENV/bin is already on PATH — not touching ~/.bashrc"
+        say "== $GLQ_VENV/bin is already on PATH — not touching shell rc files"
         return 0 ;;
     esac
-    local rc="$HOME/.bashrc"
+    local rc
+    case "$(basename "${SHELL:-bash}")" in
+        bash) rc="$HOME/.bashrc" ;;
+        zsh)  rc="$HOME/.zshrc" ;;
+        *)
+            # fish and friends do not speak POSIX `export`; writing bash syntax into
+            # their config would break every new shell. Print the line, let the user
+            # place it.
+            say "== login shell $(basename "${SHELL:-?}") — add this yourself if wanted:"
+            say '   export PATH="$PATH:'"$GLQ_VENV"'/bin"'
+            return 0 ;;
+    esac
     if [ -f "$rc" ] && grep -qF "$GLQ_VENV/bin" "$rc"; then
-        say "== ~/.bashrc already references $GLQ_VENV/bin — leaving it as is"
+        say "== $rc already references $GLQ_VENV/bin — leaving it as is"
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '  [dry-run] append to %s: export PATH="$PATH:%s/bin"\n' "$rc" "$GLQ_VENV"
         return 0
     fi
-    say "== appending $GLQ_VENV/bin to PATH in ~/.bashrc (opt out: --no-modify-path)"
+    say "== appending $GLQ_VENV/bin to PATH in $rc (opt out: --no-modify-path)"
     printf '\n# added by glq install.sh — lets ninja/vllm/glq-* resolve by name (remove with the export)\nexport PATH="$PATH:%s/bin"\n' "$GLQ_VENV" >> "$rc"
-    say "   takes effect in new shells; for this one: source ~/.bashrc"
+    say "   takes effect in new shells; for this one: source $rc"
 }
 
 hand_over() {
