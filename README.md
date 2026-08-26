@@ -58,10 +58,10 @@ them against your GPU and offers the ones that fit. When it finishes it offers t
 start GLQ and open the chat; answer no and it just prints the steps. It refuses to
 run as root and never calls `sudo`.
 
-The installer is built from **components** — an interactive picker lets you toggle
-them, or pass `--components` to skip the prompt. With the one-liner, arguments go
-through `bash -s --` (the script arrives on stdin, so `bash` needs telling where its
-own options end):
+The installer is built from **components**. The plain one-liner above asks you
+interactively; or, to pick them up front and skip the prompt, pass `--components`
+through `bash -s --` — the script arrives on stdin, so `bash` needs telling where
+its own options end:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | \
