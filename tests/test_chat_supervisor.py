@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import inspect
 import io
+import os
+import sys
 import tempfile
 import types
 from pathlib import Path
@@ -35,6 +37,8 @@ class FakeProc:
     def __init__(self, argv, alive_for=0, output=(), env=None):
         self.argv = argv
         self.env = env
+        self.pid = 4242                      # a pgid-leader stand-in for group-kill tests
+        self.spawn_kwargs = {}
         self.terminated = self.killed = False
         self.waited = False
         self._alive_for = alive_for          # polls before it "exits" on its own; 0 = forever
@@ -77,6 +81,7 @@ def _sup(*, healthy_after=1, alive_for=0, output=(), **kw):
                 fh.write(line)
             fh.flush()
         p = FakeProc(argv, alive_for=alive_for, output=output, env=kw.get("env"))
+        p.spawn_kwargs = kw
         spawned.append(p)
         return p
 
@@ -1060,3 +1065,167 @@ def test_a_nonsense_timeout_is_refused(monkeypatch):
     chat, _events, _made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
     with pytest.raises(SystemExit):
         chat.main(["--model", "org/ckpt", "--ready-timeout", "0"])
+
+
+# ============================================ the child must be able to find its own tools
+#
+# Running a venv binary by absolute path — ~/.glq/venv/bin/vllm serve … — does NOT put the
+# venv's bin/ on PATH; only `source activate` does. So anything that shells out to a sibling
+# tool cannot find it.
+#
+# Measured on an RTX PRO 6000: FlashInfer ships no prebuilt sampler for sm_120, JIT-compiles
+# at first sample, shells out to ninja, and dies with
+#
+#     FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+#
+# taking EngineCore with it — while ~/.glq/venv/bin/ninja existed all along, installed by
+# install.sh for exactly this purpose. nvcc was present too, so the 0.8.7 fallback did not
+# fire and could not have helped.
+
+def test_the_venv_bin_directory_is_on_the_child_path():
+    import glq.supervisor as S
+    env = S.child_env()
+    first = env["PATH"].split(os.pathsep)[0]
+    assert first == os.path.dirname(sys.executable), (
+        "vLLM shells out to ninja by name; without the venv's bin/ first on PATH the JIT "
+        "build fails even though ninja is installed")
+
+
+def test_the_existing_path_is_kept(monkeypatch):
+    """Prepend, never replace: the child still needs the system's own tools."""
+    import glq.supervisor as S
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = S.child_env()
+    assert env["PATH"].endswith("/usr/bin:/bin")
+    assert os.path.dirname(sys.executable) in env["PATH"]
+
+
+def test_the_directory_is_not_duplicated(monkeypatch):
+    import glq.supervisor as S
+    bindir = os.path.dirname(sys.executable)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin")
+    assert S.child_env()["PATH"].count(bindir) == 1
+
+
+def test_a_missing_ninja_also_triggers_the_sampler_fallback():
+    """nvcc alone is not sufficient — the JIT needs ninja too, and this is exactly the case
+    the sm_120 box hit: nvcc present, ninja unreachable, engine dead."""
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="12.0", have_nvcc=True, have_ninja=False) == {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"}
+
+
+def test_a_complete_toolchain_leaves_flashinfer_alone():
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="12.0", have_nvcc=True, have_ninja=True) == {}
+
+
+# ==================================================== progress-aware wait + group teardown
+
+def test_a_growing_download_keeps_the_wait_alive_past_the_timeout():
+    """A 14 GB checkpoint on a slow link writes NOTHING to the log — the only sign of life
+    is the HF cache growing. Measured (gemma-4-26B, unauthenticated, RTX PRO 6000): the
+    engine sat healthy in snapshot_download for 15 minutes and the old fixed deadline shot
+    it. The timeout must be a no-progress window, not a stopwatch."""
+    dl = {"bytes": 0}
+    sup, spawned = _sup(healthy_after=400, timeout=60.0,
+                        download_bytes=lambda: dl["bytes"])
+    inner = sup._sleep
+
+    def sleep_and_download(s):
+        inner(s)
+        dl["bytes"] += 50_000_000            # the download is moving
+
+    sup._sleep = sleep_and_download
+    sup.start()                              # 400 polls x 2s >> 60s: only progress saves it
+    assert spawned and not spawned[0].terminated
+
+
+def test_fresh_log_output_also_resets_the_window():
+    """Loading, compiling and graph capture all log but can individually exceed a short
+    window — a child that keeps talking is not stuck."""
+    sup, _ = _sup(healthy_after=400, timeout=60.0, download_bytes=lambda: 0)
+    inner = sup._sleep
+
+    def sleep_and_chat(s):
+        inner(s)
+        with open(sup.log_path, "a") as fh:
+            fh.write("INFO still loading\n")
+
+    sup._sleep = sleep_and_chat
+    sup.start()
+
+
+def test_true_silence_still_times_out_at_the_window():
+    sup, _ = _sup(healthy_after=10**6, timeout=60.0, download_bytes=lambda: 0)
+    with pytest.raises(RuntimeError, match="progress"):
+        sup.start()
+
+
+def test_the_timeout_error_names_the_unauthenticated_download():
+    """The failure that motivated all of this: rate-limited anonymous download, silent log,
+    timeout. The error must say the fix, not just the symptom."""
+    sup, _ = _sup(healthy_after=10**6, timeout=60.0, download_bytes=lambda: 0,
+                  output=["Warning: You are sending unauthenticated requests to the "
+                          "HF Hub. Please set a HF_TOKEN.\n"])
+    with pytest.raises(RuntimeError, match="HF_TOKEN"):
+        sup.start()
+
+
+def test_the_progress_line_reports_download_bytes_when_the_log_is_silent():
+    out = io.StringIO()
+    dl = {"bytes": 0}
+    sup, _ = _sup(healthy_after=200, timeout=10_000.0, out=out,
+                  report_every=30.0, download_bytes=lambda: dl["bytes"])
+    inner = sup._sleep
+
+    def sleep_and_download(s):
+        inner(s)
+        dl["bytes"] += 100_000_000
+
+    sup._sleep = sleep_and_download
+    sup.start()
+    assert "downloading weights" in out.getvalue()
+
+
+def test_the_child_is_started_in_its_own_session():
+    """The group is what holds the VRAM, so the group must be killable as a unit — that
+    starts with giving the child its own session at spawn."""
+    sup, spawned = _sup(healthy_after=2)
+    sup.start()
+    assert spawned[0].spawn_kwargs.get("start_new_session") is True
+
+
+def test_stop_ends_the_whole_process_group_not_just_the_child():
+    """SIGTERM to the API server orphaned an EngineCore holding 17 GiB while stop()
+    claimed the GPU was free. Signal the group."""
+    seen = []
+    sup, spawned = _sup(healthy_after=2,
+                        killpg=lambda pgid, sig: seen.append((pgid, sig)),
+                        getpgid=lambda pid: pid)
+    sup.start()
+    sup.stop()
+    assert seen and seen[0][0] == spawned[0].pid
+
+
+def test_group_kill_escalates_when_terminate_is_ignored():
+    seen = []
+    sup, spawned = _sup(healthy_after=2,
+                        killpg=lambda pgid, sig: seen.append((pgid, sig)),
+                        getpgid=lambda pid: pid)
+    sup.start()
+    spawned[0].ignores_terminate = True
+    sup.stop()
+    import signal as _signal
+    assert [s for _, s in seen] == [_signal.SIGTERM, _signal.SIGKILL]
+
+
+def test_a_child_that_does_not_lead_its_group_gets_plain_terminate():
+    """Never killpg a group we do not own — an attached or oddly-spawned child falls back
+    to the old single-process terminate."""
+    sup, spawned = _sup(healthy_after=2,
+                        killpg=lambda pgid, sig: (_ for _ in ()).throw(AssertionError),
+                        getpgid=lambda pid: pid + 1)
+    sup.start()
+    sup.stop()
+    assert spawned[0].terminated

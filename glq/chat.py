@@ -304,8 +304,9 @@ def main(argv=None) -> int:
     # 5-way concurrency, 12 legs of 44 failed purely because startup outran this window.
     p.add_argument("--ready-timeout", type=positive_seconds, default=DEFAULT_READY_TIMEOUT,
                    metavar="SECONDS",
-                   help=f"how long to wait for vLLM to answer before giving up "
-                        f"(default {DEFAULT_READY_TIMEOUT:g})")
+                   help=f"give up after this long without progress — no log output and no "
+                        f"weight-download movement; a slow but moving download never trips "
+                        f"it (default {DEFAULT_READY_TIMEOUT:g})")
     p.add_argument("--no-serve", dest="serve", action="store_false",
                    help="do not start vLLM; attach to a server you started yourself")
     p.add_argument("--no-browser", dest="browser", action="store_false",

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -102,6 +103,16 @@ def server_up(base_url: str, timeout: float = 1.5) -> bool:
         return False
 
 
+def _ninja_present(which=shutil.which) -> bool:
+    """Is ninja reachable? FlashInfer's JIT shells out to it **by name**, with no override.
+
+    `install.sh` installs it into the venv, but running a venv binary by absolute path does
+    not put the venv's bin/ on PATH — which is why `child_env` prepends it.
+    """
+    return bool(which("ninja") or which(
+        "ninja", path=os.path.dirname(sys.executable)))
+
+
 def _nvcc_present(which=shutil.which) -> bool:
     """Is the NVIDIA CUDA Toolkit's compiler on PATH (or under CUDA_HOME)?
 
@@ -129,7 +140,7 @@ def _compute_cap(run=subprocess.run):
 _FLASHINFER_PREBUILT_BELOW = 12.0
 
 
-def flashinfer_env(compute_cap=None, have_nvcc=None) -> dict:
+def flashinfer_env(compute_cap=None, have_nvcc=None, have_ninja=None) -> dict:
     """Environment overrides needed for vLLM to start on this machine.
 
     Measured on an RTX PRO 6000 (sm_120), vLLM 0.27.1, no CUDA Toolkit: GLQ's own prebuilt
@@ -146,7 +157,13 @@ def flashinfer_env(compute_cap=None, have_nvcc=None) -> dict:
         compute_cap = _compute_cap()
     if have_nvcc is None:
         have_nvcc = _nvcc_present()
-    if have_nvcc or not compute_cap:
+    if have_ninja is None:
+        have_ninja = _ninja_present()
+    # nvcc alone is not enough. Measured on an RTX PRO 6000 with a CUDA 13.2 toolkit on
+    # PATH: FlashInfer still died with `FileNotFoundError: 'ninja'`, because the JIT shells
+    # out to ninja and the venv's bin/ was not on the child's PATH. A toolchain missing
+    # either half cannot build, so either half is grounds to fall back.
+    if (have_nvcc and have_ninja) or not compute_cap:
         return {}
     try:
         cap = float(compute_cap)
@@ -161,8 +178,38 @@ def child_env() -> dict:
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
     explaining a failure arrive long after we have given up — or never, if it dies with them
     unflushed.
+
+    PATH: the venv's own bin/ goes first. We launch vLLM by absolute path, which does NOT
+    put that directory on PATH the way `source activate` would — so a child that shells out
+    to a sibling tool cannot find it. Measured: FlashInfer JIT-compiles its sampler on
+    sm_120, runs `ninja` by name, and dies with FileNotFoundError while
+    ~/.glq/venv/bin/ninja sits there unused, installed by install.sh for this exact purpose.
     """
-    return {**os.environ, "PYTHONUNBUFFERED": "1", **flashinfer_env()}
+    bindir = os.path.dirname(sys.executable)
+    path = os.environ.get("PATH", "")
+    parts = [p for p in path.split(os.pathsep) if p and p != bindir]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1",
+           "PATH": os.pathsep.join([bindir, *parts])}
+    # After PATH, so the probe sees the tools the child will actually have.
+    env.update(flashinfer_env())
+    return env
+
+
+def _hf_download_bytes() -> int:
+    """Bytes of in-flight HF downloads: the sizes of `*.incomplete` blobs in the hub cache.
+
+    A checkpoint download writes NOTHING to vLLM's log, so this is the only sign of life
+    during the phase that takes longest on a first run. Shallow glob on the hub layout
+    (`models--*/blobs/*.incomplete`) — cheap enough to poll every 2 s even on a large cache.
+    """
+    root = Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
+    total = 0
+    for p in (root / "hub").glob("models--*/blobs/*.incomplete"):
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+    return total
 
 
 class VllmSupervisor:
@@ -176,6 +223,8 @@ class VllmSupervisor:
                  vllm_bin=None, extra_args=(), serve=True,
                  spawn=subprocess.Popen, probe=server_up,
                  sleep=time.sleep, monotonic=time.monotonic,
+                 download_bytes=_hf_download_bytes,
+                 killpg=os.killpg, getpgid=os.getpgid,
                  timeout=DEFAULT_READY_TIMEOUT, out=None,
                  log_path=None, verbose=False,
                  report_every=DEFAULT_REPORT_EVERY,
@@ -197,6 +246,9 @@ class VllmSupervisor:
         self.serve = serve
         self._spawn, self._probe = spawn, probe
         self._sleep, self._monotonic = sleep, monotonic
+        self._download_bytes = download_bytes
+        self._killpg, self._getpgid = killpg, getpgid
+        self._dl_seen = 0                #: in-flight download bytes at the last poll
         self.timeout = float(timeout)
         self._out = out if out is not None else sys.stderr
         self.proc = None                 #: set only when *we* started it
@@ -260,8 +312,11 @@ class VllmSupervisor:
             self._say("  cannot build one — falling back to vLLM's built-in sampler. "
                       "Please install the CUDA Toolkit for the faster path:")
             self._say("  https://developer.nvidia.com/cuda-downloads")
+        # Its own session: the engine core is a spawned grandchild, and the group is what
+        # holds the VRAM — stop() signals the group, which only works if we lead one.
         self.proc = self._spawn(self.argv(), stdout=log,
-                                stderr=subprocess.STDOUT, env=env)
+                                stderr=subprocess.STDOUT, env=env,
+                                start_new_session=True)
         try:
             self._wait_until_ready()
         except BaseException:
@@ -280,21 +335,42 @@ class VllmSupervisor:
         return self._log_fh
 
     def stop(self) -> None:
-        """Terminate the child, escalating to kill. A server we merely attached to is left
-        alone — we did not start it, so it is not ours to end."""
+        """End the child's whole process group, escalating to SIGKILL. A server we merely
+        attached to is left alone — we did not start it, so it is not ours to end.
+
+        The group, not just the child: vLLM's engine core is a spawned grandchild, and a
+        SIGTERM to the API server alone left an EngineCore parked in a weight download
+        holding 17 GiB — while this method printed "the GPU is free again". The group is
+        the unit that holds VRAM, so the group is the unit stop() ends.
+        """
         proc, self.proc = self.proc, None
         if proc is None:
             return
         self._say("stopping vLLM — the GPU is free again")
-        proc.terminate()
+        self._signal_tree(proc, hard=False)
         try:
             proc.wait(timeout=20)
         except Exception:                # noqa: BLE001 - TimeoutExpired, or a fake's stand-in
-            proc.kill()
+            self._signal_tree(proc, hard=True)
             try:
                 proc.wait(timeout=10)
             except Exception:            # noqa: BLE001 - nothing further we can do
                 pass
+
+    def _signal_tree(self, proc, *, hard: bool) -> None:
+        """Signal the child's process group if it leads one; fall back to the child alone.
+
+        The leadership check keeps this safe for anything not spawned by start() with its
+        own session — never signal a group we do not own.
+        """
+        sig = signal.SIGKILL if hard else signal.SIGTERM
+        try:
+            if self._getpgid(proc.pid) == proc.pid:
+                self._killpg(proc.pid, sig)
+                return
+        except Exception:                # noqa: BLE001 - no such process, or a fake's stand-in
+            pass
+        proc.kill() if hard else proc.terminate()
 
     def __enter__(self):
         self.start()
@@ -318,8 +394,9 @@ class VllmSupervisor:
         between a terminal that looks busy and one that looks hung.
         """
         started = self._monotonic()
-        deadline = started + self.timeout
+        last_progress = started
         last_report = started
+        dl_baseline = self._safe_download_bytes()
         while True:
             rc = self.proc.poll()
             self._collect()
@@ -330,13 +407,36 @@ class VllmSupervisor:
                 self._say(f"ready in {self._monotonic() - started:.0f}s — {self.base_url}")
                 return
             now = self._monotonic()
-            if now >= deadline:
+            # The timeout is a NO-PROGRESS window, not a stopwatch. A first run downloads
+            # the weights, and a download writes nothing to the log — measured on a 26B:
+            # 15 minutes parked in snapshot_download, perfectly healthy, and a fixed
+            # deadline shot it. Log output and download growth both count as progress; a
+            # true hang still ends after `timeout` seconds of neither.
+            if self._last_output_at is not None:
+                last_progress = max(last_progress, self._last_output_at)
+            dl = self._safe_download_bytes()
+            if dl > dl_baseline:
+                dl_baseline = dl
+                self._dl_seen = dl
+                last_progress = now
+            if now - last_progress >= self.timeout:
+                hint = ""
+                if any("unauthenticated requests" in ln for ln in self._tail):
+                    hint = ("\nThe weight download is running unauthenticated, which HF "
+                            "rate-limits hard — set HF_TOKEN in the environment and retry.")
                 raise RuntimeError(
-                    f"vLLM did not become ready within {self.timeout:.0f}s.\n" + self._drain())
+                    f"vLLM made no progress for {self.timeout:.0f}s — no log output and "
+                    f"no weight-download movement.\n" + self._drain() + hint)
             if now - last_report >= self.report_every:
                 self._report(now - started)
                 last_report = now
             self._sleep(2.0)
+
+    def _safe_download_bytes(self) -> int:
+        try:
+            return int(self._download_bytes())
+        except Exception:                # noqa: BLE001 - a broken probe must not kill the wait
+            return 0
 
     @staticmethod
     def _informative(line: str) -> bool:
@@ -383,6 +483,11 @@ class VllmSupervisor:
             since = self._monotonic() - self._last_output_at
             if since >= 30:
                 quiet = f"  (no new output for {since:.0f}s)"
+        # A silent log with a growing cache is the most common healthy state of a first
+        # run — say what is actually happening instead of quoting a stale line.
+        if self._dl_seen:
+            latest = f"downloading weights: {self._dl_seen / 2**30:.1f} GiB so far"
+            quiet = ""
         self._say(f"[{elapsed:4.0f}s] {latest}{quiet}")
 
     def _drain(self, keep: int = 25) -> str:
