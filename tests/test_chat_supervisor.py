@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import inspect
 import io
+import os
+import sys
 import tempfile
 import types
 from pathlib import Path
@@ -1060,3 +1062,56 @@ def test_a_nonsense_timeout_is_refused(monkeypatch):
     chat, _events, _made, _launched = _run_chat(monkeypatch, ["--model", "org/ckpt"])
     with pytest.raises(SystemExit):
         chat.main(["--model", "org/ckpt", "--ready-timeout", "0"])
+
+
+# ============================================ the child must be able to find its own tools
+#
+# Running a venv binary by absolute path — ~/.glq/venv/bin/vllm serve … — does NOT put the
+# venv's bin/ on PATH; only `source activate` does. So anything that shells out to a sibling
+# tool cannot find it.
+#
+# Measured on an RTX PRO 6000: FlashInfer ships no prebuilt sampler for sm_120, JIT-compiles
+# at first sample, shells out to ninja, and dies with
+#
+#     FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+#
+# taking EngineCore with it — while ~/.glq/venv/bin/ninja existed all along, installed by
+# install.sh for exactly this purpose. nvcc was present too, so the 0.8.7 fallback did not
+# fire and could not have helped.
+
+def test_the_venv_bin_directory_is_on_the_child_path():
+    import glq.supervisor as S
+    env = S.child_env()
+    first = env["PATH"].split(os.pathsep)[0]
+    assert first == os.path.dirname(sys.executable), (
+        "vLLM shells out to ninja by name; without the venv's bin/ first on PATH the JIT "
+        "build fails even though ninja is installed")
+
+
+def test_the_existing_path_is_kept(monkeypatch):
+    """Prepend, never replace: the child still needs the system's own tools."""
+    import glq.supervisor as S
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = S.child_env()
+    assert env["PATH"].endswith("/usr/bin:/bin")
+    assert os.path.dirname(sys.executable) in env["PATH"]
+
+
+def test_the_directory_is_not_duplicated(monkeypatch):
+    import glq.supervisor as S
+    bindir = os.path.dirname(sys.executable)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin")
+    assert S.child_env()["PATH"].count(bindir) == 1
+
+
+def test_a_missing_ninja_also_triggers_the_sampler_fallback():
+    """nvcc alone is not sufficient — the JIT needs ninja too, and this is exactly the case
+    the sm_120 box hit: nvcc present, ninja unreachable, engine dead."""
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="12.0", have_nvcc=True, have_ninja=False) == {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0"}
+
+
+def test_a_complete_toolchain_leaves_flashinfer_alone():
+    from glq.supervisor import flashinfer_env
+    assert flashinfer_env(compute_cap="12.0", have_nvcc=True, have_ninja=True) == {}

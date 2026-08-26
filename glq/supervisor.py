@@ -102,6 +102,16 @@ def server_up(base_url: str, timeout: float = 1.5) -> bool:
         return False
 
 
+def _ninja_present(which=shutil.which) -> bool:
+    """Is ninja reachable? FlashInfer's JIT shells out to it **by name**, with no override.
+
+    `install.sh` installs it into the venv, but running a venv binary by absolute path does
+    not put the venv's bin/ on PATH — which is why `child_env` prepends it.
+    """
+    return bool(which("ninja") or which(
+        "ninja", path=os.path.dirname(sys.executable)))
+
+
 def _nvcc_present(which=shutil.which) -> bool:
     """Is the NVIDIA CUDA Toolkit's compiler on PATH (or under CUDA_HOME)?
 
@@ -129,7 +139,7 @@ def _compute_cap(run=subprocess.run):
 _FLASHINFER_PREBUILT_BELOW = 12.0
 
 
-def flashinfer_env(compute_cap=None, have_nvcc=None) -> dict:
+def flashinfer_env(compute_cap=None, have_nvcc=None, have_ninja=None) -> dict:
     """Environment overrides needed for vLLM to start on this machine.
 
     Measured on an RTX PRO 6000 (sm_120), vLLM 0.27.1, no CUDA Toolkit: GLQ's own prebuilt
@@ -146,7 +156,13 @@ def flashinfer_env(compute_cap=None, have_nvcc=None) -> dict:
         compute_cap = _compute_cap()
     if have_nvcc is None:
         have_nvcc = _nvcc_present()
-    if have_nvcc or not compute_cap:
+    if have_ninja is None:
+        have_ninja = _ninja_present()
+    # nvcc alone is not enough. Measured on an RTX PRO 6000 with a CUDA 13.2 toolkit on
+    # PATH: FlashInfer still died with `FileNotFoundError: 'ninja'`, because the JIT shells
+    # out to ninja and the venv's bin/ was not on the child's PATH. A toolchain missing
+    # either half cannot build, so either half is grounds to fall back.
+    if (have_nvcc and have_ninja) or not compute_cap:
         return {}
     try:
         cap = float(compute_cap)
@@ -161,8 +177,21 @@ def child_env() -> dict:
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
     explaining a failure arrive long after we have given up — or never, if it dies with them
     unflushed.
+
+    PATH: the venv's own bin/ goes first. We launch vLLM by absolute path, which does NOT
+    put that directory on PATH the way `source activate` would — so a child that shells out
+    to a sibling tool cannot find it. Measured: FlashInfer JIT-compiles its sampler on
+    sm_120, runs `ninja` by name, and dies with FileNotFoundError while
+    ~/.glq/venv/bin/ninja sits there unused, installed by install.sh for this exact purpose.
     """
-    return {**os.environ, "PYTHONUNBUFFERED": "1", **flashinfer_env()}
+    bindir = os.path.dirname(sys.executable)
+    path = os.environ.get("PATH", "")
+    parts = [p for p in path.split(os.pathsep) if p and p != bindir]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1",
+           "PATH": os.pathsep.join([bindir, *parts])}
+    # After PATH, so the probe sees the tools the child will actually have.
+    env.update(flashinfer_env())
+    return env
 
 
 class VllmSupervisor:
