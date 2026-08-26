@@ -41,6 +41,14 @@ def _glq_vllm_importable() -> bool:
         return False
 
 
+def _quantize_deps_importable() -> bool:
+    """datasets is the quantize dep nothing else drags in — transformers, safetensors and
+    accelerate all ride with vLLM, so its absence is what an incomplete quantize install
+    actually looks like at runtime."""
+    import importlib.util
+    return importlib.util.find_spec("datasets") is not None
+
+
 def _plugin_registered() -> bool:
     """Is the `glq` plugin visible in the entry-point group vLLM reads?
 
@@ -91,7 +99,8 @@ def run_checks(components, *, glq_importable=_glq_importable,
                glq_vllm_importable=_glq_vllm_importable,
                plugin_registered=_plugin_registered,
                cuda_available=_cuda_available,
-               kernels_available=_kernels_available) -> list[Check]:
+               kernels_available=_kernels_available,
+               quantize_deps_importable=_quantize_deps_importable) -> list[Check]:
     """Assert the install can actually do what the next-steps text is about to promise."""
     checks: list[Check] = []
 
@@ -116,6 +125,14 @@ def run_checks(components, *, glq_importable=_glq_importable,
             "the glq entry point is not registered, so vLLM will report "
             "'Unknown quantization method: glq'. Fix: pip install --force-reinstall glq"
             + (f" ({err})" if err else "")))
+
+    if "quantize" in components:
+        have, err = _safe(quantize_deps_importable, False)
+        checks.append(Check(
+            "quantize deps importable", bool(have),
+            "datasets present — glq-quantize can load calibration data" if have else
+            "the quantize deps are missing — glq-quantize will fail at import. "
+            "Fix: pip install 'glq[quantize]'" + (f" ({err})" if err else "")))
 
     cuda, err = _safe(cuda_available, False)
     checks.append(Check(

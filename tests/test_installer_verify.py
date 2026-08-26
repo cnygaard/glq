@@ -146,3 +146,23 @@ def test_render_is_readable_and_marks_each_line():
     text = V.render(V.run_checks(("core", "vllm"), **_probes(glq_vllm=False, plugin=False)))
     assert "glq_vllm" in text
     assert "FAIL" in text and "ok" in text
+
+
+def test_quantize_component_checks_its_deps_are_importable():
+    """The binary exists in every install; only the deps distinguish a working quantize
+    from a traceback on `from datasets import load_dataset` twenty minutes in."""
+    checks = V.run_checks(("core", "quantize"), **_probes(),
+                          quantize_deps_importable=lambda: False)
+    c = [c for c in checks if "quantize" in c.name]
+    assert c and not c[0].ok
+    assert "glq[quantize]" in c[0].detail
+
+    checks = V.run_checks(("core", "quantize"), **_probes(),
+                          quantize_deps_importable=lambda: True)
+    c = [c for c in checks if "quantize" in c.name]
+    assert c and c[0].ok
+
+
+def test_no_quantize_component_no_quantize_check():
+    checks = V.run_checks(("core",), **_probes())
+    assert not any("quantize" in c.name for c in checks)
