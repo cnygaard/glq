@@ -59,8 +59,14 @@ start GLQ and open the chat; answer no and it just prints the steps. It refuses 
 run as root and never calls `sudo`.
 
 The installer is built from **components** — an interactive picker lets you toggle
-them, or pass `--components` (e.g. `--components core,vllm,chat,quantize`) to skip
-the prompt:
+them, or pass `--components` to skip the prompt. With the one-liner, arguments go
+through `bash -s --` (the script arrives on stdin, so `bash` needs telling where its
+own options end):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | \
+  bash -s -- --components core,vllm,chat,quantize
+```
 
 | Component | What it installs | Default |
 |---|---|:-:|
