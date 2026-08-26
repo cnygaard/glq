@@ -51,15 +51,35 @@ architecture fallbacks dequantize instead).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash
+
+# or preselect components (`bash -s --` passes arguments to a piped script):
+curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --components core,vllm,chat,quantize
 ```
 
 Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
 them against your GPU and offers the ones that fit. When it finishes it offers to
-start GLQ and open the chat; answer no and it just prints the steps. `--dry-run`
-prints every command without running it; `--list` shows the checkpoints and exits;
-`--components core,vllm,picode,chat` skips the prompt; `--start` / `--no-start`
-decide the handoff without being asked. It refuses to run as root and never calls
-`sudo`.
+start GLQ and open the chat; answer no and it just prints the steps. It refuses to
+run as root and never calls `sudo`.
+
+In a terminal the installer **prompts** for components and checkpoint (the prompts
+read `/dev/tty`, so they appear even though the script itself arrives on stdin).
+Scripted — `--yes`, `--dry-run`, or no terminal at all (CI, `ssh host 'cmd'`,
+`docker build`) — it prompts for **nothing** and installs the defaults, so use
+`--components` there to get anything non-default. The **components**:
+
+| Component | What it installs | Default |
+|---|---|:-:|
+| `core` | the venv + glq itself | always |
+| `vllm` | vLLM — the OpenAI-compatible server behind the chat UI and picode | ✓ |
+| `chat` | the Gradio chat UI | ✓ |
+| `picode` | the pi coding agent (installs node via nvm) | opt-in |
+| `quantize` | the deps for quantizing your own models (`glq[quantize]`) | opt-in |
+
+Other flags: `--dry-run` prints every command without running it; `--list` shows the
+checkpoints and exits; `--start` / `--no-start` decide the handoff without being
+asked; `--no-modify-path` leaves your shell rc file alone (by default the venv's
+`bin/` is appended to `PATH` in `~/.bashrc` / `~/.zshrc` so `vllm`, `glq-chat` and
+`ninja` resolve by name in new shells).
 
 `~/.glq/venv/bin/glq-chat` is the one command afterwards: it starts vLLM, waits for
 it, serves the Gradio UI on <http://localhost:7860>, and stops the server again when
