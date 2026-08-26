@@ -50,17 +50,22 @@ architecture fallbacks dequantize instead).
 ### Installer command (venv, glq, vLLM, chat UI, optional pi agent)
 
 ```bash
-# interactive — pick components at the prompt
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash
 
-# or preselect them and skip the prompt (`bash -s --` passes arguments to a piped script)
+# or preselect components (`bash -s --` passes arguments to a piped script):
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --components core,vllm,chat,quantize
 ```
 
 Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
 them against your GPU and offers the ones that fit. When it finishes it offers to
 start GLQ and open the chat; answer no and it just prints the steps. It refuses to
-run as root and never calls `sudo`. The **components**:
+run as root and never calls `sudo`.
+
+In a terminal the installer **prompts** for components and checkpoint (the prompts
+read `/dev/tty`, so they appear even though the script itself arrives on stdin).
+Scripted — `--yes`, `--dry-run`, or no terminal at all (CI, `ssh host 'cmd'`,
+`docker build`) — it prompts for **nothing** and installs the defaults, so use
+`--components` there to get anything non-default. The **components**:
 
 | Component | What it installs | Default |
 |---|---|:-:|
