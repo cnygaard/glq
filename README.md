@@ -55,11 +55,26 @@ curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash
 
 Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
 them against your GPU and offers the ones that fit. When it finishes it offers to
-start GLQ and open the chat; answer no and it just prints the steps. `--dry-run`
-prints every command without running it; `--list` shows the checkpoints and exits;
-`--components core,vllm,picode,chat` skips the prompt; `--start` / `--no-start`
-decide the handoff without being asked. It refuses to run as root and never calls
-`sudo`.
+start GLQ and open the chat; answer no and it just prints the steps. It refuses to
+run as root and never calls `sudo`.
+
+The installer is built from **components** — an interactive picker lets you toggle
+them, or pass `--components` (e.g. `--components core,vllm,chat,quantize`) to skip
+the prompt:
+
+| Component | What it installs | Default |
+|---|---|:-:|
+| `core` | the venv + glq itself | always |
+| `vllm` | vLLM — the OpenAI-compatible server behind the chat UI and picode | ✓ |
+| `chat` | the Gradio chat UI | ✓ |
+| `picode` | the pi coding agent (installs node via nvm) | opt-in |
+| `quantize` | the deps for quantizing your own models (`glq[quantize]`) | opt-in |
+
+Other flags: `--dry-run` prints every command without running it; `--list` shows the
+checkpoints and exits; `--start` / `--no-start` decide the handoff without being
+asked; `--no-modify-path` leaves your shell rc file alone (by default the venv's
+`bin/` is appended to `PATH` in `~/.bashrc` / `~/.zshrc` so `vllm`, `glq-chat` and
+`ninja` resolve by name in new shells).
 
 `~/.glq/venv/bin/glq-chat` is the one command afterwards: it starts vLLM, waits for
 it, serves the Gradio UI on <http://localhost:7860>, and stops the server again when
