@@ -219,3 +219,11 @@ def test_the_default_is_visible_in_the_question():
     tty = _Tty("\n")
     P.confirm("Start GLQ now?", default=False, tty=tty)
     assert "[y/N]" in tty.screen
+
+
+def test_quantize_is_offered_but_not_default():
+    """`glq-quantize` ships in every install (it is a console script of the base package)
+    but its deps do not — the component closes that gap for people who want it, while the
+    serving-only default stays lean."""
+    assert "quantize" in P.COMPONENTS
+    assert "quantize" not in P.DEFAULT_COMPONENTS

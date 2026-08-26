@@ -259,3 +259,17 @@ def test_the_e8_cache_is_never_printed_as_an_instruction():
         t = next_steps(venv=VENV, model=MODEL, components=ALL, port=8000, size_gib=1.8,
                        fp8_kv=chosen)
         assert "GLQ_KV_QUANT" not in t
+
+
+def test_quantize_component_drops_the_manual_pip_step():
+    """With the component installed, telling the user to pip-install the extra they just
+    got would read as if the install had not worked."""
+    txt = _text(components=("core", "vllm", "chat", "quantize"))
+    assert "glq-quantize" in txt
+    assert "glq[quantize]" not in txt
+
+
+def test_without_the_component_the_manual_pip_step_remains():
+    txt = _text(components=("core", "vllm", "chat"))
+    assert "glq[quantize]" in txt
+    assert "glq-quantize" in txt

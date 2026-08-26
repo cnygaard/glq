@@ -16,10 +16,14 @@ COMPONENTS = {
     "vllm": "vLLM — OpenAI-compatible server for the chat UI and picode",
     "picode": "pi coding agent (installs node via nvm)",
     "chat": "Gradio chat UI",
+    "quantize": "quantize your own models (pulls datasets/accelerate/sentencepiece)",
 }
 
 #: picode is off by default: it is the only component that installs a second language
-#: runtime, which is a surprising thing for an unattended install to do.
+#: runtime, which is a surprising thing for an unattended install to do. quantize is off
+#: by default because most installs serve published checkpoints — the glq-quantize binary
+#: ships regardless (it is a console script of the base package); the component only adds
+#: the deps it imports at runtime.
 DEFAULT_COMPONENTS = ("core", "vllm", "chat")
 
 

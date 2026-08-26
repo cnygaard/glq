@@ -59,3 +59,19 @@ def test_the_pin_travels_with_vllm_not_with_the_chat_ui():
 
 def test_nothing_is_installed_when_no_component_asks_for_it():
     assert _pip_commands(("core",)) == ""
+
+
+def test_quantize_component_installs_the_extra_without_upgrading_glq():
+    """`glq[quantize]` names glq itself, so `--upgrade` would replace a --glq-source dev
+    install with the PyPI release — the extra must ride a plain install, where an
+    already-satisfied glq is left alone and only the missing deps resolve."""
+    seen = []
+    M._install_python_extras(lambda cmd, **kw: seen.append([str(c) for c in cmd]),
+                             Path("/home/u/.glq/venv"), ("core", "quantize"))
+    quant = [c for c in seen if any("glq[quantize]" in a for a in c)]
+    assert quant, f"no glq[quantize] install in: {seen}"
+    assert "--upgrade" not in quant[0], quant[0]
+
+
+def test_quantize_extra_is_not_installed_by_default():
+    assert "glq[quantize]" not in _pip_commands(("core", "vllm", "chat"))

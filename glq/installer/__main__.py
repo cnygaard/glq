@@ -72,6 +72,13 @@ def _install_python_extras(run: Runner, venv: Path, components) -> None:
     if wanted:
         print(f"\n== installing: {', '.join(wanted)}")
         run([pip, "install", "--upgrade", *wanted])
+    if "quantize" in components:
+        # Deliberately a separate command with NO --upgrade: `glq[quantize]` names glq
+        # itself, and --upgrade would replace a --glq-source dev install with the PyPI
+        # release. Plain install leaves an already-satisfied glq alone and resolves only
+        # the extra's missing deps (pyproject stays the single source of truth for them).
+        print("\n== installing: glq[quantize]")
+        run([pip, "install", "glq[quantize]"])
 
 
 def _install_open_webui(run: Runner) -> Path | None:
@@ -228,10 +235,15 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
          f"{_venv_bin(venv, 'glq-setup')} --list",
          f"{_venv_bin(venv, 'glq-setup')} --model <repo-id>")
 
-    step("Quantize a model of your own:",
-         f"{_venv_bin(venv, 'pip')} install 'glq[quantize]'",
-         f"{_venv_bin(venv, 'glq-quantize')} --model <hf-repo> --output ./out "
-         f"--bpw 4 --nsamples 128")
+    if "quantize" in components:
+        step("Quantize a model of your own:",
+             f"{_venv_bin(venv, 'glq-quantize')} --model <hf-repo> --output ./out "
+             f"--bpw 4 --nsamples 128")
+    else:
+        step("Quantize a model of your own:",
+             f"{_venv_bin(venv, 'pip')} install 'glq[quantize]'",
+             f"{_venv_bin(venv, 'glq-quantize')} --model <hf-repo> --output ./out "
+             f"--bpw 4 --nsamples 128")
 
     out += [f"Python in this venv: {py}",
             f"Config written to:   {GLQ_HOME / 'config.json'}",
@@ -244,7 +256,7 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="glq-setup", description="Set up GLQ serving, a chat UI and picode.")
-    p.add_argument("--components", help="comma-separated: core,vllm,picode,chat")
+    p.add_argument("--components", help="comma-separated: core,vllm,picode,chat,quantize")
     p.add_argument("--model", help="HF repo id to serve (default: chosen interactively)")
     p.add_argument("--chat", choices=("gradio", "openwebui", "none"), default="gradio")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
