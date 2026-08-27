@@ -11,9 +11,11 @@ card. Sizes therefore come from the file tree, summing `.safetensors` entries.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 COLLECTION_SLUG = "xv0y5ncu/start-here-recommended-glq-checkpoints"
 _API = "https://huggingface.co/api"
@@ -41,9 +43,31 @@ class Checkpoint:
         return self.repo_id.split("/", 1)[-1]
 
 
+def _auth_headers() -> dict:
+    """Authorization for the Hub API when a token is around, else nothing.
+
+    Anonymous is fine for the public collection, but glq-chat reuses this fetcher to size
+    PRIVATE checkpoints for the KV-pool plan — and the anonymous tree call 401s there, so
+    the plan silently degrades to the 0.45 default. Fine on a 96 GB card, fatal on a
+    24 GB one serving a 17 GiB model. Plain stdlib on purpose: the installer's core
+    profile has no huggingface_hub, so read the same places its client would — the env
+    var first, then the token `hf auth login` stores.
+    """
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        stored = Path(os.environ.get("HF_HOME")
+                      or Path.home() / ".cache" / "huggingface") / "token"
+        try:
+            token = stored.read_text().strip()
+        except OSError:
+            token = None
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _fetch_json(url: str):
     """Default fetcher. Injected in tests so no test touches huggingface.co."""
-    req = urllib.request.Request(url, headers={"User-Agent": "glq-installer"})
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "glq-installer", **_auth_headers()})
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:      # noqa: S310
         return json.loads(resp.read().decode("utf-8"))
 

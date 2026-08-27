@@ -35,7 +35,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
-                            DEFAULT_MAX_MODEL_LEN, DEFAULT_READY_TIMEOUT,
+                            DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS,
+                            DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -292,6 +293,11 @@ def main(argv=None) -> int:
                    help=f"context window to serve (default {DEFAULT_MAX_MODEL_LEN}; vLLM "
                         f"would otherwise take the model's own maximum, which for gemma-4 "
                         f"is 262144 and needs GiB of KV cache for a single request)")
+    p.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS,
+                   help=f"concurrent sequences vLLM plans for (default "
+                        f"{DEFAULT_MAX_NUM_SEQS}; its own default is 1024 — a batch-server "
+                        f"number that hybrid-GDN models cannot even start under, since "
+                        f"every sequence reserves a Mamba cache block)")
     p.add_argument("--fp8-kv-cache", dest="fp8_kv", action="store_true",
                    default=cfg.get("fp8_kv", False),
                    help="vLLM's fp8 KV cache: about twice the context per GiB, at lower "
@@ -348,6 +354,7 @@ def main(argv=None) -> int:
         serve=args.serve,
         verbose=args.verbose,
         max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
         fp8_kv=args.fp8_kv,
         timeout=args.ready_timeout,
         # Size the KV pool for this checkpoint. Skipped entirely when the user named a

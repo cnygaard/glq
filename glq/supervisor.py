@@ -61,6 +61,14 @@ _MIN_KV_BYTES = 2 * 1024 ** 3
 #: model of this size. 8192 is a conversation; raise it with --max-model-len.
 DEFAULT_MAX_MODEL_LEN = 8192
 
+#: vLLM defaults max_num_seqs to 1024 — sized for a batch server, absurd for a single-user
+#: chat — and on hybrid-GDN models every decode sequence reserves its own Mamba cache
+#: block before a single request exists. Measured with a 27B GDN hybrid on a 96 GB card:
+#: "max_num_seqs (1024) exceeds available Mamba cache blocks (399)", startup refused, with
+#: a pool that held ~24 GiB of cache. 16 covers regenerations and a couple of parallel
+#: tabs, and shrinks CUDA-graph capture and KV pressure for every model, not just hybrids.
+DEFAULT_MAX_NUM_SEQS = 16
+
 #: Leave a slice of the card for the desktop. Above this, vLLM competes with the compositor
 #: and a display server can fail to allocate.
 _MAX_UTILIZATION = 0.92
@@ -229,7 +237,8 @@ class VllmSupervisor:
                  log_path=None, verbose=False,
                  report_every=DEFAULT_REPORT_EVERY,
                  weights_bytes=None, vram_bytes=None,
-                 max_model_len=DEFAULT_MAX_MODEL_LEN, fp8_kv=False):
+                 max_model_len=DEFAULT_MAX_MODEL_LEN, fp8_kv=False,
+                 max_num_seqs=DEFAULT_MAX_NUM_SEQS):
         self.model = model
         self.port = int(port)
         self.base_url = base_url or f"http://127.0.0.1:{self.port}/v1"
@@ -242,6 +251,7 @@ class VllmSupervisor:
         self.vllm_bin = vllm_bin or os.path.join(os.path.dirname(sys.executable), "vllm")
         self.extra_args = list(extra_args)
         self.max_model_len = int(max_model_len)
+        self.max_num_seqs = int(max_num_seqs)
         self.fp8_kv = bool(fp8_kv)
         self.serve = serve
         self._spawn, self._probe = spawn, probe
@@ -268,6 +278,7 @@ class VllmSupervisor:
                 "--port", str(self.port),
                 "--gpu-memory-utilization", str(self.gpu_memory_utilization),
                 "--max-model-len", str(self.max_model_len),
+                "--max-num-seqs", str(self.max_num_seqs),
                 *kv_compression.serve_args(self.fp8_kv),
                 *self.extra_args]
 
