@@ -399,14 +399,24 @@ ensure_venv_on_path() {
     # passing explicit env. The file follows the LOGIN shell ($SHELL), not the shell
     # running this script — the one-liner always executes under bash, so $SHELL is the
     # only signal a zsh user emits.
+    # Export for THIS process first, unconditionally: the rc-file append below cannot
+    # reach the shell that is already running install.sh, and this process's env is what
+    # hand_over — and its offer to start glq-chat — inherits. Measured: a chat started
+    # right after installing crashed with FileNotFoundError: 'ninja', because FlashInfer's
+    # JIT resolves tools via PATH and the freshly-appended rc line had never been sourced.
+    # The export dies with the script, so it breaks nothing --no-modify-path promises.
+    local was_on_path=0
+    case ":$PATH:" in *":$GLQ_VENV/bin:"*) was_on_path=1 ;; esac
+    [ "$was_on_path" -eq 1 ] || export PATH="$PATH:$GLQ_VENV/bin"
     if [ "$MODIFY_PATH" -eq 0 ]; then
-        say "== leaving PATH alone (--no-modify-path)"
+        say "== not touching shell rc files (--no-modify-path); this session still finds "
+        say "   the venv's tools"
         return 0
     fi
-    case ":$PATH:" in *":$GLQ_VENV/bin:"*)
+    if [ "$was_on_path" -eq 1 ]; then
         say "== $GLQ_VENV/bin is already on PATH — not touching shell rc files"
-        return 0 ;;
-    esac
+        return 0
+    fi
     local rc
     case "$(basename "${SHELL:-bash}")" in
         bash) rc="$HOME/.bashrc" ;;
