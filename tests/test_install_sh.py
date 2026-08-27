@@ -483,3 +483,50 @@ def test_unknown_shell_prints_the_line_instead_of_guessing(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "add this yourself" in proc.stdout
     assert ".bashrc" not in proc.stdout and ".zshrc" not in proc.stdout
+
+
+def _run_path_fn(tmp_path, *, modify_path="1", pre_path=None):
+    """Execute just ensure_venv_on_path() in a bash harness and report the process PATH.
+
+    The rc-file append cannot help the shell ALREADY running install.sh — and that
+    process's env is what hand_over (and its offer to start glq-chat) inherits. Measured:
+    a chat started right after installing crashed with FileNotFoundError: 'ninja' because
+    FlashInfer's JIT resolves tools via PATH.
+    """
+    script = f'''
+        set -euo pipefail
+        GLQ_VENV=/fake/venv; HOME="{tmp_path}"; MODIFY_PATH={modify_path}
+        DRY_RUN=0; SHELL=/bin/bash
+        {f'PATH="{pre_path}"' if pre_path else ""}
+        say() {{ :; }}
+        source <(sed -n "/^ensure_venv_on_path()/,/^}}/p" "{INSTALL_SH}")
+        ensure_venv_on_path
+        case ":$PATH:" in *":/fake/venv/bin:"*) echo EXPORTED;; *) echo MISSING;; esac
+    '''
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def test_the_running_process_gets_the_venv_on_path(tmp_path):
+    proc = _run_path_fn(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "EXPORTED" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_no_modify_path_still_exports_for_this_process(tmp_path):
+    """--no-modify-path is about the user's rc files. The script's own environment dies
+    with the script, so exporting there breaks nothing the flag promises — and without it
+    the 'start now?' offer launches a chat that cannot find ninja."""
+    proc = _run_path_fn(tmp_path, modify_path="0")
+    assert proc.returncode == 0, proc.stderr
+    assert "EXPORTED" in proc.stdout, proc.stdout + proc.stderr
+    assert not (tmp_path / ".bashrc").exists(), "--no-modify-path must not write rc files"
+
+
+def test_in_process_export_does_not_suppress_the_rc_append(tmp_path):
+    """The export must not trick the 'already on PATH' check into skipping the rc file —
+    the append is for FUTURE shells, which the process env cannot reach."""
+    proc = _run_path_fn(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    rc = tmp_path / ".bashrc"
+    assert rc.exists() and "/fake/venv/bin" in rc.read_text(), (
+        "rc append was skipped; future shells stay broken")
