@@ -61,6 +61,12 @@ class Runner:
 #: vLLM builds gemma-4 from per-layer configs.
 GEMMA4_TRANSFORMERS = "transformers>=5.13.1,<5.15"
 
+#: The version pin matters: templates track vLLM's parser expectations, and this one is
+#: the pairing the README's tool-calling recipe was validated against.
+GEMMA4_TOOL_TEMPLATE = "tool_chat_template_gemma4.jinja"
+GEMMA4_TOOL_TEMPLATE_URL = ("https://raw.githubusercontent.com/vllm-project/vllm/"
+                            f"v0.20.2/examples/{GEMMA4_TOOL_TEMPLATE}")
+
 
 def _install_python_extras(run: Runner, venv: Path, components) -> None:
     pip = _venv_bin(venv, "pip")
@@ -118,6 +124,24 @@ def _install_picode(run: Runner) -> None:
     run(["bash", "-c",
          ". ~/.nvm/nvm.sh && nvm install --lts >/dev/null && "
          "npm install -g --force @earendil-works/pi-coding-agent"])
+    # gemma-4's tool template is not in the model checkpoint (its bundled template is
+    # plain chat) and not in the vLLM wheel — it lives in vLLM's repo examples. Measured:
+    # the printed serve command referenced a path that did not exist and vLLM refused to
+    # start. Fetched here, once, for every install that picks picode: the chosen model is
+    # known at configure time but users switch models later, and the file is a few KB.
+    # mkdir rides inside the same command so --dry-run creates nothing.
+    tpl = GLQ_HOME / "templates" / GEMMA4_TOOL_TEMPLATE
+    print("== gemma-4 tool-calling template (from vLLM's examples/)")
+    try:
+        run(["bash", "-c",
+             f"mkdir -p {tpl.parent} && "
+             f"curl --proto '=https' --tlsv1.2 -fsSL {GEMMA4_TOOL_TEMPLATE_URL} "
+             f"-o {tpl}"])
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"   fetch failed ({exc}) — tool calling on gemma-4 models needs it; "
+              f"get it yourself later:\n"
+              f"   curl --proto '=https' --tlsv1.2 -fsSL {GEMMA4_TOOL_TEMPLATE_URL} "
+              f"-o {tpl}")
 
 
 def _start_chat(venv) -> None:
@@ -163,12 +187,22 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     first_run = (f"downloads ~{size_gib:.1f} GiB of weights and then " if size_gib
                  else "downloads the weights and then ")
 
-    # pi is a tool-using agent: without these two flags every request it makes fails with
+    # pi is a tool-using agent: without these flags every request it makes fails with
     # `400 "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser`.
     # Only added when picode was installed — they change server behaviour, so someone who
-    # just wants to chat should not silently get them.
-    tools = (" --enable-auto-tool-choice --tool-call-parser hermes"
-             if "picode" in components else "")
+    # just wants to chat should not silently get them. The parser follows the model's
+    # FAMILY: hermes matches SmolLM3/Qwen-style <tool_call> markup and silently mangles
+    # gemma-4's, which needs its own parser plus the external template the picode
+    # component downloads (gemma-4's bundled chat template is plain chat).
+    is_gemma4 = "gemma-4" in model.lower()
+    tools = ""
+    if "picode" in components:
+        if is_gemma4:
+            tpl = GLQ_HOME / "templates" / GEMMA4_TOOL_TEMPLATE
+            tools = (f" --enable-auto-tool-choice --tool-call-parser gemma4 "
+                     f"--reasoning-parser gemma4 --chat-template {tpl}")
+        else:
+            tools = " --enable-auto-tool-choice --tool-call-parser hermes"
     # A serving-time choice, so it belongs on the command the user copies — vLLM's own
     # flags, which is why they can simply be appended.
     kv_flags = kv_env.shell_suffix(fp8_kv)
@@ -197,7 +231,12 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
           if "chat" in components else f"Serve the model. {slow_start}"),
          f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
          f"--port {port}{kv_flags}{tools}")
-    if tools:
+    if tools and is_gemma4:
+        out.insert(len(out) - 1,
+                   "   (the tool-choice flags are what pi needs; the chat template is "
+                   "gemma-4's tool\n    template, downloaded by the installer — the "
+                   "model's own template is plain chat)\n")
+    elif tools:
         out.insert(len(out) - 1,
                    "   (the tool-choice flags are what pi needs; `hermes` matches "
                    "SmolLM3-style\n    <tool_call> markup — other model families need a "

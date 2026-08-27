@@ -273,3 +273,20 @@ def test_without_the_component_the_manual_pip_step_remains():
     txt = _text(components=("core", "vllm", "chat"))
     assert "glq[quantize]" in txt
     assert "glq-quantize" in txt
+
+
+def test_gemma4_models_get_the_gemma4_parser_and_the_downloaded_template():
+    """hermes matches SmolLM3-style <tool_call> markup and silently mangles gemma-4 tool
+    calls; gemma-4 also needs the external template the picode component now downloads.
+    The printed serve command must match the chosen model's family."""
+    t = _text(model="xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw")
+    assert "--tool-call-parser gemma4" in t
+    assert "--reasoning-parser gemma4" in t
+    assert "--chat-template" in t and "tool_chat_template_gemma4.jinja" in t
+    assert "hermes" not in t
+
+
+def test_non_gemma_models_keep_the_hermes_parser():
+    t = _text()          # the default model is SmolLM3
+    assert "--tool-call-parser hermes" in t
+    assert "gemma4" not in t

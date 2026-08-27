@@ -75,3 +75,25 @@ def test_quantize_component_installs_the_extra_without_upgrading_glq():
 
 def test_quantize_extra_is_not_installed_by_default():
     assert "glq[quantize]" not in _pip_commands(("core", "vllm", "chat"))
+
+
+def test_picode_component_fetches_the_gemma4_tool_template():
+    """gemma-4's tool template is not in the model checkpoint and not in the vLLM wheel —
+    it lives in vLLM's repo examples. Measured on the box: the printed serve command
+    referenced a template path that did not exist and vLLM refused to start. The picode
+    component now fetches it, TLS-pinned like the installer's only other curl."""
+    seen = []
+    M._install_picode(lambda cmd, **kw: seen.append(" ".join(map(str, cmd))))
+    fetch = [c for c in seen if "tool_chat_template_gemma4.jinja" in c]
+    assert fetch, f"no template fetch in: {seen}"
+    assert "--proto" in fetch[0] and "=https" in fetch[0] and "--tlsv1.2" in fetch[0]
+    assert str(M.GLQ_HOME / "templates") in fetch[0]
+
+
+def test_a_failed_template_fetch_does_not_abort_the_install():
+    """Offline or a moved URL must not kill an install whose chosen model may not even be
+    gemma-4 — warn and continue."""
+    def run(cmd, **kw):
+        if any("tool_chat_template" in str(c) for c in cmd):
+            raise RuntimeError("curl: (6) could not resolve host")
+    M._install_picode(run)
