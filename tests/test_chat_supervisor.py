@@ -1229,3 +1229,31 @@ def test_a_child_that_does_not_lead_its_group_gets_plain_terminate():
     sup.start()
     sup.stop()
     assert spawned[0].terminated
+
+
+# ------------------------------------------------------- chat-scale concurrency cap
+
+def test_the_server_is_capped_to_chat_scale_concurrency():
+    """vLLM defaults max_num_seqs to 1024 — sized for a batch server, absurd for a
+    single-user chat — and on hybrid-GDN models every decode sequence needs its own Mamba
+    cache block, so the default turns a modest KV pool into a refusal to start. Measured
+    (Qwen3.8-27B, 96 GB card, 0.45 utilization): 'max_num_seqs (1024) exceeds available
+    Mamba cache blocks (399)'."""
+    sup, spawned = _sup(healthy_after=2)
+    sup.start()
+    argv = spawned[0].argv
+    assert "--max-num-seqs" in argv
+    assert argv[argv.index("--max-num-seqs") + 1] == "16"
+
+
+def test_max_num_seqs_is_overridable():
+    sup, spawned = _sup(healthy_after=2, max_num_seqs=4)
+    sup.start()
+    argv = spawned[0].argv
+    assert argv[argv.index("--max-num-seqs") + 1] == "4"
+
+
+def test_the_chat_wires_max_num_seqs_through(monkeypatch):
+    chat, _, made, _ = _run_chat(monkeypatch, [])
+    chat.main(["--model", "org/ckpt", "--max-num-seqs", "8"])
+    assert made and made[0].get("max_num_seqs") == 8

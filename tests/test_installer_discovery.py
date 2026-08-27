@@ -189,3 +189,28 @@ def test_repo_name_alone_does_not_decide():
     def fetch(url):
         return {"quantization_config": {"quant_method": "glq", "bpw": 4}}
     assert D.repo_is_trellis("xv0y5ncu/looks-like-trellis-3inst-4bpw", fetch=fetch) is False
+
+
+# --------------------------------------------------------------- authenticated lookups
+
+def test_auth_header_comes_from_the_env_token(monkeypatch):
+    """Private checkpoints 401 on the anonymous tree call, which silently degrades
+    glq-chat's pool sizing to the 0.45 default — fine on a 96 GB card, fatal on a 24 GB
+    one serving a 17 GiB model."""
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
+    assert D._auth_headers() == {"Authorization": "Bearer hf_secret"}
+
+
+def test_auth_header_falls_back_to_the_stored_login(monkeypatch, tmp_path):
+    """`hf auth login` stores the token under $HF_HOME/token; read the same place the hub
+    client does so a logged-in box needs no env plumbing."""
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    (tmp_path / "token").write_text("hf_stored\n")
+    assert D._auth_headers() == {"Authorization": "Bearer hf_stored"}
+
+
+def test_no_token_anywhere_means_no_header(monkeypatch, tmp_path):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    assert D._auth_headers() == {}
