@@ -14,7 +14,7 @@ from __future__ import annotations
 COMPONENTS = {
     "core": "venv + glq (always installed)",
     "vllm": "vLLM — OpenAI-compatible server for the chat UI and picode",
-    "picode": "pi coding agent (installs node via nvm)",
+    "picode": "pi coding agent (installs node via nvm; run with glq-code)",
     "chat": "Gradio chat UI",
     "quantize": "quantize your own models (pulls datasets/accelerate/sentencepiece)",
 }

@@ -58,16 +58,18 @@ def test_chat_is_omitted_when_not_installed():
     assert "glq-chat" not in t
 
 
-def test_picode_line_sources_nvm_because_it_is_not_on_the_path():
-    """nvm is a shell function, absent from a non-login shell — the documented trap from
-    benchmarks/harbor_pi_glq.py. Printing a bare `pi …` gives command-not-found."""
+def test_picode_step_is_the_one_command_not_an_incantation():
+    """The old step printed `. ~/.nvm/nvm.sh && pi …` — one dropped dot and Ubuntu
+    suggests installing the unrelated Raspberry-Pi package. glq-code resolves pi, serves
+    with family-correct tool flags, and frees the GPU when pi exits; the step is one
+    word."""
     t = _text()
-    assert "~/.nvm/nvm.sh" in t
-    assert f"pi --provider glq --model {MODEL}" in t
+    assert "glq-code" in t
+    assert "~/.nvm/nvm.sh" not in t
 
 
 def test_picode_is_omitted_when_not_installed():
-    assert "pi --provider" not in _text(components=("core", "vllm", "chat"))
+    assert "glq-code" not in _text(components=("core", "vllm", "chat"))
 
 
 def test_serve_command_enables_tool_choice_when_picode_is_installed():
@@ -238,8 +240,7 @@ def test_the_serve_line_shows_how_to_turn_the_fp8_cache_on():
 def test_the_picode_line_carries_it_too():
     t = next_steps(venv=VENV, model=MODEL, components=ALL, port=8000, size_gib=1.8,
                    fp8_kv=True)
-    pi_block = [ln for ln in t.splitlines() if "pi --provider" in ln]
-    assert pi_block, "no picode line at all"
+    assert "glq-code" in t, "no picode step in the fp8 variant"
 
 
 def test_the_summary_says_what_it_costs():

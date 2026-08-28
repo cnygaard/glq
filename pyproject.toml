@@ -40,6 +40,7 @@ glq-quantize-kv = "glq.quantize_kv:main"
 glq-bench = "glq.bench.cli:main"
 glq-setup = "glq.installer.__main__:main"
 glq-chat = "glq.chat:main"
+glq-code = "glq.code:main"
 
 [project.entry-points."vllm.general_plugins"]
 glq = "glq_vllm:register"

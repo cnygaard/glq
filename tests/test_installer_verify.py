@@ -166,3 +166,23 @@ def test_quantize_component_checks_its_deps_are_importable():
 def test_no_quantize_component_no_quantize_check():
     checks = V.run_checks(("core",), **_probes())
     assert not any("quantize" in c.name for c in checks)
+
+
+def test_picode_component_checks_the_pi_binary_resolves():
+    """The summary is about to print `glq-code`; if pi is not actually resolvable the
+    user meets a runtime error far from the install that caused it."""
+    checks = V.run_checks(("core", "picode"), **_probes(),
+                          pi_resolvable=lambda: False)
+    c = [c for c in checks if "pi " in c.name or "picode" in c.name]
+    assert c and not c[0].ok
+    assert "picode" in c[0].detail
+
+    checks = V.run_checks(("core", "picode"), **_probes(),
+                          pi_resolvable=lambda: True)
+    c = [c for c in checks if "pi " in c.name or "picode" in c.name]
+    assert c and c[0].ok
+
+
+def test_no_picode_component_no_pi_check():
+    checks = V.run_checks(("core",), **_probes())
+    assert not any("pi " in c.name or "picode" in c.name for c in checks)
