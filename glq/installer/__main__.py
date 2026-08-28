@@ -61,11 +61,10 @@ class Runner:
 #: vLLM builds gemma-4 from per-layer configs.
 GEMMA4_TRANSFORMERS = "transformers>=5.13.1,<5.15"
 
-#: The version pin matters: templates track vLLM's parser expectations, and this one is
-#: the pairing the README's tool-calling recipe was validated against.
-GEMMA4_TOOL_TEMPLATE = "tool_chat_template_gemma4.jinja"
-GEMMA4_TOOL_TEMPLATE_URL = ("https://raw.githubusercontent.com/vllm-project/vllm/"
-                            f"v0.20.2/examples/{GEMMA4_TOOL_TEMPLATE}")
+# Template constants live in glq.tooling — the single source both this installer and
+# glq-code read, so the family knowledge cannot drift again.
+from glq.tooling import (GEMMA4_TOOL_TEMPLATE,  # noqa: E402
+                         GEMMA4_TOOL_TEMPLATE_URL, tool_serve_args)
 
 
 def _install_python_extras(run: Runner, venv: Path, components) -> None:
@@ -197,12 +196,11 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     is_gemma4 = "gemma-4" in model.lower()
     tools = ""
     if "picode" in components:
-        if is_gemma4:
-            tpl = GLQ_HOME / "templates" / GEMMA4_TOOL_TEMPLATE
-            tools = (f" --enable-auto-tool-choice --tool-call-parser gemma4 "
-                     f"--reasoning-parser gemma4 --chat-template {tpl}")
-        else:
-            tools = " --enable-auto-tool-choice --tool-call-parser hermes"
+        # hermes for families the shared helper does not know: the by-hand command is
+        # advisory, and printing SOMETHING beats printing nothing — glq-code, which
+        # actually starts servers, refuses unknown families instead.
+        args = tool_serve_args(model, templates_dir=GLQ_HOME / "templates") or             ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
+        tools = " " + " ".join(args)
     # A serving-time choice, so it belongs on the command the user copies — vLLM's own
     # flags, which is why they can simply be appended.
     kv_flags = kv_env.shell_suffix(fp8_kv)
@@ -260,10 +258,13 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
          "   A working install completes it with Paris.")
 
     if "picode" in components:
-        # nvm is a shell function and is NOT on a non-login shell's PATH; a bare `pi`
-        # gives command-not-found. Same trap as benchmarks/harbor_pi_glq.py.
-        step("Use the pi coding agent against it (nvm must be sourced first):",
-             f". ~/.nvm/nvm.sh && pi --provider glq --model {model}")
+        # One command: glq-code resolves pi (no nvm sourcing — one dropped dot there and
+        # Ubuntu suggests the unrelated Raspberry-Pi package), serves vLLM with the
+        # family-correct tool flags, and frees the GPU when pi exits.
+        step("Code with the pi agent — starts its own tool-calling server, stops it "
+             "when pi exits:",
+             f"{_venv_bin(venv, 'glq-code')}   # --model <repo-id> for another "
+             f"checkpoint")
 
     if fp8_kv:
         out += ["   KV cache: fp8 (vLLM's own) — about twice the context per GiB, at lower",

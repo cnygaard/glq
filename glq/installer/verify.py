@@ -49,6 +49,19 @@ def _quantize_deps_importable() -> bool:
     return importlib.util.find_spec("datasets") is not None
 
 
+def _pi_resolvable() -> bool:
+    """Can the pi binary the summary is about to promise actually be found?
+
+    Lazy import: glq.code pulls the supervisor chain, which verify should not pay for
+    unless the component was chosen.
+    """
+    try:
+        from glq.code import _find_pi
+        return _find_pi() is not None
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
 def _plugin_registered() -> bool:
     """Is the `glq` plugin visible in the entry-point group vLLM reads?
 
@@ -100,7 +113,8 @@ def run_checks(components, *, glq_importable=_glq_importable,
                plugin_registered=_plugin_registered,
                cuda_available=_cuda_available,
                kernels_available=_kernels_available,
-               quantize_deps_importable=_quantize_deps_importable) -> list[Check]:
+               quantize_deps_importable=_quantize_deps_importable,
+               pi_resolvable=_pi_resolvable) -> list[Check]:
     """Assert the install can actually do what the next-steps text is about to promise."""
     checks: list[Check] = []
 
@@ -133,6 +147,14 @@ def run_checks(components, *, glq_importable=_glq_importable,
             "datasets present — glq-quantize can load calibration data" if have else
             "the quantize deps are missing — glq-quantize will fail at import. "
             "Fix: pip install 'glq[quantize]'" + (f" ({err})" if err else "")))
+
+    if "picode" in components:
+        have, err = _safe(pi_resolvable, False)
+        checks.append(Check(
+            "pi binary resolvable", bool(have),
+            "the pi coding agent is installed — glq-code can run it" if have else
+            "pi is not resolvable — glq-code cannot run. Fix: re-run install.sh with "
+            "the picode component" + (f" ({err})" if err else "")))
 
     cuda, err = _safe(cuda_available, False)
     checks.append(Check(
