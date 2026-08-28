@@ -104,3 +104,30 @@ def test_glq_config_records_what_was_installed(tmp_path):
     assert doc["base_url"].endswith("/v1")
     assert "chat" in doc["components"]
     assert doc["available"] == [MODEL, "x/y"]
+
+
+def test_model_entries_can_carry_the_output_budget():
+    """Without contextWindow/maxTokens, pi requests the FULL window as output budget and
+    every request fails: measured live, `max_tokens=16384` against a 16384 window left
+    "0 input tokens" for a 5804-character prompt — 400 on the very first call, which
+    pi's --print mode swallows silently."""
+    doc = C.pi_models_json("http://127.0.0.1:8000/v1", ["org/m"],
+                           context_window=16384, max_tokens=4096)
+    entry = doc["providers"]["glq"]["models"][0]
+    assert entry["contextWindow"] == 16384
+    assert entry["maxTokens"] == 4096
+
+
+def test_limits_are_omitted_when_not_given():
+    """The plain shape stays byte-compatible for callers that do not know the window."""
+    entry = C.pi_models_json("http://x/v1", ["org/m"])["providers"]["glq"]["models"][0]
+    assert entry == {"id": "org/m"}
+
+
+def test_write_pi_models_passes_the_limits_through(tmp_path):
+    p = tmp_path / "models.json"
+    C.write_pi_models(p, "http://127.0.0.1:8000/v1", ["org/m"],
+                      context_window=8192, max_tokens=2048)
+    import json
+    entry = json.loads(p.read_text())["providers"]["glq"]["models"][0]
+    assert entry["contextWindow"] == 8192 and entry["maxTokens"] == 2048

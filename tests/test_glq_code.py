@@ -73,8 +73,8 @@ def _run_code(monkeypatch, tmp_path, *, cfg=None, pi_exit=0, pi_missing=False,
 
     monkeypatch.setattr(code, "_run_pi", run_pi)
     monkeypatch.setattr(code, "write_pi_models",
-                        lambda path, base_url, ids: wrote.append((str(path), base_url,
-                                                                  list(ids))))
+                        lambda path, base_url, ids, **kw: wrote.append(
+                            (str(path), base_url, list(ids))))
     monkeypatch.setattr(code, "ensure_gemma4_template",
                         lambda: tmp_path / "tool_chat_template_gemma4.jinja")
     return events, made, ran, wrote
@@ -185,3 +185,21 @@ def test_attaching_to_an_existing_server_warns_about_tool_flags(monkeypatch, tmp
     _run_code(monkeypatch, tmp_path, attach=True)
     code.main(["--model", SMOL])
     assert "tool" in capsys.readouterr().err.lower()
+
+
+def test_models_json_carries_the_window_and_a_capped_output_budget(monkeypatch,
+                                                                   tmp_path):
+    """pi treats maxTokens as its per-turn output ask; without a cap it requests the full
+    window and vLLM 400s every call (measured: the first live glq-code run produced an
+    empty assistant turn and a silent exit). A quarter of the window leaves room for the
+    transcript to grow across tool turns."""
+    wrote = {}
+
+    def record(path, base_url, ids, **kw):
+        wrote.update(kw)
+
+    _run_code(monkeypatch, tmp_path)
+    monkeypatch.setattr(code, "write_pi_models", record)
+    code.main(["--model", SMOL, "--max-model-len", "16384"])
+    assert wrote["context_window"] == 16384
+    assert wrote["max_tokens"] == 4096

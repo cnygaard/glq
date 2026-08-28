@@ -22,13 +22,21 @@ API_KEY_PLACEHOLDER = "glq"
 PROVIDER = "glq"
 
 
-def pi_models_json(base_url: str, model_ids) -> dict:
+def pi_models_json(base_url: str, model_ids,
+                   context_window=None, max_tokens=None) -> dict:
     """The `glq` provider block for pi, in the shape of `examples/pi/models.json`."""
     return {"providers": {PROVIDER: {
         "baseUrl": base_url,
         "api": "openai-completions",       # the dialect vLLM's server speaks
         "apiKey": API_KEY_PLACEHOLDER,
-        "models": [{"id": m} for m in model_ids],
+        # Without these, pi asks for the FULL window as its output budget and vLLM
+        # 400s every request — measured live: max_tokens=16384 against a 16384 window
+        # left "0 input tokens" for the prompt, and pi's --print mode swallowed the
+        # error into an empty assistant turn.
+        "models": [{"id": m,
+                    **({"contextWindow": int(context_window)} if context_window else {}),
+                    **({"maxTokens": int(max_tokens)} if max_tokens else {})}
+                   for m in model_ids],
     }}}
 
 
@@ -43,7 +51,8 @@ def _write_private_json(path: Path, doc: dict) -> None:
     tmp.replace(path)
 
 
-def write_pi_models(path, base_url: str, model_ids) -> None:
+def write_pi_models(path, base_url: str, model_ids,
+                    context_window=None, max_tokens=None) -> None:
     """Merge the `glq` provider into an existing pi config, preserving the others.
 
     An unreadable existing file is copied to `<name>.bak` before being replaced: we cannot
@@ -63,7 +72,9 @@ def write_pi_models(path, base_url: str, model_ids) -> None:
             backup.write_bytes(path.read_bytes())
             os.chmod(backup, 0o600)
 
-    doc["providers"][PROVIDER] = pi_models_json(base_url, model_ids)["providers"][PROVIDER]
+    doc["providers"][PROVIDER] = pi_models_json(
+        base_url, model_ids, context_window=context_window,
+        max_tokens=max_tokens)["providers"][PROVIDER]
     _write_private_json(path, doc)
 
 
