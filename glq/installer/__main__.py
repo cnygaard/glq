@@ -385,9 +385,14 @@ def main(argv=None) -> int:
             components=components, available=[c.repo_id for c in checkpoints],
             fp8_kv=bool(kv_on))
         if "picode" in components:
+            # Same limits glq-code serves with; without them pi asks for the full
+            # window as output and every request 400s (see configure.pi_models_json).
+            from glq.code import DEFAULT_CODE_MAX_MODEL_LEN
             configure.write_pi_models(
                 Path.home() / ".pi" / "agent" / "models.json", base_url,
-                [chosen.repo_id])
+                [chosen.repo_id],
+                context_window=DEFAULT_CODE_MAX_MODEL_LEN,
+                max_tokens=max(1024, DEFAULT_CODE_MAX_MODEL_LEN // 4))
     else:
         print(f"  [dry-run] would write {GLQ_HOME / 'config.json'}")
 

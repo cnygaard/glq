@@ -106,8 +106,12 @@ def main(argv=None) -> int:
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
     # provider always points at the server this process is about to own. Merge-safe:
     # other providers in the file are preserved.
+    # maxTokens = window/4: pi treats it as the per-turn output ask, and the transcript
+    # grows with every tool round-trip — window/2 fits the first turn and 400s later ones.
     write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
-                    args.base_url, [args.model])
+                    args.base_url, [args.model],
+                    context_window=args.max_model_len,
+                    max_tokens=max(1024, args.max_model_len // 4))
 
     supervisor = VllmSupervisor(
         model=args.model,
