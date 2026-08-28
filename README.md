@@ -51,9 +51,20 @@ architecture fallbacks dequantize instead).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash
+```
 
-# or preselect components (`bash -s --` passes arguments to a piped script):
+Or preselect components — `bash -s --` is how arguments reach a piped script. With
+the quantize deps, for making your own checkpoints:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --components core,vllm,chat,quantize
+```
+
+Or with the pi coding agent (installs node via nvm; afterwards `glq-code` serves a
+tool-calling vLLM and runs pi against it):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --components core,vllm,chat,picode
 ```
 
 Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
