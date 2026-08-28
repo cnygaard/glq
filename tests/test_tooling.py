@@ -26,6 +26,12 @@ def test_gemma4_gets_its_own_parser_and_the_external_template(tmp_path):
     assert "--tool-call-parser gemma4" in joined
     assert "--reasoning-parser gemma4" in joined
     assert f"--chat-template {tmp_path / T.GEMMA4_TOOL_TEMPLATE}" in joined
+    # Without enable_thinking the template never opens a thought section, but the
+    # RL-trained model thinks anyway — measured live: <|thought|> markers and tool-call
+    # syntax leaking into prose, plus a "thoughtthoughtthought" repetition loop in the
+    # reasoning field. The README's validated recipe always carried this kwarg; compact
+    # JSON (no spaces) so the printed shell command stays copy-pasteable unquoted.
+    assert '--default-chat-template-kwargs {"enable_thinking":true}' in joined
 
 
 @pytest.mark.parametrize("model", [
