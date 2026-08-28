@@ -15,12 +15,12 @@
 # `ubuntu:24.04` also works and is what tests/test_installer_distros.py exercises; the CUDA
 # runtime base is kept because the eval tooling below links against it.
 #
-# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.10 .
-#          docker build --build-arg GLQ_VERSION=0.8.10 .
+# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.11 .
+#          docker build --build-arg GLQ_VERSION=0.8.11 .
 # Run:     docker run --gpus all -it --rm \
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
-#              ghcr.io/cnygaard/glq-env:0.8.10
+#              ghcr.io/cnygaard/glq-env:0.8.11
 ARG CUDA_VERSION=12.9.1
 ARG UBUNTU_VERSION=24.04
 
@@ -28,7 +28,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
 # Which glq to install. Everything else — torch, vLLM, transformers, the CUDA build
 # toolchain — is resolved by the installer, so there is exactly one pin to bump here.
-ARG GLQ_VERSION=0.8.10
+ARG GLQ_VERSION=0.8.11
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \

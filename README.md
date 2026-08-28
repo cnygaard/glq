@@ -72,7 +72,7 @@ Scripted — `--yes`, `--dry-run`, or no terminal at all (CI, `ssh host 'cmd'`,
 | `core` | the venv + glq itself | always |
 | `vllm` | vLLM — the OpenAI-compatible server behind the chat UI and picode | ✓ |
 | `chat` | the Gradio chat UI | ✓ |
-| `picode` | the pi coding agent (installs node via nvm) | opt-in |
+| `picode` | the pi coding agent (installs node via nvm) — run with `glq-code`, which starts a tool-calling vLLM for it and frees the GPU when pi exits | opt-in |
 | `quantize` | the deps for quantizing your own models (`glq[quantize]`) | opt-in |
 
 Other flags: `--dry-run` prints every command without running it; `--list` shows the
