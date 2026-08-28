@@ -40,7 +40,14 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
         return ["--enable-auto-tool-choice",
                 "--tool-call-parser", "gemma4",
                 "--reasoning-parser", "gemma4",
-                "--chat-template", str(tpl)]
+                "--chat-template", str(tpl),
+                # Without this the template never opens a thought section, but the
+                # RL-trained model thinks anyway — measured live in a pi session:
+                # <|thought|> markers and tool-call syntax leaking into prose, and a
+                # "thoughtthoughtthought" repetition loop in the reasoning field. The
+                # README's validated recipe always carried it. Compact JSON (no spaces)
+                # keeps the printed shell command copy-pasteable without quoting.
+                "--default-chat-template-kwargs", '{"enable_thinking":true}']
     if "smollm3" in name or "qwen" in name:
         # Both families emit hermes-style <tool_call> markup; SmolLM3+hermes is the
         # pairing the Terminal-Bench integration validated end to end.
