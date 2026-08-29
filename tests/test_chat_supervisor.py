@@ -235,6 +235,8 @@ class _FakeSup:
 
     def __init__(self, events, **kw):
         self.events, self.kw = events, kw
+        # the real supervisor resolves None to a planned window; 8192 stands in for it
+        self.max_model_len = kw.get("max_model_len") or 8192
 
     def __enter__(self):
         self.events.append("start")
@@ -1318,3 +1320,120 @@ def test_fresh_log_output_takes_the_line_back_from_the_download():
     sup._sleep = sleep_download_then_chat
     sup.start()
     assert "loading weights from disk" in out.getvalue()
+
+
+# ------------------------------------------------- headroom-tiered context window
+
+GIB = 2**30
+
+
+def test_an_l4_serving_the_26b_stays_at_the_floor():
+    """No regression on the cards the 8192 default was designed for: 23 GiB card,
+    14.4 GiB weights → pool 0.89·23 ≈ 20.5 GiB, headroom ≈ 2.1 GiB after overhead;
+    16384×8×24.6 KiB ≈ 3.1 GiB does not fit."""
+    got = sup_mod.plan_max_model_len(weights_bytes=int(14.4 * GIB),
+                                     vram_bytes=23 * GIB, model_max_len=262144)
+    assert got == 8192
+
+
+def test_a_96gib_card_reaches_the_top_tier():
+    """96 GiB, same 26B: pool floors at 0.45 → 43 GiB, headroom ≈ 24 GiB;
+    65536×8×24.6 KiB ≈ 12.3 GiB fits with room to spare."""
+    got = sup_mod.plan_max_model_len(weights_bytes=int(14.4 * GIB),
+                                     vram_bytes=96 * GIB, model_max_len=262144)
+    assert got == 65536
+
+
+def test_the_declared_maximum_clamps_the_tier():
+    got = sup_mod.plan_max_model_len(weights_bytes=int(14.4 * GIB),
+                                     vram_bytes=96 * GIB, model_max_len=32768)
+    assert got == 32768
+
+
+def test_a_small_declared_maximum_wins_over_the_floor():
+    """SmolLM2 declares 8192; a huge card must not talk vLLM into refusing to start."""
+    got = sup_mod.plan_max_model_len(weights_bytes=1 * GIB, vram_bytes=96 * GIB,
+                                     model_max_len=8192)
+    assert got == 8192
+
+
+@pytest.mark.parametrize("kw", [
+    dict(weights_bytes=None, vram_bytes=96 * GIB, model_max_len=262144),
+    dict(weights_bytes=14 * GIB, vram_bytes=None, model_max_len=262144),
+    dict(weights_bytes=14 * GIB, vram_bytes=96 * GIB, model_max_len=None),
+])
+def test_any_unknown_input_means_the_conservative_floor(kw):
+    """Never tier up blind: an oversized guess makes vLLM refuse to start, which is
+    strictly worse than a small window."""
+    assert sup_mod.plan_max_model_len(**kw) == 8192
+
+
+def test_the_floor_is_a_parameter_for_glq_code():
+    got = sup_mod.plan_max_model_len(weights_bytes=None, vram_bytes=None,
+                                     model_max_len=None, floor=16384)
+    assert got == 16384
+
+
+def test_the_supervisor_plans_the_window_when_not_pinned():
+    sup, _ = _sup(healthy_after=2, max_model_len=None, model_max_len=262144,
+                  weights_bytes=int(14.4 * GIB), vram_bytes=96 * GIB)
+    assert sup.max_model_len == 65536
+    sup.start()
+
+
+def test_an_explicit_window_is_used_verbatim_with_no_planning():
+    sup, spawned = _sup(healthy_after=2, max_model_len=4096)
+    sup.start()
+    argv = spawned[0].argv
+    assert argv[argv.index("--max-model-len") + 1] == "4096"
+
+
+def test_the_announcement_says_when_the_window_was_sized_from_headroom():
+    out = io.StringIO()
+    sup, _ = _sup(healthy_after=2, out=out, max_model_len=None, model_max_len=262144,
+                  weights_bytes=int(14.4 * GIB), vram_bytes=96 * GIB)
+    sup.start()
+    assert "sized from KV headroom" in out.getvalue()
+    out2 = io.StringIO()
+    sup2, _ = _sup(healthy_after=2, out=out2, max_model_len=8192)
+    sup2.start()
+    assert "sized from KV headroom" not in out2.getvalue()
+
+
+
+# ------------------------------------------------- chat wiring for the sized window
+
+def test_the_chat_defaults_to_a_planned_window(monkeypatch):
+    chat, _, made, _ = _run_chat(monkeypatch, [])
+    monkeypatch.setattr(chat, "_model_max_len", lambda repo: 262144)
+    chat.main(["--model", "org/ckpt"])
+    assert made[0]["max_model_len"] is None
+    assert made[0]["model_max_len"] == 262144
+
+
+def test_a_pinned_window_skips_the_config_lookup(monkeypatch):
+    """Same principle as the pool plan: an explicit flag costs no network round trip."""
+    chat, _, made, _ = _run_chat(monkeypatch, [])
+    monkeypatch.setattr(chat, "_model_max_len",
+                        lambda repo: (_ for _ in ()).throw(AssertionError("looked up")))
+    chat.main(["--model", "org/ckpt", "--max-model-len", "4096"])
+    assert made[0]["max_model_len"] == 4096
+    assert made[0].get("model_max_len") is None
+
+
+def test_the_slider_ceiling_follows_the_planned_window(monkeypatch):
+    """max_tokens_ceiling is half the window; with auto sizing the chosen value lives on
+    the supervisor, not in args."""
+    chat, _, made, _ = _run_chat(monkeypatch, [])
+    monkeypatch.setattr(chat, "_model_max_len", lambda repo: 262144)
+    seen = {}
+
+    def build(base_url, models, *, max_model_len):
+        seen["mml"] = max_model_len
+        demo = types.SimpleNamespace()
+        demo.launch = lambda **kw: None
+        return demo
+
+    monkeypatch.setattr(chat, "build_ui", build)
+    chat.main(["--model", "org/ckpt"])
+    assert seen["mml"] == 8192, "must read the supervisor's chosen window"

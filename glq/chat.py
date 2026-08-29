@@ -257,6 +257,19 @@ def _vram_bytes():
         return None
 
 
+def _model_max_len(repo_id: str):
+    """The model's declared context maximum, or None — sizes the auto window's clamp.
+
+    Same never-block contract as _checkpoint_bytes: one small HTTP call whose failure
+    must not stop the chat from starting at the conservative floor.
+    """
+    try:
+        from glq.installer.discovery import model_max_len
+        return model_max_len(repo_id) or None
+    except Exception:                                       # noqa: BLE001 - offline, 404, …
+        return None
+
+
 def _checkpoint_bytes(repo_id: str):
     """How much VRAM the weights will want, or None if we cannot find out.
 
@@ -289,10 +302,12 @@ def main(argv=None) -> int:
                    help=f"fraction of VRAM vLLM may reserve "
                         f"(default {DEFAULT_GPU_MEMORY_UTILIZATION}; the rest stays free "
                         f"for whatever else uses the GPU)")
-    p.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN,
-                   help=f"context window to serve (default {DEFAULT_MAX_MODEL_LEN}; vLLM "
-                        f"would otherwise take the model's own maximum, which for gemma-4 "
-                        f"is 262144 and needs GiB of KV cache for a single request)")
+    p.add_argument("--max-model-len", type=int, default=None,
+                   help="context window to serve (default: sized from VRAM headroom in "
+                        "tiers 8192-65536, clamped to the model's own maximum; pass a "
+                        "number to pin it — vLLM would otherwise take the model's "
+                        "declared maximum, which for gemma-4 is 262144 and needs GiB of "
+                        "KV cache for a single request)")
     p.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS,
                    help=f"concurrent sequences vLLM plans for (default "
                         f"{DEFAULT_MAX_NUM_SEQS}; its own default is 1024 — a batch-server "
@@ -354,6 +369,10 @@ def main(argv=None) -> int:
         serve=args.serve,
         verbose=args.verbose,
         max_model_len=args.max_model_len,
+        # The declared-max lookup only runs in auto mode — an explicit flag costs no
+        # network round trip, same principle as the pool plan below.
+        model_max_len=(None if args.max_model_len is not None or not args.model
+                       else _model_max_len(args.model)),
         max_num_seqs=args.max_num_seqs,
         fp8_kv=args.fp8_kv,
         timeout=args.ready_timeout,
@@ -404,7 +423,8 @@ def main(argv=None) -> int:
         # gradio writes `.gradio` into the current directory; stand somewhere writable
         # first, or the share tunnel dies wherever the user happened to launch from.
         os.chdir(writable_workdir())
-        build_ui(args.base_url, models, max_model_len=args.max_model_len).launch(
+        build_ui(args.base_url, models,
+                 max_model_len=supervisor.max_model_len).launch(
             server_port=args.port, share=args.share,
             inbrowser=args.browser and _display_available())
     return 0
