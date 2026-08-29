@@ -258,7 +258,10 @@ class VllmSupervisor:
         self._sleep, self._monotonic = sleep, monotonic
         self._download_bytes = download_bytes
         self._killpg, self._getpgid = killpg, getpgid
-        self._dl_seen = 0                #: in-flight download bytes at the last poll
+        self._dl_seen = 0                #: highest in-flight download byte count seen
+        self._dl_at = None               #: when the download last grew
+        #: expected .safetensors bytes — the download total, when the caller looked it up
+        self.weights_bytes = weights_bytes
         self.timeout = float(timeout)
         self._out = out if out is not None else sys.stderr
         self.proc = None                 #: set only when *we* started it
@@ -302,8 +305,10 @@ class VllmSupervisor:
         # Say how long this takes *before* going quiet. Minutes of silence you were warned
         # about is patience; the same silence unannounced is indistinguishable from a hang,
         # and that is what a first run looks like today.
-        self._say("  the first run downloads the weights and loads the model — expect a few "
-                  "minutes")
+        size = (f" (~{self.weights_bytes / 2**30:.1f} GiB)"
+                if self.weights_bytes else "")
+        self._say(f"  the first run downloads the weights{size} and loads the model — "
+                  f"expect a few minutes")
 
         # A file, not a pipe. A pipe holds ~64 KiB and then *blocks the writer*, so a child
         # this chatty could wedge on its own logging with nobody reading. It also gives the
@@ -429,6 +434,7 @@ class VllmSupervisor:
             if dl > dl_baseline:
                 dl_baseline = dl
                 self._dl_seen = dl
+                self._dl_at = now
                 last_progress = now
             if now - last_progress >= self.timeout:
                 hint = ""
@@ -495,9 +501,20 @@ class VllmSupervisor:
             if since >= 30:
                 quiet = f"  (no new output for {since:.0f}s)"
         # A silent log with a growing cache is the most common healthy state of a first
-        # run — say what is actually happening instead of quoting a stale line.
-        if self._dl_seen:
-            latest = f"downloading weights: {self._dl_seen / 2**30:.1f} GiB so far"
+        # run — say what is actually happening instead of quoting a stale line. But the
+        # download owns the line only while it is the FRESHEST signal: measured, the old
+        # unconditional label froze at "17.8 GiB so far" through the whole load phase.
+        if self._dl_seen and (self._last_output_at is None
+                              or (self._dl_at or 0) >= self._last_output_at):
+            if self.weights_bytes and self._dl_seen >= 0.98 * self.weights_bytes:
+                latest = (f"weights downloaded "
+                          f"({self.weights_bytes / 2**30:.1f} GiB) — the engine is "
+                          f"loading them")
+            elif self.weights_bytes:
+                latest = (f"downloading weights: {self._dl_seen / 2**30:.1f} / "
+                          f"{self.weights_bytes / 2**30:.1f} GiB")
+            else:
+                latest = f"downloading weights: {self._dl_seen / 2**30:.1f} GiB so far"
             quiet = ""
         self._say(f"[{elapsed:4.0f}s] {latest}{quiet}")
 
