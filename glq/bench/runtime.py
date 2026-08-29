@@ -40,9 +40,17 @@ def is_multimodal(arch: str | None) -> bool:
 
 def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
                      max_model_len: int | None = None, gpu_mem_util: float = 0.9,
-                     multimodal: bool = False, cudagraph: bool = True) -> dict:
+                     multimodal: bool = False, cudagraph: bool = True,
+                     max_num_seqs: int = 64) -> dict:
+    # vLLM's max_num_seqs default is 1024 — a batch-server number. On hybrid-GDN models
+    # every decode sequence reserves a Mamba cache block before a single request exists,
+    # and the bf16 Qwen3.8-27B arm refused to start at 0.75 util on a 96 GiB card:
+    # "max_num_seqs (1024) exceeds available Mamba cache blocks (345)". 64 is ample
+    # concurrency for every bench task (PPL prefills a handful of chunks at a time;
+    # AIME queues its samples), and the same bug was fixed in the chat supervisor first.
     kw: dict = dict(model=model, dtype=dtype, trust_remote_code=True,
-                    gpu_memory_utilization=gpu_mem_util)
+                    gpu_memory_utilization=gpu_mem_util,
+                    max_num_seqs=int(max_num_seqs))
     if max_model_len:
         kw["max_model_len"] = max_model_len
     if quant and quant not in ("none", "bf16"):
@@ -60,6 +68,8 @@ def serving_command(model: str, kw: dict) -> str:
     if kw.get("quantization"):
         parts += ["--quantization", str(kw["quantization"])]
     parts += ["--gpu-memory-utilization", str(kw.get("gpu_memory_utilization", 0.9))]
+    if kw.get("max_num_seqs"):
+        parts += ["--max-num-seqs", str(kw["max_num_seqs"])]
     if kw.get("max_model_len"):
         parts += ["--max-model-len", str(kw["max_model_len"])]
     if kw.get("dtype"):
