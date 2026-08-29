@@ -234,3 +234,16 @@ def test_runner_task_config_merges():
     cfg = runner._task_config(spec, n=20, budget=8192)
     assert cfg["task_name"] == "mmlu_pro" and cfg["standardized"] is True
     assert cfg["n"] == 20 and cfg["budget"] == 8192
+
+
+def test_bench_engines_cap_max_num_seqs():
+    """vLLM's default is 1024 — a batch-server number. On hybrid-GDN models every decode
+    sequence reserves a Mamba cache block up front, and the bf16 27B arm refused to start:
+    'max_num_seqs (1024) exceeds available Mamba cache blocks (345)'. Same bug the chat
+    supervisor fixed, one layer over. 64 is ample concurrency for every bench task."""
+    kw = runtime.build_llm_kwargs("org/M", quant="none")
+    assert kw["max_num_seqs"] == 64
+    kw = runtime.build_llm_kwargs("org/M", quant="glq", max_num_seqs=16)
+    assert kw["max_num_seqs"] == 16
+    assert "--max-num-seqs 64" in runtime.serving_command(
+        "org/M", runtime.build_llm_kwargs("org/M"))
