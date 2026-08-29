@@ -26,6 +26,8 @@ import glq.code as code  # noqa: E402
 class _FakeSup:
     def __init__(self, events, **kw):
         self.events, self.kw = events, kw
+        # the real supervisor resolves None to a planned window; the floor stands in
+        self.max_model_len = kw.get("max_model_len") or kw.get("max_model_len_floor", 8192)
         self.proc = None
 
     def __enter__(self):
@@ -202,4 +204,31 @@ def test_models_json_carries_the_window_and_a_capped_output_budget(monkeypatch,
     monkeypatch.setattr(code, "write_pi_models", record)
     code.main(["--model", SMOL, "--max-model-len", "16384"])
     assert wrote["context_window"] == 16384
+    assert wrote["max_tokens"] == 4096
+
+
+def test_glq_code_plans_its_window_with_the_coding_floor(monkeypatch, tmp_path):
+    """A coding agent's floor is 16384 (file contents + diffs); the tiering above it is
+    the supervisor's job."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    monkeypatch.setattr(code, "_model_max_len", lambda repo: 262144)
+    code.main(["--model", SMOL])
+    assert made[0]["max_model_len"] is None
+    assert made[0]["max_model_len_floor"] == 16384
+    assert made[0]["model_max_len"] == 262144
+
+
+def test_the_pi_budget_follows_the_planned_window(monkeypatch, tmp_path):
+    """maxTokens = window/4 must use the window actually served, which in auto mode is
+    the supervisor's choice, not an args value that no longer exists."""
+    wrote = {}
+
+    def record(path, base_url, ids, **kw):
+        wrote.update(kw)
+
+    _run_code(monkeypatch, tmp_path)
+    monkeypatch.setattr(code, "write_pi_models", record)
+    monkeypatch.setattr(code, "_model_max_len", lambda repo: 262144)
+    code.main(["--model", SMOL])
+    assert wrote["context_window"] == 16384     # the fake supervisor's resolved window
     assert wrote["max_tokens"] == 4096

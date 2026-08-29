@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 from glq.chat import (DEFAULT_BASE_URL, _checkpoint_bytes, _installed_config,
-                      _server_port, _vram_bytes, positive_seconds)
+                      _model_max_len, _server_port, _vram_bytes, positive_seconds)
 from glq.installer.configure import write_pi_models
 from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
@@ -64,10 +64,10 @@ def main(argv=None) -> int:
     p.add_argument("--gpu-memory-utilization", type=float, default=None,
                    help="fraction of VRAM vLLM may reserve (default: sized from the "
                         "checkpoint)")
-    p.add_argument("--max-model-len", type=int, default=DEFAULT_CODE_MAX_MODEL_LEN,
-                   help=f"context window to serve (default {DEFAULT_CODE_MAX_MODEL_LEN} "
-                        f"— a coding agent carries file contents and diffs; glq-chat's "
-                        f"8192 is a conversation)")
+    p.add_argument("--max-model-len", type=int, default=None,
+                   help=f"context window to serve (default: sized from VRAM headroom, "
+                        f"floor {DEFAULT_CODE_MAX_MODEL_LEN} — a coding agent carries "
+                        f"file contents and diffs; pass a number to pin it)")
     p.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS)
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
@@ -103,16 +103,6 @@ def main(argv=None) -> int:
         # downloads it, but this install may predate that or have skipped picode.
         ensure_gemma4_template()
 
-    # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
-    # provider always points at the server this process is about to own. Merge-safe:
-    # other providers in the file are preserved.
-    # maxTokens = window/4: pi treats it as the per-turn output ask, and the transcript
-    # grows with every tool round-trip — window/2 fits the first turn and 400s later ones.
-    write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
-                    args.base_url, [args.model],
-                    context_window=args.max_model_len,
-                    max_tokens=max(1024, args.max_model_len // 4))
-
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -121,6 +111,9 @@ def main(argv=None) -> int:
         serve=args.serve,
         verbose=args.verbose,
         max_model_len=args.max_model_len,
+        max_model_len_floor=DEFAULT_CODE_MAX_MODEL_LEN,
+        model_max_len=(None if args.max_model_len is not None or not args.model
+                       else _model_max_len(args.model)),
         max_num_seqs=args.max_num_seqs,
         timeout=args.ready_timeout,
         extra_args=tool_args,
@@ -128,6 +121,17 @@ def main(argv=None) -> int:
                        else _checkpoint_bytes(args.model)),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
     )
+
+    # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
+    # provider always points at the server this process is about to own (merge-safe:
+    # other providers are preserved). After supervisor construction, because in auto
+    # mode the served window is the supervisor's choice, not an args value.
+    # maxTokens = window/4: pi treats it as the per-turn output ask, and the transcript
+    # grows with every tool round-trip — window/2 fits the first turn and 400s later ones.
+    write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
+                    args.base_url, [args.model],
+                    context_window=supervisor.max_model_len,
+                    max_tokens=max(1024, supervisor.max_model_len // 4))
 
     # `kill` and a closed terminal end the process without unwinding the context
     # manager below; turn them into SystemExit so the server still comes down.

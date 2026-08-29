@@ -93,6 +93,48 @@ def plan_gpu_memory_utilization(*, weights_bytes, vram_bytes):
     return min(max(needed / vram_bytes, DEFAULT_GPU_MEMORY_UTILIZATION), _MAX_UTILIZATION)
 
 
+#: gemma-4's measured KV cost — 6.15 GiB for one 262,144-token request — is the
+#: worst-case anchor among the served families: hybrid-GDN models keep constant-size
+#: state for most layers and sliding-window layers page smaller, so sizing against this
+#: number only over-reserves. Exact per-model KV math is vLLM's job; duplicating it
+#: client-side breaks on every backend change.
+_KV_BYTES_PER_TOKEN = int(6.15 * 1024**3 / 262144)
+
+_WINDOW_TIERS = (8192, 16384, 32768, 65536)
+
+#: The window must be affordable at realistic chat concurrency, not for one request —
+#: half of DEFAULT_MAX_NUM_SEQS. This is the constant that keeps a 23 GiB L4 serving a
+#: 14.4 GiB 26B at 8192 (headroom ≈ 2.1 GiB; 16384×8×24.6 KiB ≈ 3.1 GiB does not fit)
+#: while a 96 GiB card reaches 65536 (headroom ≈ 24 GiB ≥ 12.3 GiB).
+_WINDOW_CONCURRENCY = 8
+
+
+def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
+                       floor=DEFAULT_MAX_MODEL_LEN):
+    """The served context window, tiered from the KV headroom the pool plan leaves.
+
+    A fixed 8192 was designed for 24 GiB desktops and wastes a 96 GiB card; the model's
+    declared maximum (gemma-4: 262,144) drowns any card. Pick the largest tier whose
+    full window, at chat concurrency and the worst-case per-token anchor, fits inside
+    the pool `plan_gpu_memory_utilization` is already going to reserve — this feature
+    grabs no extra VRAM.
+
+    Any unknown input returns the floor: tiering up blind is strictly worse than a
+    small window, because vLLM refuses a --max-model-len above the model's declared
+    maximum (SmolLM2-class models declare 8192) and then nothing serves at all.
+    """
+    if not weights_bytes or not vram_bytes or not model_max_len:
+        return floor
+    util = plan_gpu_memory_utilization(weights_bytes=weights_bytes,
+                                       vram_bytes=vram_bytes)
+    headroom = util * vram_bytes - weights_bytes - _RUNTIME_OVERHEAD_BYTES
+    chosen = floor
+    for tier in _WINDOW_TIERS:
+        if tier * _WINDOW_CONCURRENCY * _KV_BYTES_PER_TOKEN <= headroom:
+            chosen = max(chosen, tier)
+    return min(chosen, int(model_max_len))
+
+
 def default_log_path():
     return Path(os.environ.get("GLQ_HOME", Path.home() / ".glq")) / "vllm.log"
 
@@ -237,7 +279,8 @@ class VllmSupervisor:
                  log_path=None, verbose=False,
                  report_every=DEFAULT_REPORT_EVERY,
                  weights_bytes=None, vram_bytes=None,
-                 max_model_len=DEFAULT_MAX_MODEL_LEN, fp8_kv=False,
+                 max_model_len=None, model_max_len=None,
+                 max_model_len_floor=DEFAULT_MAX_MODEL_LEN, fp8_kv=False,
                  max_num_seqs=DEFAULT_MAX_NUM_SEQS):
         self.model = model
         self.port = int(port)
@@ -250,6 +293,18 @@ class VllmSupervisor:
                                              vram_bytes=vram_bytes))
         self.vllm_bin = vllm_bin or os.path.join(os.path.dirname(sys.executable), "vllm")
         self.extra_args = list(extra_args)
+        # max_model_len=None means "size it": the largest window tier the planned
+        # pool's KV headroom affords, clamped to the model's declared maximum. With any
+        # sizing input unknown this lands exactly on the old fixed default, so callers
+        # that never pass the lookups keep today's behavior.
+        self._window_note = ""
+        if max_model_len is None:
+            max_model_len = plan_max_model_len(
+                weights_bytes=weights_bytes, vram_bytes=vram_bytes,
+                model_max_len=model_max_len, floor=max_model_len_floor)
+            if max_model_len > max_model_len_floor:
+                self._window_note = (" (sized from KV headroom; "
+                                     "--max-model-len overrides)")
         self.max_model_len = int(max_model_len)
         self.max_num_seqs = int(max_num_seqs)
         self.fp8_kv = bool(fp8_kv)
@@ -301,7 +356,8 @@ class VllmSupervisor:
 
         self._say(f"starting vLLM for {self.model}")
         self._say(f"  reserving {self.gpu_memory_utilization:.0%} of VRAM for the weights "
-                  f"and KV cache, with a {self.max_model_len} token context")
+                  f"and KV cache, with a {self.max_model_len} token context"
+                  f"{self._window_note}")
         # Say how long this takes *before* going quiet. Minutes of silence you were warned
         # about is patience; the same silence unannounced is indistinguishable from a hang,
         # and that is what a first run looks like today.
