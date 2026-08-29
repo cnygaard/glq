@@ -96,9 +96,11 @@ asked; `--no-modify-path` leaves your shell rc file alone (by default the venv's
 it, serves the Gradio UI on <http://localhost:7860>, and stops the server again when
 you press Ctrl-C — vLLM has no idle unload, so a server left running keeps its share
 of the card. It sizes the VRAM reservation from the checkpoint — weights, runtime
-overhead and a usable cache — and serves an 8192-token context
-(`--gpu-memory-utilization` / `--max-model-len` to change either, `--no-serve` to
-attach to a server you started yourself).
+overhead and a usable cache — and sizes the context window from the card's KV
+headroom, in tiers from 8192 up to 65536, clamped to the model's own maximum (a
+24 GB card serving a 26B stays at 8192; a 96 GB card reaches 65536).
+`--gpu-memory-utilization` / `--max-model-len` pin either; `--no-serve` attaches to
+a server you started yourself.
 
 The first start takes minutes — weights download, model load, CUDA-graph capture —
 so it reports progress in vLLM's own words while it waits and writes the full server
