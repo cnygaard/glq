@@ -1257,3 +1257,64 @@ def test_the_chat_wires_max_num_seqs_through(monkeypatch):
     chat, _, made, _ = _run_chat(monkeypatch, [])
     chat.main(["--model", "org/ckpt", "--max-num-seqs", "8"])
     assert made and made[0].get("max_num_seqs") == 8
+
+
+# ------------------------------------------------- download progress: total + handoff
+
+def _sup_with_download(dl, **kw):
+    out = io.StringIO()
+    sup, spawned = _sup(healthy_after=200, timeout=10_000.0, out=out,
+                        report_every=30.0, download_bytes=lambda: dl["bytes"], **kw)
+    inner = sup._sleep
+
+    def sleep_and_download(s):
+        inner(s)
+        dl["bytes"] = min(dl["bytes"] + dl.get("step", 0), dl.get("cap", 1 << 60))
+
+    sup._sleep = sleep_and_download
+    return sup, out
+
+
+def test_the_download_line_shows_the_total_when_the_checkpoint_size_is_known():
+    """The size is already looked up for pool sizing — "17.8 GiB so far" with no
+    denominator reads as a hang to someone expecting 14 and watching 17.8."""
+    dl = {"bytes": 0, "step": 200_000_000}
+    sup, out = _sup_with_download(dl, weights_bytes=4 * 2**30)
+    sup.start()
+    assert "/ 4.0 GiB" in out.getvalue()
+
+
+def test_the_announcement_names_the_download_size_up_front():
+    dl = {"bytes": 0, "step": 200_000_000}
+    sup, out = _sup_with_download(dl, weights_bytes=4 * 2**30)
+    sup.start()
+    assert "~4.0 GiB" in out.getvalue()
+
+
+def test_a_finished_download_says_so_instead_of_sticking(monkeypatch):
+    """Measured: the line froze at "17.8 GiB so far" for the whole load phase — the
+    download was done, and the label never moved again."""
+    dl = {"bytes": 0, "step": 2 * 2**30, "cap": 4 * 2**30}
+    sup, out = _sup_with_download(dl, weights_bytes=4 * 2**30)
+    sup.start()
+    assert "weights downloaded (4.0 GiB)" in out.getvalue()
+
+
+def test_fresh_log_output_takes_the_line_back_from_the_download():
+    """Once the engine logs again (loading, compiling, graph capture), its own words are
+    the truth — the stale download figure must not shadow them."""
+    dl = {"bytes": 0, "step": 100_000_000, "cap": 300_000_000}
+    sup, out = _sup_with_download(dl)
+    inner = sup._sleep
+    tick = {"n": 0}
+
+    def sleep_download_then_chat(s):
+        inner(s)
+        tick["n"] += 1
+        if tick["n"] > 10:                        # download over; the engine talks again
+            with open(sup.log_path, "a") as fh:
+                fh.write("INFO loading weights from disk\n")
+
+    sup._sleep = sleep_download_then_chat
+    sup.start()
+    assert "loading weights from disk" in out.getvalue()
