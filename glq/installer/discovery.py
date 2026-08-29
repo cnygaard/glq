@@ -110,6 +110,23 @@ def repo_size_bytes(repo_id: str, fetch=_fetch_json) -> int:
                if str(f.get("path", "")).endswith(".safetensors"))
 
 
+def model_max_len(repo_id: str, fetch=_fetch_json):
+    """The model's declared context maximum (max_position_embeddings), or None.
+
+    This clamps the auto-sized serving window: vLLM refuses a --max-model-len above the
+    declared maximum, so tiering up past it breaks serving outright — SmolLM2-class
+    models declare 8192. Multimodal wrappers (gemma-4, Qwen3.5) declare the text limits
+    on text_config. None on any failure, same contract as repo_size_bytes: the caller
+    falls back to the conservative floor rather than aborting a start.
+    """
+    try:
+        cfg = fetch(f"https://huggingface.co/{repo_id}/resolve/main/config.json")
+        val = cfg.get("max_position_embeddings") or             (cfg.get("text_config") or {}).get("max_position_embeddings")
+        return int(val) if val else None
+    except Exception:                                                 # noqa: BLE001
+        return None
+
+
 def repo_is_trellis(repo_id: str, fetch=_fetch_json) -> bool | None:
     """Whether a checkpoint uses the trellis codebook, per its own config.json.
 

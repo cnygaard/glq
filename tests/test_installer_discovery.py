@@ -214,3 +214,25 @@ def test_no_token_anywhere_means_no_header(monkeypatch, tmp_path):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path))
     assert D._auth_headers() == {}
+
+
+# ---------------------------------------------------------------- declared context max
+
+def test_model_max_len_reads_the_top_level_key():
+    """The declared maximum clamps the auto-sized serving window: vLLM refuses a
+    --max-model-len above it, so tiering up past it breaks serving outright."""
+    fetch = lambda url: {"max_position_embeddings": 65536}  # noqa: E731
+    assert D.model_max_len("org/m", fetch=fetch) == 65536
+
+
+def test_model_max_len_descends_into_text_config():
+    """gemma-4 and Qwen wrappers declare the text limits on text_config, not the top."""
+    fetch = lambda url: {"text_config": {"max_position_embeddings": 262144}}  # noqa: E731
+    assert D.model_max_len("org/m", fetch=fetch) == 262144
+
+
+def test_model_max_len_is_none_when_absent_or_unreachable():
+    assert D.model_max_len("org/m", fetch=lambda url: {"hidden_size": 64}) is None
+    def boom(url):
+        raise OSError("offline")
+    assert D.model_max_len("org/m", fetch=boom) is None
