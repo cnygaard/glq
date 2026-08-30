@@ -390,25 +390,29 @@ def test_cuda_3inst_matmul_batched_matches_reference(B, K):
 
 @needs_cuda
 @pytest.mark.parametrize("K", KS)
-def test_cuda_3inst_matmul_row_parity_with_gemv(K):
+@pytest.mark.parametrize("B", [9, 25, 33, 64])
+def test_cuda_3inst_matmul_row_parity_with_gemv(B, K):
     """Row b of the batched GEMM must be BIT-EXACT vs the B=1 GEMV on x[b] — same mma sequence,
-    same k-split, same A-fragment; only the token's N-column differs."""
+    same k-split, same A-fragment; only the token's N-column differs. The B values cross the
+    token-tile boundaries the parallel-column epilogue has to get right: ragged last tiles
+    (9, 25, 33 — reader warps whose out_tok >= B) and full tiles (64)."""
     m, n = 256, 512
     cb, packed = _quantized_3inst_cuda(m, n, K, seed=22)
     torch.manual_seed(5)
-    x = (torch.randn(9, n, device="cuda") * 0.5).to(torch.float16)   # 9 → crosses a token tile
+    x = (torch.randn(B, n, device="cuda") * 0.5).to(torch.float16)
     batched = _ext().glq_decode_matmul_trellis_3inst_cuda(x, packed, m, n)
-    for b in range(9):
+    for b in range(B):
         gemv = _ext().glq_decode_matvec_trellis_3inst_cuda(x[b].contiguous(), packed, m, n)
-        assert torch.equal(batched[b], gemv), f"K={K} row {b} != GEMV"
+        assert torch.equal(batched[b], gemv), f"K={K} B={B} row {b} != GEMV"
 
 
 @needs_cuda
 @pytest.mark.parametrize("K", KS)
-def test_cuda_3inst_matmul_is_deterministic(K):
+@pytest.mark.parametrize("B", [16, 33])
+def test_cuda_3inst_matmul_is_deterministic(B, K):
     m, n = 256, 512
     cb, packed = _quantized_3inst_cuda(m, n, K, seed=23)
-    x = (torch.randn(16, n, device="cuda") * 0.5).to(torch.float16)
+    x = (torch.randn(B, n, device="cuda") * 0.5).to(torch.float16)
     a = _ext().glq_decode_matmul_trellis_3inst_cuda(x, packed, m, n)
     b = _ext().glq_decode_matmul_trellis_3inst_cuda(x, packed, m, n)
     assert torch.equal(a, b)

@@ -527,9 +527,17 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
  *      nothing, and dropping it frees 4 KB (we're already at 64 KB dynamic for the LUT).
  *   2. Ragged tail by PREDICATION (active = tok < B), not padding — we're on raw mma.sync.
  *   3. C-harvest: g/t swap roles between the B and C fragments (in C, g is the row and t the
- *      column pair), so all four accumulators are live. We loop the 8 columns through the
- *      existing 4 KB reduce_gather rather than widening it 8x to 32 KB (64+32 KB would crush
- *      occupancy); the reduce runs once per m-tile-pair, so 8 passes are free vs the k-loop.
+ *      column pair), so all four accumulators are live. Every lane parks its whole C-fragment
+ *      in a padded 36 KB gather buffer, then 8 reader warps reduce the 8 columns in PARALLEL
+ *      behind a single barrier — each element still summed in warpi 0..31 order, so the fp32
+ *      result is bit-identical to a serial reduce. The original one-column-at-a-time loop
+ *      cost 16 __syncthreads per m-pair with 31 warps idling behind warp 0's serial sum:
+ *      ncu measured it at 23% of ALL warp stalls, and replacing it is a uniform ~28% win
+ *      (B=8 24.3→17.5 µs, B=32 69.9→49.8, B=64 134.6→94.5 at (8192,5120) R=4 on a 188-SM
+ *      RTX PRO 6000). Deliberately NOT widened into cross-tile decode amortization: grouping
+ *      2/4 token tiles per block (register-, smem-fragment- and cp.async-pipelined variants
+ *      all measured) LOSES — under the 64-reg/1024-thread envelope every variant costs more
+ *      in unroll-4 double-buffer scheduling than the L2-fed re-decode was costing.
  *
  * Grid (tr_grid_x()=#SMs, ceil(B/8)): each (blockIdx.x → m-range, blockIdx.y → token-tile) owns
  * disjoint output, so the in-block fixed-order reduce stays deterministic with NO global
@@ -614,7 +622,10 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
         __syncthreads();
     }
 
-    __shared__ float reduce_gather[TR_WARPS][2][16];
+    // C-fragment gather for the parallel-column reduce: [warpi][pi][row-elem][column],
+    // last dim padded 8→9 so reader lanes (stride 9, coprime with the 32 banks) stay
+    // conflict-free. 36 KB static.
+    __shared__ float cfrag_gather[TR_WARPS][2][16][9];
 
     for (uint32_t mi = 0; mi < m_per_block; mi += 1) {
         if (tileIdM * 2 >= tileCountM) return;   // block-uniform → no __syncthreads deadlock
@@ -682,34 +693,35 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
 
         // C-fragment: lane l holds c0→(row g, col 2t)  c1→(row g, col 2t+1)
         //                          c2→(row g+8, col 2t) c3→(row g+8, col 2t+1)
-        // One column (= one token) per pass, reusing the 4 KB reduce_gather.
-        for (uint32_t c = 0; c < 8; c += 1) {
-            if (t == (c >> 1)) {
-                const bool even = ((c & 1) == 0);
-                for (int pi = 0; pi < 2; pi++) {
-                    reduce_gather[warpId][pi][g]     = even ? reg_p[pi].x : reg_p[pi].y;
-                    reduce_gather[warpId][pi][g + 8] = even ? reg_p[pi].z : reg_p[pi].w;
-                }
-            }
-            __syncthreads();
-            if (warpId < 1) {
-                const uint32_t out_tok = blockIdx.y * 8 + c;
-                if (out_tok < B) {
-                    int pi = laneId / 16;
-                    float reduced = 0.0f;
-                    for (uint32_t warpi = 0; warpi < TR_WARPS; warpi++)
-                        reduced += reduce_gather[warpi][pi][laneId % 16];
-                    // RS1: ×wscale folded into the store; RVQ stage 2 accumulates (see the
-                    // matvec note — disjoint (m-range, token-tile) ownership makes `+=` safe
-                    // and deterministic, and __fadd_rn keeps it exactly stage1+stage2).
-                    // GROUPED: `ws` is this tile's expert scale; ungrouped it IS `wscale`.
-                    const size_t oi = (size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId;
-                    const float v = reduced * ws;
-                    out[oi] = accum ? __fadd_rn(out[oi], v) : v;
-                }
-            }
-            __syncthreads();
+        // Parallel-column reduce: every lane parks its full fragment, ONE barrier, then
+        // reader warp c sums column c for all 32 rows — each element in the SAME
+        // warpi 0..31 order the serial loop used, so the fp32 result is bit-identical.
+        // (The old per-column loop was 16 __syncthreads per m-pair with 31 warps parked
+        // behind warp 0's serial sum — measured at 23% of all warp stalls under ncu.)
+        for (int pi = 0; pi < 2; pi++) {
+            cfrag_gather[warpId][pi][g][2 * t]         = reg_p[pi].x;
+            cfrag_gather[warpId][pi][g][2 * t + 1]     = reg_p[pi].y;
+            cfrag_gather[warpId][pi][g + 8][2 * t]     = reg_p[pi].z;
+            cfrag_gather[warpId][pi][g + 8][2 * t + 1] = reg_p[pi].w;
         }
+        __syncthreads();
+        if (warpId < 8) {
+            const uint32_t out_tok = blockIdx.y * 8 + warpId;   // column c == warpId
+            if (out_tok < B) {
+                int pi = laneId / 16;
+                float reduced = 0.0f;
+                for (uint32_t warpi = 0; warpi < TR_WARPS; warpi++)
+                    reduced += cfrag_gather[warpi][pi][laneId % 16][warpId];
+                // RS1: ×wscale folded into the store; RVQ stage 2 accumulates (see the
+                // matvec note — disjoint (m-range, token-tile) ownership makes `+=` safe
+                // and deterministic, and __fadd_rn keeps it exactly stage1+stage2).
+                // GROUPED: `ws` is this tile's expert scale; ungrouped it IS `wscale`.
+                const size_t oi = (size_t)out_tok * m + (tileIdM * 2) * TR_MMA_M + laneId;
+                const float v = reduced * ws;
+                out[oi] = accum ? __fadd_rn(out[oi], v) : v;
+            }
+        }
+        __syncthreads();
         tileIdM += 1;
     }
 }
