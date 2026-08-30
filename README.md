@@ -45,6 +45,27 @@ architecture fallbacks dequantize instead).
 [vLLM](#docker-image-nvidia-gpu) ·
 [how it works](#how-it-works)
 
+## System requirements
+
+**Linux x86_64 with an NVIDIA GPU.** That is the whole envelope — GLQ serves through
+vLLM/CUDA, so both are hard requirements.
+
+- **GPU**: NVIDIA Ampere-class or newer (`sm_86+`). Developed for 24–32 GB cards
+  (3090 / 4080 / 4090 / L4 / L40S); validated live on an Ada L4 (`sm_89`) and an RTX PRO
+  6000 Blackwell (`sm_120`). A recent NVIDIA driver is required; a CUDA *toolkit* is not —
+  `pip install glq` ships prebuilt kernels (CPython 3.10–3.14, x86_64), and `nvcc` is only
+  needed for the from-source fallback (and for FlashInfer's sampler JIT on Blackwell —
+  without it `glq-chat` falls back to vLLM's built-in sampler).
+- **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
+  pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 12,
+  Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
+  (`tests/test_installer_distros.py`), so other distros are expected to install and run.
+- **Windows**: no native support (no Windows wheels, and vLLM is Linux-only). WSL2 with
+  the NVIDIA CUDA driver should work in principle — untested.
+- **macOS**: not supported. There is no CUDA on Apple hardware, and Docker Desktop on
+  macOS cannot pass through an NVIDIA GPU, so a container does not help.
+- **Python**: 3.10–3.14 (the installer creates its own venv).
+
 ## Quickstart
 
 ### Installer command (venv, glq, vLLM, chat UI, optional pi agent)
