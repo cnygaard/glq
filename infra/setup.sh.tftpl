@@ -66,7 +66,7 @@ source $VENV/bin/activate
 # suites plus a byte-identical checkpoint comparison.
 pip install -q pip --upgrade
 pip install -q vllm==0.27.1
-pip install -q 'glq[quantize]==0.8.13' ninja wheel
+pip install -q 'glq[quantize]==0.8.14' ninja wheel
 # mamba-ssm and causal-conv1d need CUDA_HOME for building
 export CUDA_HOME=/usr/local/cuda-12.9
 unset CUDA_HOME

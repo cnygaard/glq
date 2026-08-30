@@ -401,7 +401,12 @@ tested the other methods for those properties.</sub>
 Where GLQ speed stands after v0.7.1 (measured, SmolLM3-3B on an RTX PRO 6000, vLLM 0.25):
 **single-stream (B=1) trellis-3INST decode is at bf16 parity** — 176 vs 180 tok/s — while
 using a third of the weight memory. At batch, bf16 still leads (2,423 vs 4,887 tok/s at
-concurrency 32) — the batched GEMM is the remaining gap. The shell/e8p codebooks decode
+concurrency 32) — the batched GEMM is the remaining gap, though v0.8.14 narrowed it: a
+parallel-column reduce in the batched kernel is worth −26–29% kernel time at B=16–64
+(RTX PRO 6000, 27B shapes; −12–21% on an L4) and +11.8% serving throughput at
+concurrency 32 (Qwen3.8-27B-3bpw, same box/workload), bit-identical outputs. On a
+bandwidth-starved L4 the compressed batched kernel now beats cuBLAS-on-dense through
+B=32. The shell/e8p codebooks decode
 slower than trellis; their draw is the 2–8 bpw range and mixed precision. A
 weight-quantization method's headline win remains **footprint** — the freed VRAM as KV /
 longer-context headroom, and fitting models bf16 can't — but at 4 bpw trellis the
