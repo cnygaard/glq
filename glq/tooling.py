@@ -48,9 +48,22 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
                 # README's validated recipe always carried it. Compact JSON (no spaces)
                 # keeps the printed shell command copy-pasteable without quoting.
                 "--default-chat-template-kwargs", '{"enable_thinking":true}']
-    if "smollm3" in name or "qwen" in name:
-        # Both families emit hermes-style <tool_call> markup; SmolLM3+hermes is the
-        # pairing the Terminal-Bench integration validated end to end.
+    if "qwen" in name:
+        # hermes matches Qwen's <tool_call> markup, but Qwen3.x are THINKING models:
+        # without --reasoning-parser qwen3 the <think> block stays in `content` and
+        # leaks into the agent's prose — the same failure class as gemma-4's
+        # enable_thinking leak (#85), and in a pi session it reads as rambling or
+        # repetition. Parser name per vLLM's official Qwen3.5 recipe
+        # (vllm-project/recipes Qwen/Qwen3.5.md). --language-model-only skips the
+        # multimodal wrapper's bf16 vision tower, which text-only agent/chat serving
+        # never uses — pure VRAM back on 24 GB cards.
+        return ["--enable-auto-tool-choice", "--tool-call-parser", "hermes",
+                "--reasoning-parser", "qwen3",
+                "--language-model-only"]
+    if "smollm3" in name:
+        # SmolLM3 emits hermes-style <tool_call> markup too; SmolLM3+hermes WITHOUT a
+        # reasoning parser is the pairing the Terminal-Bench integration validated end
+        # to end — don't drift it as a side effect of Qwen changes.
         return ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
     return None
 
