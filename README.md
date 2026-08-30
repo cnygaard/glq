@@ -178,23 +178,28 @@ vllm serve xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel --quantization glq
 
 ### Available pre-quantized checkpoints
 
-A few popular checkpoints (all on the [**`xv0y5ncu`** HF org](https://huggingface.co/xv0y5ncu)):
+The table mirrors the live [**start-here** collection](https://huggingface.co/collections/xv0y5ncu/start-here-recommended-glq-checkpoints)
+— the same curated list `glq-setup --list` and the installer picker read — in its order,
+plus one downloads-earned extra at the end. Everything is on the
+[**`xv0y5ncu`** HF org](https://huggingface.co/xv0y5ncu).
 
 | Repo | Base model | bpw | License | Footprint¹ | Best for |
 |---|---|---|--:|--:|---|
-| [`gemma-4-E4B-it-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-E4B-it-GLQ-trellis-3inst-4bpw) | Gemma-4-E4B (8B, multimodal) | 4.0 trellis | Apache 2.0 | 6.58 GiB | a capable model on an 8–12 GB card |
-| [`SmolLM3-3B-trellis-3inst-4bpw-kernel`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel) | SmolLM3-3B | 4.0 trellis | Apache 2.0 | 1.9 GiB | **fastest GLQ decode** — single-stream at bf16 parity |
-| [`SmolLM3-3B-GLQ-block-diagonal-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-block-diagonal-3.5bpw) | SmolLM3-3B | 3.5 mix | Apache 2.0 | 1.8 GiB | small + fast, fits anything |
-| [`Gemma-4-12B-it-GLQ-5.0bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-12B-it-GLQ-5.0bpw) | Gemma-4-12B | 5.0 mix | Apache 2.0 | 6.9 GiB | 12B on a 24 GB card |
+| [`SmolLM3-3B-trellis-3inst-4bpw-kernel`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel) | SmolLM3-3B | 4.0 trellis | Apache 2.0 | 1.9 GiB | **flagship / fastest GLQ decode** — single-stream at bf16 parity |
 | [`gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw) | Gemma-4-26B-A4B (MoE) | 4.0 trellis | Apache 2.0 | 14.4 GiB | best quality-per-GB (MoE) |
-| [`Qwen3.8-27B-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw) | Qwen3.8-27B (hybrid GDN) | 4.0 trellis | Apache 2.0 | 16.7 GiB | the biggest model on a 24 GB card — PPL 7.06 vs bf16 7.02 |
-| [`Gemma-4-31B-it-GLQ-5.0bpw-mix3-8`](https://huggingface.co/xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8) | Gemma-4-31B | 5.0 mix | Apache 2.0 | 16.5 GiB | a 31B on **one** 24–32 GB card |
-| [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic |
-| [`SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-360M | 4.0 | Apache 2.0 | 0.25 GiB | tiny / CI demo |
+| [`gemma-4-26B-A4B-it-GLQ-trellis-3inst-3bpw`](https://huggingface.co/xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-3bpw) | Gemma-4-26B-A4B (MoE) | 3.0 trellis | Apache 2.0 | 11.9 GiB | the 26B for 12–16 GB cards — AIME-2026 avg@8 82.1% vs 86.25% at 4 bpw |
+| [`Qwen3.8-27B-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw) | Qwen3.8-27B (hybrid GDN) | 4.0 trellis | Apache 2.0 | 16.7 GiB | the biggest model on a 24 GB card — AIME-2026 avg@8 90.4% (bf16 87.9%, n=30) |
+| [`Gemma-4-31B-it-GLQ-5.0bpw-mix3-8`](https://huggingface.co/xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8) | Gemma-4-31B | 5.0 mix | Apache 2.0 | 16.5 GiB | a 31B on **one** 24–32 GB card (vs 57.9 GiB bf16) |
+| [`Gemma-4-12B-it-GLQ-5.0bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-12B-it-GLQ-5.0bpw) | Gemma-4-12B | 5.0 mix | Apache 2.0 | 6.9 GiB | 12B, mixed 3–8 bpw allocation |
+| [`gemma-4-E4B-it-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-E4B-it-GLQ-trellis-3inst-4bpw) | Gemma-4-E4B (8B, multimodal) | 4.0 trellis | Apache 2.0 | 6.58 GiB | a capable model on an 8–12 GB card |
+| [`SmolLM3-3B-GLQ-block-diagonal-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-block-diagonal-3.5bpw) | SmolLM3-3B | 3.5 mix | Apache 2.0 | 1.8 GiB | fractional-bpw example; small + fast |
+| [`SmolLM2-360M-Instruct-GLQ-trellis-3inst-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-trellis-3inst-6bpw) | SmolLM2-360M | 6.0 trellis | Apache 2.0 | 0.31 GiB | near-lossless tiny — wikitext-2 PPL within +0.2% of bf16 |
+| [`SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-135M | 4.0 | Apache 2.0 | 0.1 GiB | smallest checkpoint; CI smoke tests |
+| [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic (top-15 by downloads; not in start-here) |
 
-**35 checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has trellis
-builds of the whole Gemma-4 family (E2B/E4B/12B/26B/31B at 4 bpw, 26B at 3 bpw), SmolLM3-3B
-and SmolLM2-360M trellis ladders at 3–6 bpw, and the Gemma-4 12B/31B/E4B family across
+**44 public checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has
+trellis builds of the whole Gemma-4 family (E2B/E4B/12B/26B/31B at 4 bpw), SmolLM3-3B and
+SmolLM2-360M trellis ladders at 3–6 bpw, and the Gemma-4 12B/31B/E4B family across
 **3–8 bpw** (incl. `e8p` variants). Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
 each model card and in [How GLQ compares](#how-glq-compares) and
 [Quality & footprint](#quality--footprint) below.
