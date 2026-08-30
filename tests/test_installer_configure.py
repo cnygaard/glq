@@ -131,3 +131,23 @@ def test_write_pi_models_passes_the_limits_through(tmp_path):
     import json
     entry = json.loads(p.read_text())["providers"]["glq"]["models"][0]
     assert entry["contextWindow"] == 8192 and entry["maxTokens"] == 2048
+
+
+# ---- per-command model defaults (glq-code → Qwen, glq-chat → gemma-4) ------------------
+
+def test_config_records_per_command_models(tmp_path):
+    path = tmp_path / "config.json"
+    C.write_glq_config(path, model="m", base_url="u", components=["core"], available=["m"],
+                       code_model="xv0y5ncu/qwen", chat_model="xv0y5ncu/gemma")
+    doc = json.loads(path.read_text())
+    assert doc["code_model"] == "xv0y5ncu/qwen"
+    assert doc["chat_model"] == "xv0y5ncu/gemma"
+
+
+def test_per_command_models_are_omitted_when_not_chosen(tmp_path):
+    """Old-style configs stay old-style: absent keys, not nulls — `cfg.get` fallbacks in
+    glq-chat/glq-code rely on absence meaning 'use the generic model'."""
+    path = tmp_path / "config.json"
+    C.write_glq_config(path, model="m", base_url="u", components=["core"], available=["m"])
+    doc = json.loads(path.read_text())
+    assert "code_model" not in doc and "chat_model" not in doc

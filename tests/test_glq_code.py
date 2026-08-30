@@ -232,3 +232,22 @@ def test_the_pi_budget_follows_the_planned_window(monkeypatch, tmp_path):
     code.main(["--model", SMOL])
     assert wrote["context_window"] == 16384     # the fake supervisor's resolved window
     assert wrote["max_tokens"] == 4096
+
+
+QWEN = "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw"
+
+
+def test_code_serves_the_code_model_over_the_generic_pick(monkeypatch, tmp_path):
+    """The installer records code_model (Qwen: native hermes tool calling, AIME at bf16
+    parity) separately from chat's pick; glq-code must serve it when --model is absent."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path,
+                              cfg={"model": GEMMA, "code_model": QWEN})
+    code.main([])
+    assert made[0]["model"] == QWEN
+
+
+def test_an_explicit_model_flag_still_wins(monkeypatch, tmp_path):
+    _, made, _, _ = _run_code(monkeypatch, tmp_path,
+                              cfg={"model": GEMMA, "code_model": QWEN})
+    code.main(["--model", SMOL])
+    assert made[0]["model"] == SMOL

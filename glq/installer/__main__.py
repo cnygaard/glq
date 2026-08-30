@@ -18,7 +18,7 @@ from pathlib import Path
 from glq import kv_compression as kv_env
 
 from . import configure, discovery, hardware, prompt, verify
-from .recommend import rank
+from .recommend import per_command_picks, rank
 
 GLQ_HOME = Path(os.environ.get("GLQ_HOME", Path.home() / ".glq"))
 DEFAULT_PORT = 8000
@@ -379,18 +379,24 @@ def main(argv=None) -> int:
         _install_open_webui(run)
 
     base_url = f"http://127.0.0.1:{args.port}/v1"
+    # Per-command defaults: glq-code prefers a fitting Qwen (native hermes tool calling,
+    # AIME at bf16 parity), glq-chat a fitting gemma-4 (fastest MoE decode). Fit-gated by
+    # the same VRAM budget as the menu; the user's generic pick is the floor.
+    picks = per_command_picks(checkpoints, vram, fallback=chosen.repo_id)
     if not args.dry_run:
         configure.write_glq_config(
             GLQ_HOME / "config.json", model=chosen.repo_id, base_url=base_url,
             components=components, available=[c.repo_id for c in checkpoints],
-            fp8_kv=bool(kv_on))
+            fp8_kv=bool(kv_on),
+            code_model=picks["code_model"], chat_model=picks["chat_model"])
         if "picode" in components:
             # Same limits glq-code serves with; without them pi asks for the full
             # window as output and every request 400s (see configure.pi_models_json).
+            # The id listed is what glq-code will SERVE — its per-command pick.
             from glq.code import DEFAULT_CODE_MAX_MODEL_LEN
             configure.write_pi_models(
                 Path.home() / ".pi" / "agent" / "models.json", base_url,
-                [chosen.repo_id],
+                [picks["code_model"]],
                 context_window=DEFAULT_CODE_MAX_MODEL_LEN,
                 max_tokens=max(1024, DEFAULT_CODE_MAX_MODEL_LEN // 4))
     else:
