@@ -23,7 +23,8 @@ import sys
 from pathlib import Path
 
 from glq.chat import (DEFAULT_BASE_URL, _checkpoint_bytes, _installed_config,
-                      _model_max_len, _server_port, _vram_bytes, positive_seconds)
+                      _model_max_len, _server_port, _vram_bytes, default_model,
+                      positive_seconds)
 from glq.installer.configure import write_pi_models
 from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
@@ -58,8 +59,9 @@ def _run_pi(cmd, env) -> int:
 def main(argv=None) -> int:
     cfg = _installed_config()
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model", default=cfg.get("model"),
-                   help="checkpoint to serve (default: the one install.sh configured)")
+    p.add_argument("--model", default=default_model(cfg, "code"),
+                   help="checkpoint to serve (default: the installer's code pick, "
+                        "then its generic one)")
     p.add_argument("--base-url", default=cfg.get("base_url", DEFAULT_BASE_URL))
     p.add_argument("--gpu-memory-utilization", type=float, default=None,
                    help="fraction of VRAM vLLM may reserve (default: sized from the "

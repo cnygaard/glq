@@ -195,3 +195,59 @@ def test_old_style_checkpoints_without_the_flag_still_work():
     c = Checkpoint("xv0y5ncu/legacy", int(2 * GIB))
     assert c.trellis is None
     assert len(R.rank([c], int(95.6 * GIB))) == 1
+
+
+# ---- per-command family preference: glq-code wants Qwen, glq-chat wants gemma-4 --------
+# Rationale (measured, 2026-08): Qwen3.8's tool calling is native hermes markup — no
+# external template, no thought-markup leak risk — and its GLQ-4bpw AIME ties bf16, which
+# is what a coding agent needs. gemma-4's 26B-A4B MoE decodes fastest for interactive chat.
+
+QWEN27 = "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw"
+GEMMA26 = "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw"
+
+FAMILY_FLEET = [
+    Checkpoint("xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8", int(22.4 * GIB), trellis=True),
+    Checkpoint(QWEN27, int(16.7 * GIB), trellis=True),
+    Checkpoint(GEMMA26, int(15.0 * GIB), trellis=True),
+    Checkpoint("xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel", int(1.8 * GIB), trellis=True),
+]
+
+
+def test_prefer_family_qwen_beats_a_larger_gemma():
+    """On a big card the 31B would win on size; prefer_family='qwen' must pick the Qwen."""
+    ranked = R.rank(FAMILY_FLEET, int(95.6 * GIB), prefer_family="qwen")
+    picked = [r for r in ranked if r.recommended][0]
+    assert picked.checkpoint.repo_id == QWEN27
+
+
+def test_prefer_family_gemma4_picks_the_moe_not_the_qwen():
+    ranked = R.rank(FAMILY_FLEET, int(95.6 * GIB), prefer_family="gemma-4")
+    picked = [r for r in ranked if r.recommended][0]
+    # Largest fitting gemma-4 wins within the family.
+    assert picked.checkpoint.repo_id == "xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8"
+
+
+def test_family_preference_never_recommends_what_does_not_fit():
+    """A 16 GiB card (12 GiB weight budget) cannot run the 16.7 GiB Qwen; the preference
+    must fall back to the plain recommendation, not force an OOM download."""
+    plain = [r for r in R.rank(FAMILY_FLEET, int(16 * GIB)) if r.recommended][0]
+    fam = [r for r in R.rank(FAMILY_FLEET, int(16 * GIB), prefer_family="qwen")
+           if r.recommended][0]
+    assert fam.checkpoint.repo_id == plain.checkpoint.repo_id
+
+
+def test_no_family_argument_is_byte_identical_to_before():
+    assert R.rank(FAMILY_FLEET, int(24 * GIB)) == R.rank(FAMILY_FLEET, int(24 * GIB),
+                                                         prefer_family=None)
+
+
+def test_per_command_picks_assigns_qwen_to_code_and_gemma_to_chat():
+    picks = R.per_command_picks(FAMILY_FLEET, int(24 * GIB), fallback=GEMMA26)
+    assert picks["code_model"] == QWEN27
+    assert picks["chat_model"] == GEMMA26   # 31B does not fit 24 GiB; 26B does
+
+
+def test_per_command_picks_falls_back_when_vram_is_unknown():
+    """No nvidia-smi → nothing is recommended → both commands serve the generic choice."""
+    picks = R.per_command_picks(FAMILY_FLEET, None, fallback=GEMMA26)
+    assert picks == {"code_model": GEMMA26, "chat_model": GEMMA26}

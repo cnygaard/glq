@@ -79,12 +79,19 @@ def write_pi_models(path, base_url: str, model_ids,
 
 
 def write_glq_config(path, *, model: str, base_url: str, components, available,
-                     fp8_kv: bool = False) -> None:
+                     fp8_kv: bool = False,
+                     code_model: str | None = None,
+                     chat_model: str | None = None) -> None:
     """Record what the installer chose.
 
     `examples/chat/app.py` reads this to populate its model dropdown, and it is the only
     record of the installer's decisions — worth having when someone reports that it served
     a model they did not expect.
+
+    `code_model`/`chat_model` are the per-command defaults (glq-code prefers Qwen for its
+    native hermes tool calling, glq-chat prefers gemma-4 for its MoE decode speed — see
+    recommend.PREFERRED_FAMILIES). Written only when chosen: absence is what tells
+    glq-code/glq-chat to fall back to the generic `model`, so old configs keep old behavior.
     """
     _write_private_json(Path(path), {
         "model": model,
@@ -94,4 +101,6 @@ def write_glq_config(path, *, model: str, base_url: str, components, available,
         # `glq-chat` reads this back as its default, so the KV question is asked once at
         # install time rather than on every start.
         "fp8_kv": bool(fp8_kv),
+        **({"code_model": code_model} if code_model else {}),
+        **({"chat_model": chat_model} if chat_model else {}),
     })

@@ -50,6 +50,15 @@ def _installed_config() -> dict:
         return {}
 
 
+def default_model(cfg: dict, command: str) -> str | None:
+    """The model a command serves when --model is absent: the installer's per-command
+    pick (`code_model`/`chat_model` — glq-code prefers Qwen for native hermes tool
+    calling, glq-chat prefers gemma-4 for MoE decode speed; see
+    installer.recommend.PREFERRED_FAMILIES), else the generic install-time choice.
+    Absent keys mean an older config — behavior is then exactly the pre-split default."""
+    return cfg.get(f"{command}_model") or cfg.get("model")
+
+
 #: The `chat` extra. Both are imported lazily — `openai` costs ~1.0 s of import time and
 #: gradio far more — so nothing here fails at module scope, and the rest of glq works
 #: without either.
@@ -294,8 +303,9 @@ def _display_available() -> bool:
 def main(argv=None) -> int:
     cfg = _installed_config()
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model", default=cfg.get("model"),
-                   help="checkpoint to serve (default: the one install.sh configured)")
+    p.add_argument("--model", default=default_model(cfg, "chat"),
+                   help="checkpoint to serve (default: the installer's chat pick, "
+                        "then its generic one)")
     p.add_argument("--base-url", default=cfg.get("base_url", DEFAULT_BASE_URL))
     p.add_argument("--port", type=int, default=7860, help="port for the chat UI itself")
     p.add_argument("--gpu-memory-utilization", type=float, default=None,

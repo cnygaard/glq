@@ -1437,3 +1437,18 @@ def test_the_slider_ceiling_follows_the_planned_window(monkeypatch):
     monkeypatch.setattr(chat, "build_ui", build)
     chat.main(["--model", "org/ckpt"])
     assert seen["mml"] == 8192, "must read the supervisor's chosen window"
+
+
+# ---- per-command default model resolution ----------------------------------------------
+
+def test_default_model_prefers_the_per_command_key():
+    from glq.chat import default_model
+    cfg = {"model": "generic", "chat_model": "gemma", "code_model": "qwen"}
+    assert default_model(cfg, "chat") == "gemma"
+    assert default_model(cfg, "code") == "qwen"
+
+
+def test_default_model_falls_back_to_the_generic_pick():
+    from glq.chat import default_model
+    assert default_model({"model": "generic"}, "chat") == "generic"
+    assert default_model({}, "code") is None
