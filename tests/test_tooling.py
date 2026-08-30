@@ -49,6 +49,30 @@ def test_smollm3_and_qwen_use_hermes(model):
     assert "--chat-template" not in joined
 
 
+@pytest.mark.parametrize("model", [
+    "xv0y5ncu/Qwen3.5-2B-GLQ-trellis-3inst-4bpw",
+    "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw",
+])
+def test_qwen_gets_the_qwen3_reasoning_parser_and_text_only_load(model):
+    """Qwen3.x are thinking models: without --reasoning-parser qwen3 the <think> block
+    stays in `content` and leaks into the agent's prose — the same failure class as
+    gemma-4's enable_thinking leak, and it reads as rambling/repetition in pi. Parser
+    name per vLLM's official Qwen3.5 recipe. --language-model-only skips the multimodal
+    wrapper's bf16 vision tower, which a text-only agent/chat never uses."""
+    joined = " ".join(T.tool_serve_args(model))
+    assert "--reasoning-parser qwen3" in joined
+    assert "--language-model-only" in joined
+
+
+def test_smollm3_keeps_the_validated_pairing_without_a_reasoning_parser():
+    """SmolLM3+hermes WITHOUT a reasoning parser is what Terminal-Bench validated
+    end to end; qwen3's parser is not known to match SmolLM3's markup. Don't drift it
+    as a side effect of the Qwen fix."""
+    joined = " ".join(T.tool_serve_args("xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel"))
+    assert "--reasoning-parser" not in joined
+    assert "--language-model-only" not in joined
+
+
 def test_unknown_families_get_none_not_a_guess(tmp_path):
     """A silently wrong parser produces tool calls that never parse — the worst failure
     mode, because it looks like a bad model rather than a bad flag."""
