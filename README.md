@@ -226,8 +226,21 @@ variant), the recommended format since v0.7. Other bit-widths: `--bpw 2` through
 `--bpw 8`, **uniform integers only** — trellis has no mixed-precision encoding. For
 fractional rates like `2.5`, and for per-layer mixed precision, add `--codebook e8_shell`
 (or `e8p`); the refusal names them if you forget. `glq-quantize --help` lists every flag.
-For models that don't fit in system RAM use `--streaming` (loads one layer at a time from
-safetensors).
+
+**`--streaming`** loads one layer at a time from safetensors. It is **required** for the
+gemma-4 and Qwen3.5/Qwen3.8 families (their per-layer embeddings / multimodal wrappers
+only load correctly this way), and useful for anything bigger than system RAM. Do *not*
+pass it for Llama/SmolLM-style models — the streaming loader does not support their
+profile — they load whole anyway.
+
+A realistic large-model run (this is how the published Qwen3.8-27B checkpoints were made):
+
+```bash
+GLQ_TRELLIS_VARIANT=3inst glq-quantize \
+    --model Qwen/Qwen3.8-27B \
+    --output ./qwen38-27b-trellis-3inst-4bpw \
+    --codebook trellis --bpw 4 --nsamples 128 --streaming
+```
 
 For **mixed-precision** allocation, run a two-pass flow: a profile
 pass writes a per-layer `bpw_allocation.json`, then a quantize pass
@@ -258,7 +271,8 @@ K=bpw−4 residual), which costs roughly 2× the decode of a single stage;
 5–8 bpw checkpoints need **glq ≥ 0.8.0** and `GLQ_TRELLIS_VARIANT=3inst`.
 Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
 automatically — the PLE table quantizes via the shell codebook (requires
-glq ≥ 0.7.2). Use `--streaming` for Gemma-4 family models.
+glq ≥ 0.7.2). `--streaming` is **required** for the Gemma-4 and
+Qwen3.5/Qwen3.8 families, not just recommended.
 
 **Mixture-of-Experts** (Gemma-4 26B-A4B and similar) needs **glq ≥ 0.8.1**,
 which added the fused grouped trellis MoE decode. It serves under a full
