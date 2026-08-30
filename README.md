@@ -45,6 +45,27 @@ architecture fallbacks dequantize instead).
 [vLLM](#docker-image-nvidia-gpu) ·
 [how it works](#how-it-works)
 
+## System requirements
+
+**Linux x86_64 with an NVIDIA GPU.** That is the whole envelope — GLQ serves through
+vLLM/CUDA, so both are hard requirements.
+
+- **GPU**: NVIDIA Ampere-class or newer (`sm_86+`). Developed for 24–32 GB cards
+  (3090 / 4080 / 4090 / L4 / L40S); validated live on an Ada L4 (`sm_89`) and an RTX PRO
+  6000 Blackwell (`sm_120`). A recent NVIDIA driver is required; a CUDA *toolkit* is not —
+  `pip install glq` ships prebuilt kernels (CPython 3.10–3.14, x86_64), and `nvcc` is only
+  needed for the from-source fallback (and for FlashInfer's sampler JIT on Blackwell —
+  without it `glq-chat` falls back to vLLM's built-in sampler).
+- **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
+  pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 12,
+  Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
+  (`tests/test_installer_distros.py`), so other distros are expected to install and run.
+- **Windows**: no native support (no Windows wheels, and vLLM is Linux-only). WSL2 with
+  the NVIDIA CUDA driver should work in principle — untested.
+- **macOS**: not supported. There is no CUDA on Apple hardware, and Docker Desktop on
+  macOS cannot pass through an NVIDIA GPU, so a container does not help.
+- **Python**: 3.10–3.14 (the installer creates its own venv).
+
 ## Quickstart
 
 ### Installer command (venv, glq, vLLM, chat UI, optional pi agent)
@@ -157,23 +178,28 @@ vllm serve xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel --quantization glq
 
 ### Available pre-quantized checkpoints
 
-A few popular checkpoints (all on the [**`xv0y5ncu`** HF org](https://huggingface.co/xv0y5ncu)):
+The table mirrors the live [**start-here** collection](https://huggingface.co/collections/xv0y5ncu/start-here-recommended-glq-checkpoints)
+— the same curated list `glq-setup --list` and the installer picker read — in its order,
+plus one downloads-earned extra at the end. Everything is on the
+[**`xv0y5ncu`** HF org](https://huggingface.co/xv0y5ncu).
 
 | Repo | Base model | bpw | License | Footprint¹ | Best for |
 |---|---|---|--:|--:|---|
-| [`gemma-4-E4B-it-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-E4B-it-GLQ-trellis-3inst-4bpw) | Gemma-4-E4B (8B, multimodal) | 4.0 trellis | Apache 2.0 | 6.58 GiB | a capable model on an 8–12 GB card |
-| [`SmolLM3-3B-trellis-3inst-4bpw-kernel`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel) | SmolLM3-3B | 4.0 trellis | Apache 2.0 | 1.9 GiB | **fastest GLQ decode** — single-stream at bf16 parity |
-| [`SmolLM3-3B-GLQ-block-diagonal-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-block-diagonal-3.5bpw) | SmolLM3-3B | 3.5 mix | Apache 2.0 | 1.8 GiB | small + fast, fits anything |
-| [`Gemma-4-12B-it-GLQ-5.0bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-12B-it-GLQ-5.0bpw) | Gemma-4-12B | 5.0 mix | Apache 2.0 | 6.9 GiB | 12B on a 24 GB card |
+| [`SmolLM3-3B-trellis-3inst-4bpw-kernel`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel) | SmolLM3-3B | 4.0 trellis | Apache 2.0 | 1.9 GiB | **flagship / fastest GLQ decode** — single-stream at bf16 parity |
 | [`gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw) | Gemma-4-26B-A4B (MoE) | 4.0 trellis | Apache 2.0 | 14.4 GiB | best quality-per-GB (MoE) |
-| [`Qwen3.8-27B-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw) | Qwen3.8-27B (hybrid GDN) | 4.0 trellis | Apache 2.0 | 16.7 GiB | the biggest model on a 24 GB card — PPL 7.06 vs bf16 7.02 |
-| [`Gemma-4-31B-it-GLQ-5.0bpw-mix3-8`](https://huggingface.co/xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8) | Gemma-4-31B | 5.0 mix | Apache 2.0 | 16.5 GiB | a 31B on **one** 24–32 GB card |
-| [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic |
-| [`SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-360M | 4.0 | Apache 2.0 | 0.25 GiB | tiny / CI demo |
+| [`gemma-4-26B-A4B-it-GLQ-trellis-3inst-3bpw`](https://huggingface.co/xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-3bpw) | Gemma-4-26B-A4B (MoE) | 3.0 trellis | Apache 2.0 | 11.9 GiB | the 26B for 12–16 GB cards — AIME-2026 avg@8 82.1% vs 86.25% at 4 bpw |
+| [`Qwen3.8-27B-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw) | Qwen3.8-27B (hybrid GDN) | 4.0 trellis | Apache 2.0 | 16.7 GiB | the biggest model on a 24 GB card — AIME-2026 avg@8 90.4% (bf16 87.9%, n=30) |
+| [`Gemma-4-31B-it-GLQ-5.0bpw-mix3-8`](https://huggingface.co/xv0y5ncu/Gemma-4-31B-it-GLQ-5.0bpw-mix3-8) | Gemma-4-31B | 5.0 mix | Apache 2.0 | 16.5 GiB | a 31B on **one** 24–32 GB card (vs 57.9 GiB bf16) |
+| [`Gemma-4-12B-it-GLQ-5.0bpw`](https://huggingface.co/xv0y5ncu/Gemma-4-12B-it-GLQ-5.0bpw) | Gemma-4-12B | 5.0 mix | Apache 2.0 | 6.9 GiB | 12B, mixed 3–8 bpw allocation |
+| [`gemma-4-E4B-it-GLQ-trellis-3inst-4bpw`](https://huggingface.co/xv0y5ncu/gemma-4-E4B-it-GLQ-trellis-3inst-4bpw) | Gemma-4-E4B (8B, multimodal) | 4.0 trellis | Apache 2.0 | 6.58 GiB | a capable model on an 8–12 GB card |
+| [`SmolLM3-3B-GLQ-block-diagonal-3.5bpw`](https://huggingface.co/xv0y5ncu/SmolLM3-3B-GLQ-block-diagonal-3.5bpw) | SmolLM3-3B | 3.5 mix | Apache 2.0 | 1.8 GiB | fractional-bpw example; small + fast |
+| [`SmolLM2-360M-Instruct-GLQ-trellis-3inst-6bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-360M-Instruct-GLQ-trellis-3inst-6bpw) | SmolLM2-360M | 6.0 trellis | Apache 2.0 | 0.31 GiB | near-lossless tiny — wikitext-2 PPL within +0.2% of bf16 |
+| [`SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-135M | 4.0 | Apache 2.0 | 0.1 GiB | smallest checkpoint; CI smoke tests |
+| [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic (top-15 by downloads; not in start-here) |
 
-**35 checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has trellis
-builds of the whole Gemma-4 family (E2B/E4B/12B/26B/31B at 4 bpw, 26B at 3 bpw), SmolLM3-3B
-and SmolLM2-360M trellis ladders at 3–6 bpw, and the Gemma-4 12B/31B/E4B family across
+**44 public checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has
+trellis builds of the whole Gemma-4 family (E2B/E4B/12B/26B/31B at 4 bpw), SmolLM3-3B and
+SmolLM2-360M trellis ladders at 3–6 bpw, and the Gemma-4 12B/31B/E4B family across
 **3–8 bpw** (incl. `e8p` variants). Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
 each model card and in [How GLQ compares](#how-glq-compares) and
 [Quality & footprint](#quality--footprint) below.
@@ -205,8 +231,21 @@ variant), the recommended format since v0.7. Other bit-widths: `--bpw 2` through
 `--bpw 8`, **uniform integers only** — trellis has no mixed-precision encoding. For
 fractional rates like `2.5`, and for per-layer mixed precision, add `--codebook e8_shell`
 (or `e8p`); the refusal names them if you forget. `glq-quantize --help` lists every flag.
-For models that don't fit in system RAM use `--streaming` (loads one layer at a time from
-safetensors).
+
+**`--streaming`** loads one layer at a time from safetensors. It is **required** for the
+gemma-4 and Qwen3.5/Qwen3.8 families (their per-layer embeddings / multimodal wrappers
+only load correctly this way), and useful for anything bigger than system RAM. Do *not*
+pass it for Llama/SmolLM-style models — the streaming loader does not support their
+profile — they load whole anyway.
+
+A realistic large-model run (this is how the published Qwen3.8-27B checkpoints were made):
+
+```bash
+GLQ_TRELLIS_VARIANT=3inst glq-quantize \
+    --model Qwen/Qwen3.8-27B \
+    --output ./qwen38-27b-trellis-3inst-4bpw \
+    --codebook trellis --bpw 4 --nsamples 128 --streaming
+```
 
 For **mixed-precision** allocation, run a two-pass flow: a profile
 pass writes a per-layer `bpw_allocation.json`, then a quantize pass
@@ -237,7 +276,8 @@ K=bpw−4 residual), which costs roughly 2× the decode of a single stage;
 5–8 bpw checkpoints need **glq ≥ 0.8.0** and `GLQ_TRELLIS_VARIANT=3inst`.
 Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
 automatically — the PLE table quantizes via the shell codebook (requires
-glq ≥ 0.7.2). Use `--streaming` for Gemma-4 family models.
+glq ≥ 0.7.2). `--streaming` is **required** for the Gemma-4 and
+Qwen3.5/Qwen3.8 families, not just recommended.
 
 **Mixture-of-Experts** (Gemma-4 26B-A4B and similar) needs **glq ≥ 0.8.1**,
 which added the fused grouped trellis MoE decode. It serves under a full
@@ -550,29 +590,49 @@ parity, bf16 ahead at batch (measured numbers there).
 
 ## How it works
 
-1. **E8 lattice codebook.** 65,536 vectors from the first seven shells
-   of the E8 lattice in 8 dimensions. Each 8-weight group of the weight
-   matrix is encoded as one 16-bit index into this codebook (so the
-   primary stage is 2 bpw). For 3–8 bpw, additional 8-bit (256-entry)
-   or 16-bit (E8) residual codebooks refine the primary's
-   reconstruction error.
+Every codebook shares the same bracket: rotate (RHT), quantize with error
+feedback (LDLQ), then serve from the compressed form with fused kernels.
+What differs is the codebook in the middle — **trellis is the default**
+since v0.8.8; the E8 lattice family covers fractional and mixed precision.
 
-2. **Randomized Hadamard Transform.** Random sign flips followed by
-   Fast Walsh-Hadamard Transform rotate both weights and Hessian.
+1. **Randomized Hadamard Transform.** Random sign flips followed by a
+   Fast Walsh–Hadamard Transform rotate both weights and Hessian.
    After RHT the Hessian is approximately diagonal, so plain Euclidean
-   nearest-neighbour in the codebook is near-optimal under the
-   Hessian-weighted proxy loss.
+   nearest-neighbour against the codebook is near-optimal under the
+   Hessian-weighted proxy loss. Large layers use a block-diagonal
+   transform; the inverse runs inside the inference kernels.
 
-3. **LDLQ error feedback.** Block-LDL decomposition of the Hessian
-   drives a sequential sweep — GPTQ-style, but over 8-D blocks instead
-   of scalar columns. Each block's quantization error propagates
-   forward to correct downstream blocks.
+2. **LDLQ error feedback.** Block-LDL decomposition of the Hessian
+   drives a sequential sweep — GPTQ-style, but over multi-weight blocks
+   instead of scalar columns. Each block's quantization error
+   propagates forward to correct downstream blocks.
 
-4. **Fused inference kernels.** Custom CUDA C and Triton kernels read
-   codebook indices from HBM, gather the 8-D vectors from the
-   L2-cached 1 MB codebook, and accumulate the matmul directly — the
-   dense weight matrix is never materialized. GPU memory savings scale
-   with the compression ratio.
+3. **Codebooks.**
+   - **Trellis (default; QTIP-style TCQ).** No stored codebook at all: a
+     16-bit state slides along the weight stream emitting two weights per
+     step, and each weight costs its K bits (2–4 native). The shipped
+     `3inst` variant decodes a state arithmetically — an integer
+     multiply-add, a mask/xor, and one fp16 add — so decode needs no
+     table lookup and no shared memory. Encoding is a Viterbi
+     (add-compare-select) sweep over the trellis, fused in Triton.
+     5–8 bpw stack two trellis stages as residual VQ (each stage K ≤ 4,
+     residual scale fitted per layer).
+   - **E8 lattice (`e8_shell`, `e8p`).** 65,536 vectors from the first
+     seven shells of the E8 lattice; each 8-weight group is one 16-bit
+     index (2 bpw primary), refined by 8-bit or 16-bit residual stages.
+     This is the path for fractional (e.g. 3.5 bpw) and per-layer mixed
+     precision; `e8p` adds a block-diagonal tensor-core decode.
+
+4. **Fused inference kernels.** Custom CUDA and Triton kernels keep the
+   weights compressed end-to-end — the dense matrix is never
+   materialized, so VRAM scales with the compression ratio. Trellis
+   decode runs entirely in registers and feeds tensor-core `mma`
+   directly (B=1 GEMV, a batched kernel through B=64 with a
+   parallel-column reduce, dense fallback for long prefills); E8 decode
+   gathers from the L2-cached 1 MiB codebook. Decode is bit-exact
+   against the Python reference and deterministic run-to-run — no
+   atomics, fixed reduction order — which is what lets the test suite
+   gate kernels with `torch.equal` rather than tolerances.
 
 ## Advanced
 
