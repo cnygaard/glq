@@ -136,16 +136,30 @@ def run(ctx, config: dict):
                "--num-runs", str(num_runs),
                "--server-ready-timeout", "600",
                "-o", tmp, "-e", exp]
+        # The venv's bin/ first on PATH. `vllm` is invoked by absolute path, which does not
+        # put that directory on PATH the way `source activate` would — and vLLM's own
+        # dependencies shell out to siblings by name. Measured on an RTX PRO 6000: the
+        # sweep died because FlashInfer JIT-compiles its sm_120 sampler and ran `ninja`,
+        # which was installed at ~/.glq/venv/bin/ninja and simply not on the child's PATH.
+        bindir = os.path.dirname(sys.executable)
+        env = {**os.environ,
+               "PATH": os.pathsep.join(
+                   [bindir, *[p for p in os.environ.get("PATH", "").split(os.pathsep)
+                              if p and p != bindir]])}
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, env=env)
 
         summary = os.path.join(tmp, exp, "summary.csv")   # serve.py writes this
         per_conc = _parse_summary(summary) if os.path.exists(summary) else {}
 
     if not per_conc:
+        # 400 characters of stderr lost the actual cause more than once: vLLM's sweep
+        # wrapper ends with "The script was terminated early", and the reason the server
+        # died is thousands of lines earlier, in stdout.
         raise RuntimeError(
-            f"vllm bench sweep serve produced no summary.csv (rc={proc.returncode}). "
-            f"stderr tail: {(proc.stderr or '')[-400:]}")
+            f"vllm bench sweep serve produced no summary.csv (rc={proc.returncode}).\n"
+            f"--- stderr tail ---\n{(proc.stderr or '')[-2000:]}\n"
+            f"--- stdout tail ---\n{(proc.stdout or '')[-2000:]}")
 
     # Headline is single-stream when it was asked for — the number that decides whether a
     # quantized model is usable interactively.
