@@ -528,7 +528,8 @@ glq_trellis_matvec_kernel(float *__restrict__ out,
  *   2. Ragged tail by PREDICATION (active = tok < B), not padding — we're on raw mma.sync.
  *   3. C-harvest: g/t swap roles between the B and C fragments (in C, g is the row and t the
  *      column pair), so all four accumulators are live. Every lane parks its whole C-fragment
- *      in a padded 36 KB gather buffer, then 8 reader warps reduce the 8 columns in PARALLEL
+ *      in a gather buffer (36 KB padded for 3INST, 32 KB unpadded for HYB — see the CPAD
+ *      note at the declaration), then 8 reader warps reduce the 8 columns in PARALLEL
  *      behind a single barrier — each element still summed in warpi 0..31 order, so the fp32
  *      result is bit-identical to a serial reduce. The original one-column-at-a-time loop
  *      cost 16 __syncthreads per m-pair with 31 warps idling behind warp 0's serial sum:
@@ -622,10 +623,17 @@ glq_trellis_matmul_kernel(float *__restrict__ out,
         __syncthreads();
     }
 
-    // C-fragment gather for the parallel-column reduce: [warpi][pi][row-elem][column],
-    // last dim padded 8→9 so reader lanes (stride 9, coprime with the 32 banks) stay
-    // conflict-free. 36 KB static.
-    __shared__ float cfrag_gather[TR_WARPS][2][16][9];
+    // C-fragment gather for the parallel-column reduce: [warpi][pi][row-elem][column].
+    // 3INST pads the last dim 8→9 so reader lanes (stride 9, coprime with the 32 banks)
+    // stay conflict-free — 36 KB static, and with no dynamic tlut it sits under the 48 KB
+    // no-opt-in limit on every arch (sm_86/89/120). HYB CANNOT afford the pad: its 64 KB
+    // dynamic tlut plus a 36 KB gather is 103.4 KB, over the 101,376 B per-block opt-in
+    // cap on sm_86/89/120 alike, and every batched launch throws cudaErrorInvalidValue
+    // (measured — 36 HYB kernel tests). Unpadded it is 32 KB → 99,328 B total, which
+    // fits; the reader-loop bank conflicts this re-admits are a once-per-m-pair cost on
+    // the non-default variant, still far cheaper than the old 16-barrier serial reduce.
+    constexpr uint32_t CPAD = IS_3INST ? 9 : 8;
+    __shared__ float cfrag_gather[TR_WARPS][2][16][CPAD];
 
     for (uint32_t mi = 0; mi < m_per_block; mi += 1) {
         if (tileIdM * 2 >= tileCountM) return;   // block-uniform → no __syncthreads deadlock
