@@ -571,29 +571,49 @@ parity, bf16 ahead at batch (measured numbers there).
 
 ## How it works
 
-1. **E8 lattice codebook.** 65,536 vectors from the first seven shells
-   of the E8 lattice in 8 dimensions. Each 8-weight group of the weight
-   matrix is encoded as one 16-bit index into this codebook (so the
-   primary stage is 2 bpw). For 3–8 bpw, additional 8-bit (256-entry)
-   or 16-bit (E8) residual codebooks refine the primary's
-   reconstruction error.
+Every codebook shares the same bracket: rotate (RHT), quantize with error
+feedback (LDLQ), then serve from the compressed form with fused kernels.
+What differs is the codebook in the middle — **trellis is the default**
+since v0.8.8; the E8 lattice family covers fractional and mixed precision.
 
-2. **Randomized Hadamard Transform.** Random sign flips followed by
-   Fast Walsh-Hadamard Transform rotate both weights and Hessian.
+1. **Randomized Hadamard Transform.** Random sign flips followed by a
+   Fast Walsh–Hadamard Transform rotate both weights and Hessian.
    After RHT the Hessian is approximately diagonal, so plain Euclidean
-   nearest-neighbour in the codebook is near-optimal under the
-   Hessian-weighted proxy loss.
+   nearest-neighbour against the codebook is near-optimal under the
+   Hessian-weighted proxy loss. Large layers use a block-diagonal
+   transform; the inverse runs inside the inference kernels.
 
-3. **LDLQ error feedback.** Block-LDL decomposition of the Hessian
-   drives a sequential sweep — GPTQ-style, but over 8-D blocks instead
-   of scalar columns. Each block's quantization error propagates
-   forward to correct downstream blocks.
+2. **LDLQ error feedback.** Block-LDL decomposition of the Hessian
+   drives a sequential sweep — GPTQ-style, but over multi-weight blocks
+   instead of scalar columns. Each block's quantization error
+   propagates forward to correct downstream blocks.
 
-4. **Fused inference kernels.** Custom CUDA C and Triton kernels read
-   codebook indices from HBM, gather the 8-D vectors from the
-   L2-cached 1 MB codebook, and accumulate the matmul directly — the
-   dense weight matrix is never materialized. GPU memory savings scale
-   with the compression ratio.
+3. **Codebooks.**
+   - **Trellis (default; QTIP-style TCQ).** No stored codebook at all: a
+     16-bit state slides along the weight stream emitting two weights per
+     step, and each weight costs its K bits (2–4 native). The shipped
+     `3inst` variant decodes a state arithmetically — an integer
+     multiply-add, a mask/xor, and one fp16 add — so decode needs no
+     table lookup and no shared memory. Encoding is a Viterbi
+     (add-compare-select) sweep over the trellis, fused in Triton.
+     5–8 bpw stack two trellis stages as residual VQ (each stage K ≤ 4,
+     residual scale fitted per layer).
+   - **E8 lattice (`e8_shell`, `e8p`).** 65,536 vectors from the first
+     seven shells of the E8 lattice; each 8-weight group is one 16-bit
+     index (2 bpw primary), refined by 8-bit or 16-bit residual stages.
+     This is the path for fractional (e.g. 3.5 bpw) and per-layer mixed
+     precision; `e8p` adds a block-diagonal tensor-core decode.
+
+4. **Fused inference kernels.** Custom CUDA and Triton kernels keep the
+   weights compressed end-to-end — the dense matrix is never
+   materialized, so VRAM scales with the compression ratio. Trellis
+   decode runs entirely in registers and feeds tensor-core `mma`
+   directly (B=1 GEMV, a batched kernel through B=64 with a
+   parallel-column reduce, dense fallback for long prefills); E8 decode
+   gathers from the L2-cached 1 MiB codebook. Decode is bit-exact
+   against the Python reference and deterministic run-to-run — no
+   atomics, fixed reduction order — which is what lets the test suite
+   gate kernels with `torch.equal` rather than tolerances.
 
 ## Advanced
 
