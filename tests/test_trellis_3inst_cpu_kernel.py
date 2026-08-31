@@ -282,6 +282,72 @@ def test_cpu_fht_blockdiag_bitexact_vs_pytorch_fht(blocks):
     assert torch.equal(x, x0)   # unlike block_diagonal_fht, the op must NOT mutate its input
 
 
+# ---- Gate 8: E8RHTLinear on CPU — the fused path ENGAGES and the dense cache does not ----
+def _cpu_layer(in_f=512, out_f=256, seed=11, K=2):
+    from glq.quantized_linear import E8RHTLinear
+    torch.manual_seed(seed)
+    W = (torch.randn(out_f, in_f) * 0.05).float()
+    X = torch.randn(256, in_f)
+    H = (X.T @ X) / 256
+    cb = gt.TrellisCodebook(variant="3inst", K=K, device="cpu")
+    W_hat, art = gt.quantize_layer_trellis_rht(W, H, cb)
+    layer = E8RHTLinear(in_f, out_f, codebook_type="trellis")
+    layer.load_state_dict({
+        "trellis_packed": art["trellis_packed"],
+        "SU": art["SU"], "SV": art["SV"],
+        "Wscale": torch.tensor(art["Wscale"], dtype=torch.float32),
+    }, strict=False)
+    layer.set_codebook(cb)
+    return layer, W_hat
+
+
+def _sqnr(ref, got):
+    import math
+    return 10 * math.log10(ref.float().pow(2).mean().item()
+                           / (got.float() - ref.float()).pow(2).mean().item())
+
+
+@pytest.mark.parametrize("B", [1, 4])
+def test_cpu_fused_linear_engages_and_matches(B):
+    """The mechanism gate: on a CPU tensor the layer must take the fused path (compressed
+    weights only — the dense fp32 cache must NOT materialize) and track x @ W_hat.T."""
+    _ext()
+    layer, W_hat = _cpu_layer()
+    torch.manual_seed(3)
+    x = (torch.randn(B, 512) * 0.5).half()
+    y = layer(x)
+    assert layer._trellis_op_cpu is True
+    assert layer._trellis_W_rht is None, "dense cache materialized — fused path not engaged"
+    ref = x.float() @ W_hat.t().float()
+    assert _sqnr(ref, y) > 35.0, f"B={B} SQNR {_sqnr(ref, y):.1f} dB"
+
+
+def test_cpu_fused_kill_switch_restores_dense_path(monkeypatch):
+    _ext()
+    import glq.quantized_linear as ql
+    layer, _ = _cpu_layer(seed=12)
+    x = (torch.randn(2, 512) * 0.5).half()
+    y_fused = layer(x)
+    assert layer._trellis_op_cpu is True
+
+    monkeypatch.setattr(ql, "_GLQ_FUSED_TRELLIS_CPU_ENABLED", False)
+    layer2, _ = _cpu_layer(seed=12)
+    y_dense = layer2(x)
+    assert layer2._trellis_op_cpu is False
+    assert layer2._trellis_W_rht is not None      # the dense fallback ran
+    assert _sqnr(y_dense, y_fused) > 80.0         # same math, different accumulation order
+
+
+def test_cpu_path_does_not_latch_the_cuda_resolver():
+    """A CPU forward must leave the CUDA-path cache untouched: the old single-slot bool
+    would latch False on the first CPU token and never re-examine after .to('cuda')."""
+    _ext()
+    layer, _ = _cpu_layer(seed=13)
+    layer((torch.randn(1, 512) * 0.5).half())
+    assert layer._trellis_op is None
+    assert layer._trellis_op_cpu is True
+
+
 # ---- Gate 9 (loader/dispatch diagnostics) ------------------------------------------------
 def test_cpu_unknown_isa_tier_raises():
     ext = _ext()
