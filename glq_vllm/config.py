@@ -71,7 +71,9 @@ class GLQvLLMConfig(QuantizationConfig):
         return "glq"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.float16, torch.bfloat16]
+        # float32 is for the CPU platform (its default dtype list is bf16-first, which
+        # also works — the CPU fused path takes activations to fp32 internally).
+        return [torch.float16, torch.bfloat16, torch.float32]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -190,6 +192,15 @@ class GLQvLLMConfig(QuantizationConfig):
                 from vllm.model_executor.layers.fused_moe.layer import (
                     FusedMoE as _MoELayer)       # vLLM <= 0.23
             if isinstance(layer, _MoELayer):
+                from vllm.platforms import current_platform
+                if getattr(current_platform, "device_type", "") == "cpu":
+                    # Every GLQ MoE path — the fused ops AND the Python fallbacks —
+                    # bottoms out in CUDA kernels (the per-expert dequant asserts
+                    # sv.is_cuda). Refuse loudly rather than fail mid-load.
+                    raise NotImplementedError(
+                        "GLQ MoE checkpoints are not servable on the CPU platform "
+                        "(the expert decode kernels are CUDA-only). Use a dense "
+                        "trellis checkpoint for CPU serving.")
                 from .fused_moe_method import GLQFusedMoEMethod
                 return GLQFusedMoEMethod(self, moe=layer.moe_config)
         except (ImportError, AttributeError):

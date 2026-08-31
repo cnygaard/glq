@@ -54,4 +54,5 @@ markers = [
 include = ["glq*", "glq_vllm*"]
 
 [tool.setuptools.package-data]
-glq = ["*.pt", "csrc/*.cu", "csrc/*.cpp", "csrc/*.h", "csrc/*.cuh", "templates/*.j2"]
+glq = ["*.pt", "csrc/*.cu", "csrc/*.cpp", "csrc/*.h", "csrc/*.cuh",
+       "csrc/cpu/*.cpp", "csrc/cpu/*.hpp", "csrc/cpu/*.inl", "templates/*.j2"]

@@ -74,6 +74,7 @@ jobs:
           # whole option with "Malformed environment option" before any build starts.
           CIBW_ENVIRONMENT: >-
             GLQ_BUILD_EXT=1
+            GLQ_BUILD_CPU_EXT=1
             GLQ_TORCH_VERSION=${{ env.GLQ_TORCH_VERSION }}
             TORCH_CUDA_ARCH_LIST="${{ env.TORCH_CUDA_ARCH_LIST }}"
             MAX_JOBS=4
@@ -101,6 +102,8 @@ jobs:
             echo "== $whl"
             python -m zipfile -l "$whl" | grep -E 'glq/_C\..*\.so' \
               || { echo "no glq/_C*.so in $whl"; exit 1; }
+            python -m zipfile -l "$whl" | grep -E 'glq/_C_cpu\..*\.so' \
+              || { echo "no glq/_C_cpu*.so in $whl"; exit 1; }
           done
 
       - uses: actions/upload-artifact@v4

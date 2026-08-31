@@ -28,6 +28,9 @@ _GLQ_FUSED_E8P_ENABLED = True
 # reaches the pure-torch decode: GLQ_TRELLIS_DENSE picks the dense branch *inside* the fused
 # op, which still consumes trellis_packed2 and so cannot isolate the kernel.
 _GLQ_FUSED_TRELLIS_ENABLED = os.environ.get("GLQ_FUSED_TRELLIS", "1") != "0"
+# CPU fused decode (glq._C_cpu). Separate switch: the CPU path is newer, and turning
+# one off must not silently disable the other.
+_GLQ_FUSED_TRELLIS_CPU_ENABLED = os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0"
 # One-shot latch so the "5-8 bpw has no fused kernel" notice fires once per process, not
 # once per layer (a 3B model would emit it ~200 times).
 _WARNED_TRELLIS_RVQ_EAGER = False
@@ -369,6 +372,8 @@ class E8RHTLinear(nn.Module):
         self._trellis_has_kernel = True
         self._trellis_W_rht = None       # dense fallback cache (NOT used on the CUDA path)
         self._trellis_op = None          # resolved fused CUDA op (False = unavailable)
+        self._trellis_op_cpu = None      # resolved fused CPU op — its OWN slot: the CUDA
+                                         # bool must never latch from a CPU forward
         # Block-diagonal RHT metadata for the fused trellis op (trellis never pads, so these
         # sum to in_features / out_features exactly).
         self._blocks_n_tensor = torch.tensor(self.blocks_n, dtype=torch.int64, device="cpu")
@@ -411,6 +416,7 @@ class E8RHTLinear(nn.Module):
             self._trellis_has_kernel = getattr(codebook, 'has_kernel', True)
             self._trellis_W_rht = None
             self._trellis_op = None      # re-resolve (has_kernel gates the CUDA path)
+            self._trellis_op_cpu = None
             # Stage-2 FLAG and stage-2 SCALE are resolved in ONE block, deliberately. The
             # e8p stage-3/4 silent drop came from resolving them under different conditions:
             # the flag said "stage present" while the scale stayed 0.0, and the decode then
@@ -858,10 +864,34 @@ class E8RHTLinear(nn.Module):
         residual buffer next to ``trellis_packed`` would silently shift ``blocks_n`` into
         ``tlut``'s slot and run the whole RHT on the wrong block decomposition.
         """
+        has_s2 = trellis_packed2 is not None and trellis_packed2.numel() > 0
+        if not x2d.is_cuda:
+            # ---- CPU fused path (glq._C_cpu): 3INST only; fp32 activations end to end
+            # (a deliberate divergence from the GPU path's fp16 — accuracy only gains).
+            # blocks_*_meta arrive as the CPU int32 metas from the caller.
+            if tlut is not None and tlut.numel() > 0:
+                raise NotImplementedError(
+                    "the fused CPU trellis path is 3INST-only — HYB layers take the dense "
+                    "pure-torch fallback (gate with _trellis_cpu_op_usable, not directly).")
+            from . import inference_kernel_cpu as _ikc
+            ext = _ikc.require_cpu_ext()
+            xf = x2d.float().contiguous()
+            if has_s2:
+                y = ext.glq_fused_linear_trellis_3inst_rvq2_cpu(
+                    xf, SV, SU, trellis_packed, trellis_packed2,
+                    blocks_n_meta, blocks_m_meta, float(wscale), float(inv_resid_scale2),
+                    in_features, out_features, n_pad, m_pad).to(out_dtype)
+            else:
+                y = ext.glq_fused_linear_trellis_3inst_cpu(
+                    xf, SV, SU, trellis_packed, blocks_n_meta, blocks_m_meta,
+                    float(wscale), in_features, out_features, n_pad, m_pad).to(out_dtype)
+            if bias is not None:
+                y = y + bias.unsqueeze(0).to(out_dtype)
+            return y
+
         from . import inference_kernel as _ik
         _ik._try_load_cuda_ext()
         _has_glq_ops = hasattr(torch.ops, "glq")
-        has_s2 = trellis_packed2 is not None and trellis_packed2.numel() > 0
         if tlut is not None and tlut.numel() > 0:                    # HYB
             # This staticmethod is the single choke point shared by HF and vLLM, whose gating
             # lives in different files; one hard refusal here beats two gates that can drift.
@@ -945,6 +975,30 @@ class E8RHTLinear(nn.Module):
         self._trellis_op = ok
         return ok
 
+    def _trellis_cpu_op_usable(self, x2d):
+        """Can this layer take the fused CPU path? (cached in its OWN slot — a CPU forward
+        must never latch the CUDA resolver, and vice versa.)
+
+        Requires: CPU input, the switch on, kernel storage layout, 3INST (the CPU extension
+        has no tlut/HYB path — HYB keeps the dense fallback), the extension building, a
+        supported shape, and for stacked RVQ the rvq2 entry. Anything else falls back to
+        the dense pure-torch decode, same contract as the CUDA resolver.
+        """
+        if self._trellis_op_cpu is not None:
+            return bool(self._trellis_op_cpu)
+        ok = False
+        if (not x2d.is_cuda) and _GLQ_FUSED_TRELLIS_CPU_ENABLED and self._trellis_has_kernel \
+                and self.tlut.numel() == 0:
+            from . import inference_kernel_cpu as _ikc
+            entry = ("glq_fused_linear_trellis_3inst_rvq2_cpu"
+                     if getattr(self, '_trellis_has_stage2', False)
+                     else "glq_fused_linear_trellis_3inst_cpu")
+            if (_ikc._try_load_cpu_ext() and hasattr(_ikc._glq_cpu, entry)
+                    and _ikc._glq_cpu.glq_trellis_cpu_kernel_supported(self.m_pad, self.n_pad)):
+                ok = True
+        self._trellis_op_cpu = ok
+        return ok
+
     def _forward_trellis(self, x: torch.Tensor) -> torch.Tensor:
         """QTIP-trellis forward.
 
@@ -969,7 +1023,11 @@ class E8RHTLinear(nn.Module):
             self._wscale_float = self.Wscale.item()
             self._inv_rs2_float = self.inv_resid_scale2.item() if has_s2 else 0.0
 
-        if self._trellis_op_usable(x2d):
+        # The is_cuda guard is load-bearing twice over: it keeps a CPU token from latching
+        # the CUDA resolver's single-slot cache to False (poisoning a later .to("cuda")),
+        # and from firing the stacked-RVQ "no fused CUDA entry" warning on inputs the CPU
+        # path is about to serve.
+        if x2d.is_cuda and self._trellis_op_usable(x2d):
             if self._blocks_n_meta_gpu is None or self._blocks_n_meta_gpu.device != x.device:
                 self._blocks_n_meta_gpu = self._blocks_n_meta_cpu.to(x.device, non_blocking=True)
                 self._blocks_m_meta_gpu = self._blocks_m_meta_cpu.to(x.device, non_blocking=True)
@@ -977,6 +1035,17 @@ class E8RHTLinear(nn.Module):
                 x2d, self.SV, self.SU, self.trellis_packed, self.tlut,
                 self._blocks_n_tensor, self._blocks_m_tensor,
                 self._blocks_n_meta_gpu, self._blocks_m_meta_gpu,
+                self._wscale_float, self.in_features, self.out_features,
+                self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype,
+                trellis_packed2=self.trellis_packed2,
+                inv_resid_scale2=self._inv_rs2_float)
+            return y.reshape(*shape[:-1], self.out_features)
+
+        if (not x2d.is_cuda) and self._trellis_cpu_op_usable(x2d):
+            y = E8RHTLinear._trellis_linear_apply(
+                x2d, self.SV, self.SU, self.trellis_packed, self.tlut,
+                self._blocks_n_tensor, self._blocks_m_tensor,
+                self._blocks_n_meta_cpu, self._blocks_m_meta_cpu,
                 self._wscale_float, self.in_features, self.out_features,
                 self.n_pad, self.m_pad, bias=self.bias, out_dtype=x.dtype,
                 trellis_packed2=self.trellis_packed2,

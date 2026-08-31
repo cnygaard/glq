@@ -669,7 +669,9 @@ def _glq_apply_trellis(x, layer):
 
     if getattr(layer, 'glq_is_fused', False):
         s4b = getattr(layer, '_glq_s4b', None)
-        if s4b is not None and _GLQ_BATCH_OUT_RHT:
+        # S4b's shards-RHT op is CUDA-only; on CPU fall through to the per-shard loop,
+        # which funnels into _trellis_linear_apply's CPU branch.
+        if s4b is not None and _GLQ_BATCH_OUT_RHT and x.is_cuda:
             _has_ops = hasattr(torch.ops, "glq")
             if _has_ops and hasattr(torch.ops.glq, "fused_linear_trellis_3inst_yrht"):
                 _yrht = torch.ops.glq.fused_linear_trellis_3inst_yrht
@@ -1513,6 +1515,11 @@ class GLQLinearMethod(LinearMethodBase):
         device = x.device
         cb, cb2 = _codebook, _codebook2_small
 
+        if not x.is_cuda and not getattr(layer, 'glq_is_trellis', False):
+            raise NotImplementedError(
+                "GLQ on the CPU platform serves trellis-3INST checkpoints only — the "
+                "e8p/shell decode kernels are CUDA-only. Re-quantize with "
+                "--codebook trellis (the default since 0.8.8) for CPU serving.")
         if getattr(layer, 'glq_is_trellis', False):
             y = _glq_apply_trellis(x, layer)
             out_features = (sum(layer.glq_shard_sizes)

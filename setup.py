@@ -111,6 +111,40 @@ if MODE != "0":
         # `use_ninja` inherits MAX_JOBS, which CI sets to the runner's core count.
         cmdclass = {"build_ext": BuildExtension.with_options(use_ninja=True)}
 
+# ---- CPU fused-decode extension (glq._C_cpu) — plain C++, no nvcc anywhere ----------
+#: "auto" (default): build when a torch C++ toolchain exists. "1": require. "0": never.
+#: Independent of GLQ_BUILD_EXT: a no-GPU machine gets no CUDA extension but SHOULD get
+#: this one — it is what gives no-CUDA installs a fused decode path at all.
+CPU_MODE = os.environ.get("GLQ_BUILD_CPU_EXT", "auto")
+CPU_SOURCES = [f"glq/csrc/cpu/{name}" for name in
+               ("glq_trellis_cpu_scalar.cpp", "glq_trellis_cpu_avx2.cpp",
+                "glq_trellis_cpu_avx512.cpp", "glq_trellis_cpu_fp16.cpp", "glq_fht_cpu.cpp",
+                "glq_cpu_dispatch.cpp", "glq_bindings_cpu.cpp")]
+
+if CPU_MODE != "0":
+    try:
+        from torch.utils.cpp_extension import BuildExtension as _BE
+        from torch.utils.cpp_extension import CppExtension as _CE
+        ext_modules.append(_CE(
+            name="glq._C_cpu",
+            sources=CPU_SOURCES,
+            # Matches inference_kernel_cpu.py's JIT flags exactly. Per-ISA code uses
+            # in-source `#pragma GCC target` (never global -m flags), so this list stays
+            # baseline-safe for every x86-64 machine the manylinux wheel reaches.
+            extra_compile_args={"cxx": ["-O3", "-std=c++17", "-fopenmp"]},
+            extra_link_args=["-fopenmp"],
+        ))
+        # The CUDA branch above sets cmdclass only when nvcc exists; the CPU extension
+        # needs BuildExtension regardless.
+        if not cmdclass:
+            cmdclass = {"build_ext": _BE.with_options(use_ninja=True)}
+    except Exception as exc:                                          # noqa: BLE001
+        if CPU_MODE == "1":
+            raise SystemExit(f"GLQ_BUILD_CPU_EXT=1 but the CPU extension cannot be set up: "
+                             f"{type(exc).__name__}: {exc}")
+        print(f"glq: building without the CPU extension ({type(exc).__name__}: {exc}); "
+              f"it will JIT-compile on first use", file=sys.stderr)
+
 # Everything else — name, version, deps, entry points, package data — stays in
-# pyproject.toml. This file exists only to add the extension.
+# pyproject.toml. This file exists only to add the extensions.
 setup(ext_modules=ext_modules, cmdclass=cmdclass)

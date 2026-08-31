@@ -36,6 +36,24 @@ FUSED_MOE_TRELLIS_3INST_SCHEMA = (
     "int activation_type) -> Tensor")
 
 
+def _register_embedding_dequant(dispatch_key):
+    """GLQ per-row embedding lookup (gather + dequant + inverse RHT) for the Gemma-4
+    GLQ-quantized PLE embedding. The shared helper's raw ``fast_hadamard_transform`` is
+    a kernel dynamo can't trace, which was the last path breaking vLLM's torch.compile;
+    wrap it as one opaque op so the embedding lookup compiles + cudagraph-captures.
+    Real impl is the same ``_dequant_embedding_rows`` the HF path uses (pure torch, so
+    it registers unchanged under the CPU dispatch key), out_dtype carried as ScalarType.
+    """
+    from glq.quantized_linear import _dequant_embedding_rows
+    _glq_lib.define(
+        "embedding_dequant(Tensor input_ids, Tensor qidxs, Tensor sv, "
+        "Tensor wscale, Tensor codebook, Tensor? qidxs2, "
+        "Tensor? inv_resid_scale, Tensor? codebook2, int n_pad, "
+        "int embedding_dim, float embed_scale, ScalarType? out_dtype) -> Tensor")
+    _glq_lib.impl("embedding_dequant", _dequant_embedding_rows, dispatch_key)
+    _glq_lib._register_fake("embedding_dequant", _embedding_dequant_fake)
+
+
 def _ensure_registered():
     """Register GLQ CUDA C kernels as torch custom ops. Idempotent."""
     global _registered
@@ -47,6 +65,19 @@ def _ensure_registered():
     from glq import inference_kernel as _ik
 
     if not _try_load_cuda_ext() or _ik._glq_cuda is None:
+        # No CUDA extension — a CPU-platform install, or a failed build. The linear path
+        # needs no torch.ops here (E8RHTLinear._trellis_linear_apply's CPU branch runs
+        # before any op lookup), but gemma-4 PLE embeddings call
+        # torch.ops.glq.embedding_dequant, whose real impl is pure torch — register that
+        # one op so PLE models serve on the CPU platform. The vllm import stays inside
+        # this branch and guarded: schema unit tests call this with neither a built
+        # extension nor an installed vllm, and must keep working.
+        try:
+            from vllm.platforms import current_platform
+            if current_platform.dispatch_key == "CPU":
+                _register_embedding_dequant(current_platform.dispatch_key)
+        except ImportError:
+            pass
         return
 
     from vllm.platforms import current_platform
@@ -291,21 +322,8 @@ def _ensure_registered():
         _glq_lib._register_fake("fused_moe_trellis_3inst",
                                 _fused_moe_trellis_3inst_fake)
 
-    # -- 11. embedding_dequant: GLQ per-row embedding lookup (gather + dequant +
-    #         inverse RHT) for the Gemma-4 GLQ-quantized PLE embedding. The shared
-    #         helper's raw ``fast_hadamard_transform`` is a kernel dynamo can't
-    #         trace, which was the last path breaking vLLM's torch.compile; wrap
-    #         it as one opaque op so the embedding lookup compiles + cudagraph-
-    #         captures. Real impl is the same ``_dequant_embedding_rows`` the HF
-    #         path uses (out_dtype carried as ScalarType). --
-    from glq.quantized_linear import _dequant_embedding_rows
-    _glq_lib.define(
-        "embedding_dequant(Tensor input_ids, Tensor qidxs, Tensor sv, "
-        "Tensor wscale, Tensor codebook, Tensor? qidxs2, "
-        "Tensor? inv_resid_scale, Tensor? codebook2, int n_pad, "
-        "int embedding_dim, float embed_scale, ScalarType? out_dtype) -> Tensor")
-    _glq_lib.impl("embedding_dequant", _dequant_embedding_rows, dispatch_key)
-    _glq_lib._register_fake("embedding_dequant", _embedding_dequant_fake)
+    # -- 11. embedding_dequant (see _register_embedding_dequant) --
+    _register_embedding_dequant(dispatch_key)
 
     # -- 12. E8P (--codebook e8p) tensor-core decode ops. Pybind-only otherwise,
     #        so torch.dynamo can't trace the e8p forward; registering them as

@@ -51,6 +51,16 @@ def register():
     import os
     bpw_map_path = os.environ.get("GLQ_KV_BPW_MAP")
     spec = os.environ.get("GLQ_KV_QUANT")
+    if (bpw_map_path or spec):
+        try:
+            from vllm.platforms import current_platform
+            if getattr(current_platform, "device_type", "") == "cpu":
+                import warnings
+                warnings.warn("GLQ_KV_QUANT/GLQ_KV_BPW_MAP are Triton-only and have no "
+                              "effect on the CPU platform; ignoring.", RuntimeWarning)
+                bpw_map_path, spec = None, None
+        except ImportError:
+            pass
     if bpw_map_path:
         try:
             import json

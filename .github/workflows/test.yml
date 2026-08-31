@@ -31,7 +31,12 @@ jobs:
           # and is the only thing that builds the real UI. It was written after a gradio 6
           # API change crashed glq-chat on a box, and until now it skipped in CI too, so the
           # regression it exists to catch was caught by nobody.
-          pip install -e ".[hub,chat]"
+          # --no-build-isolation is what lets GLQ_BUILD_CPU_EXT=1 actually build: pip's
+          # isolated build env has no torch (it is installed two lines up, in THIS env),
+          # and the flag correctly turns that into a hard error rather than a silent
+          # skip. Non-isolated builds need the build deps present explicitly.
+          pip install setuptools wheel ninja
+          GLQ_BUILD_CPU_EXT=1 pip install -e ".[hub,chat]" --no-build-isolation
           pip install pytest
 
       - name: Run tests
