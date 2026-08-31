@@ -75,12 +75,22 @@ extern uint16_t g_lut16[65536];
 extern float    g_lut32[65536];
 void init_lut();
 
+// ---- decode micro-variant (SIMD tiers implement both; scalar is LUT-only) ---------
+enum DecodeVariant { DECODE_AUTO = 0, DECODE_ARITH = 1, DECODE_LUT = 2 };
+extern DecodeVariant g_decode_variant;
+
 // ---- tier vtable ------------------------------------------------------------------
 struct Kernels {
     // decompress packed -> W (m x k) fp16 bit patterns (row-major, stride k).
     void (*decompress)(const uint16_t* packed_u16, uint16_t* W, int64_t m, int64_t k,
                        int R);
-    // (matvec / matmul / fused-linear slots arrive in P1/P2)
+    // fused GEMV: y (m fp32) (+)= wscale * (W @ x), weights never materialized.
+    // One call handles rows [row_begin, row_end) in units of 32-row m-pair blocks so
+    // at::parallel_for can partition rows without splitting any row across threads.
+    void (*matvec)(const uint16_t* packed_u16, const float* x, float* y,
+                   int64_t m, int64_t k, int R, float wscale, bool accum,
+                   int64_t blk_begin, int64_t blk_end);
+    // (matmul / fused-linear slots arrive in P2)
 };
 
 enum Tier { TIER_SCALAR = 0, TIER_AVX2 = 1, TIER_AVX512 = 2, TIER_AVX512FP16 = 3,

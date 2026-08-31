@@ -93,6 +93,93 @@ def test_cpu_r1_refused_as_primary():
         _ext().glq_decompress_trellis_3inst_cpu(packed, m, n)         # allow_r1 defaults False
 
 
+# ---- Gate 3: decode micro-variants agree (arith SIMD vs LUT gather) ----------------------
+@pytest.mark.parametrize("variant", ["arith", "lut"])
+def test_cpu_decode_variants_agree(variant, isa):
+    ext = _ext()
+    if isa == "scalar" and variant == "arith":
+        pytest.skip("scalar tier decodes via the LUT only")
+    ext.glq_cpu_set_decode_variant(variant)
+    try:
+        m, n, K = 128, 256, 4
+        cb, packed = _make(K, m, n, seed=3)
+        ref = gt.decode_layer(cb, packed, m, n, has_kernel=True)
+        W = ext.glq_decompress_trellis_3inst_cpu(packed, m, n)
+        assert torch.equal(W.float(), ref.float()), f"variant={variant} isa={isa}"
+    finally:
+        ext.glq_cpu_set_decode_variant("auto")
+
+
+# ---- Gate 4: fused GEMV — accuracy vs fp64 reference, determinism, thread-independence ---
+@pytest.mark.parametrize("K", KS)
+def test_cpu_matvec_sqnr_vs_fp64_reference(K, isa):
+    m, n = 256, 512
+    cb, packed = _make(K, m, n, seed=11)
+    W64 = gt.decode_layer(cb, packed, m, n, has_kernel=True).double()
+    torch.manual_seed(5)
+    x = torch.randn(n) * 0.5
+    ref = (x.double() @ W64.t()).float()
+    y = _ext().glq_decode_matvec_trellis_3inst_cpu(x.contiguous(), packed, m, n, 1.0)
+    assert y.shape == (m,) and y.dtype == torch.float32
+    err = (y.double() - ref.double()).pow(2).mean()
+    sqnr = 10 * torch.log10(ref.double().pow(2).mean() / err).item()
+    assert sqnr > 90.0, f"K={K} isa={isa} SQNR {sqnr:.1f} dB"
+
+
+def test_cpu_matvec_is_deterministic_across_runs_and_threads(isa):
+    m, n, K = 256, 512, 4
+    cb, packed = _make(K, m, n, seed=12)
+    x = (torch.randn(n) * 0.5).contiguous()
+    ext = _ext()
+    prev = torch.get_num_threads()
+    try:
+        outs = []
+        for nt in (1, 2, prev):
+            torch.set_num_threads(nt)
+            outs.append(ext.glq_decode_matvec_trellis_3inst_cpu(x, packed, m, n, 1.0))
+            outs.append(ext.glq_decode_matvec_trellis_3inst_cpu(x, packed, m, n, 1.0))
+        for o in outs[1:]:
+            assert torch.equal(outs[0], o)
+    finally:
+        torch.set_num_threads(prev)
+
+
+def test_cpu_matvec_wscale_and_accum_fold(isa):
+    """wscale multiplies the stored result; accum=True adds onto the caller's buffer —
+    the RVQ stage-2 contract (y = y1 + wscale2*y2 exactly, __fadd-style single add)."""
+    m, n, K = 64, 128, 2
+    cb, packed = _make(K, m, n, seed=13)
+    x = (torch.randn(n) * 0.5).contiguous()
+    ext = _ext()
+    y1 = ext.glq_decode_matvec_trellis_3inst_cpu(x, packed, m, n, 1.0)
+    y2 = ext.glq_decode_matvec_trellis_3inst_cpu(x, packed, m, n, 0.5)
+    assert torch.equal(y2, y1 * 0.5)
+    acc = y1.clone()
+    ext.glq_decode_matvec_trellis_3inst_cpu(x, packed, m, n, 0.5, acc, True)
+    assert torch.equal(acc, y1 + y2)
+
+
+# ---- Gate 7: in-op block-diagonal FHT bit-exact vs the torch reference -------------------
+@pytest.mark.parametrize("blocks", [[2048], [1024, 512, 256], [64, 64]])
+def test_cpu_fht_blockdiag_bitexact_vs_pytorch_fht(blocks):
+    from glq.hadamard import _pytorch_fht
+    n = sum(blocks)
+    torch.manual_seed(17)
+    x = torch.randn(3, n).float()
+    ref = x.clone()
+    off = 0
+    for bs in blocks:
+        ref[..., off:off + bs] = _pytorch_fht(ref[..., off:off + bs].contiguous())
+        off += bs
+    meta = torch.tensor(
+        [[sum(blocks[:i]), bs, bs.bit_length() - 1, 0] for i, bs in enumerate(blocks)],
+        dtype=torch.int32)
+    x0 = x.clone()
+    out = _ext().glq_blockdiag_fht_cpu(x.contiguous(), meta)
+    assert torch.equal(out, ref)
+    assert torch.equal(x, x0)   # unlike block_diagonal_fht, the op must NOT mutate its input
+
+
 # ---- Gate 9 (loader/dispatch diagnostics) ------------------------------------------------
 def test_cpu_unknown_isa_tier_raises():
     ext = _ext()

@@ -36,9 +36,12 @@ void init_lut() {
 }
 
 const Kernels* scalar_kernels();   // defined in the scalar TU (always compiled)
+const Kernels* avx2_kernels();     // avx2 TU (returns null on non-x86 builds)
 
 const Kernels* g_tier_tables[TIER_COUNT] = { nullptr, nullptr, nullptr, nullptr };
 const char* const g_tier_names[TIER_COUNT] = { "scalar", "avx2", "avx512", "avx512fp16" };
+
+DecodeVariant g_decode_variant = DECODE_AUTO;
 
 namespace {
 std::atomic<int> g_active{-1};   // -1 = unresolved
@@ -48,7 +51,8 @@ void ensure_tables() {
     std::call_once(once, [] {
         init_lut();
         g_tier_tables[TIER_SCALAR] = scalar_kernels();
-        // avx2/avx512/avx512fp16 slots are filled by their TUs' registrars in P1/P4.
+        g_tier_tables[TIER_AVX2] = avx2_kernels();
+        // avx512 / avx512fp16 slots are filled by their TUs in P4/P6.
     });
 }
 }  // namespace

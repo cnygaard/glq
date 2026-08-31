@@ -67,7 +67,73 @@ void decompress_scalar(const uint16_t* packed, uint16_t* W, int64_t m, int64_t k
     }
 }
 
-const Kernels kScalar = { decompress_scalar };
+/* Fused GEMV over m-pair blocks [blk_begin, blk_end). Accumulation order per output row
+ * is FIXED (w ascending, ki ascending, subki, submi, lane, then the four column terms
+ * c0, c0+1, c0+8, c0+9) and rows are never split across calls — deterministic and
+ * thread-count independent by construction. */
+template <int R>
+void matvec_impl(const uint16_t* packed, const float* x, float* y, int64_t m, int64_t k,
+                 float wscale, bool accum, int64_t blk_begin, int64_t blk_end) {
+    const Geom g = Geom::make(m, k, R);
+    for (int64_t p = blk_begin; p < blk_end; ++p) {
+        float acc[32] = {};                                 // rows 32p .. 32p+31
+        for (int w = 0; w < 32; ++w) {
+            const int64_t this_warp_k = g.k_per_block + (w < g.warp_rem ? 2 : 0);
+            const uint16_t* base = packed + p * g.weight_row_step + (int64_t)w * 2 * g.utb;
+            for (int64_t ki = 0; ki < this_warp_k; ++ki) {
+                const uint16_t* buf =
+                    base + (ki / 2) * 2 * g.weight_step + (ki % 2) * g.utb;
+                uint32_t chunks[4][32];
+                for (int l = 0; l < 32; ++l) {
+                    uint32_t c[4];
+                    lane_chunks<R>(buf, l, c);
+                    chunks[0][l] = c[0]; chunks[1][l] = c[1];
+                    chunks[2][l] = c[2]; chunks[3][l] = c[3];
+                }
+                for (int subki = 0; subki < 2; ++subki) {
+                    const int64_t k_tile =
+                        4 * (int64_t)w + 2 * (ki % 2) + subki + (4 * 32) * (ki / 2);
+                    const float* xc = x + k_tile * 16;
+                    for (int submi = 0; submi < 2; ++submi) {
+                        const uint32_t* ch = chunks[kSlot[submi][subki]];
+                        float* arow = acc + submi * 16;     // rows of m_tile 2p+submi
+                        for (int l = 0; l < 32; ++l) {
+                            uint16_t s[8];
+                            lane_states<R>(ch[l], lane_cont<R>(ch, l), s);
+                            const int gi = l >> 2;
+                            const int c0 = 2 * (l & 3);
+                            arow[gi] += g_lut32[s[0]] * xc[c0]
+                                      + g_lut32[s[1]] * xc[c0 + 1]
+                                      + g_lut32[s[4]] * xc[c0 + 8]
+                                      + g_lut32[s[5]] * xc[c0 + 9];
+                            arow[gi + 8] += g_lut32[s[2]] * xc[c0]
+                                          + g_lut32[s[3]] * xc[c0 + 1]
+                                          + g_lut32[s[6]] * xc[c0 + 8]
+                                          + g_lut32[s[7]] * xc[c0 + 9];
+                        }
+                    }
+                }
+            }
+        }
+        float* yp = y + p * 32;
+        for (int r = 0; r < 32; ++r) {
+            const float v = acc[r] * wscale;
+            yp[r] = accum ? yp[r] + v : v;
+        }
+    }
+}
+
+void matvec_scalar(const uint16_t* packed, const float* x, float* y, int64_t m, int64_t k,
+                   int R, float wscale, bool accum, int64_t blk_begin, int64_t blk_end) {
+    switch (R) {
+        case 1: matvec_impl<1>(packed, x, y, m, k, wscale, accum, blk_begin, blk_end); break;
+        case 2: matvec_impl<2>(packed, x, y, m, k, wscale, accum, blk_begin, blk_end); break;
+        case 3: matvec_impl<3>(packed, x, y, m, k, wscale, accum, blk_begin, blk_end); break;
+        default: matvec_impl<4>(packed, x, y, m, k, wscale, accum, blk_begin, blk_end); break;
+    }
+}
+
+const Kernels kScalar = { decompress_scalar, matvec_scalar };
 
 }  // namespace
 
