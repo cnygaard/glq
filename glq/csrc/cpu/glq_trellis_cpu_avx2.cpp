@@ -224,7 +224,107 @@ void matvec_avx2(const uint16_t* packed, const float* x, float* y, int64_t m, in
     }
 }
 
-const Kernels kAvx2 = { decompress_avx2, matvec_avx2 };
+/* Batched GEMM: decode each fragment vector ONCE, FMA it into every token's lane-parallel
+ * accumulators. Per (b, lane) the FMA order (j = 0,1,4,5 into g; 2,3,6,7 into g+8, per
+ * (w, ki, subki, submi)) and the quad-tree epilogue are IDENTICAL to matvec_impl — row b
+ * of the GEMM is bit-identical to the GEMV on x[b]. accbuf is L1-resident (<=4 KB). */
+template <int R>
+void matmul_impl(const uint16_t* packed, const float* x, float* y, int64_t B, int64_t m,
+                 int64_t k, float wscale, bool accum, int64_t blk_begin, int64_t blk_end) {
+    const Geom g = Geom::make(m, k, R);
+    const bool arith = use_arith();
+    const __m256i pidx0 = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    const __m256i pidx1 = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+    alignas(32) uint32_t states[4][8][32];
+    alignas(32) float accbuf[8][2][2][4][8];
+
+    for (int64_t p = blk_begin; p < blk_end; ++p) {
+        for (int64_t b = 0; b < B; ++b)
+            for (int s0 = 0; s0 < 2; ++s0)
+                for (int h = 0; h < 2; ++h)
+                    for (int q = 0; q < 4; ++q)
+                        _mm256_store_ps(accbuf[b][s0][h][q], _mm256_setzero_ps());
+        for (int w = 0; w < 32; ++w) {
+            const int64_t this_warp_k = g.k_per_block + (w < g.warp_rem ? 2 : 0);
+            const uint16_t* base = packed + p * g.weight_row_step + (int64_t)w * 2 * g.utb;
+            for (int64_t ki = 0; ki < this_warp_k; ++ki) {
+                const uint16_t* buf = base + (ki / 2) * 2 * g.weight_step + (ki % 2) * g.utb;
+                unpack_group<R>(buf, states);
+                for (int subki = 0; subki < 2; ++subki) {
+                    const int64_t k_tile =
+                        4 * (int64_t)w + 2 * (ki % 2) + subki + (4 * 32) * (ki / 2);
+                    for (int submi = 0; submi < 2; ++submi) {
+                        const auto& st = states[kSlotA[submi][subki]];
+                        for (int q = 0; q < 4; ++q) {
+                            const auto ld = [&](int j) {
+                                return _mm256_load_si256((const __m256i*)(st[j] + 8 * q));
+                            };
+                            const __m256 w0 = decode8(ld(0), arith);
+                            const __m256 w1 = decode8(ld(1), arith);
+                            const __m256 w2 = decode8(ld(2), arith);
+                            const __m256 w3 = decode8(ld(3), arith);
+                            const __m256 w4 = decode8(ld(4), arith);
+                            const __m256 w5 = decode8(ld(5), arith);
+                            const __m256 w6 = decode8(ld(6), arith);
+                            const __m256 w7 = decode8(ld(7), arith);
+                            for (int64_t b = 0; b < B; ++b) {
+                                const float* xc = x + b * k + k_tile * 16;
+                                const __m256 xlo = _mm256_loadu_ps(xc);
+                                const __m256 xhi = _mm256_loadu_ps(xc + 8);
+                                const __m256 xp0 = _mm256_permutevar8x32_ps(xlo, pidx0);
+                                const __m256 xp1 = _mm256_permutevar8x32_ps(xlo, pidx1);
+                                const __m256 xp2 = _mm256_permutevar8x32_ps(xhi, pidx0);
+                                const __m256 xp3 = _mm256_permutevar8x32_ps(xhi, pidx1);
+                                __m256 ag = _mm256_load_ps(accbuf[b][submi][0][q]);
+                                __m256 a8 = _mm256_load_ps(accbuf[b][submi][1][q]);
+                                ag = _mm256_fmadd_ps(w0, xp0, ag);
+                                ag = _mm256_fmadd_ps(w1, xp1, ag);
+                                ag = _mm256_fmadd_ps(w4, xp2, ag);
+                                ag = _mm256_fmadd_ps(w5, xp3, ag);
+                                a8 = _mm256_fmadd_ps(w2, xp0, a8);
+                                a8 = _mm256_fmadd_ps(w3, xp1, a8);
+                                a8 = _mm256_fmadd_ps(w6, xp2, a8);
+                                a8 = _mm256_fmadd_ps(w7, xp3, a8);
+                                _mm256_store_ps(accbuf[b][submi][0][q], ag);
+                                _mm256_store_ps(accbuf[b][submi][1][q], a8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (int64_t b = 0; b < B; ++b) {
+            float* yp = y + b * m + p * 32;
+            for (int submi = 0; submi < 2; ++submi) {
+                for (int half = 0; half < 2; ++half) {
+                    for (int q = 0; q < 4; ++q) {
+                        const float* a = accbuf[b][submi][half][q];
+                        const float r_even = (a[0] + a[1]) + (a[2] + a[3]);
+                        const float r_odd  = (a[4] + a[5]) + (a[6] + a[7]);
+                        const int64_t row = submi * 16 + half * 8 + 2 * q;
+                        const float ve = r_even * wscale;
+                        const float vo = r_odd * wscale;
+                        yp[row]     = accum ? yp[row] + ve : ve;
+                        yp[row + 1] = accum ? yp[row + 1] + vo : vo;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void matmul_avx2(const uint16_t* packed, const float* x, float* y, int64_t B, int64_t m,
+                 int64_t k, int R, float wscale, bool accum,
+                 int64_t blk_begin, int64_t blk_end) {
+    switch (R) {
+        case 1: matmul_impl<1>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+        case 2: matmul_impl<2>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+        case 3: matmul_impl<3>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+        default: matmul_impl<4>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+    }
+}
+
+const Kernels kAvx2 = { decompress_avx2, matvec_avx2, matmul_avx2 };
 
 }  // namespace
 

@@ -133,7 +133,78 @@ void matvec_scalar(const uint16_t* packed, const float* x, float* y, int64_t m, 
     }
 }
 
-const Kernels kScalar = { decompress_scalar, matvec_scalar };
+/* Batched GEMM, decode amortized over B. The per-(b, row) accumulation chain — the same
+ * (w, ki, subki, submi, lane, 4-term) order as matvec_impl — is what makes row b
+ * bit-identical to the GEMV on x[b]; the b loop's position cannot perturb any chain. */
+template <int R>
+void matmul_impl(const uint16_t* packed, const float* x, float* y, int64_t B, int64_t m,
+                 int64_t k, float wscale, bool accum, int64_t blk_begin, int64_t blk_end) {
+    const Geom g = Geom::make(m, k, R);
+    float acc[8][32];
+    for (int64_t p = blk_begin; p < blk_end; ++p) {
+        for (int64_t b = 0; b < B; ++b)
+            for (int r = 0; r < 32; ++r) acc[b][r] = 0.0f;
+        for (int w = 0; w < 32; ++w) {
+            const int64_t this_warp_k = g.k_per_block + (w < g.warp_rem ? 2 : 0);
+            const uint16_t* base = packed + p * g.weight_row_step + (int64_t)w * 2 * g.utb;
+            for (int64_t ki = 0; ki < this_warp_k; ++ki) {
+                const uint16_t* buf =
+                    base + (ki / 2) * 2 * g.weight_step + (ki % 2) * g.utb;
+                uint32_t chunks[4][32];
+                for (int l = 0; l < 32; ++l) {
+                    uint32_t c[4];
+                    lane_chunks<R>(buf, l, c);
+                    chunks[0][l] = c[0]; chunks[1][l] = c[1];
+                    chunks[2][l] = c[2]; chunks[3][l] = c[3];
+                }
+                for (int subki = 0; subki < 2; ++subki) {
+                    const int64_t k_tile =
+                        4 * (int64_t)w + 2 * (ki % 2) + subki + (4 * 32) * (ki / 2);
+                    for (int submi = 0; submi < 2; ++submi) {
+                        const uint32_t* ch = chunks[kSlot[submi][subki]];
+                        for (int l = 0; l < 32; ++l) {
+                            uint16_t s[8];
+                            lane_states<R>(ch[l], lane_cont<R>(ch, l), s);
+                            const int gi = submi * 16 + (l >> 2);
+                            const float w0 = g_lut32[s[0]], w1 = g_lut32[s[1]];
+                            const float w2 = g_lut32[s[2]], w3 = g_lut32[s[3]];
+                            const float w4 = g_lut32[s[4]], w5 = g_lut32[s[5]];
+                            const float w6 = g_lut32[s[6]], w7 = g_lut32[s[7]];
+                            const int64_t co = k_tile * 16 + 2 * (l & 3);
+                            for (int64_t b = 0; b < B; ++b) {
+                                const float* xc = x + b * k + co;
+                                acc[b][gi] += w0 * xc[0] + w1 * xc[1]
+                                            + w4 * xc[8] + w5 * xc[9];
+                                acc[b][gi + 8] += w2 * xc[0] + w3 * xc[1]
+                                               + w6 * xc[8] + w7 * xc[9];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (int64_t b = 0; b < B; ++b) {
+            float* yp = y + b * m + p * 32;
+            for (int r = 0; r < 32; ++r) {
+                const float v = acc[b][r] * wscale;
+                yp[r] = accum ? yp[r] + v : v;
+            }
+        }
+    }
+}
+
+void matmul_scalar(const uint16_t* packed, const float* x, float* y, int64_t B, int64_t m,
+                   int64_t k, int R, float wscale, bool accum,
+                   int64_t blk_begin, int64_t blk_end) {
+    switch (R) {
+        case 1: matmul_impl<1>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+        case 2: matmul_impl<2>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+        case 3: matmul_impl<3>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+        default: matmul_impl<4>(packed, x, y, B, m, k, wscale, accum, blk_begin, blk_end); break;
+    }
+}
+
+const Kernels kScalar = { decompress_scalar, matvec_scalar, matmul_scalar };
 
 }  // namespace
 

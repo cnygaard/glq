@@ -90,7 +90,12 @@ struct Kernels {
     void (*matvec)(const uint16_t* packed_u16, const float* x, float* y,
                    int64_t m, int64_t k, int R, float wscale, bool accum,
                    int64_t blk_begin, int64_t blk_end);
-    // (matmul / fused-linear slots arrive in P2)
+    // fused small-batch GEMM: y (B x m, row-major) (+)= wscale * (x @ W.T); decode runs
+    // once per fragment and is amortized over the B tokens. Row b's accumulation chain
+    // is IDENTICAL to matvec on x[b] — bit-exact row parity is the contract.
+    void (*matmul)(const uint16_t* packed_u16, const float* x, float* y, int64_t B,
+                   int64_t m, int64_t k, int R, float wscale, bool accum,
+                   int64_t blk_begin, int64_t blk_end);
 };
 
 enum Tier { TIER_SCALAR = 0, TIER_AVX2 = 1, TIER_AVX512 = 2, TIER_AVX512FP16 = 3,
