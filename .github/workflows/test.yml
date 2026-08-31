@@ -31,7 +31,7 @@ jobs:
           # and is the only thing that builds the real UI. It was written after a gradio 6
           # API change crashed glq-chat on a box, and until now it skipped in CI too, so the
           # regression it exists to catch was caught by nobody.
-          pip install -e ".[hub,chat]"
+          GLQ_BUILD_CPU_EXT=1 pip install -e ".[hub,chat]"
           pip install pytest
 
       - name: Run tests
