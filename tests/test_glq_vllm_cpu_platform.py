@@ -47,7 +47,7 @@ def test_embedding_dequant_cpu_matches_the_pure_torch_impl():
     vocab, n_pad, dim = 32, 64, 64
     qidxs = torch.randint(0, 255, (vocab, n_pad // 8), dtype=torch.uint8)
     sv = torch.where(torch.rand(n_pad) < 0.5, -1.0, 1.0).half()
-    wscale = torch.tensor(0.5)
+    wscale = torch.full((vocab,), 0.5)
     codebook = torch.randn(256, 8).half()
     ids = torch.tensor([3, 7, 1])
 
@@ -69,7 +69,7 @@ def test_moe_quant_method_refuses_on_cpu():
         except ImportError:
             pytest.skip("no MoE layer class in this vllm")
 
-    cfg = GLQvLLMConfig(bpw=4, codebook="trellis", variant="3inst")
+    cfg = GLQvLLMConfig(bpw=4, codebook="trellis", variant="3inst", trellis_layout="kernel")
     layer = _MoELayer.__new__(_MoELayer)          # isinstance without __init__ plumbing
     with pytest.raises(NotImplementedError, match="not servable on the CPU platform"):
         GLQvLLMConfig.get_quant_method(cfg, layer, prefix="model.layers.0.mlp.experts")
@@ -77,5 +77,5 @@ def test_moe_quant_method_refuses_on_cpu():
 
 def test_fp32_is_a_supported_act_dtype():
     from glq_vllm.config import GLQvLLMConfig
-    cfg = GLQvLLMConfig(bpw=4, codebook="trellis", variant="3inst")
+    cfg = GLQvLLMConfig(bpw=4, codebook="trellis", variant="3inst", trellis_layout="kernel")
     assert torch.float32 in cfg.get_supported_act_dtypes()
