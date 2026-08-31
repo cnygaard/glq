@@ -28,25 +28,6 @@
 namespace glq_cpu {
 namespace {
 
-constexpr int kSlotA[2][2] = {{0, 2}, {1, 3}};   // (submi, subki) -> window slot
-
-// Unpack one window-group into states[slot][j][lane] (u32 storage for vector loads).
-template <int R>
-inline void unpack_group(const uint16_t* buf, uint32_t states[4][8][32]) {
-    uint32_t chunks[4][32];
-    for (int l = 0; l < 32; ++l) {
-        uint32_t c[4];
-        lane_chunks<R>(buf, l, c);
-        chunks[0][l] = c[0]; chunks[1][l] = c[1]; chunks[2][l] = c[2]; chunks[3][l] = c[3];
-    }
-    for (int slot = 0; slot < 4; ++slot) {
-        for (int l = 0; l < 32; ++l) {
-            uint16_t s[8];
-            lane_states<R>(chunks[slot][l], lane_cont<R>(chunks[slot], l), s);
-            for (int j = 0; j < 8; ++j) states[slot][j][l] = s[j];
-        }
-    }
-}
 
 // ---- decode: 8 states (u32 ymm) -> 8 oracle-exact fp32 weights ----------------------
 inline __m256 decode8_lut(__m256i idx) {
@@ -94,12 +75,12 @@ void decompress_impl(const uint16_t* packed, uint16_t* W, int64_t m, int64_t k) 
             const uint16_t* base = packed + p * g.weight_row_step + (int64_t)w * 2 * g.utb;
             for (int64_t ki = 0; ki < this_warp_k; ++ki) {
                 const uint16_t* buf = base + (ki / 2) * 2 * g.weight_step + (ki % 2) * g.utb;
-                unpack_group<R>(buf, states);
+                unpack_group_states<R>(buf, states);
                 for (int subki = 0; subki < 2; ++subki) {
                     const int64_t k_tile =
                         4 * (int64_t)w + 2 * (ki % 2) + subki + (4 * 32) * (ki / 2);
                     for (int submi = 0; submi < 2; ++submi) {
-                        const auto& st = states[kSlotA[submi][subki]];
+                        const auto& st = states[kSlotMap[submi][subki]];
                         for (int j = 0; j < 8; ++j)
                             for (int q = 0; q < 4; ++q)
                                 _mm256_store_ps(
@@ -160,7 +141,7 @@ void matvec_impl(const uint16_t* packed, const float* x, float* y, int64_t m, in
             const uint16_t* base = packed + p * g.weight_row_step + (int64_t)w * 2 * g.utb;
             for (int64_t ki = 0; ki < this_warp_k; ++ki) {
                 const uint16_t* buf = base + (ki / 2) * 2 * g.weight_step + (ki % 2) * g.utb;
-                unpack_group<R>(buf, states);
+                unpack_group_states<R>(buf, states);
                 for (int subki = 0; subki < 2; ++subki) {
                     const int64_t k_tile =
                         4 * (int64_t)w + 2 * (ki % 2) + subki + (4 * 32) * (ki / 2);
@@ -172,7 +153,7 @@ void matvec_impl(const uint16_t* packed, const float* x, float* y, int64_t m, in
                     const __m256 xp2 = _mm256_permutevar8x32_ps(xhi, pidx0);
                     const __m256 xp3 = _mm256_permutevar8x32_ps(xhi, pidx1);
                     for (int submi = 0; submi < 2; ++submi) {
-                        const auto& st = states[kSlotA[submi][subki]];
+                        const auto& st = states[kSlotMap[submi][subki]];
                         for (int q = 0; q < 4; ++q) {
                             const auto ld = [&](int j) {
                                 return _mm256_load_si256((const __m256i*)(st[j] + 8 * q));
@@ -249,12 +230,12 @@ void matmul_impl(const uint16_t* packed, const float* x, float* y, int64_t B, in
             const uint16_t* base = packed + p * g.weight_row_step + (int64_t)w * 2 * g.utb;
             for (int64_t ki = 0; ki < this_warp_k; ++ki) {
                 const uint16_t* buf = base + (ki / 2) * 2 * g.weight_step + (ki % 2) * g.utb;
-                unpack_group<R>(buf, states);
+                unpack_group_states<R>(buf, states);
                 for (int subki = 0; subki < 2; ++subki) {
                     const int64_t k_tile =
                         4 * (int64_t)w + 2 * (ki % 2) + subki + (4 * 32) * (ki / 2);
                     for (int submi = 0; submi < 2; ++submi) {
-                        const auto& st = states[kSlotA[submi][subki]];
+                        const auto& st = states[kSlotMap[submi][subki]];
                         for (int q = 0; q < 4; ++q) {
                             const auto ld = [&](int j) {
                                 return _mm256_load_si256((const __m256i*)(st[j] + 8 * q));

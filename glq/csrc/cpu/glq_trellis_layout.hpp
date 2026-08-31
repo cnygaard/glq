@@ -95,4 +95,26 @@ inline void lane_states(uint32_t chunk, uint32_t cont, uint16_t s[8]) {
         s[j] = (uint16_t)((ext >> (8 * R - R * j)) & 0xFFFF);
 }
 
+// (submi, subki) -> window chunk slot, mirroring _KEY = {(0,0):x,(1,0):y,(0,1):z,(1,1):w}.
+constexpr int kSlotMap[2][2] = {{0, 2}, {1, 3}};
+
+// Unpack one window-group into states[slot][j][lane] (u32 storage so SIMD tiers can load
+// vectors straight from the staging array). Shared by every tier — one copy, no drift.
+template <int R>
+inline void unpack_group_states(const uint16_t* buf, uint32_t states[4][8][32]) {
+    uint32_t chunks[4][32];
+    for (int l = 0; l < 32; ++l) {
+        uint32_t c[4];
+        lane_chunks<R>(buf, l, c);
+        chunks[0][l] = c[0]; chunks[1][l] = c[1]; chunks[2][l] = c[2]; chunks[3][l] = c[3];
+    }
+    for (int slot = 0; slot < 4; ++slot) {
+        for (int l = 0; l < 32; ++l) {
+            uint16_t s[8];
+            lane_states<R>(chunks[slot][l], lane_cont<R>(chunks[slot], l), s);
+            for (int j = 0; j < 8; ++j) states[slot][j][l] = s[j];
+        }
+    }
+}
+
 }  // namespace glq_cpu

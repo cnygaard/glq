@@ -118,7 +118,8 @@ if MODE != "0":
 CPU_MODE = os.environ.get("GLQ_BUILD_CPU_EXT", "auto")
 CPU_SOURCES = [f"glq/csrc/cpu/{name}" for name in
                ("glq_trellis_cpu_scalar.cpp", "glq_trellis_cpu_avx2.cpp",
-                "glq_fht_cpu.cpp", "glq_cpu_dispatch.cpp", "glq_bindings_cpu.cpp")]
+                "glq_trellis_cpu_avx512.cpp", "glq_fht_cpu.cpp",
+                "glq_cpu_dispatch.cpp", "glq_bindings_cpu.cpp")]
 
 if CPU_MODE != "0":
     try:
