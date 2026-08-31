@@ -55,4 +55,4 @@ include = ["glq*", "glq_vllm*"]
 
 [tool.setuptools.package-data]
 glq = ["*.pt", "csrc/*.cu", "csrc/*.cpp", "csrc/*.h", "csrc/*.cuh",
-       "csrc/cpu/*.cpp", "csrc/cpu/*.hpp", "templates/*.j2"]
+       "csrc/cpu/*.cpp", "csrc/cpu/*.hpp", "csrc/cpu/*.inl", "templates/*.j2"]

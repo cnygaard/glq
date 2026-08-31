@@ -17,7 +17,7 @@ _cpu_ext_error: str | None = None
 _tried = False
 
 _SOURCES = ("glq_trellis_cpu_scalar.cpp", "glq_trellis_cpu_avx2.cpp",
-            "glq_trellis_cpu_avx512.cpp", "glq_fht_cpu.cpp",
+            "glq_trellis_cpu_avx512.cpp", "glq_trellis_cpu_fp16.cpp", "glq_fht_cpu.cpp",
             "glq_cpu_dispatch.cpp", "glq_bindings_cpu.cpp")
 
 
