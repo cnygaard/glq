@@ -109,6 +109,17 @@ def run(ctx, config: dict):
     gpu_mem = config.get("gpu_memory_utilization")
     serve_extra = config.get("serve_extra", "")
 
+    # Fail BEFORE the measurement, not after: vLLM's sweep tool imports pandas only at
+    # the very end (writing summary.csv), so a missing dep otherwise discards a completed
+    # ~40-minute run. Fresh venvs lack it — vllm[bench] is an extra, and only the quantize
+    # extra pulls it transitively.
+    import importlib.util
+    if importlib.util.find_spec("pandas") is None:
+        raise RuntimeError(
+            "decode_sweep needs pandas in this venv (vllm's sweep tool imports it when "
+            "writing summary.csv — at the END of the run). Install it first: "
+            "pip install pandas")
+
     vllm = _resolve_vllm()
     serve_flags = f"--max-model-len {max_model_len} --port {port}"
     if ctx.quant and ctx.quant not in ("none", "bf16"):
