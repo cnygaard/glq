@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 import sys
 
 import pytest
@@ -267,8 +268,13 @@ def test_core_installs_the_build_toolchain_glq_compiles_with(tmp_path):
     They go in the *same* pip invocation as glq deliberately. torch already constrains
     `cuda-toolkit==<major.minor>`; resolving in one transaction lets pip apply the extras to
     that pin instead of us hardcoding a CUDA version that rots on every torch release.
+
+    GLQ_ASSUME_GPU=1 is the test hook for the GPU branch: the suite must assert this
+    behavior from no-GPU machines too, where install.sh now (correctly) skips the CUDA
+    toolchain entirely.
     """
-    proc = _run(["--dry-run", "--yes"], env={"GLQ_HOME": str(tmp_path / "h")})
+    proc = _run(["--dry-run", "--yes"],
+                env={"GLQ_HOME": str(tmp_path / "h"), "GLQ_ASSUME_GPU": "1"})
     assert proc.returncode == 0, proc.stderr
 
     installs = [ln for ln in proc.stdout.splitlines()
@@ -300,7 +306,10 @@ def test_the_cuda_toolchain_is_resolved_apart_from_torch(tmp_path):
     was meant to avoid; installing the extras separately, at the version already present,
     cannot move torch at all.
     """
-    proc = _run(["--dry-run", "--yes"], env={"GLQ_HOME": str(tmp_path / "h")})
+    # GLQ_ASSUME_GPU: without the GPU branch the toolchain never installs and this
+    # negative assertion would pass while checking nothing.
+    proc = _run(["--dry-run", "--yes"],
+                env={"GLQ_HOME": str(tmp_path / "h"), "GLQ_ASSUME_GPU": "1"})
     for line in proc.stdout.splitlines():
         if "cuda-toolkit" in line and "glq" in line:
             raise AssertionError(
@@ -530,3 +539,30 @@ def test_in_process_export_does_not_suppress_the_rc_append(tmp_path):
     rc = tmp_path / ".bashrc"
     assert rc.exists() and "/fake/venv/bin" in rc.read_text(), (
         "rc append was skipped; future shells stay broken")
+
+
+# ---- --cpu: the CPU-serving install path -------------------------------------------------
+
+def test_cpu_flag_is_documented_in_help():
+    proc = _run(["--help"])
+    assert "--cpu" in proc.stdout
+
+
+def test_cpu_flag_reaches_stage_two():
+    """glq-setup owns the vLLM wheel choice, so the flag must survive the hand-over —
+    the old --assume-no-gpu was consumed in stage 1 and never forwarded."""
+    src = Path(INSTALL_SH).read_text()
+    cpu_case = [ln for ln in src.splitlines() if "--cpu)" in ln]
+    assert cpu_case and "PASSTHRU" in cpu_case[0], cpu_case
+
+
+def test_assume_no_gpu_remains_accepted_as_an_alias():
+    src = Path(INSTALL_SH).read_text()
+    assert "--assume-no-gpu)" in src
+
+
+def test_no_gpu_skips_the_cuda_toolchain():
+    """pip-installing nvcc + CCCL on a CPU-only box wastes minutes and gigabytes for a
+    toolchain nothing will ever invoke — the CPU extension needs only a C++ compiler."""
+    src = Path(INSTALL_SH).read_text()
+    assert "skipping the CUDA build toolchain" in src

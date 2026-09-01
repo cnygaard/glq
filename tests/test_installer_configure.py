@@ -151,3 +151,20 @@ def test_per_command_models_are_omitted_when_not_chosen(tmp_path):
     C.write_glq_config(path, model="m", base_url="u", components=["core"], available=["m"])
     doc = json.loads(path.read_text())
     assert "code_model" not in doc and "chat_model" not in doc
+
+
+# ---- the device the installer decided on (drives wheel choice, sizing, messaging) --------
+
+def test_config_records_the_device(tmp_path):
+    path = tmp_path / "config.json"
+    C.write_glq_config(path, model="m", base_url="u", components=["core"], available=["m"],
+                       device="cpu")
+    assert json.loads(path.read_text())["device"] == "cpu"
+
+
+def test_device_is_omitted_when_not_decided(tmp_path):
+    """Old-style configs stay old-style — absence means 'pre-device install', and the
+    serving commands detect live anyway."""
+    path = tmp_path / "config.json"
+    C.write_glq_config(path, model="m", base_url="u", components=["core"], available=["m"])
+    assert "device" not in json.loads(path.read_text())

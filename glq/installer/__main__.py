@@ -67,16 +67,33 @@ from glq.tooling import (GEMMA4_TOOL_TEMPLATE,  # noqa: E402
                          GEMMA4_TOOL_TEMPLATE_URL, tool_serve_args)
 
 
-def _install_python_extras(run: Runner, venv: Path, components) -> None:
+def _install_python_extras(run: Runner, venv: Path, components, device: str = "cuda") -> None:
     pip = _venv_bin(venv, "pip")
     wanted = []
+    extra_pip_args = []
     if "vllm" in components:
-        wanted += ["vllm", GEMMA4_TRANSFORMERS]
+        if device == "cpu":
+            # vLLM's CPU backend is a GitHub-release wheel (`+cpu`), not on PyPI — a bare
+            # `vllm` spec would resolve the CUDA build. The transformers pin is
+            # model-bound (gemma-4), so it rides along unchanged.
+            import platform
+
+            from . import cpu_wheel
+            arch = cpu_wheel.wheel_arch()
+            if arch is None:
+                raise SystemExit(
+                    f"vLLM ships no CPU wheel for this architecture "
+                    f"({platform.machine()}); CPU serving needs x86_64 or aarch64.")
+            url = cpu_wheel.latest_cpu_wheel_url(arch)
+            wanted += cpu_wheel.cpu_install_args(url)[:1] + [GEMMA4_TRANSFORMERS]
+            extra_pip_args = cpu_wheel.cpu_install_args(url)[1:]
+        else:
+            wanted += ["vllm", GEMMA4_TRANSFORMERS]
     if "chat" in components:
         wanted += ["gradio", "openai"]
     if wanted:
         print(f"\n== installing: {', '.join(wanted)}")
-        run([pip, "install", "--upgrade", *wanted])
+        run([pip, "install", "--upgrade", *wanted, *extra_pip_args])
     if "quantize" in components:
         # Deliberately a separate command with NO --upgrade: `glq[quantize]` names glq
         # itself, and --upgrade would replace a --glq-source dev install with the PyPI
@@ -162,7 +179,7 @@ def _start_chat(venv) -> None:
 
 
 def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0,
-               fp8_kv: bool = False) -> str:
+               fp8_kv: bool = False, device: str = "cuda") -> str:
     """The whole user manual for someone who arrived via `curl … | bash`.
 
     They have no repo checkout and no docs open, so every command must be copy-pasteable
@@ -209,9 +226,13 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     # machine is proportionally slower. Quote the range rather than the best case; someone
     # who was promised 30 s and waits 90 reasonably concludes it has hung. Whichever command
     # they run first pays this, so the warning goes on step 1 wherever step 1 lands.
-    slow_start = (f"The first run {first_run}JIT-builds the CUDA"
-                  f"\n   extension if no prebuilt kernel matches this Python (about a minute,"
-                  f"\n   longer on fewer cores), so it is slow to start; later runs are not.")
+    if device == "cpu":
+        slow_start = (f"The first run {first_run}serves on the CPU backend —"
+                      f"\n   expect single-digit tokens per second on desktop-class machines.")
+    else:
+        slow_start = (f"The first run {first_run}JIT-builds the CUDA"
+                      f"\n   extension if no prebuilt kernel matches this Python (about a minute,"
+                      f"\n   longer on fewer cores), so it is slow to start; later runs are not.")
 
     if "chat" in components:
         # One command, one terminal. glq-chat starts vLLM itself, waits for it, opens the
@@ -227,8 +248,11 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
 
     step(("Serve it by hand instead — for a headless box, another client, or picode."
           if "chat" in components else f"Serve the model. {slow_start}"),
-         f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
-         f"--port {port}{kv_flags}{tools}")
+         (f"VLLM_CPU_KVCACHE_SPACE=8 {_venv_bin(venv, 'vllm')} serve {model} "
+          f"--quantization glq --enforce-eager --port {port}{tools}"
+          if device == "cpu" else
+          f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
+          f"--port {port}{kv_flags}{tools}"))
     if tools and is_gemma4:
         out.insert(len(out) - 1,
                    "   (the tool-choice flags are what pi needs; the chat template is "
@@ -314,6 +338,15 @@ def main(argv=None) -> int:
     p.add_argument("--verify", action="store_true",
                    help="self-check an existing install and exit (no network)")
     p.add_argument("--dry-run", action="store_true", help="print commands, change nothing")
+    p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto",
+                   help="serving device (default: auto — cuda when an NVIDIA GPU is "
+                        "detected, else cpu via the vLLM CPU backend)")
+    p.add_argument("--cpu", dest="device", action="store_const", const="cpu",
+                   help="shorthand for --device cpu: install the vLLM CPU wheel and "
+                        "serve on CPU even if a GPU is present")
+    # Back-compat: install.sh shipped --assume-no-gpu before --cpu existed. Hidden.
+    p.add_argument("--assume-no-gpu", dest="device", action="store_const", const="cpu",
+                   help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     venv = Path(args.venv)
@@ -321,20 +354,46 @@ def main(argv=None) -> int:
 
     if args.verify:
         components = tuple(c.strip() for c in (args.components or "core,vllm").split(","))
-        checks = verify.run_checks(components)
+        # A --cpu verify (or a config that records a cpu install) must not probe the
+        # CUDA rows — the probe attempts a JIT build that cannot succeed there.
+        vdev = args.device if args.device != "auto" else None
+        if vdev is None:
+            try:
+                vdev = json.loads((GLQ_HOME / "config.json").read_text()).get("device")
+            except Exception:                                     # noqa: BLE001
+                vdev = None
+        checks = verify.run_checks(components, device=vdev)
         print(verify.render(checks))
         return 0 if verify.all_ok(checks) else 1
 
     gpu, vram = hardware.gpu_name(), hardware.vram_bytes()
     print(f"GPU:  {gpu or 'none detected'}"
           + (f"  ({vram / 1024**3:.1f} GiB)" if vram else ""))
+    # Device: the flag wins; auto follows detection. This choice drives which vLLM wheel
+    # gets installed, what the model menu sizes against, and the printed serve commands —
+    # the serving commands themselves re-detect at runtime (the installed wheel wins).
+    device = args.device if args.device != "auto" else ("cuda" if vram else "cpu")
+    ram = hardware.ram_bytes() if device == "cpu" else None
+    if device == "cpu":
+        print("Serving on CPU (vLLM CPU backend) — expect single-digit tok/s."
+              + (f"  Sizing from system RAM ({ram / 1024**3:.0f} GiB)." if ram else ""))
 
     try:
         checkpoints = discovery.discover()
     except discovery.DiscoveryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    ranked = rank(checkpoints, vram)
+    if device == "cpu":
+        # RAM is the budget; only dense trellis serves on the CPU backend (MoE and
+        # e8p/shell refuse at load), so gate the recommendation accordingly. The menu
+        # still lists everything.
+        from .recommend import CPU_WEIGHT_FRACTION
+        ranked = rank(checkpoints, ram, weight_fraction=CPU_WEIGHT_FRACTION,
+                      require_trellis=True)
+        print("note: MoE and e8p/shell checkpoints do not serve on the CPU backend —"
+              " only dense trellis builds are recommended here.")
+    else:
+        ranked = rank(checkpoints, vram)
     print(f"Found {len(checkpoints)} checkpoints in the GLQ collection.")
 
     if args.list:
@@ -352,7 +411,14 @@ def main(argv=None) -> int:
             components = prompt.select_components(prompt.DEFAULT_COMPONENTS, tty=tty)
 
         kv_on = args.fp8_kv
-        if kv_on is None:
+        if device == "cpu":
+            # Unvalidated on the CPU backend; silently serving with an unvalidated flag
+            # is worse than a narrower install. Forced off, said once.
+            if kv_on:
+                print("fp8 KV cache is not validated on the CPU backend — serving at "
+                      "full precision.")
+            kv_on = False
+        elif kv_on is None:
             kv_on = prompt.confirm(
                 "\nUse vLLM's fp8 KV cache? The cache holds 8 bits per element instead of "
                 "16, so about twice the context fits in the same VRAM, at lower attention "
@@ -372,7 +438,7 @@ def main(argv=None) -> int:
     print(f"\nComponents: {', '.join(components)}")
     print(f"Model:      {chosen.repo_id}")
 
-    _install_python_extras(run, venv, components)
+    _install_python_extras(run, venv, components, device=device)
     if "picode" in components:
         _install_picode(run)
     if args.chat == "openwebui":
@@ -382,13 +448,20 @@ def main(argv=None) -> int:
     # Per-command defaults: glq-code prefers a fitting Qwen (native hermes tool calling,
     # AIME at bf16 parity), glq-chat a fitting gemma-4 (fastest MoE decode). Fit-gated by
     # the same VRAM budget as the menu; the user's generic pick is the floor.
-    picks = per_command_picks(checkpoints, vram, fallback=chosen.repo_id)
+    if device == "cpu":
+        from .recommend import CPU_WEIGHT_FRACTION
+        picks = per_command_picks(checkpoints, ram, fallback=chosen.repo_id,
+                                  weight_fraction=CPU_WEIGHT_FRACTION,
+                                  require_trellis=True)
+    else:
+        picks = per_command_picks(checkpoints, vram, fallback=chosen.repo_id)
     if not args.dry_run:
         configure.write_glq_config(
             GLQ_HOME / "config.json", model=chosen.repo_id, base_url=base_url,
             components=components, available=[c.repo_id for c in checkpoints],
             fp8_kv=bool(kv_on),
-            code_model=picks["code_model"], chat_model=picks["chat_model"])
+            code_model=picks["code_model"], chat_model=picks["chat_model"],
+            device=device)
         if "picode" in components:
             # Same limits glq-code serves with; without them pi asks for the full
             # window as output and every request 400s (see configure.pi_models_json).
@@ -418,7 +491,7 @@ def main(argv=None) -> int:
     # "GLQ is installed." over a venv whose plugin does not resolve sends the user to
     # "Unknown quantization method: glq" with no clue the installer already knew.
     if not args.dry_run:
-        checks = verify.run_checks(components)
+        checks = verify.run_checks(components, device=device)
         print(verify.render(checks))
         if not verify.all_ok(checks):
             print("\n" + "=" * 74)
@@ -429,7 +502,8 @@ def main(argv=None) -> int:
             return 1
 
     print(next_steps(venv=venv, model=chosen.repo_id, components=components,
-                     port=args.port, size_gib=chosen.size_gib, fp8_kv=bool(kv_on)))
+                     port=args.port, size_gib=chosen.size_gib, fp8_kv=bool(kv_on),
+                     device=device))
 
     # The handoff. `glq-chat` starts vLLM, opens the browser and stops the server again on
     # exit, so this turns "installed, now read four steps" into "installed, here is your

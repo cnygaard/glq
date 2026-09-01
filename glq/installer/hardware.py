@@ -50,3 +50,28 @@ def gpu_name(run=subprocess.run) -> str | None:
     that it detected the wrong card before agreeing to a multi-GiB download."""
     names = _query("name", run=run)
     return names[0] if names else None
+
+
+def _read_meminfo() -> str:
+    with open("/proc/meminfo") as fh:
+        return fh.read()
+
+
+def ram_bytes(read=_read_meminfo) -> int | None:
+    """Total system RAM, or None if it can't be determined.
+
+    The CPU-serving budget source: when there is no GPU, model recommendation sizes
+    against RAM instead of VRAM. /proc/meminfo is Linux-only by design — GLQ's serving
+    stack is Linux-only (see README system requirements) — and every failure returns
+    None, same contract as vram_bytes: no recommendation beats a wrong one.
+    """
+    try:
+        for line in read().splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1]) * 1024          # meminfo reports kB
+                return None
+    except Exception:                                    # noqa: BLE001 - any failure = unknown
+        return None
+    return None

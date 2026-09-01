@@ -97,3 +97,43 @@ def test_a_failed_template_fetch_does_not_abort_the_install():
         if any("tool_chat_template" in str(c) for c in cmd):
             raise RuntimeError("curl: (6) could not resolve host")
     M._install_picode(run)
+
+
+# ---- CPU-only machines get the vLLM +cpu wheel, not the CUDA one -------------------------
+
+def _pip_commands_cpu(components, monkeypatch):
+    """Hermetic: stub the release lookup — these tests assert argv shape, and the live
+    GitHub API is rate-limited and returns %2B-encoded URLs."""
+    from glq.installer import cpu_wheel
+    monkeypatch.setattr(cpu_wheel, "latest_cpu_wheel_url",
+                        lambda arch, fetch=None: cpu_wheel.FALLBACK_X86)
+    seen = []
+    M._install_python_extras(lambda cmd, **kw: seen.append([str(c) for c in cmd]),
+                             Path("/home/u/.glq/venv"), components, device="cpu")
+    return " ".join(" ".join(c) for c in seen)
+
+
+def test_cpu_install_uses_the_cpu_wheel_and_pytorch_cpu_index(monkeypatch):
+    flat = _pip_commands_cpu(("core", "vllm"), monkeypatch)
+    assert "+cpu" in flat and "manylinux_2_34" in flat, f"no +cpu wheel URL:\n{flat}"
+    assert "download.pytorch.org/whl/cpu" in flat
+
+
+def test_cpu_install_never_names_bare_vllm(monkeypatch):
+    """A bare `vllm` spec resolves the CUDA wheel from PyPI — the exact mistake this
+    fork exists to prevent."""
+    for cmd in _pip_commands_cpu(("core", "vllm"), monkeypatch).split(" "):
+        assert cmd != "vllm"
+
+
+def test_cpu_install_keeps_the_transformers_pin(monkeypatch):
+    """The gemma-4 pin is model-bound, not device-bound — it applies equally on CPU."""
+    flat = _pip_commands_cpu(("core", "vllm"), monkeypatch)
+    assert ">=5.13.1" in flat and "<5.15" in flat
+
+
+def test_default_device_argv_is_unchanged():
+    """The GPU path must not drift: bare `vllm` from PyPI, no wheel URL, no extra index."""
+    flat = _pip_commands(("core", "vllm"))
+    assert " vllm " in f" {flat} "
+    assert "+cpu" not in flat and "--extra-index-url" not in flat

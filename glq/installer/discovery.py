@@ -33,6 +33,10 @@ class Checkpoint:
     size_bytes: int
     #: True/False from the checkpoint's own config, None when it could not be read.
     trellis: bool | None = None
+    #: Mixture-of-experts, from the same config read (num_local_experts / num_experts /
+    #: n_routed_experts > 1). None = could not tell. The CPU backend refuses MoE, so the
+    #: CPU recommendation gate treats None as ineligible — conservative by design.
+    moe: bool | None = None
 
     @property
     def size_gib(self) -> float:
@@ -127,33 +131,50 @@ def model_max_len(repo_id: str, fetch=_fetch_json):
         return None
 
 
-def repo_is_trellis(repo_id: str, fetch=_fetch_json) -> bool | None:
-    """Whether a checkpoint uses the trellis codebook, per its own config.json.
+_MOE_KEYS = ("num_local_experts", "num_experts", "n_routed_experts")
 
-    Read from `quantization_config` rather than inferred from the repo name. Names are a
+
+def repo_traits(repo_id: str, fetch=_fetch_json) -> tuple[bool | None, bool | None]:
+    """(trellis, moe) for a checkpoint, from ONE read of its config.json.
+
+    Both read from the config rather than inferred from the repo name. Names are a
     convention that can drift; the config is what the loader actually dispatches on, and
     this repo has already been bitten once by a name heuristic standing in for a capability
-    check. The markers live in **config.json**, not quantize_config.json.
+    check. Trellis markers live in **config.json → quantization_config**; MoE-ness is any
+    expert-count key > 1 (checked on the top level and on text_config, where multimodal
+    wrappers keep the LM config).
 
-    None means "could not tell" (network failure, missing file) and is deliberately distinct
-    from False, so a blip cannot silently demote a trellis checkpoint.
+    None means "could not tell" (network failure, malformed body) and is deliberately
+    distinct from False, so a blip cannot silently demote a checkpoint.
     """
     try:
         cfg = fetch(f"https://huggingface.co/{repo_id}/resolve/main/config.json")
     except Exception:                                                 # noqa: BLE001
-        return None
+        return None, None
     # Anything but a JSON object means the Hub handed back something we don't understand
     # (an error page, an LFS pointer, a redirect body) — unknown, not "not trellis".
     if not isinstance(cfg, dict):
-        return None
+        return None, None
     q = cfg.get("quantization_config")
-    if not isinstance(q, dict):
-        return False
-    return bool(q.get("variant") or q.get("trellis_layout"))
+    trellis = (bool(q.get("variant") or q.get("trellis_layout"))
+               if isinstance(q, dict) else False)
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    moe = any(
+        isinstance(src.get(key), int) and src.get(key) > 1
+        for src in (cfg, text) for key in _MOE_KEYS)
+    return trellis, moe
+
+
+def repo_is_trellis(repo_id: str, fetch=_fetch_json) -> bool | None:
+    """Back-compat single-trait read; new callers want repo_traits (same one fetch)."""
+    return repo_traits(repo_id, fetch=fetch)[0]
 
 
 def discover(fetch=_fetch_json) -> list[Checkpoint]:
-    """Every offerable checkpoint, with its on-disk size and whether it is trellis."""
-    return [Checkpoint(rid, repo_size_bytes(rid, fetch=fetch),
-                       repo_is_trellis(rid, fetch=fetch))
-            for rid in collection_repo_ids(fetch=fetch)]
+    """Every offerable checkpoint: on-disk size, trellis-ness and MoE-ness (one config
+    fetch per repo for both traits)."""
+    out = []
+    for rid in collection_repo_ids(fetch=fetch):
+        trellis, moe = repo_traits(rid, fetch=fetch)
+        out.append(Checkpoint(rid, repo_size_bytes(rid, fetch=fetch), trellis, moe))
+    return out

@@ -92,6 +92,10 @@ def _sup(*, healthy_after=1, alive_for=0, output=(), **kw):
     clock = {"t": 0.0}
     # Never the real ~/.glq/vllm.log: these tests must not write to the user's home.
     kw.setdefault("log_path", Path(tempfile.mkdtemp()) / "vllm.log")
+    # Pin the device: these tests describe each mode explicitly, and auto-detection on
+    # the machine running the suite (no vllm metadata, no nvidia-smi) would land on cpu
+    # and flip every GPU-flag assertion.
+    kw.setdefault("device", "cuda")
     sup = VllmSupervisor(
         model="xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel",
         port=8000,
@@ -1452,3 +1456,107 @@ def test_default_model_falls_back_to_the_generic_pick():
     from glq.chat import default_model
     assert default_model({"model": "generic"}, "chat") == "generic"
     assert default_model({}, "code") is None
+
+
+# ------------------------------------------------------------------ CPU serving mode
+# The device follows the INSTALLED vLLM wheel first, the live GPU second: a `+cpu` wheel
+# cannot use a GPU however the flags read (the Xeon e2e case — GPU visible, CPU wheel
+# installed), and a CUDA wheel without a visible GPU can only sensibly get CPU flags.
+
+def test_detect_device_cpu_wheel_wins_over_a_live_gpu():
+    assert sup_mod.detect_device(vllm_version=lambda: "0.28.0+cpu",
+                                 vram=lambda: 96 * GIB) == "cpu"
+
+
+def test_detect_device_no_gpu_means_cpu():
+    assert sup_mod.detect_device(vllm_version=lambda: "0.11.0",
+                                 vram=lambda: None) == "cpu"
+
+
+def test_detect_device_cuda_wheel_plus_gpu_means_cuda():
+    assert sup_mod.detect_device(vllm_version=lambda: "0.11.0",
+                                 vram=lambda: 24 * GIB) == "cuda"
+
+
+def test_detect_device_unreadable_wheel_falls_to_the_gpu_probe():
+    def boom():
+        raise RuntimeError("vllm not installed")
+    assert sup_mod.detect_device(vllm_version=boom, vram=lambda: 24 * GIB) == "cuda"
+    assert sup_mod.detect_device(vllm_version=boom, vram=lambda: None) == "cpu"
+
+
+def test_cpu_argv_swaps_the_gpu_flags_for_eager():
+    """--gpu-memory-utilization means nothing to the CPU backend, and fullgraph compile
+    cannot trace the CPU decode path — --enforce-eager is required, not a preference."""
+    sup, _ = _sup(device="cpu")
+    argv = sup.argv()
+    assert "--gpu-memory-utilization" not in argv
+    assert "--enforce-eager" in argv
+    assert "--max-model-len" in argv          # the floor still applies
+
+
+def test_cuda_argv_is_unchanged():
+    sup, _ = _sup(device="cuda")
+    argv = sup.argv()
+    assert "--gpu-memory-utilization" in argv
+    assert "--enforce-eager" not in argv
+
+
+def test_max_num_seqs_auto_resolves_by_device():
+    """At single-digit tok/s total, 16 concurrent decodes is thrash — 4 covers a
+    regeneration plus a parallel tab. Explicit values always win."""
+    cpu, _ = _sup(device="cpu")
+    cuda, _ = _sup(device="cuda")
+    explicit, _ = _sup(device="cpu", max_num_seqs=8)
+    assert cpu.max_num_seqs == sup_mod.DEFAULT_CPU_MAX_NUM_SEQS == 4
+    assert cuda.max_num_seqs == sup_mod.DEFAULT_MAX_NUM_SEQS == 16
+    assert explicit.max_num_seqs == 8
+
+
+def test_plan_cpu_kvcache_tiers():
+    """8 GiB is the validated value; smaller machines scale down, never below 2."""
+    assert sup_mod.plan_cpu_kvcache_gib(None) == 8
+    assert sup_mod.plan_cpu_kvcache_gib(16 * GIB) == 4
+    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB) == 8
+    assert sup_mod.plan_cpu_kvcache_gib(64 * GIB) == 8
+    assert sup_mod.plan_cpu_kvcache_gib(6 * GIB) == 2
+
+
+def test_cpu_spawn_env_carries_the_kvcache_pool(monkeypatch):
+    monkeypatch.delenv("VLLM_CPU_KVCACHE_SPACE", raising=False)
+    sup, spawned = _sup(device="cpu", healthy_after=2)
+    sup.start()
+    assert spawned[0].env.get("VLLM_CPU_KVCACHE_SPACE") is not None
+
+
+def test_a_user_kvcache_value_survives(monkeypatch):
+    monkeypatch.setenv("VLLM_CPU_KVCACHE_SPACE", "3")
+    sup, spawned = _sup(device="cpu", healthy_after=2)
+    sup.start()
+    assert spawned[0].env["VLLM_CPU_KVCACHE_SPACE"] == "3"
+
+
+def test_cuda_spawn_env_has_no_kvcache_pool(monkeypatch):
+    monkeypatch.delenv("VLLM_CPU_KVCACHE_SPACE", raising=False)
+    sup, spawned = _sup(device="cuda", healthy_after=2)
+    sup.start()
+    assert "VLLM_CPU_KVCACHE_SPACE" not in spawned[0].env
+
+
+def test_cpu_banner_speaks_cpu_not_vram(capsys):
+    import io
+    buf = io.StringIO()
+    sup, _ = _sup(device="cpu", healthy_after=2, out=buf)
+    sup.start()
+    text = buf.getvalue()
+    assert "CPU backend" in text
+    assert "of VRAM" not in text
+
+
+def test_cpu_oom_hint_names_the_kvcache_pool_not_gpu_flags():
+    sup, _ = _sup(device="cpu", healthy_after=2,
+                  output=["ERROR: No available memory for the cache blocks\n"])
+    sup.start()
+    hint = sup._drain()
+    assert "--gpu-memory-utilization" not in hint
+    assert "VLLM_CPU_KVCACHE_SPACE" in hint

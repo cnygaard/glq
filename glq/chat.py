@@ -318,11 +318,12 @@ def main(argv=None) -> int:
                         "number to pin it — vLLM would otherwise take the model's "
                         "declared maximum, which for gemma-4 is 262144 and needs GiB of "
                         "KV cache for a single request)")
-    p.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS,
+    p.add_argument("--max-num-seqs", type=int, default=None,
                    help=f"concurrent sequences vLLM plans for (default "
-                        f"{DEFAULT_MAX_NUM_SEQS}; its own default is 1024 — a batch-server "
-                        f"number that hybrid-GDN models cannot even start under, since "
-                        f"every sequence reserves a Mamba cache block)")
+                        f"{DEFAULT_MAX_NUM_SEQS} on GPU, 4 on the CPU backend; vLLM's own "
+                        f"default is 1024 — a batch-server number that hybrid-GDN models "
+                        f"cannot even start under, since every sequence reserves a Mamba "
+                        f"cache block)")
     p.add_argument("--fp8-kv-cache", dest="fp8_kv", action="store_true",
                    default=cfg.get("fp8_kv", False),
                    help="vLLM's fp8 KV cache: about twice the context per GiB, at lower "

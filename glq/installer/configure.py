@@ -81,7 +81,8 @@ def write_pi_models(path, base_url: str, model_ids,
 def write_glq_config(path, *, model: str, base_url: str, components, available,
                      fp8_kv: bool = False,
                      code_model: str | None = None,
-                     chat_model: str | None = None) -> None:
+                     chat_model: str | None = None,
+                     device: str | None = None) -> None:
     """Record what the installer chose.
 
     `examples/chat/app.py` reads this to populate its model dropdown, and it is the only
@@ -103,4 +104,8 @@ def write_glq_config(path, *, model: str, base_url: str, components, available,
         "fp8_kv": bool(fp8_kv),
         **({"code_model": code_model} if code_model else {}),
         **({"chat_model": chat_model} if chat_model else {}),
+        # The device the installer decided on ("cuda"/"cpu") — drives which vLLM wheel
+        # was installed, model sizing, and messaging. Absent on pre-device configs; the
+        # serving commands detect live regardless (the installed wheel wins).
+        **({"device": device} if device else {}),
     })
