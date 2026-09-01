@@ -70,7 +70,8 @@ def main(argv=None) -> int:
                    help=f"context window to serve (default: sized from VRAM headroom, "
                         f"floor {DEFAULT_CODE_MAX_MODEL_LEN} — a coding agent carries "
                         f"file contents and diffs; pass a number to pin it)")
-    p.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_NUM_SEQS)
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                   help="concurrent sequences (default: 16 on GPU, 4 on the CPU backend)")
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",

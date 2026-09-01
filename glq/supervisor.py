@@ -69,6 +69,10 @@ DEFAULT_MAX_MODEL_LEN = 8192
 #: tabs, and shrinks CUDA-graph capture and KV pressure for every model, not just hybrids.
 DEFAULT_MAX_NUM_SEQS = 16
 
+#: The CPU-backend default. At single-digit tok/s TOTAL, 16 concurrent decodes is thrash;
+#: 4 covers a regeneration plus one parallel tab. Explicit --max-num-seqs always wins.
+DEFAULT_CPU_MAX_NUM_SEQS = 4
+
 #: Leave a slice of the card for the desktop. Above this, vLLM competes with the compositor
 #: and a display server can fail to allocate.
 _MAX_UTILIZATION = 0.92
@@ -222,7 +226,45 @@ def flashinfer_env(compute_cap=None, have_nvcc=None, have_ninja=None) -> dict:
     return {"VLLM_USE_FLASHINFER_SAMPLER": "0"} if cap >= _FLASHINFER_PREBUILT_BELOW else {}
 
 
-def child_env() -> dict:
+def _installed_vllm_version() -> str:
+    from importlib.metadata import version
+    return version("vllm")
+
+
+def detect_device(vllm_version=_installed_vllm_version, vram=None) -> str:
+    """"cpu" or "cuda" — the backend this venv can actually serve with.
+
+    The INSTALLED WHEEL wins over the live GPU: a `+cpu` vLLM cannot use a GPU however
+    the flags read (real case: a GPU box where the user installed the CPU stack), and
+    reading the wheel's local version is a metadata lookup, not an import. Only when the
+    version is unreadable does the GPU probe decide.
+    """
+    try:
+        if "+cpu" in vllm_version():
+            return "cpu"
+    except Exception:                                    # noqa: BLE001 - fall to the probe
+        pass
+    if vram is None:
+        from glq.installer.hardware import vram_bytes as vram_probe
+        vram = vram_probe
+    return "cuda" if vram() is not None else "cpu"
+
+
+#: VLLM_CPU_KVCACHE_SPACE bounds, GiB. 8 is the value the CPU serving path was validated
+#: with; at the ~24.6 KiB/token worst-case anchor it already holds ~340k tokens, far past
+#: any served window at CPU concurrency — more would only crowd out the weights.
+_CPU_KV_MIN_GIB, _CPU_KV_MAX_GIB = 2, 8
+
+
+def plan_cpu_kvcache_gib(ram_bytes) -> int:
+    """The CPU KV pool: a quarter of RAM, clamped to [2, 8] GiB; 8 when RAM is unknown."""
+    if not ram_bytes:
+        return _CPU_KV_MAX_GIB
+    quarter = int(ram_bytes / 2**30) // 4
+    return max(_CPU_KV_MIN_GIB, min(_CPU_KV_MAX_GIB, quarter))
+
+
+def child_env(device: str = "cuda", ram_bytes=None) -> dict:
     """The environment `vllm serve` is started with.
 
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
@@ -240,6 +282,12 @@ def child_env() -> dict:
     parts = [p for p in path.split(os.pathsep) if p and p != bindir]
     env = {**os.environ, "PYTHONUNBUFFERED": "1",
            "PATH": os.pathsep.join([bindir, *parts])}
+    if device == "cpu":
+        # The CPU backend takes its KV pool from this env var (GiB). A user-set value
+        # always wins; the flashinfer probe is skipped — it answers a GPU question with
+        # an nvidia-smi subprocess this path has no use for.
+        env.setdefault("VLLM_CPU_KVCACHE_SPACE", str(plan_cpu_kvcache_gib(ram_bytes)))
+        return env
     # After PATH, so the probe sees the tools the child will actually have.
     env.update(flashinfer_env())
     return env
@@ -281,7 +329,7 @@ class VllmSupervisor:
                  weights_bytes=None, vram_bytes=None,
                  max_model_len=None, model_max_len=None,
                  max_model_len_floor=DEFAULT_MAX_MODEL_LEN, fp8_kv=False,
-                 max_num_seqs=DEFAULT_MAX_NUM_SEQS):
+                 max_num_seqs=None, device=None, ram_bytes=None):
         self.model = model
         self.port = int(port)
         self.base_url = base_url or f"http://127.0.0.1:{self.port}/v1"
@@ -306,7 +354,24 @@ class VllmSupervisor:
                 self._window_note = (" (sized from KV headroom; "
                                      "--max-model-len overrides)")
         self.max_model_len = int(max_model_len)
-        self.max_num_seqs = int(max_num_seqs)
+        # None = auto: follow the wheel/GPU detection. Explicit "cpu"/"cuda" is for tests
+        # and for callers that already decided (the config records the installer's choice,
+        # but the wheel in THIS venv is what actually serves — so live detection is the
+        # default even then).
+        self.device = device if device in ("cpu", "cuda") else detect_device()
+        if self.device == "cpu" and ram_bytes is None:
+            try:
+                from glq.installer.hardware import ram_bytes as _ram
+                ram_bytes = _ram()
+            except Exception:                            # noqa: BLE001 - pool falls to 8 GiB
+                ram_bytes = None
+        self._ram_bytes = ram_bytes
+        # A --gpu-memory-utilization on the CPU backend would be silently meaningless;
+        # remember it so start() can say so once instead of dropping it wordlessly.
+        self._ignored_gpu_flag = (self.device == "cpu"
+                                  and gpu_memory_utilization is not None)
+        self.max_num_seqs = int(max_num_seqs) if max_num_seqs is not None else (
+            DEFAULT_CPU_MAX_NUM_SEQS if self.device == "cpu" else DEFAULT_MAX_NUM_SEQS)
         self.fp8_kv = bool(fp8_kv)
         self.serve = serve
         self._spawn, self._probe = spawn, probe
@@ -331,6 +396,18 @@ class VllmSupervisor:
     # ------------------------------------------------------------------ lifecycle
 
     def argv(self) -> list[str]:
+        if self.device == "cpu":
+            # --gpu-memory-utilization means nothing to the CPU backend, and its
+            # fullgraph compile cannot trace the fused CPU decode path — --enforce-eager
+            # is a requirement, not a preference. The KV pool travels in the child env
+            # (VLLM_CPU_KVCACHE_SPACE), not a flag.
+            return [self.vllm_bin, "serve", self.model,
+                    "--quantization", "glq",
+                    "--port", str(self.port),
+                    "--enforce-eager",
+                    "--max-model-len", str(self.max_model_len),
+                    "--max-num-seqs", str(self.max_num_seqs),
+                    *self.extra_args]
         return [self.vllm_bin, "serve", self.model,
                 "--quantization", "glq",
                 "--port", str(self.port),
@@ -355,9 +432,16 @@ class VllmSupervisor:
                 f"  {' '.join(self.argv())}")
 
         self._say(f"starting vLLM for {self.model}")
-        self._say(f"  reserving {self.gpu_memory_utilization:.0%} of VRAM for the weights "
-                  f"and KV cache, with a {self.max_model_len} token context"
-                  f"{self._window_note}")
+        if self.device == "cpu":
+            self._say(f"  serving on the CPU backend — expect single-digit tokens/s; "
+                      f"{self.max_model_len} token context")
+            if self._ignored_gpu_flag:
+                self._say("  (--gpu-memory-utilization has no effect on the CPU backend "
+                          "— ignoring it)")
+        else:
+            self._say(f"  reserving {self.gpu_memory_utilization:.0%} of VRAM for the weights "
+                      f"and KV cache, with a {self.max_model_len} token context"
+                      f"{self._window_note}")
         # Say how long this takes *before* going quiet. Minutes of silence you were warned
         # about is patience; the same silence unannounced is indistinguishable from a hang,
         # and that is what a first run looks like today.
@@ -377,7 +461,7 @@ class VllmSupervisor:
         # with them unflushed.
         if self.fp8_kv:
             self._say("  KV cache in fp8 (vLLM's own) — about twice the context per GiB")
-        env = child_env()
+        env = child_env(device=self.device, ram_bytes=self._ram_bytes)
         if "VLLM_USE_FLASHINFER_SAMPLER" in env:
             self._say("  the NVIDIA CUDA Toolkit is not installed, and FlashInfer ships no "
                       "prebuilt sampler for this GPU, so it")
@@ -584,8 +668,14 @@ class VllmSupervisor:
         # This is the one startup failure with a one-line fix, so spell it out.
         hint = ""
         if "No available memory for the cache blocks" in tail:
-            hint = (f"\n\nThe model did not fit in {self.gpu_memory_utilization:.0%} of this "
-                    f"GPU. Retry with a larger share, e.g.\n"
-                    f"  glq-chat --gpu-memory-utilization "
-                    f"{min(self.gpu_memory_utilization + 0.2, 0.95):.2f}")
+            if self.device == "cpu":
+                hint = ("\n\nThe model plus its KV pool did not fit in RAM. Retry with a "
+                        "smaller pool, e.g.\n"
+                        "  VLLM_CPU_KVCACHE_SPACE=2 glq-chat\n"
+                        "or pick a smaller checkpoint.")
+            else:
+                hint = (f"\n\nThe model did not fit in {self.gpu_memory_utilization:.0%} of this "
+                        f"GPU. Retry with a larger share, e.g.\n"
+                        f"  glq-chat --gpu-memory-utilization "
+                        f"{min(self.gpu_memory_utilization + 0.2, 0.95):.2f}")
         return f"{tail}{hint}\n\nFull log: {self.log_path}"
