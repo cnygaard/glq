@@ -100,6 +100,28 @@ def _kernels_available():
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _cpu_kernels_available():
+    """(built, status) for the fused CPU kernels.
+
+    Must actually attempt the load: cpu_ext_status() alone reads "not attempted" on a
+    fresh process. On a CPU-only box with the vllm component this IS the serving path.
+    """
+    try:
+        from glq import inference_kernel_cpu as ikc
+        return bool(ikc._try_load_cpu_ext()), ikc.cpu_ext_status()
+    except Exception as exc:                                      # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _vllm_version():
+    """The installed vLLM's version string (metadata read, no import), or None."""
+    try:
+        from importlib.metadata import version
+        return version("vllm")
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
 def _safe(probe, on_error):
     """Run a probe; a self-check that crashes the installer is worse than none."""
     try:
@@ -114,7 +136,9 @@ def run_checks(components, *, glq_importable=_glq_importable,
                cuda_available=_cuda_available,
                kernels_available=_kernels_available,
                quantize_deps_importable=_quantize_deps_importable,
-               pi_resolvable=_pi_resolvable) -> list[Check]:
+               pi_resolvable=_pi_resolvable,
+               cpu_kernels_available=_cpu_kernels_available,
+               vllm_version=_vllm_version) -> list[Check]:
     """Assert the install can actually do what the next-steps text is about to promise."""
     checks: list[Check] = []
 
@@ -175,6 +199,42 @@ def run_checks(components, *, glq_importable=_glq_importable,
         + (f":\n{reason}" if reason else "")
         + (f" ({err})" if err else ""),
         warning_only=not bool(cuda)))
+
+    # The mirror check for CPU serving: on a CPU-only box with the vllm component, the
+    # CPU extension IS the serving path — failure-level there, informational elsewhere.
+    (cpu_built, cpu_status), err = _safe(cpu_kernels_available, (False, None))
+    checks.append(Check(
+        "glq cpu kernels", bool(cpu_built),
+        f"fused CPU kernels ready ({cpu_status})" if cpu_built else
+        "the CPU kernels are not available — CPU serving would fall back to the slow "
+        "dense path" + (f": {cpu_status}" if cpu_status else "")
+        + (f" ({err})" if err else ""),
+        warning_only=bool(cuda) or "vllm" not in components))
+
+    # Wheel/device match: a CUDA vLLM on a CPU-only box cannot serve at all, and the
+    # failure it produces at start time (CUDA driver errors from a wheel import) does not
+    # name the actual fix. A +cpu wheel on a GPU box serves — on the CPU — so that is a
+    # warning: probably not what the user meant, but not broken.
+    if "vllm" in components:
+        ver, err = _safe(vllm_version, None)
+        if ver is None:
+            checks.append(Check(
+                "vllm backend", True,
+                "vllm not installed (or unreadable) — nothing to match against"
+                + (f" ({err})" if err else ""), warning_only=True))
+        elif "+cpu" in ver:
+            checks.append(Check(
+                "vllm backend", bool(cuda) is False,
+                f"vLLM {ver} — the CPU backend" if not cuda else
+                f"vLLM {ver} is the CPU backend but a GPU is visible — serving will run "
+                f"on the CPU. Reinstall for the GPU: glq-setup --components vllm",
+                warning_only=bool(cuda)))
+        else:
+            checks.append(Check(
+                "vllm backend", bool(cuda),
+                f"vLLM {ver} — the CUDA backend" if cuda else
+                f"vLLM {ver} is the CUDA build but no GPU is visible — serving cannot "
+                f"start. Fix: glq-setup --components vllm --device cpu"))
 
     return checks
 

@@ -186,3 +186,66 @@ def test_picode_component_checks_the_pi_binary_resolves():
 def test_no_picode_component_no_pi_check():
     checks = V.run_checks(("core",), **_probes())
     assert not any("pi " in c.name or "picode" in c.name for c in checks)
+
+
+# ---- CPU serving checks (the CPU kernels + the installed-wheel/device match) -------------
+# On a CPU-only box the vLLM component's serving path IS the CPU extension and the +cpu
+# wheel; "green but silent about both" was the pre-CPU-serving behavior and it let a
+# broken CPU install print "GLQ is installed."
+
+def _cpu_probes(cuda=False, cpu_kernels=(True, "loaded (isa=avx2)"),
+                vllm_version="0.28.0+cpu", **kw):
+    probes = _probes(cuda=cuda, **kw)
+    probes["cpu_kernels_available"] = lambda: cpu_kernels
+    probes["vllm_version"] = lambda: vllm_version
+    return probes
+
+
+def test_missing_cpu_kernels_fail_on_a_cpu_box_with_vllm():
+    checks = V.run_checks(("core", "vllm"),
+                          **_cpu_probes(cpu_kernels=(False, "unavailable: no compiler")))
+    row = next(c for c in checks if "cpu kernels" in c.name)
+    assert not row.ok and not row.warning_only
+    assert not V.all_ok(checks)
+
+
+def test_missing_cpu_kernels_are_a_warning_on_a_gpu_box():
+    checks = V.run_checks(("core", "vllm"),
+                          **_cpu_probes(cuda=True,
+                                        cpu_kernels=(False, "unavailable: no compiler")))
+    row = next(c for c in checks if "cpu kernels" in c.name)
+    assert row.warning_only
+
+
+def test_missing_cpu_kernels_are_a_warning_without_the_vllm_component():
+    checks = V.run_checks(("core",),
+                          **_cpu_probes(cpu_kernels=(False, "unavailable: no compiler")))
+    row = next(c for c in checks if "cpu kernels" in c.name)
+    assert row.warning_only
+
+
+def test_cuda_wheel_on_a_cpu_box_fails_and_names_the_fix():
+    checks = V.run_checks(("core", "vllm"), **_cpu_probes(vllm_version="0.11.0"))
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert not row.ok and not row.warning_only
+    assert "--device cpu" in row.detail
+
+
+def test_cpu_wheel_on_a_cpu_box_is_ok():
+    checks = V.run_checks(("core", "vllm"), **_cpu_probes())
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert row.ok
+
+
+def test_cpu_wheel_on_a_gpu_box_is_a_warning():
+    checks = V.run_checks(("core", "vllm"), **_cpu_probes(cuda=True))
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert not row.ok and row.warning_only
+
+
+def test_unreadable_vllm_version_does_not_fail_the_check():
+    """vllm may simply not be installed (core-only venv) — that is not a backend
+    mismatch."""
+    checks = V.run_checks(("core", "vllm"), **_cpu_probes(vllm_version=None))
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert row.ok or row.warning_only
