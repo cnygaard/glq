@@ -67,16 +67,33 @@ from glq.tooling import (GEMMA4_TOOL_TEMPLATE,  # noqa: E402
                          GEMMA4_TOOL_TEMPLATE_URL, tool_serve_args)
 
 
-def _install_python_extras(run: Runner, venv: Path, components) -> None:
+def _install_python_extras(run: Runner, venv: Path, components, device: str = "cuda") -> None:
     pip = _venv_bin(venv, "pip")
     wanted = []
+    extra_pip_args = []
     if "vllm" in components:
-        wanted += ["vllm", GEMMA4_TRANSFORMERS]
+        if device == "cpu":
+            # vLLM's CPU backend is a GitHub-release wheel (`+cpu`), not on PyPI — a bare
+            # `vllm` spec would resolve the CUDA build. The transformers pin is
+            # model-bound (gemma-4), so it rides along unchanged.
+            import platform
+
+            from . import cpu_wheel
+            arch = cpu_wheel.wheel_arch()
+            if arch is None:
+                raise SystemExit(
+                    f"vLLM ships no CPU wheel for this architecture "
+                    f"({platform.machine()}); CPU serving needs x86_64 or aarch64.")
+            url = cpu_wheel.latest_cpu_wheel_url(arch)
+            wanted += cpu_wheel.cpu_install_args(url)[:1] + [GEMMA4_TRANSFORMERS]
+            extra_pip_args = cpu_wheel.cpu_install_args(url)[1:]
+        else:
+            wanted += ["vllm", GEMMA4_TRANSFORMERS]
     if "chat" in components:
         wanted += ["gradio", "openai"]
     if wanted:
         print(f"\n== installing: {', '.join(wanted)}")
-        run([pip, "install", "--upgrade", *wanted])
+        run([pip, "install", "--upgrade", *wanted, *extra_pip_args])
     if "quantize" in components:
         # Deliberately a separate command with NO --upgrade: `glq[quantize]` names glq
         # itself, and --upgrade would replace a --glq-source dev install with the PyPI
@@ -389,7 +406,7 @@ def main(argv=None) -> int:
     print(f"\nComponents: {', '.join(components)}")
     print(f"Model:      {chosen.repo_id}")
 
-    _install_python_extras(run, venv, components)
+    _install_python_extras(run, venv, components, device=device)
     if "picode" in components:
         _install_picode(run)
     if args.chat == "openwebui":

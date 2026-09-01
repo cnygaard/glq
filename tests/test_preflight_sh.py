@@ -129,10 +129,26 @@ def test_it_reports_gpu_state(tmp_path):
     assert "gpu" in out or "nvidia" in out or "cuda" in out
 
 
+def test_assume_no_gpu_alias_still_works(tmp_path):
+    """--assume-no-gpu shipped before --cpu; scripts using it must keep working."""
+    proc = _preflight("ubuntu", tmp_path, extra=["--assume-no-gpu"])
+    assert proc.returncode == 0
+    assert "cpu" in (proc.stdout + proc.stderr).lower()
+
+
+def test_no_gpu_warning_names_the_cpu_backend(tmp_path):
+    """CPU serving is real since the CPU decode work: the warning should say what the
+    user GETS (the vLLM CPU backend, single-digit tok/s), not just what is missing."""
+    proc = _preflight("ubuntu", tmp_path, extra=["--cpu"])
+    out = proc.stdout + proc.stderr          # warn() writes to stderr
+    assert "vLLM CPU backend" in out
+    assert "single-digit" in out
+
+
 def test_absent_gpu_is_a_warning_not_a_failure(tmp_path):
     """CPU-only is supported (dequantize-then-matmul), just slow. Pre-flight must not
     refuse to install on a laptop."""
-    proc = _preflight("ubuntu", tmp_path, extra=["--assume-no-gpu"])
+    proc = _preflight("ubuntu", tmp_path, extra=["--cpu"])
     assert proc.returncode == 0
     assert "cpu" in _out(proc).lower()
 

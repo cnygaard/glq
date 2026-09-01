@@ -74,6 +74,8 @@ GLQ installer
   --yes               accept defaults, never prompt (and never start GLQ)
   --start/--no-start  start GLQ + the chat when done, or never offer to
   --list              list available checkpoints and exit
+  --cpu               no-GPU install: skip the CUDA toolchain and serve on CPU
+                      (vLLM CPU backend — expect single-digit tok/s)
   --preflight         check prerequisites and exit (changes nothing)
   --no-modify-path    don't append the venv bin dir to PATH in ~/.bashrc / ~/.zshrc
   --dry-run           print every command, change nothing
@@ -88,7 +90,8 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --preflight)    PREFLIGHT_ONLY=1; shift ;;
-            --assume-no-gpu) ASSUME_NO_GPU=1; shift ;;
+            --cpu)          ASSUME_NO_GPU=1; PASSTHRU+=("--cpu"); shift ;;
+            --assume-no-gpu) ASSUME_NO_GPU=1; PASSTHRU+=("--cpu"); shift ;;  # pre---cpu alias
             --no-modify-path) MODIFY_PATH=0; shift ;;
             --dry-run)      DRY_RUN=1; PASSTHRU+=("$1"); shift ;;
             --allow-root)   ALLOW_ROOT=1; shift ;;
@@ -239,7 +242,7 @@ preflight() {
         say "  gpu:     $(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -1)"
         say "  cuda:    $(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1)"
     else
-        warn "  gpu:     no NVIDIA GPU detected — GLQ will run on CPU (dequantize-then-matmul, slow)"
+        warn "  gpu:     no NVIDIA GPU detected — GLQ will serve on CPU (vLLM CPU backend; expect single-digit tok/s)"
         case " $DISTRO_ID " in
             *steamos*) warn "           SteamOS/Steam Deck is AMD; the CUDA fast path is unavailable there" ;;
         esac
@@ -381,7 +384,18 @@ install_glq() {
     say "== installing $spec + build toolchain (this pulls PyTorch and takes a few minutes)"
     run "$GLQ_VENV/bin/pip" install --upgrade pip
     run "$GLQ_VENV/bin/pip" install --upgrade "$spec" ninja
-    install_cuda_toolchain
+    # GLQ_ASSUME_GPU=1 is a test hook: the suite runs on no-GPU machines but must
+    # still assert the GPU branch's behavior (mirrors ASSUME_NO_GPU in pre-flight).
+    if [ "${GLQ_ASSUME_GPU:-0}" -eq 1 ] || { [ "$ASSUME_NO_GPU" -eq 0 ] \
+       && command -v nvidia-smi >/dev/null 2>&1 \
+       && nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1; }; then
+        install_cuda_toolchain
+    else
+        # The CUDA kernels can never build or run here, and the CPU extension ships
+        # prebuilt in the wheel (JIT needs only a C++ compiler) — pip-installing nvcc
+        # would cost minutes and gigabytes for a toolchain nothing invokes.
+        say "== no NVIDIA GPU — skipping the CUDA build toolchain (serving uses the vLLM CPU backend)"
+    fi
 }
 
 ensure_venv_on_path() {
