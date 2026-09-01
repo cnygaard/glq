@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "glq"
-version = "0.8.15"
+version = "0.8.16"
 description = "Lattice and trellis-coded quantization for LLM weights (2-8 bpw)"
 readme = "README.md"
 license = "GPL-3.0-only"

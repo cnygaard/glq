@@ -47,15 +47,22 @@ architecture fallbacks dequantize instead).
 
 ## System requirements
 
-**Linux x86_64 with an NVIDIA GPU.** That is the whole envelope — GLQ serves through
-vLLM/CUDA, so both are hard requirements.
+**Linux x86_64.** An NVIDIA GPU is the fast path; since 0.8.16 a CPU-only machine is
+also supported — the installer detects the hardware and sets up the matching vLLM
+backend automatically.
 
-- **GPU**: NVIDIA Ampere-class or newer (`sm_86+`). Developed for 24–32 GB cards
-  (3090 / 4080 / 4090 / L4 / L40S); validated live on an Ada L4 (`sm_89`) and an RTX PRO
-  6000 Blackwell (`sm_120`). A recent NVIDIA driver is required; a CUDA *toolkit* is not —
-  `pip install glq` ships prebuilt kernels (CPython 3.10–3.14, x86_64), and `nvcc` is only
-  needed for the from-source fallback (and for FlashInfer's sampler JIT on Blackwell —
-  without it `glq-chat` falls back to vLLM's built-in sampler).
+- **GPU (recommended)**: NVIDIA Ampere-class or newer (`sm_86+`). Developed for 24–32 GB
+  cards (3090 / 4080 / 4090 / L4 / L40S); validated live on an Ada L4 (`sm_89`) and an
+  RTX PRO 6000 Blackwell (`sm_120`). A recent NVIDIA driver is required; a CUDA
+  *toolkit* is not — `pip install glq` ships prebuilt kernels (CPython 3.10–3.14,
+  x86_64), and `nvcc` is only needed for the from-source fallback (and for FlashInfer's
+  sampler JIT on Blackwell — without it `glq-chat` falls back to vLLM's built-in sampler).
+- **CPU-only**: no GPU → the installer sets up vLLM's CPU backend and GLQ's own fused
+  CPU kernels (AVX2 floor, AVX-512 tiers used when present); `--cpu` forces this on a
+  GPU machine. Dense trellis checkpoints only (MoE and e8p/shell need CUDA), and expect
+  single-digit tok/s — e.g. a 3B at ~5–6 tok/s on desktop-class 4–8 core machines
+  (measured); usable for short answers and background work, not fast chat. Model
+  recommendations size against system RAM.
 - **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
   pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 12,
   Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
@@ -86,6 +93,13 @@ tool-calling vLLM and runs pi against it):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --components core,vllm,chat,picode
+```
+
+CPU-only serving on a machine that has a GPU you don't want used (no flag needed on a
+machine without one — the installer detects it):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --cpu
 ```
 
 Creates a venv at `~/.glq/venv`, then discovers the published checkpoints, sizes
