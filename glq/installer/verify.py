@@ -138,7 +138,8 @@ def run_checks(components, *, glq_importable=_glq_importable,
                quantize_deps_importable=_quantize_deps_importable,
                pi_resolvable=_pi_resolvable,
                cpu_kernels_available=_cpu_kernels_available,
-               vllm_version=_vllm_version) -> list[Check]:
+               vllm_version=_vllm_version,
+               device=None) -> list[Check]:
     """Assert the install can actually do what the next-steps text is about to promise."""
     checks: list[Check] = []
 
@@ -180,25 +181,39 @@ def run_checks(components, *, glq_importable=_glq_importable,
             "pi is not resolvable — glq-code cannot run. Fix: re-run install.sh with "
             "the picode component" + (f" ({err})" if err else "")))
 
-    cuda, err = _safe(cuda_available, False)
-    checks.append(Check(
-        "cuda available", bool(cuda),
-        "GPU visible to torch" if cuda else
-        "no CUDA GPU visible — GLQ falls back to dequantize-then-matmul on CPU, which "
-        "works but is slow" + (f" ({err})" if err else ""),
-        warning_only=True))
+    if device == "cpu":
+        # A deliberate cpu install: the CUDA rows are not this install's serving path,
+        # and PROBING them is actively harmful — measured on a GPU box, the kernels
+        # probe attempted a CUDA JIT against +cpu torch headers (a certain failure)
+        # and flagged a healthy install INCOMPLETE.
+        cuda = False
+        checks.append(Check(
+            "cuda available", True,
+            "cpu install — the GPU (if any) is deliberately not used", warning_only=True))
+        checks.append(Check(
+            "glq cuda kernels", True,
+            "skipped: cpu install serves via the CPU kernels", warning_only=True))
+    else:
+        cuda, err = _safe(cuda_available, False)
+        checks.append(Check(
+            "cuda available", bool(cuda),
+            "GPU visible to torch" if cuda else
+            "no CUDA GPU visible — GLQ falls back to dequantize-then-matmul on CPU, which "
+            "works but is slow" + (f" ({err})" if err else ""),
+            warning_only=True))
 
     # The check that matters on a GPU box: the kernels are compiled here, so a healthy GPU
     # does not imply a working GLQ. Only a real failure when a GPU *is* present — with no
     # GPU there is nothing to build against and CPU-only is a supported configuration.
-    (built, reason), err = _safe(kernels_available, (False, None))
-    checks.append(Check(
-        "glq cuda kernels", bool(built),
-        "fused kernels ready" if built else
-        "the CUDA kernels are not built, so GLQ cannot run its fast path"
-        + (f":\n{reason}" if reason else "")
-        + (f" ({err})" if err else ""),
-        warning_only=not bool(cuda)))
+    if device != "cpu":
+        (built, reason), err = _safe(kernels_available, (False, None))
+        checks.append(Check(
+            "glq cuda kernels", bool(built),
+            "fused kernels ready" if built else
+            "the CUDA kernels are not built, so GLQ cannot run its fast path"
+            + (f":\n{reason}" if reason else "")
+            + (f" ({err})" if err else ""),
+            warning_only=not bool(cuda)))
 
     # The mirror check for CPU serving: on a CPU-only box with the vllm component, the
     # CPU extension IS the serving path — failure-level there, informational elsewhere.
@@ -223,12 +238,13 @@ def run_checks(components, *, glq_importable=_glq_importable,
                 "vllm not installed (or unreadable) — nothing to match against"
                 + (f" ({err})" if err else ""), warning_only=True))
         elif "+cpu" in ver:
+            gpu_surprise = bool(cuda) and device != "cpu"
             checks.append(Check(
-                "vllm backend", bool(cuda) is False,
-                f"vLLM {ver} — the CPU backend" if not cuda else
+                "vllm backend", not gpu_surprise,
+                f"vLLM {ver} — the CPU backend" if not gpu_surprise else
                 f"vLLM {ver} is the CPU backend but a GPU is visible — serving will run "
                 f"on the CPU. Reinstall for the GPU: glq-setup --components vllm",
-                warning_only=bool(cuda)))
+                warning_only=gpu_surprise))
         else:
             checks.append(Check(
                 "vllm backend", bool(cuda),

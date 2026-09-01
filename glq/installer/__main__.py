@@ -354,7 +354,15 @@ def main(argv=None) -> int:
 
     if args.verify:
         components = tuple(c.strip() for c in (args.components or "core,vllm").split(","))
-        checks = verify.run_checks(components)
+        # A --cpu verify (or a config that records a cpu install) must not probe the
+        # CUDA rows — the probe attempts a JIT build that cannot succeed there.
+        vdev = args.device if args.device != "auto" else None
+        if vdev is None:
+            try:
+                vdev = json.loads((GLQ_HOME / "config.json").read_text()).get("device")
+            except Exception:                                     # noqa: BLE001
+                vdev = None
+        checks = verify.run_checks(components, device=vdev)
         print(verify.render(checks))
         return 0 if verify.all_ok(checks) else 1
 
@@ -483,7 +491,7 @@ def main(argv=None) -> int:
     # "GLQ is installed." over a venv whose plugin does not resolve sends the user to
     # "Unknown quantization method: glq" with no clue the installer already knew.
     if not args.dry_run:
-        checks = verify.run_checks(components)
+        checks = verify.run_checks(components, device=device)
         print(verify.render(checks))
         if not verify.all_ok(checks):
             print("\n" + "=" * 74)

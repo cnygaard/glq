@@ -249,3 +249,41 @@ def test_unreadable_vllm_version_does_not_fail_the_check():
     checks = V.run_checks(("core", "vllm"), **_cpu_probes(vllm_version=None))
     row = next(c for c in checks if "vllm backend" in c.name)
     assert row.ok or row.warning_only
+
+
+# ---- device-aware verify: a --cpu install must not exercise (or fail on) CUDA ------------
+
+def test_cpu_device_skips_the_cuda_jit_and_downgrades_cuda_rows():
+    """Measured on a GPU box with --cpu: the installer's verify attempted the CUDA JIT
+    (system nvcc + by-then +cpu torch headers = certain failure) and reported it at
+    failure level — 'Install INCOMPLETE' on a healthy CPU install. With device=cpu the
+    CUDA probes are not run at all."""
+    probed = {"kernels": 0}
+
+    def kernels():
+        probed["kernels"] += 1
+        return (False, "should never run")
+
+    probes = _cpu_probes()
+    probes["kernels_available"] = kernels
+    checks = V.run_checks(("core", "vllm"), device="cpu", **probes)
+    assert probed["kernels"] == 0, "the CUDA JIT was attempted on a cpu install"
+    cuda_row = next(c for c in checks if c.name == "glq cuda kernels")
+    assert cuda_row.warning_only
+    assert V.all_ok(checks)
+
+
+def test_cpu_device_accepts_the_cpu_wheel_without_a_gpu_warning():
+    """On a deliberate cpu install, '+cpu wheel while a GPU is visible' is the CHOSEN
+    state, not a surprise to warn about."""
+    probes = _cpu_probes(cuda=True)
+    checks = V.run_checks(("core", "vllm"), device="cpu", **probes)
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert row.ok and not row.warning_only
+
+
+def test_default_device_keeps_live_probing():
+    probes = _cpu_probes(cuda=True, cpu_kernels=(False, "x"))
+    checks = V.run_checks(("core", "vllm"), **probes)
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert row.warning_only          # +cpu wheel on a GPU box, no declared device
