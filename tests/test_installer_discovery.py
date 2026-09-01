@@ -236,3 +236,62 @@ def test_model_max_len_is_none_when_absent_or_unreachable():
     def boom(url):
         raise OSError("offline")
     assert D.model_max_len("org/m", fetch=boom) is None
+
+
+# ---- repo_traits: trellis AND MoE from one config fetch ----------------------------------
+# MoE matters because the CPU backend refuses MoE checkpoints; detection follows the
+# config (num_local_experts / num_experts / n_routed_experts), never the repo name —
+# this module's own docstring records being bitten by a name heuristic once already.
+
+def _traits_fetch(cfg):
+    def fetch(url):
+        assert "config.json" in url
+        return cfg
+    return fetch
+
+
+def test_repo_traits_dense_trellis():
+    t, m = D.repo_traits("org/x", fetch=_traits_fetch(
+        {"quantization_config": {"variant": "3inst"}, "num_hidden_layers": 4}))
+    assert t is True and m is False
+
+
+def test_repo_traits_moe_via_num_local_experts():
+    t, m = D.repo_traits("org/x", fetch=_traits_fetch(
+        {"quantization_config": {"variant": "3inst"}, "num_local_experts": 64}))
+    assert m is True
+
+
+def test_repo_traits_moe_via_num_experts_nested_text_config():
+    """Multimodal wrappers (gemma-4, Qwen3.x) keep the LM config under text_config."""
+    t, m = D.repo_traits("org/x", fetch=_traits_fetch(
+        {"quantization_config": {"variant": "3inst"},
+         "text_config": {"num_experts": 128}}))
+    assert m is True
+
+
+def test_repo_traits_single_expert_is_not_moe():
+    _, m = D.repo_traits("org/x", fetch=_traits_fetch({"num_experts": 1}))
+    assert m is False
+
+
+def test_repo_traits_fetch_failure_is_unknown_for_both():
+    def boom(url):
+        raise OSError("offline")
+    assert D.repo_traits("org/x", fetch=boom) == (None, None)
+
+
+def test_discover_carries_moe_with_one_config_fetch_per_repo(monkeypatch):
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if "collections" in url:
+            return {"items": [{"type": "model", "id": "org/a"}]}
+        if "/tree/" in url:
+            return [{"path": "model.safetensors", "size": 1000}]
+        return {"quantization_config": {"variant": "3inst"}, "num_local_experts": 8}
+
+    ckpts = D.discover(fetch=fetch)
+    assert len(ckpts) == 1 and ckpts[0].moe is True and ckpts[0].trellis is True
+    assert sum("config.json" in u for u in calls) == 1

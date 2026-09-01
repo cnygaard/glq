@@ -251,3 +251,53 @@ def test_per_command_picks_falls_back_when_vram_is_unknown():
     """No nvidia-smi → nothing is recommended → both commands serve the generic choice."""
     picks = R.per_command_picks(FAMILY_FLEET, None, fallback=GEMMA26)
     assert picks == {"code_model": GEMMA26, "chat_model": GEMMA26}
+
+
+# ---- CPU gating: RAM budget fraction + trellis-only + no MoE -----------------------------
+
+CPU_FLEET = [
+    Checkpoint("xv0y5ncu/gemma-4-26B-A4B-moe-4bpw", int(15.0 * GIB), trellis=True,
+               moe=True),
+    Checkpoint("xv0y5ncu/dense-9B-trellis-4bpw", int(5.6 * GIB), trellis=True, moe=False),
+    Checkpoint("xv0y5ncu/dense-3B-trellis-4bpw", int(1.8 * GIB), trellis=True, moe=False),
+    Checkpoint("xv0y5ncu/old-e8p-4bpw", int(1.7 * GIB), trellis=False, moe=False),
+    Checkpoint("xv0y5ncu/unknown-traits", int(1.6 * GIB)),
+]
+
+
+def test_weight_fraction_changes_the_budget():
+    """16 GiB at the CPU fraction (0.5) affords 8 GiB of weights; at the GPU 0.75 it
+    would afford 12. The 9B (5.6 GiB) fits either; a 10 GiB entry only the latter."""
+    fleet = [Checkpoint("xv0y5ncu/ten-gib", int(10 * GIB), trellis=True, moe=False)]
+    gpu = R.rank(fleet, int(16 * GIB))
+    cpu = R.rank(fleet, int(16 * GIB), weight_fraction=R.CPU_WEIGHT_FRACTION)
+    assert gpu[0].fits is True
+    assert cpu[0].fits is False
+
+
+def test_cpu_gate_excludes_moe_and_non_trellis_and_unknown():
+    ranked = R.rank(CPU_FLEET, int(32 * GIB), weight_fraction=R.CPU_WEIGHT_FRACTION,
+                    require_trellis=True)
+    picked = [r for r in ranked if r.recommended]
+    assert len(picked) == 1
+    assert picked[0].checkpoint.repo_id == "xv0y5ncu/dense-9B-trellis-4bpw"
+
+
+def test_cpu_gate_recommends_nothing_rather_than_an_unservable_model():
+    """A fleet of only MoE/e8p/unknown entries must yield NO recommendation on CPU —
+    the menu still lists them, but recommending one would download gigabytes into a
+    hard refusal at serve time."""
+    fleet = [c for c in CPU_FLEET if c.repo_id != "xv0y5ncu/dense-9B-trellis-4bpw"
+             and c.repo_id != "xv0y5ncu/dense-3B-trellis-4bpw"]
+    ranked = R.rank(fleet, int(32 * GIB), weight_fraction=R.CPU_WEIGHT_FRACTION,
+                    require_trellis=True)
+    assert not any(r.recommended for r in ranked)
+
+
+def test_per_command_picks_under_cpu_gating_never_return_moe():
+    picks = R.per_command_picks(CPU_FLEET, int(32 * GIB),
+                                fallback="xv0y5ncu/dense-3B-trellis-4bpw",
+                                weight_fraction=R.CPU_WEIGHT_FRACTION,
+                                require_trellis=True)
+    for model in picks.values():
+        assert "moe" not in model

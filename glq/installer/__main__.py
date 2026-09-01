@@ -179,7 +179,7 @@ def _start_chat(venv) -> None:
 
 
 def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0,
-               fp8_kv: bool = False) -> str:
+               fp8_kv: bool = False, device: str = "cuda") -> str:
     """The whole user manual for someone who arrived via `curl … | bash`.
 
     They have no repo checkout and no docs open, so every command must be copy-pasteable
@@ -226,9 +226,13 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     # machine is proportionally slower. Quote the range rather than the best case; someone
     # who was promised 30 s and waits 90 reasonably concludes it has hung. Whichever command
     # they run first pays this, so the warning goes on step 1 wherever step 1 lands.
-    slow_start = (f"The first run {first_run}JIT-builds the CUDA"
-                  f"\n   extension if no prebuilt kernel matches this Python (about a minute,"
-                  f"\n   longer on fewer cores), so it is slow to start; later runs are not.")
+    if device == "cpu":
+        slow_start = (f"The first run {first_run}serves on the CPU backend —"
+                      f"\n   expect single-digit tokens per second on desktop-class machines.")
+    else:
+        slow_start = (f"The first run {first_run}JIT-builds the CUDA"
+                      f"\n   extension if no prebuilt kernel matches this Python (about a minute,"
+                      f"\n   longer on fewer cores), so it is slow to start; later runs are not.")
 
     if "chat" in components:
         # One command, one terminal. glq-chat starts vLLM itself, waits for it, opens the
@@ -244,8 +248,11 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
 
     step(("Serve it by hand instead — for a headless box, another client, or picode."
           if "chat" in components else f"Serve the model. {slow_start}"),
-         f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
-         f"--port {port}{kv_flags}{tools}")
+         (f"VLLM_CPU_KVCACHE_SPACE=8 {_venv_bin(venv, 'vllm')} serve {model} "
+          f"--quantization glq --enforce-eager --port {port}{tools}"
+          if device == "cpu" else
+          f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
+          f"--port {port}{kv_flags}{tools}"))
     if tools and is_gemma4:
         out.insert(len(out) - 1,
                    "   (the tool-choice flags are what pi needs; the chat template is "
@@ -368,7 +375,17 @@ def main(argv=None) -> int:
     except discovery.DiscoveryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    ranked = rank(checkpoints, vram)
+    if device == "cpu":
+        # RAM is the budget; only dense trellis serves on the CPU backend (MoE and
+        # e8p/shell refuse at load), so gate the recommendation accordingly. The menu
+        # still lists everything.
+        from .recommend import CPU_WEIGHT_FRACTION
+        ranked = rank(checkpoints, ram, weight_fraction=CPU_WEIGHT_FRACTION,
+                      require_trellis=True)
+        print("note: MoE and e8p/shell checkpoints do not serve on the CPU backend —"
+              " only dense trellis builds are recommended here.")
+    else:
+        ranked = rank(checkpoints, vram)
     print(f"Found {len(checkpoints)} checkpoints in the GLQ collection.")
 
     if args.list:
@@ -386,7 +403,14 @@ def main(argv=None) -> int:
             components = prompt.select_components(prompt.DEFAULT_COMPONENTS, tty=tty)
 
         kv_on = args.fp8_kv
-        if kv_on is None:
+        if device == "cpu":
+            # Unvalidated on the CPU backend; silently serving with an unvalidated flag
+            # is worse than a narrower install. Forced off, said once.
+            if kv_on:
+                print("fp8 KV cache is not validated on the CPU backend — serving at "
+                      "full precision.")
+            kv_on = False
+        elif kv_on is None:
             kv_on = prompt.confirm(
                 "\nUse vLLM's fp8 KV cache? The cache holds 8 bits per element instead of "
                 "16, so about twice the context fits in the same VRAM, at lower attention "
@@ -416,7 +440,13 @@ def main(argv=None) -> int:
     # Per-command defaults: glq-code prefers a fitting Qwen (native hermes tool calling,
     # AIME at bf16 parity), glq-chat a fitting gemma-4 (fastest MoE decode). Fit-gated by
     # the same VRAM budget as the menu; the user's generic pick is the floor.
-    picks = per_command_picks(checkpoints, vram, fallback=chosen.repo_id)
+    if device == "cpu":
+        from .recommend import CPU_WEIGHT_FRACTION
+        picks = per_command_picks(checkpoints, ram, fallback=chosen.repo_id,
+                                  weight_fraction=CPU_WEIGHT_FRACTION,
+                                  require_trellis=True)
+    else:
+        picks = per_command_picks(checkpoints, vram, fallback=chosen.repo_id)
     if not args.dry_run:
         configure.write_glq_config(
             GLQ_HOME / "config.json", model=chosen.repo_id, base_url=base_url,
@@ -464,7 +494,8 @@ def main(argv=None) -> int:
             return 1
 
     print(next_steps(venv=venv, model=chosen.repo_id, components=components,
-                     port=args.port, size_gib=chosen.size_gib, fp8_kv=bool(kv_on)))
+                     port=args.port, size_gib=chosen.size_gib, fp8_kv=bool(kv_on),
+                     device=device))
 
     # The handoff. `glq-chat` starts vLLM, opens the browser and stops the server again on
     # exit, so this turns "installed, now read four steps" into "installed, here is your

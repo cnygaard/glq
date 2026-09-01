@@ -22,6 +22,12 @@ from .discovery import Checkpoint
 #: Share of VRAM that may go to weights; the rest is KV cache, activations, fragmentation.
 WEIGHT_FRACTION = 0.75
 
+#: Share of system RAM that may go to weights on a CPU-only box. Deliberately lower than
+#: the VRAM fraction: RAM also holds the OS, page cache, the Python process and the
+#: separate VLLM_CPU_KVCACHE_SPACE pool — and oversizing here means swap-death rather
+#: than a clean OOM. Erring small costs one keystroke in the menu.
+CPU_WEIGHT_FRACTION = 0.5
+
 #: Per-command model-family preference, matched as a substring of the repo id. Measured
 #: rationale (2026-08, RTX PRO 6000 evals): Qwen3.8's tool calling is native hermes markup
 #: — no external template, no thought-markup leakage — and its GLQ-4bpw AIME ties bf16,
@@ -39,13 +45,15 @@ class Ranked:
     recommended: bool
 
 
-def usable_weight_bytes(vram_bytes: int) -> int:
-    """VRAM a checkpoint's weights may occupy, after reserving non-weight headroom."""
-    return int(vram_bytes * WEIGHT_FRACTION)
+def usable_weight_bytes(vram_bytes: int, weight_fraction: float = WEIGHT_FRACTION) -> int:
+    """Memory a checkpoint's weights may occupy, after reserving non-weight headroom."""
+    return int(vram_bytes * weight_fraction)
 
 
 def rank(checkpoints, vram_bytes: int | None,
-         prefer_family: str | None = None) -> list[Ranked]:
+         prefer_family: str | None = None,
+         weight_fraction: float = WEIGHT_FRACTION,
+         require_trellis: bool = False) -> list[Ranked]:
     """Largest-first, each marked fits/doesn't, with at most one recommended.
 
     With `vram_bytes=None` (no nvidia-smi, CPU-only box, container without the device) every
@@ -61,10 +69,15 @@ def rank(checkpoints, vram_bytes: int | None,
     if vram_bytes is None:
         return [Ranked(c, None, False) for c in ordered]
 
-    budget = usable_weight_bytes(vram_bytes)
+    budget = usable_weight_bytes(vram_bytes, weight_fraction)
     # size_bytes == 0 means the tree API gave us nothing usable; never treat that as
     # "fits anywhere", or a broken repo sorts to the top of the recommendation.
     fitting = [c for c in ordered if 0 < c.size_bytes <= budget]
+    if require_trellis:
+        # The CPU backend serves dense trellis only (MoE and e8p/shell refuse). Unknown
+        # (None) is ineligible on both axes: recommending gigabytes of download into a
+        # hard refusal at serve time is the worst failure this gate can produce.
+        fitting = [c for c in fitting if c.trellis is True and c.moe is False]
     if prefer_family:
         fam = [c for c in fitting if prefer_family.lower() in c.repo_id.lower()]
         if fam:
@@ -82,7 +95,9 @@ def rank(checkpoints, vram_bytes: int | None,
     return [Ranked(c, 0 < c.size_bytes <= budget, c.repo_id == best) for c in ordered]
 
 
-def per_command_picks(checkpoints, vram_bytes: int | None, fallback: str) -> dict:
+def per_command_picks(checkpoints, vram_bytes: int | None, fallback: str,
+                      weight_fraction: float = WEIGHT_FRACTION,
+                      require_trellis: bool = False) -> dict:
     """The per-command served-model defaults the installer records in config.json.
 
     `fallback` (the user's generic pick) fills any slot the family preference cannot —
@@ -92,7 +107,9 @@ def per_command_picks(checkpoints, vram_bytes: int | None, fallback: str) -> dic
     picks = {}
     for command, family in PREFERRED_FAMILIES.items():
         best = next((r.checkpoint.repo_id
-                     for r in rank(checkpoints, vram_bytes, prefer_family=family)
+                     for r in rank(checkpoints, vram_bytes, prefer_family=family,
+                                   weight_fraction=weight_fraction,
+                                   require_trellis=require_trellis)
                      if r.recommended), None)
         picks[f"{command}_model"] = best or fallback
     return picks
