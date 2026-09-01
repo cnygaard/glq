@@ -59,7 +59,8 @@ def _try_load_cpu_ext() -> bool:
         _glq_cpu = cpp_extension.load(
             name="glq_cpu",
             sources=[os.path.join(src_dir, s) for s in _SOURCES],
-            extra_cflags=["-O3", "-std=c++17", "-fopenmp"],
+            # No -std flag: torch injects the standard its headers require (see setup.py).
+            extra_cflags=["-O3", "-fopenmp"],
             extra_ldflags=["-fopenmp"],
             verbose=os.environ.get("GLQ_CPU_EXT_VERBOSE", "") == "1",
         )

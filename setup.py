@@ -128,10 +128,13 @@ if CPU_MODE != "0":
         ext_modules.append(_CE(
             name="glq._C_cpu",
             sources=CPU_SOURCES,
-            # Matches inference_kernel_cpu.py's JIT flags exactly. Per-ISA code uses
-            # in-source `#pragma GCC target` (never global -m flags), so this list stays
+            # Matches inference_kernel_cpu.py's JIT flags exactly. No -std flag: torch's
+            # BuildExtension injects the standard its own headers require (C++20 as of
+            # torch 2.13 — an explicit c++17 here overrode that and broke the build the
+            # week CI's unpinned torch moved). Per-ISA code uses in-source
+            # `#pragma GCC target` (never global -m flags), so this list stays
             # baseline-safe for every x86-64 machine the manylinux wheel reaches.
-            extra_compile_args={"cxx": ["-O3", "-std=c++17", "-fopenmp"]},
+            extra_compile_args={"cxx": ["-O3", "-fopenmp"]},
             extra_link_args=["-fopenmp"],
         ))
         # The CUDA branch above sets cmdclass only when nvcc exists; the CPU extension
