@@ -314,6 +314,15 @@ def main(argv=None) -> int:
     p.add_argument("--verify", action="store_true",
                    help="self-check an existing install and exit (no network)")
     p.add_argument("--dry-run", action="store_true", help="print commands, change nothing")
+    p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto",
+                   help="serving device (default: auto — cuda when an NVIDIA GPU is "
+                        "detected, else cpu via the vLLM CPU backend)")
+    p.add_argument("--cpu", dest="device", action="store_const", const="cpu",
+                   help="shorthand for --device cpu: install the vLLM CPU wheel and "
+                        "serve on CPU even if a GPU is present")
+    # Back-compat: install.sh shipped --assume-no-gpu before --cpu existed. Hidden.
+    p.add_argument("--assume-no-gpu", dest="device", action="store_const", const="cpu",
+                   help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     venv = Path(args.venv)
@@ -328,6 +337,14 @@ def main(argv=None) -> int:
     gpu, vram = hardware.gpu_name(), hardware.vram_bytes()
     print(f"GPU:  {gpu or 'none detected'}"
           + (f"  ({vram / 1024**3:.1f} GiB)" if vram else ""))
+    # Device: the flag wins; auto follows detection. This choice drives which vLLM wheel
+    # gets installed, what the model menu sizes against, and the printed serve commands —
+    # the serving commands themselves re-detect at runtime (the installed wheel wins).
+    device = args.device if args.device != "auto" else ("cuda" if vram else "cpu")
+    ram = hardware.ram_bytes() if device == "cpu" else None
+    if device == "cpu":
+        print("Serving on CPU (vLLM CPU backend) — expect single-digit tok/s."
+              + (f"  Sizing from system RAM ({ram / 1024**3:.0f} GiB)." if ram else ""))
 
     try:
         checkpoints = discovery.discover()
@@ -388,7 +405,8 @@ def main(argv=None) -> int:
             GLQ_HOME / "config.json", model=chosen.repo_id, base_url=base_url,
             components=components, available=[c.repo_id for c in checkpoints],
             fp8_kv=bool(kv_on),
-            code_model=picks["code_model"], chat_model=picks["chat_model"])
+            code_model=picks["code_model"], chat_model=picks["chat_model"],
+            device=device)
         if "picode" in components:
             # Same limits glq-code serves with; without them pi asks for the full
             # window as output and every request 400s (see configure.pi_models_json).

@@ -68,3 +68,29 @@ def test_gpu_name_is_reported_for_the_banner():
 
 def test_gpu_name_is_none_without_a_gpu():
     assert H.gpu_name(run=_runner(raises=FileNotFoundError())) is None
+
+
+# ---- system RAM (the CPU-serving budget source) ------------------------------------------
+def _reader(text=None, raises=None):
+    def read():
+        if raises:
+            raise raises
+        return text
+    return read
+
+
+def test_ram_bytes_parses_meminfo():
+    assert H.ram_bytes(read=_reader(
+        "MemTotal:       32605616 kB\nMemFree:  1868688 kB\n")) == 32605616 * 1024
+
+
+def test_ram_bytes_missing_file_returns_none():
+    assert H.ram_bytes(read=_reader(raises=FileNotFoundError())) is None
+
+
+def test_ram_bytes_garbage_returns_none():
+    assert H.ram_bytes(read=_reader("not meminfo at all\n")) is None
+
+
+def test_ram_bytes_missing_memtotal_returns_none():
+    assert H.ram_bytes(read=_reader("MemFree: 123 kB\n")) is None

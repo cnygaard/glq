@@ -105,3 +105,46 @@ def test_verify_flag_needs_no_network(monkeypatch, capsys):
     monkeypatch.setattr(M.discovery, "discover", boom)
     monkeypatch.setattr(M.verify, "run_checks", _healthy)
     assert M.main(["--verify"]) == 0
+
+
+# ---- device resolution (GPU → cuda; none → cpu; forced by flag) --------------------------
+
+def _capture_config(monkeypatch):
+    written = {}
+    monkeypatch.setattr(M.configure, "write_glq_config",
+                        lambda path, **kw: written.update(kw))
+    return written
+
+
+def test_gpu_box_resolves_device_cuda(offline, monkeypatch):
+    monkeypatch.setattr(M.verify, "run_checks", _healthy)
+    written = _capture_config(monkeypatch)
+    assert M.main(["--yes", "--components", "core,vllm"]) == 0
+    assert written["device"] == "cuda"
+
+
+def test_no_gpu_resolves_device_cpu(offline, monkeypatch):
+    monkeypatch.setattr(M.hardware, "gpu_name", lambda *a, **k: None)
+    monkeypatch.setattr(M.hardware, "vram_bytes", lambda *a, **k: None)
+    monkeypatch.setattr(M.hardware, "ram_bytes", lambda *a, **k: int(32 * GIB))
+    monkeypatch.setattr(M.verify, "run_checks", _healthy)
+    written = _capture_config(monkeypatch)
+    assert M.main(["--yes", "--components", "core,vllm"]) == 0
+    assert written["device"] == "cpu"
+
+
+def test_cpu_flag_forces_cpu_on_a_gpu_box(offline, monkeypatch):
+    """The Xeon e2e case: a GPU is visible but the user wants the CPU stack."""
+    monkeypatch.setattr(M.hardware, "ram_bytes", lambda *a, **k: int(32 * GIB))
+    monkeypatch.setattr(M.verify, "run_checks", _healthy)
+    written = _capture_config(monkeypatch)
+    assert M.main(["--yes", "--components", "core,vllm", "--cpu"]) == 0
+    assert written["device"] == "cpu"
+
+
+def test_assume_no_gpu_is_a_back_compat_alias(offline, monkeypatch):
+    monkeypatch.setattr(M.hardware, "ram_bytes", lambda *a, **k: int(32 * GIB))
+    monkeypatch.setattr(M.verify, "run_checks", _healthy)
+    written = _capture_config(monkeypatch)
+    assert M.main(["--yes", "--components", "core,vllm", "--assume-no-gpu"]) == 0
+    assert written["device"] == "cpu"
