@@ -103,6 +103,37 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         run([pip, "install", "glq[quantize]"])
 
 
+def _self_check(venv: Path, components, device: str | None,
+                run=None) -> tuple[int, str]:
+    """Run the post-install self-check in a FRESH interpreter, and return (rc, output).
+
+    It cannot run in this process. pip has just installed vLLM into this venv, and vLLM
+    pins torch: measured on a fresh box, glq's own install pulls torch 2.14.0 and the vLLM
+    install downgrades it to 2.13.0 mid-run. This process is still holding torch 2.14 in
+    memory while 2.13 sits on disk, so an in-process `import glq_vllm` (which imports
+    vllm) fails with an unrelated-looking
+
+        AttributeError: '_OpNamespace' 'aten' object has no attribute 'cholesky'
+
+    and the installer declares a perfectly healthy install INCOMPLETE, with exit 1 — which
+    install.sh, running under `set -e`, reports as a failed install. Reproduced outside
+    Docker; it is not an import-cache problem (invalidate_caches does not help), it is a
+    torn environment, and only a new interpreter can see a consistent one.
+    """
+    cmd = [str(_venv_bin(venv, "python")), "-m", "glq.installer", "--verify",
+           "--components", ",".join(components)]
+    if device:
+        cmd += ["--device", device]
+    # Resolved at CALL time, not as a default: a default argument binds the original
+    # subprocess.run at import, which no test (or caller) can then substitute.
+    runner = run or subprocess.run
+    try:
+        proc = runner(cmd, capture_output=True, text=True)
+    except Exception as exc:                                  # noqa: BLE001
+        return 1, f"could not run the self-check: {type(exc).__name__}: {exc}\n"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
 def _install_open_webui(run: Runner) -> Path | None:
     """Open WebUI goes in its OWN venv, always.
 
@@ -491,9 +522,9 @@ def main(argv=None) -> int:
     # "GLQ is installed." over a venv whose plugin does not resolve sends the user to
     # "Unknown quantization method: glq" with no clue the installer already knew.
     if not args.dry_run:
-        checks = verify.run_checks(components, device=device)
-        print(verify.render(checks))
-        if not verify.all_ok(checks):
+        rc, check_output = _self_check(venv, components, device)
+        print(check_output, end="" if check_output.endswith("\n") else "\n")
+        if rc != 0:
             print("\n" + "=" * 74)
             print("Install INCOMPLETE — the checks above failed, so serving would not "
                   "work.\nFix the FAIL lines and re-run, or run "

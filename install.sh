@@ -248,8 +248,18 @@ preflight() {
         esac
     fi
 
-    local freeg
-    freeg=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}')
+    # No awk: openSUSE Tumbleweed and Photon base images ship none, and its absence both
+    # leaked `awk: command not found` into the user's terminal and silently skipped this
+    # gate — on exactly the minimal images most likely to be short of disk. `df -P` keeps
+    # each filesystem on one line, `tr` squeezes the column padding so `cut` can take the
+    # Available field, and the shell does the KiB -> GiB division awk was doing.
+    local freekb freeg
+    freekb=$(df -Pk "$HOME" 2>/dev/null | tail -1 | tr -s ' ' | cut -d' ' -f4)
+    freeg=""
+    case "$freekb" in
+        ''|*[!0-9]*) ;;                  # df missing or unparseable — skip, do not guess
+        *) freeg=$(( freekb / 1024 / 1024 )) ;;
+    esac
     if [ -n "$freeg" ]; then
         if [ "$freeg" -lt "$MIN_FREE_GB" ]; then
             warn "  disk:    ${freeg} GB free in \$HOME — torch + vLLM + a checkpoint want >= ${MIN_FREE_GB} GB"
