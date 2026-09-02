@@ -151,7 +151,13 @@ pkg_hint() {
         # Without it pre-flight passes and the kernel build then dies on
         # `features.h: No such file or directory` — 16 times in one distro-matrix run.
         # Verified in the container: `tdnf install -y glibc-devel` provides /usr/include/features.h.
-        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel curl which" ;;
+        # kernel-headers as well as glibc-devel: on 3.0 neither gcc-c++ nor glibc-devel
+        # pulls /usr/include/linux/limits.h, and the JIT build dies on it (measured: 161
+        # such errors in one distro-matrix leg; `tdnf install -y kernel-headers` fixes it).
+        # This branch is 3.0 and CBL-Mariner only now — 4.0 rebased onto Fedora, declares
+        # ID_LIKE=fedora, and its dnf pulls both headers with glibc-devel, so it matches
+        # the *fedora* case above and needs neither named.
+        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel kernel-headers curl which" ;;
         *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl which" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
     esac
