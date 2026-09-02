@@ -163,17 +163,21 @@ pkg_hint() {
     esac
 }
 
-# Where to get a gcc old enough for nvcc, per distro. Only the Fedora line is measured:
-# `dnf install gcc15 gcc15-c++` on fedora:44 provides /usr/bin/g++-15, and pointing nvcc at it
-# removed every "unsupported GNU version" error (6 -> 0). The others follow each distro's
-# usual naming and are NOT verified — they are a starting point, not a promise.
+# Where to get a gcc old enough for nvcc, per distro. Two lines are measured in containers:
+#   fedora:44          `dnf install gcc15 gcc15-c++` provides /usr/bin/g++-15, and pointing
+#                      nvcc at it removed every "unsupported GNU version" error (6 -> 0).
+#   opensuse/tumbleweed  default gcc is 16, and `zypper install -y gcc15-c++` provides
+#                      /usr/bin/g++-15 — verified in the image after a source-install leg
+#                      failed there with 199 of those errors.
+# The Debian and Arch lines follow each distro's usual naming and are NOT verified — they
+# are a starting point, not a promise.
 compat_gcc_hint() {
     case " $DISTRO_ID $DISTRO_LIKE " in
         *fedora*)                   echo "sudo dnf install -y gcc${MAX_NVCC_GCC} gcc${MAX_NVCC_GCC}-c++" ;;
         *ubuntu*|*debian*)          echo "sudo apt-get install -y g++-${MAX_NVCC_GCC}   # unverified" ;;
         *arch*|*manjaro*|*endeavouros*)
                                     echo "sudo pacman -S --needed gcc${MAX_NVCC_GCC}   # unverified" ;;
-        *suse*|*sles*)              echo "sudo zypper install -y gcc${MAX_NVCC_GCC}-c++   # unverified" ;;
+        *suse*|*sles*)              echo "sudo zypper install -y gcc${MAX_NVCC_GCC}-c++" ;;
         *)                          echo "install a gcc <= ${MAX_NVCC_GCC} with your package manager" ;;
     esac
 }

@@ -476,3 +476,17 @@ def test_azure_linux_4_needs_no_explicit_kernel_headers(tmp_path):
     fedora-branch hint alone leaves linux/limits.h present and a program including it
     compiles. Naming it there would be noise."""
     assert "kernel-headers" not in _out(_preflight("azurelinux", tmp_path))
+
+
+def test_the_suse_compat_gcc_advice_is_no_longer_marked_unverified(tmp_path):
+    """Measured in opensuse/tumbleweed: the image's default gcc is 16 — over nvcc's cap —
+    and `zypper install -y gcc15-c++` installs /usr/bin/g++-15, which is exactly what
+    NVCC_CCBIN then points at. The source-install leg failed there with 199 'unsupported
+    GNU version' errors before this was confirmed."""
+    src = open(INSTALL_SH).read()
+    # MAX_NVCC_GCC pins it to the compat-compiler line; the package-hint line for suse
+    # also mentions gcc-c++.
+    suse_line = [ln for ln in src.splitlines() if "*suse*" in ln and "MAX_NVCC_GCC" in ln]
+    assert suse_line, src
+    assert "unverified" not in suse_line[0], suse_line[0]
+    assert "gcc${MAX_NVCC_GCC}-c++" in suse_line[0], suse_line[0]
