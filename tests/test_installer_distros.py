@@ -422,6 +422,18 @@ for _ in $(seq 1 30); do
 done
 echo "UI_OK:$UI_OK"
 
+# vLLM says "Engine core initialization failed. See root cause above" — and "above" is its
+# OWN log file, which dies with the container. Two separate investigations stalled here for
+# exactly that reason, so dump it whenever the chat did not come up.
+if [ "$READY" != "True" ]; then
+    for f in /tmp/glq-vllm-*.log; do
+        [ -f "$f" ] || continue
+        echo "===VLLM_LOG $f"
+        tail -200 "$f"
+        echo "===VLLM_LOG_END"
+    done
+fi
+
 curl -s http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
     -d "{\"model\": \"$GLQ_SMOKE_MODEL\", \"prompt\": \"The capital of France is\", \
          \"max_tokens\": 8, \"temperature\": 0}" >/tmp/chat_gen.json 2>/dev/null

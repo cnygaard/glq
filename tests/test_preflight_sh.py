@@ -490,3 +490,19 @@ def test_the_suse_compat_gcc_advice_is_no_longer_marked_unverified(tmp_path):
     assert suse_line, src
     assert "unverified" not in suse_line[0], suse_line[0]
     assert "gcc${MAX_NVCC_GCC}-c++" in suse_line[0], suse_line[0]
+
+
+def test_suse_is_told_to_install_the_sqlite3_module(tmp_path):
+    """SUSE ships sqlite3 as its own package and vLLM imports it
+    (v1/structured_output/backend_xgrammar.py), so without it the install succeeds and the
+    SERVER dies on `ModuleNotFoundError: No module named 'sqlite3'` — seen in a wheel-mode
+    matrix leg. Measured in opensuse/tumbleweed: after this hint's own
+    `python3-devel gcc-c++ curl which`, `python3 -c "import sqlite3"` still fails; adding
+    python3-sqlite3 fixes it."""
+    assert "python3-sqlite3" in _out(_preflight("opensuse", tmp_path))
+
+
+def test_the_other_distros_are_not_told_about_sqlite3(tmp_path):
+    """Everyone else ships it inside python3 itself; naming it would be noise."""
+    for distro in ("ubuntu", "fedora", "rhel", "arch"):
+        assert "sqlite3" not in _out(_preflight(distro, tmp_path)), distro

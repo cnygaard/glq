@@ -158,7 +158,13 @@ pkg_hint() {
         # ID_LIKE=fedora, and its dnf pulls both headers with glibc-devel, so it matches
         # the *fedora* case above and needs neither named.
         *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel kernel-headers curl which" ;;
-        *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl which" ;;
+        # python3-sqlite3 explicitly: SUSE ships the sqlite3 stdlib module as its own
+        # package, and vLLM imports it (v1/structured_output/backend_xgrammar.py), so
+        # without it the install succeeds and the SERVER dies on
+        # `ModuleNotFoundError: No module named 'sqlite3'`. Measured in
+        # opensuse/tumbleweed: after this hint's own python3-devel gcc-c++ curl which,
+        # `python3 -c "import sqlite3"` still fails; adding python3-sqlite3 fixes it.
+        *suse*|*sles*)              echo "sudo zypper install -y python3-devel python3-sqlite3 gcc-c++ curl which" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
     esac
 }
