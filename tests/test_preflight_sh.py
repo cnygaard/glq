@@ -406,3 +406,36 @@ def test_preflight_computes_free_disk_without_awk(tmp_path):
         "pre-flight still shells out to awk; minimal images do not have it"
     assert "command not found" not in proc.stdout + proc.stderr
     assert re.search(r"disk:\s+\d+ GB free", proc.stdout), proc.stdout
+
+
+# ---- `which` is a vLLM runtime dependency on RPM-family images ---------------------------
+#
+# Verified in vLLM's own source, not inferred: vllm/third_party/deep_gemm/__init__.py's
+# _find_cuda_home() runs `subprocess.check_output(['which', 'nvcc'])`. A missing binary is
+# caught there, but the fallback is /usr/local/cuda — which does not exist when the CUDA
+# toolchain came from pip wheels, as it does for every prebuilt-wheel install — and the
+# function then trips `assert cuda_home is not None`, taking the engine core with it.
+#
+# Nothing in install.sh or glq calls the binary (they use the `command -v` builtin). It is
+# present on most full installs — Debian-family ships it in Essential debianutils — but
+# minimal/container images omit it and Fedora dropped it from default installs, which is
+# why the distro harness has to install it on every dnf/tdnf/zypper image and never on
+# Debian-family.
+
+@pytest.mark.parametrize("distro", ["fedora", "rhel", "rocky", "almalinux", "amzn",
+                                    "azurelinux", "mariner", "opensuse"])
+def test_rpm_family_hint_names_which(distro, tmp_path):
+    proc = _preflight(distro, tmp_path)
+    hint = [ln for ln in proc.stdout.splitlines() if "packages on this distro" in ln]
+    assert hint, proc.stdout
+    assert "which" in hint[0], (
+        f"{distro}: the hint omits `which`, so vLLM's CUDA_HOME lookup fails and the "
+        f"engine core asserts after an install that reported success:\n{hint[0]}")
+
+
+def test_debian_family_hint_does_not_name_which(tmp_path):
+    """debianutils is Essential there — asking for it would be noise in the one command
+    a new user copy-pastes."""
+    proc = _preflight("ubuntu", tmp_path)
+    hint = [ln for ln in proc.stdout.splitlines() if "packages on this distro" in ln][0]
+    assert "which" not in hint, hint
