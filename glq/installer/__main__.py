@@ -165,9 +165,18 @@ def _install_picode(run: Runner) -> None:
     print("\n== pi coding agent (installs node via nvm)")
     nvm_sh = Path.home() / ".nvm" / "nvm.sh"
     if not nvm_sh.exists():
+        # GIT_TERMINAL_PROMPT=0: nvm's installer git-clones from github.com, and git asks
+        # for a username whenever GitHub refuses the request (403/404 — most often
+        # unauthenticated rate-limiting from a shared cloud IP), because it cannot tell a
+        # private repo from a missing one. Reported from a real install, where the
+        # installer sat at `Username for 'https://github.com':` waiting for input that a
+        # piped `curl | bash` may never be able to give. Failing fast with git's actual
+        # error is strictly better than hanging, and no GitHub account is ever needed here.
         run(["bash", "-c",
+             "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true "
              "curl --proto '=https' --tlsv1.2 -fsSL "
-             "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"])
+             "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | "
+             "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true bash"])
     run(["bash", "-c",
          ". ~/.nvm/nvm.sh && nvm install --lts >/dev/null && "
          "npm install -g --force @earendil-works/pi-coding-agent"])

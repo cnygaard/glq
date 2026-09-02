@@ -137,3 +137,17 @@ def test_default_device_argv_is_unchanged():
     flat = _pip_commands(("core", "vllm"))
     assert " vllm " in f" {flat} "
     assert "+cpu" not in flat and "--extra-index-url" not in flat
+
+
+def test_the_nvm_bootstrap_cannot_block_on_a_git_credential_prompt():
+    """nvm's installer git-clones from github.com, and git asks for a username whenever
+    GitHub refuses the request (403/404 — commonly unauthenticated rate-limiting from a
+    shared cloud IP). Reported from a real install: the installer sat at
+    `Username for 'https://github.com':` waiting for input a piped `curl | bash` may never
+    be able to supply. No GitHub account is needed here, so failing fast with git's own
+    error beats hanging forever."""
+    seen = []
+    M._install_picode(lambda cmd, **kw: seen.append(" ".join(map(str, cmd))))
+    nvm = [c for c in seen if "nvm-sh/nvm" in c]
+    assert nvm, f"no nvm bootstrap in: {seen}"
+    assert "GIT_TERMINAL_PROMPT=0" in nvm[0], nvm[0]
