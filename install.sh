@@ -151,23 +151,33 @@ pkg_hint() {
         # Without it pre-flight passes and the kernel build then dies on
         # `features.h: No such file or directory` — 16 times in one distro-matrix run.
         # Verified in the container: `tdnf install -y glibc-devel` provides /usr/include/features.h.
-        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel curl which" ;;
+        # kernel-headers as well as glibc-devel: on 3.0 neither gcc-c++ nor glibc-devel
+        # pulls /usr/include/linux/limits.h, and the JIT build dies on it (measured: 161
+        # such errors in one distro-matrix leg; `tdnf install -y kernel-headers` fixes it).
+        # This branch is 3.0 and CBL-Mariner only now — 4.0 rebased onto Fedora, declares
+        # ID_LIKE=fedora, and its dnf pulls both headers with glibc-devel, so it matches
+        # the *fedora* case above and needs neither named.
+        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel kernel-headers curl which" ;;
         *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl which" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
     esac
 }
 
-# Where to get a gcc old enough for nvcc, per distro. Only the Fedora line is measured:
-# `dnf install gcc15 gcc15-c++` on fedora:44 provides /usr/bin/g++-15, and pointing nvcc at it
-# removed every "unsupported GNU version" error (6 -> 0). The others follow each distro's
-# usual naming and are NOT verified — they are a starting point, not a promise.
+# Where to get a gcc old enough for nvcc, per distro. Two lines are measured in containers:
+#   fedora:44          `dnf install gcc15 gcc15-c++` provides /usr/bin/g++-15, and pointing
+#                      nvcc at it removed every "unsupported GNU version" error (6 -> 0).
+#   opensuse/tumbleweed  default gcc is 16, and `zypper install -y gcc15-c++` provides
+#                      /usr/bin/g++-15 — verified in the image after a source-install leg
+#                      failed there with 199 of those errors.
+# The Debian and Arch lines follow each distro's usual naming and are NOT verified — they
+# are a starting point, not a promise.
 compat_gcc_hint() {
     case " $DISTRO_ID $DISTRO_LIKE " in
         *fedora*)                   echo "sudo dnf install -y gcc${MAX_NVCC_GCC} gcc${MAX_NVCC_GCC}-c++" ;;
         *ubuntu*|*debian*)          echo "sudo apt-get install -y g++-${MAX_NVCC_GCC}   # unverified" ;;
         *arch*|*manjaro*|*endeavouros*)
                                     echo "sudo pacman -S --needed gcc${MAX_NVCC_GCC}   # unverified" ;;
-        *suse*|*sles*)              echo "sudo zypper install -y gcc${MAX_NVCC_GCC}-c++   # unverified" ;;
+        *suse*|*sles*)              echo "sudo zypper install -y gcc${MAX_NVCC_GCC}-c++" ;;
         *)                          echo "install a gcc <= ${MAX_NVCC_GCC} with your package manager" ;;
     esac
 }

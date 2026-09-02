@@ -36,7 +36,13 @@ OS_RELEASE = {
     "arch": 'ID=arch\nPRETTY_NAME="Arch Linux"\n',
     "manjaro": 'ID=manjaro\nID_LIKE=arch\n',
     "amzn": 'ID="amzn"\nVERSION_ID="2023"\nPRETTY_NAME="Amazon Linux 2023"\n',
-    "azurelinux": 'ID=azurelinux\nVERSION_ID="3.0"\nPRETTY_NAME="Microsoft Azure Linux 3.0"\n',
+    # 3.0: no ID_LIKE, so it falls to the azurelinux/mariner (tdnf) branch.
+    "azurelinux3": 'ID=azurelinux\nVERSION_ID="3.0"\nPRETTY_NAME="Microsoft Azure Linux 3.0"\n',
+    # 4.0 rebased onto a Fedora upstream and now declares ID_LIKE=fedora (verified in
+    # mcr.microsoft.com/azurelinux-beta/base/core:4.0), which routes it to the fedora dnf
+    # branch instead — the image ships dnf, so that is the advice it can act on.
+    "azurelinux": 'ID=azurelinux\nID_LIKE=fedora\nVERSION_ID="4.0"\n'
+                  'PRETTY_NAME="Azure Linux 4.0 (Container Image Beta)"\n',
     "mariner": 'ID=mariner\nVERSION_ID="2.0"\nPRETTY_NAME="CBL-Mariner"\n',
     "steamos": 'ID=steamos\nID_LIKE=arch\nVERSION_ID="3.5"\nPRETTY_NAME="SteamOS"\n',
     "opensuse": 'ID="opensuse-tumbleweed"\nID_LIKE="opensuse suse"\n',
@@ -84,7 +90,7 @@ def _out(proc):
     ("ubuntu", "apt-get"), ("debian", "apt-get"),
     ("fedora", "dnf"), ("rhel", "dnf"), ("rocky", "dnf"), ("amzn", "dnf"),
     ("arch", "pacman"), ("manjaro", "pacman"),
-    ("azurelinux", "tdnf"), ("mariner", "tdnf"),
+    ("azurelinux", "dnf"), ("azurelinux3", "tdnf"), ("mariner", "tdnf"),
     ("opensuse", "zypper"),
 ])
 def test_the_remediation_command_matches_the_distro(distro, expect, tmp_path):
@@ -377,11 +383,25 @@ def test_it_never_blocks_the_install(tmp_path):
 # build-essential brings libc6-dev. Verified in the container: `tdnf install -y glibc-devel`
 # succeeds and produces /usr/include/features.h.
 
-def test_azure_linux_is_told_to_install_the_libc_headers(tmp_path):
-    out = _out(_preflight("azurelinux", tmp_path))
+def test_azure_linux_3_is_told_to_install_the_libc_headers(tmp_path):
+    """3.0's minimal core image is the one where gcc-c++ does not pull the libc headers."""
+    out = _out(_preflight("azurelinux3", tmp_path))
     assert "glibc-devel" in out, (
-        "azurelinux's gcc-c++ does not pull the libc headers, so the advice must name them; "
-        "without it pre-flight passes and the kernel build fails later")
+        "azurelinux 3's gcc-c++ does not pull the libc headers, so the advice must name "
+        "them; without it pre-flight passes and the kernel build fails later")
+
+
+def test_azure_linux_4_takes_the_fedora_advice(tmp_path):
+    """4.0 rebased onto a Fedora upstream and declares ID_LIKE=fedora, so it lands on the
+    fedora dnf branch — and that advice is sufficient there, unlike on 3.0. Measured in
+    mcr.microsoft.com/azurelinux-beta/base/core:4.0: after
+    `dnf install -y python3-devel gcc-c++ curl which`, /usr/include/features.h is present
+    (glibc-devel arrives as a dependency), a #include <features.h> program compiles,
+    python3 is 3.14.3 and g++ is 15.2.1 — at MAX_NVCC_GCC, not over it. Asking for curl
+    caused no conflict with the preinstalled one."""
+    out = _out(_preflight("azurelinux", tmp_path))
+    assert "dnf install" in out and "gcc-c++" in out and "which" in out, out
+    assert "tdnf" not in out, f"4.0 has dnf and declares ID_LIKE=fedora:\n{out}"
 
 
 def test_mariner_gets_the_same_advice(tmp_path):
@@ -439,3 +459,34 @@ def test_debian_family_hint_does_not_name_which(tmp_path):
     proc = _preflight("ubuntu", tmp_path)
     hint = [ln for ln in proc.stdout.splitlines() if "packages on this distro" in ln][0]
     assert "which" not in hint, hint
+
+
+def test_azure_linux_3_is_told_to_install_the_kernel_headers(tmp_path):
+    """Measured in mcr.microsoft.com/azurelinux/base/core:3.0 — after the hint's own
+    `tdnf install -y python3-devel gcc-c++ glibc-devel curl`, /usr/include/linux/limits.h
+    is still absent and the JIT build dies on `linux/limits.h: No such file or directory`
+    (161 such errors in one distro-matrix leg). `tdnf install -y kernel-headers` provides
+    it. Unlike Fedora and Azure Linux 4, glibc-devel here does not pull it."""
+    out = _out(_preflight("azurelinux3", tmp_path))
+    assert "kernel-headers" in out, out
+
+
+def test_azure_linux_4_needs_no_explicit_kernel_headers(tmp_path):
+    """4.0's dnf pulls kernel-headers with glibc-devel — verified in the beta image: the
+    fedora-branch hint alone leaves linux/limits.h present and a program including it
+    compiles. Naming it there would be noise."""
+    assert "kernel-headers" not in _out(_preflight("azurelinux", tmp_path))
+
+
+def test_the_suse_compat_gcc_advice_is_no_longer_marked_unverified(tmp_path):
+    """Measured in opensuse/tumbleweed: the image's default gcc is 16 — over nvcc's cap —
+    and `zypper install -y gcc15-c++` installs /usr/bin/g++-15, which is exactly what
+    NVCC_CCBIN then points at. The source-install leg failed there with 199 'unsupported
+    GNU version' errors before this was confirmed."""
+    src = open(INSTALL_SH).read()
+    # MAX_NVCC_GCC pins it to the compat-compiler line; the package-hint line for suse
+    # also mentions gcc-c++.
+    suse_line = [ln for ln in src.splitlines() if "*suse*" in ln and "MAX_NVCC_GCC" in ln]
+    assert suse_line, src
+    assert "unverified" not in suse_line[0], suse_line[0]
+    assert "gcc${MAX_NVCC_GCC}-c++" in suse_line[0], suse_line[0]

@@ -107,7 +107,14 @@ DISTROS = [
     Distro("almalinux",  "almalinux:9",                                    "dnf"),
     Distro("amazon2023", "amazonlinux:2023",                               "dnf"),
     Distro("arch",       "archlinux:latest",                               "pacman"),
-    Distro("azurelinux", "mcr.microsoft.com/azurelinux/base/core:3.0",     "tdnf"),
+    # Azure Linux 4.0 (beta channel — Microsoft has not published a 4.x tag under
+    # azurelinux/base/core yet; the whole 4.x line lives in azurelinux-beta). It is the
+    # rebase onto a Fedora upstream, and that is why it earns the slot over 3.0: the image
+    # sets ID_LIKE=fedora, which routes it to a DIFFERENT pkg_hint branch than 3.0's
+    # tdnf one — the *fedora* case matches first — and ships dnf alongside tdnf. Verified
+    # in the image: ID=azurelinux, ID_LIKE=fedora, VERSION_ID=4.0, and no which/awk/
+    # python3/gcc, so it exercises the advice path from a genuinely bare base.
+    Distro("azurelinux", "mcr.microsoft.com/azurelinux-beta/base/core:4.0", "dnf"),
     Distro("opensuse",   "opensuse/tumbleweed",                            "zypper"),
 ]
 
