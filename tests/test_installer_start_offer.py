@@ -42,8 +42,12 @@ def offline(monkeypatch):
     monkeypatch.setattr(M, "_install_python_extras", lambda *a, **k: None)
     monkeypatch.setattr(M.configure, "write_glq_config", lambda *a, **k: None)
     monkeypatch.setattr(M.configure, "write_pi_models", lambda *a, **k: None)
-    monkeypatch.setattr(M.verify, "run_checks", lambda *a, **k:
-                        [V.Check("glq importable", True, "glq 0.8.6")])
+    # The install path runs its self-check as a SUBPROCESS of the venv's python (that
+    # venv does not exist here, and in production the check cannot run in-process — pip
+    # has just swapped torch underneath it; see M._self_check). Fake that seam, not
+    # run_checks, which is what the child would call.
+    monkeypatch.setattr(M, "_self_check", lambda *a, **k:
+                        (0, V.render([V.Check("glq importable", True, "glq 0.8.6")])))
 
     started = []
     monkeypatch.setattr(M, "_start_chat", lambda venv: started.append(venv))
@@ -52,8 +56,9 @@ def offline(monkeypatch):
 
 @pytest.fixture
 def broken(monkeypatch):
-    monkeypatch.setattr(M.verify, "run_checks", lambda *a, **k:
-                        [V.Check("glq_vllm importable", False, "glq_vllm is missing")])
+    monkeypatch.setattr(M, "_self_check", lambda *a, **k:
+                        (1, V.render([V.Check("glq_vllm importable", False,
+                                              "glq_vllm is missing")])))
 
 
 def _asked(capsys):

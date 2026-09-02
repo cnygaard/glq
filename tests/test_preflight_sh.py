@@ -44,7 +44,7 @@ OS_RELEASE = {
 }
 
 
-def _preflight(distro, tmp_path, extra=(), gcc_version=None):
+def _preflight(distro, tmp_path, extra=(), gcc_version=None, trap_awk=False):
     osr = tmp_path / f"os-release-{distro}"
     osr.write_text(OS_RELEASE[distro])
     env = {**os.environ, "GLQ_OS_RELEASE": str(osr),
@@ -58,6 +58,16 @@ def _preflight(distro, tmp_path, extra=(), gcc_version=None):
         (shim / "gcc").write_text(
             f'#!/bin/sh\n[ "$1" = "-dumpversion" ] && echo {gcc_version} && exit 0\nexit 0\n')
         (shim / "gcc").chmod(0o755)
+        env["PATH"] = f"{shim}:{env['PATH']}"
+    if trap_awk:
+        # A shim that records the call and then fails exactly as a missing awk does.
+        # openSUSE Tumbleweed and Photon base images ship no awk at all.
+        shim = tmp_path / "shim-awk"
+        shim.mkdir(exist_ok=True)
+        (shim / "awk").write_text(
+            f'#!/bin/sh\ntouch {tmp_path / "awk_was_called"}\n'
+            f'echo "awk: command not found" >&2\nexit 127\n')
+        (shim / "awk").chmod(0o755)
         env["PATH"] = f"{shim}:{env['PATH']}"
     return subprocess.run(
         ["bash", INSTALL_SH, "--preflight", *extra],
@@ -384,3 +394,48 @@ def test_the_other_rpm_distros_are_not_changed(tmp_path):
     command the user is asked to paste."""
     for distro in ("fedora", "rhel"):
         assert "glibc-devel" not in _out(_preflight(distro, tmp_path))
+
+
+def test_preflight_computes_free_disk_without_awk(tmp_path):
+    """Measured in the distro matrix (2026-09-02): openSUSE Tumbleweed and Photon ship no
+    awk, so the disk check printed a raw `awk: command not found` into the user's terminal
+    and then silently skipped its own gate — the free-space warning could never fire on
+    exactly the minimal images most likely to be short of space."""
+    proc = _preflight("ubuntu", tmp_path, trap_awk=True)
+    assert not (tmp_path / "awk_was_called").exists(), \
+        "pre-flight still shells out to awk; minimal images do not have it"
+    assert "command not found" not in proc.stdout + proc.stderr
+    assert re.search(r"disk:\s+\d+ GB free", proc.stdout), proc.stdout
+
+
+# ---- `which` is a vLLM runtime dependency on RPM-family images ---------------------------
+#
+# Verified in vLLM's own source, not inferred: vllm/third_party/deep_gemm/__init__.py's
+# _find_cuda_home() runs `subprocess.check_output(['which', 'nvcc'])`. A missing binary is
+# caught there, but the fallback is /usr/local/cuda — which does not exist when the CUDA
+# toolchain came from pip wheels, as it does for every prebuilt-wheel install — and the
+# function then trips `assert cuda_home is not None`, taking the engine core with it.
+#
+# Nothing in install.sh or glq calls the binary (they use the `command -v` builtin). It is
+# present on most full installs — Debian-family ships it in Essential debianutils — but
+# minimal/container images omit it and Fedora dropped it from default installs, which is
+# why the distro harness has to install it on every dnf/tdnf/zypper image and never on
+# Debian-family.
+
+@pytest.mark.parametrize("distro", ["fedora", "rhel", "rocky", "almalinux", "amzn",
+                                    "azurelinux", "mariner", "opensuse"])
+def test_rpm_family_hint_names_which(distro, tmp_path):
+    proc = _preflight(distro, tmp_path)
+    hint = [ln for ln in proc.stdout.splitlines() if "packages on this distro" in ln]
+    assert hint, proc.stdout
+    assert "which" in hint[0], (
+        f"{distro}: the hint omits `which`, so vLLM's CUDA_HOME lookup fails and the "
+        f"engine core asserts after an install that reported success:\n{hint[0]}")
+
+
+def test_debian_family_hint_does_not_name_which(tmp_path):
+    """debianutils is Essential there — asking for it would be noise in the one command
+    a new user copy-pastes."""
+    proc = _preflight("ubuntu", tmp_path)
+    hint = [ln for ln in proc.stdout.splitlines() if "packages on this distro" in ln][0]
+    assert "which" not in hint, hint

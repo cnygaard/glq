@@ -119,6 +119,15 @@ detect_distro() {
     fi
 }
 
+# `which` rides along on the RPM families. Nothing in this script needs it — everything
+# here uses the `command -v` builtin — but vLLM's vendored deep_gemm locates nvcc with
+# `subprocess.check_output(["which", "nvcc"])` in _find_cuda_home(). A missing binary is
+# caught there, and the fallback is /usr/local/cuda, which does not exist when the CUDA
+# toolchain came from pip wheels (the prebuilt-wheel path every user takes) — so the
+# function trips `assert cuda_home is not None` and the engine core goes down after an
+# install that reported success. Debian-family ships it in Essential debianutils; the RPM
+# images that lack it are the minimal/container ones, and Fedora dropped it from default
+# installs in favour of the shell builtin.
 pkg_hint() {
     local id="$DISTRO_ID $DISTRO_LIKE"
     case " $id " in
@@ -132,8 +141,8 @@ pkg_hint() {
         #   * `curl` CONFLICTS with the preinstalled curl-minimal and aborts the whole dnf
         #     transaction, taking gcc with it. Asking for it is worse than omitting it.
         *rhel*|*centos*|*rocky*|*almalinux*|*amzn*)
-                                    echo "sudo dnf install -y python3.12 python3.12-devel gcc-c++" ;;
-        *fedora*)                   echo "sudo dnf install -y python3-devel gcc-c++ curl" ;;
+                                    echo "sudo dnf install -y python3.12 python3.12-devel gcc-c++ which" ;;
+        *fedora*)                   echo "sudo dnf install -y python3-devel gcc-c++ curl which" ;;
         *steamos*)                  echo "sudo steamos-readonly disable && sudo pacman -Syu --needed --noconfirm python gcc curl   # or use distrobox" ;;
         *arch*|*manjaro*|*endeavouros*)
                                     echo "sudo pacman -Syu --needed --noconfirm python gcc curl" ;;
@@ -142,8 +151,8 @@ pkg_hint() {
         # Without it pre-flight passes and the kernel build then dies on
         # `features.h: No such file or directory` — 16 times in one distro-matrix run.
         # Verified in the container: `tdnf install -y glibc-devel` provides /usr/include/features.h.
-        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel curl" ;;
-        *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl" ;;
+        *azurelinux*|*mariner*)     echo "sudo tdnf install -y python3-devel gcc-c++ glibc-devel curl which" ;;
+        *suse*|*sles*)              echo "sudo zypper install -y python3-devel gcc-c++ curl which" ;;
         *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
     esac
 }
@@ -248,8 +257,18 @@ preflight() {
         esac
     fi
 
-    local freeg
-    freeg=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}')
+    # No awk: openSUSE Tumbleweed and Photon base images ship none, and its absence both
+    # leaked `awk: command not found` into the user's terminal and silently skipped this
+    # gate — on exactly the minimal images most likely to be short of disk. `df -P` keeps
+    # each filesystem on one line, `tr` squeezes the column padding so `cut` can take the
+    # Available field, and the shell does the KiB -> GiB division awk was doing.
+    local freekb freeg
+    freekb=$(df -Pk "$HOME" 2>/dev/null | tail -1 | tr -s ' ' | cut -d' ' -f4)
+    freeg=""
+    case "$freekb" in
+        ''|*[!0-9]*) ;;                  # df missing or unparseable — skip, do not guess
+        *) freeg=$(( freekb / 1024 / 1024 )) ;;
+    esac
     if [ -n "$freeg" ]; then
         if [ "$freeg" -lt "$MIN_FREE_GB" ]; then
             warn "  disk:    ${freeg} GB free in \$HOME — torch + vLLM + a checkpoint want >= ${MIN_FREE_GB} GB"
