@@ -151,3 +151,25 @@ def test_the_nvm_bootstrap_cannot_block_on_a_git_credential_prompt():
     nvm = [c for c in seen if "nvm-sh/nvm" in c]
     assert nvm, f"no nvm bootstrap in: {seen}"
     assert "GIT_TERMINAL_PROMPT=0" in nvm[0], nvm[0]
+
+
+def test_the_nvm_bootstrap_does_not_use_git():
+    """Diagnosed on a cloud box: git sends `User-Agent: git/2.43.0` and GitHub replies
+    `HTTP 401 www-authenticate: Basic realm="GitHub"`, while curl to the same endpoint
+    gets 200 — GitHub challenges unauthenticated *git* operations from some IP ranges, so
+    the clone hung on a username prompt. METHOD=script fetches nvm.sh over HTTPS instead;
+    verified live, after which pi installed and `glq-setup --verify` went fully green."""
+    seen = []
+    M._install_picode(lambda cmd, **kw: seen.append(" ".join(map(str, cmd))))
+    nvm = [c for c in seen if "nvm-sh/nvm" in c]
+    assert nvm and "METHOD=script" in nvm[0], nvm
+
+
+def test_pi_is_installed_without_running_dependency_scripts():
+    """The package has no install hooks of its own (all its scripts are build-time) and a
+    plain-JS bin, so --ignore-scripts costs nothing and keeps transitive postinstalls from
+    running arbitrary code."""
+    seen = []
+    M._install_picode(lambda cmd, **kw: seen.append(" ".join(map(str, cmd))))
+    npm = [c for c in seen if "pi-coding-agent" in c]
+    assert npm and "--ignore-scripts" in npm[0], npm

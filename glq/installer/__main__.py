@@ -172,14 +172,24 @@ def _install_picode(run: Runner) -> None:
         # installer sat at `Username for 'https://github.com':` waiting for input that a
         # piped `curl | bash` may never be able to give. Failing fast with git's actual
         # error is strictly better than hanging, and no GitHub account is ever needed here.
+        # METHOD=script makes nvm's installer fetch nvm.sh over HTTPS instead of running
+        # `git clone`. Diagnosed on a cloud box: git sends `User-Agent: git/2.43.0` and
+        # GitHub answers `HTTP 401 www-authenticate: Basic realm="GitHub"`, while curl to
+        # the SAME endpoint gets 200 — GitHub challenges unauthenticated *git* operations
+        # from some IP ranges. The install then sat at `Username for 'https://github.com':`
+        # forever. No account is needed here, and the script method touches no git at all.
+        # GIT_TERMINAL_PROMPT stays as a backstop for any future path that shells out to git.
         run(["bash", "-c",
-             "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true "
              "curl --proto '=https' --tlsv1.2 -fsSL "
              "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | "
-             "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true bash"])
+             "METHOD=script GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true bash"])
+    # --ignore-scripts: the package declares no install/preinstall/postinstall hook (its
+    # scripts are all build-time) and its bin is plain JS, so nothing it needs runs at
+    # install time — while the flag stops any transitive dependency's postinstall from
+    # executing arbitrary code or making network calls the box may not permit.
     run(["bash", "-c",
          ". ~/.nvm/nvm.sh && nvm install --lts >/dev/null && "
-         "npm install -g --force @earendil-works/pi-coding-agent"])
+         "npm install -g --force --ignore-scripts @earendil-works/pi-coding-agent"])
     # gemma-4's tool template is not in the model checkpoint (its bundled template is
     # plain chat) and not in the vLLM wheel — it lives in vLLM's repo examples. Measured:
     # the printed serve command referenced a path that did not exist and vLLM refused to
