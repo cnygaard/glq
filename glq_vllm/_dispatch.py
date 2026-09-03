@@ -27,3 +27,24 @@ def _grouped_enabled(env_val, grouped_min: int, num_tokens: int) -> bool:
     if v in ("1", "on", "true", "yes"):
         return True
     return num_tokens >= grouped_min
+
+
+#: Codebooks whose MoE experts can run on the CPU platform. Only trellis: its per-expert
+#: fallback (fused_moe_method._apply_trellis) reaches E8RHTLinear._trellis_linear_apply,
+#: which has a CPU branch, and every tensor it passes follows the packed buffers' device.
+#: e8p and shell have no CPU expert path at all — their per-expert dequant asserts
+#: sv.is_cuda — so they must refuse rather than fail deep inside a forward pass.
+_CPU_MOE_CODEBOOKS = frozenset({"trellis"})
+
+
+def moe_cpu_refusal(codebook: str) -> str | None:
+    """Why this MoE cannot serve on the CPU platform, or None if it can.
+
+    Unknown codebooks are refused: opting in is a decision that needs a CPU expert path
+    behind it, and a wrong "yes" here surfaces as garbage output rather than an error.
+    """
+    if codebook in _CPU_MOE_CODEBOOKS:
+        return None
+    return (f"GLQ MoE on the CPU platform is supported for trellis checkpoints only; this "
+            f"one is {codebook}, whose expert decode kernels are CUDA-only. Serve it on a "
+            f"GPU, or pick a trellis checkpoint for CPU serving.")

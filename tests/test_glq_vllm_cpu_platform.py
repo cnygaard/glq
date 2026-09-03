@@ -58,6 +58,27 @@ def test_embedding_dequant_cpu_matches_the_pure_torch_impl():
     assert torch.equal(out, ref)
 
 
+def test_trellis_moe_is_accepted_on_cpu():
+    """The per-expert fallback reaches the CPU decode branch, so a trellis MoE serves —
+    unfused and slow, but correct. This is what lets the 26B-A4B run without a GPU."""
+    from glq_vllm.config import GLQvLLMConfig
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts as _MoELayer)
+    except ImportError:
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE as _MoELayer
+        except ImportError:
+            pytest.skip("no MoE layer class in this vllm")
+
+    cfg = GLQvLLMConfig(bpw=4, codebook="trellis", variant="3inst",
+                        trellis_layout="kernel")
+    layer = _MoELayer.__new__(_MoELayer)
+    layer.moe_config = None
+    method = GLQvLLMConfig.get_quant_method(cfg, layer, prefix="model.layers.0.mlp.experts")
+    assert method is not None and "MoE" in type(method).__name__
+
+
 def test_moe_quant_method_refuses_on_cpu():
     from glq_vllm.config import GLQvLLMConfig
     try:
@@ -69,9 +90,9 @@ def test_moe_quant_method_refuses_on_cpu():
         except ImportError:
             pytest.skip("no MoE layer class in this vllm")
 
-    cfg = GLQvLLMConfig(bpw=4, codebook="trellis", variant="3inst", trellis_layout="kernel")
+    cfg = GLQvLLMConfig(bpw=4, codebook="e8p")
     layer = _MoELayer.__new__(_MoELayer)          # isinstance without __init__ plumbing
-    with pytest.raises(NotImplementedError, match="not servable on the CPU platform"):
+    with pytest.raises(NotImplementedError, match="trellis checkpoints only"):
         GLQvLLMConfig.get_quant_method(cfg, layer, prefix="model.layers.0.mlp.experts")
 
 

@@ -194,13 +194,16 @@ class GLQvLLMConfig(QuantizationConfig):
             if isinstance(layer, _MoELayer):
                 from vllm.platforms import current_platform
                 if getattr(current_platform, "device_type", "") == "cpu":
-                    # Every GLQ MoE path — the fused ops AND the Python fallbacks —
-                    # bottoms out in CUDA kernels (the per-expert dequant asserts
-                    # sv.is_cuda). Refuse loudly rather than fail mid-load.
-                    raise NotImplementedError(
-                        "GLQ MoE checkpoints are not servable on the CPU platform "
-                        "(the expert decode kernels are CUDA-only). Use a dense "
-                        "trellis checkpoint for CPU serving.")
+                    # Trellis MoE serves on CPU through the per-expert fallback
+                    # (_apply_trellis -> E8RHTLinear._trellis_linear_apply, which has a
+                    # CPU branch); the FUSED op stays CUDA-only and the gate in apply()
+                    # already falls through when the extension is absent. e8p/shell have
+                    # no CPU expert path at all, so they still refuse here rather than
+                    # failing deep inside a forward pass.
+                    from ._dispatch import moe_cpu_refusal
+                    why = moe_cpu_refusal(self.codebook)
+                    if why:
+                        raise NotImplementedError(why)
                 from .fused_moe_method import GLQFusedMoEMethod
                 return GLQFusedMoEMethod(self, moe=layer.moe_config)
         except (ImportError, AttributeError):
