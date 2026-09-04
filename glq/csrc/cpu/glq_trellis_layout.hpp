@@ -110,8 +110,26 @@ constexpr int kSlotMap[2][2] = {{0, 2}, {1, 3}};
 // The 72% "scalar integer" share that motivated the attempt was a misread of a perf
 // instruction-class histogram: that bucket counts GPR mov/lea and loop control, which
 // live in the decode/FMA inner loop's addressing, not here. After vectorizing this the
-// share was still 75%. If the CPU decode is to get materially faster, the target is the
-// inner loop's addressing and the staging-array round-trip — not this function.
+// share was still 75%. A corrected profile (annotate restricted to the kernel symbol)
+// puts the kernel at ~95% vector: vpmulld 21%, extraction ~28%, FMA 13%, staging ~10%.
+//
+// TWO MORE MEASURED NO-GOs on the extraction, both A/B'd in isolation on Sapphire Rapids
+// (1024 states per window group, bit-identical output verified before timing):
+//
+//   VPMULTISHIFTQB (AVX512-VBMI, extracts 8 unaligned bitfields per qword in one op)
+//     68.0 ns vs 67.9 ns — parity. It really does replace ~24 shift/mask/narrow ops with
+//     2, but the states come out lane-major and the VPERMI2W transpose back to
+//     state-major costs exactly what the multishift saved.
+//
+//   u16 staging instead of u32 (half the bytes)
+//     87.0 ns vs 67.9 ns — 28% SLOWER. qword->word needs a second narrowing step and the
+//     128-bit stores schedule worse than 256-bit ones.
+//
+// What the same A/B did establish: the staging STORE is 36% of extraction time (67.9 ns
+// with it, 43.4 ns computing the states into a register instead). That is ~10% of the
+// kernel and the only remaining lever here — but capturing it means consuming states from
+// registers, i.e. rewriting the two zmm loop bodies, for ~10%. Measure before believing
+// any of this changed: three consecutive "obvious" wins came out at parity or worse.
 template <int R>
 inline void unpack_group_states(const uint16_t* buf, uint32_t states[4][8][32]) {
     uint32_t chunks[4][32];
