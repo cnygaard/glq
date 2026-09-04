@@ -52,7 +52,8 @@ torch::Tensor expert_bracket(const torch::Tensor& rows_in,   // (n, k) fp32 cont
                              const torch::Tensor& su_e,      // (m,) fp16, this expert
                              const torch::Tensor& packed_e,  // (tiles, 16R) int16
                              const torch::Tensor& meta_n, const torch::Tensor& meta_m,
-                             float wscale, int64_t m, int64_t k, int R) {
+                             float wscale, int64_t m, int64_t k, int R,
+                             bool inner_parallel) {
     const int64_t n = rows_in.size(0);
     auto xr = (rows_in * sv.to(torch::kFloat32)).contiguous();
     auto mn = meta_n.contiguous();
@@ -70,18 +71,26 @@ torch::Tensor expert_bracket(const torch::Tensor& rows_in,   // (n, k) fp32 cont
         y = torch::empty({1, m}, torch::dtype(torch::kFloat32));
         const float* xp = xr.data_ptr<float>();
         float* yp = y.data_ptr<float>();
-        at::parallel_for(0, m / 32, 1, [&](int64_t b0, int64_t b1) {
-            kern.matvec(pp, xp, yp, m, k, R, wscale, /*accum=*/false, b0, b1);
-        });
+        if (inner_parallel) {
+            at::parallel_for(0, m / 32, 1, [&](int64_t b0, int64_t b1) {
+                kern.matvec(pp, xp, yp, m, k, R, wscale, /*accum=*/false, b0, b1);
+            });
+        } else {
+            kern.matvec(pp, xp, yp, m, k, R, wscale, /*accum=*/false, 0, m / 32);
+        }
     } else if (n <= glq_cpu::batch_max()) {
         y = torch::empty({n, m}, torch::dtype(torch::kFloat32));
         const float* xp = xr.data_ptr<float>();
         float* yp = y.data_ptr<float>();
         // Parallel over 32-row output blocks, the same partitioning the dense op uses, so
         // a row's accumulation order does not depend on the thread count.
-        at::parallel_for(0, m / 32, 1, [&](int64_t b0, int64_t b1) {
-            kern.matmul(pp, xp, yp, n, m, k, R, wscale, /*accum=*/false, b0, b1);
-        });
+        if (inner_parallel) {
+            at::parallel_for(0, m / 32, 1, [&](int64_t b0, int64_t b1) {
+                kern.matmul(pp, xp, yp, n, m, k, R, wscale, /*accum=*/false, b0, b1);
+            });
+        } else {
+            kern.matmul(pp, xp, yp, n, m, k, R, wscale, /*accum=*/false, 0, m / 32);
+        }
     } else {
         // Above the fused batch cap the SIMD kernels have no accumulator room (their
         // per-row state is a fixed 8-deep array), so the dense path decompresses ONCE and
@@ -165,9 +174,21 @@ torch::Tensor fused_moe_trellis_3inst_cpu(
     // happens afterwards in k order, so the result cannot depend on expert ordering.
     auto expert_out = torch::zeros({routings, hidden}, torch::dtype(torch::kFloat32));
 
-    for (int64_t e = 0; e < E; ++e) {
+    // Which experts actually have work, so the parallel decision is about real tasks.
+    std::vector<int64_t> used;
+    for (int64_t e = 0; e < E; ++e)
+        if (!by_expert[(size_t)e].empty()) used.push_back(e);
+
+    // Profiled on an 8-vcpu Sapphire Rapids: with one parallel_for per expert-projection,
+    // 14% of kernel time went to gomp barriers — 16 tiny parallel regions per token, each
+    // with little work. When there are at least as many routed experts as threads, giving
+    // each thread a whole expert costs ONE barrier instead. Neither choice changes any
+    // output element's accumulation order (an element is produced from one expert's data
+    // by one thread, and the reduce over k happens separately), so both stay bit-exact.
+    const bool expert_parallel = (int64_t)used.size() >= at::get_num_threads();
+
+    auto run_expert = [&](int64_t e, bool inner_parallel) {
         const auto& rs = by_expert[(size_t)e];
-        if (rs.empty()) continue;                      // an unrouted expert decodes nothing
         const int64_t n = (int64_t)rs.size();
 
         auto rows = torch::empty({n, hidden}, torch::dtype(torch::kFloat32));
@@ -178,14 +199,23 @@ torch::Tensor fused_moe_trellis_3inst_cpu(
 
         auto h = expert_bracket(rows, w13_SV, w13_SU[e], w13_packed[e], meta_n_w13,
                                 meta_m_w13, w13_Wscale[e].item<float>(), w13_out, hidden,
-                                R13);
+                                R13, inner_parallel);
         auto act = apply_gated_activation(h, inter, activation);
         auto z = expert_bracket(act, w2_SV, w2_SU[e], w2_packed[e], meta_n_w2, meta_m_w2,
-                                w2_Wscale[e].item<float>(), hidden, inter, R2);
+                                w2_Wscale[e].item<float>(), hidden, inter, R2,
+                                inner_parallel);
 
         auto dst = torch::from_blob(const_cast<int64_t*>(rs.data()), {n},
                                     torch::dtype(torch::kLong));
         expert_out.index_copy_(0, dst, z);
+    };
+
+    if (expert_parallel) {
+        at::parallel_for(0, (int64_t)used.size(), 1, [&](int64_t i0, int64_t i1) {
+            for (int64_t i = i0; i < i1; ++i) run_expert(used[(size_t)i], false);
+        });
+    } else {
+        for (int64_t e : used) run_expert(e, true);
     }
 
     // out[t] = sum_k wts[t,k] * expert_out[t*topk + k], k ascending — the GPU's order.
