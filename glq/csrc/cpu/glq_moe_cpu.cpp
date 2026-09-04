@@ -62,7 +62,18 @@ torch::Tensor expert_bracket(const torch::Tensor& rows_in,   // (n, k) fp32 cont
     const auto& kern = glq_cpu::active();
     const uint16_t* pp = reinterpret_cast<const uint16_t*>(packed_e.data_ptr<int16_t>());
     torch::Tensor y;
-    if (n <= glq_cpu::batch_max()) {
+    if (n == 1) {
+        // The decode case, and the common one: one token routed to top-k experts gives
+        // each expert exactly ONE row. matvec is the specialised path the dense op uses at
+        // B=1 and is bit-identical to matmul there (the row-parity contract), but measured
+        // materially faster — on AVX2 the batched path at B=1 was slower than scalar.
+        y = torch::empty({1, m}, torch::dtype(torch::kFloat32));
+        const float* xp = xr.data_ptr<float>();
+        float* yp = y.data_ptr<float>();
+        at::parallel_for(0, m / 32, 1, [&](int64_t b0, int64_t b1) {
+            kern.matvec(pp, xp, yp, m, k, R, wscale, /*accum=*/false, b0, b1);
+        });
+    } else if (n <= glq_cpu::batch_max()) {
         y = torch::empty({n, m}, torch::dtype(torch::kFloat32));
         const float* xp = xr.data_ptr<float>();
         float* yp = y.data_ptr<float>();
