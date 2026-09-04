@@ -100,6 +100,18 @@ constexpr int kSlotMap[2][2] = {{0, 2}, {1, 3}};
 
 // Unpack one window-group into states[slot][j][lane] (u32 storage so SIMD tiers can load
 // vectors straight from the staging array). Shared by every tier — one copy, no drift.
+//
+// MEASURED NO-GO: hand-vectorizing the state extraction below (8 lanes per zmm as u64,
+// one VPSRLVQ + mask + VPMOVQD per j) is bit-exact but buys NOTHING — on a Sapphire
+// Rapids, MoE decode moved 2.61 -> 2.70 ms on the fp16 tier and decompress not at all,
+// both inside run-to-run noise. GCC already auto-vectorizes this loop under each tier's
+// target pragma, so the hand-written version only replaces equivalent code.
+//
+// The 72% "scalar integer" share that motivated the attempt was a misread of a perf
+// instruction-class histogram: that bucket counts GPR mov/lea and loop control, which
+// live in the decode/FMA inner loop's addressing, not here. After vectorizing this the
+// share was still 75%. If the CPU decode is to get materially faster, the target is the
+// inner loop's addressing and the staging-array round-trip — not this function.
 template <int R>
 inline void unpack_group_states(const uint16_t* buf, uint32_t states[4][8][32]) {
     uint32_t chunks[4][32];
