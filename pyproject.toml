@@ -8,7 +8,7 @@ version = "0.8.17"
 description = "Lattice and trellis-coded quantization for LLM weights (2-8 bpw)"
 readme = "README.md"
 license = "GPL-3.0-only"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # numpy: glq.trellis imports it at module scope, and glq_vllm imports glq.trellis while
 # loading weights — so serving the default codebook needs it. It was missing for a long
 # time without being noticed because both usual installs bring it in by accident (vLLM and

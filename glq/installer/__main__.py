@@ -139,7 +139,7 @@ def _install_open_webui(run: Runner) -> Path | None:
 
     It pins 119 dependencies exactly, including `transformers==5.5.4`, while GLQ needs
     >=5.13.1 to serve gemma-4. Sharing a venv silently downgrades transformers and breaks
-    GLQ. It also requires Python >=3.11,<3.13 where glq supports 3.10.
+    GLQ. It also requires Python >=3.11,<3.13 where glq needs >=3.12.
     """
     webui_venv = GLQ_HOME / "venv-webui"
     print("\n== Open WebUI (separate venv — it pins transformers==5.5.4, which would "

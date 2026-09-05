@@ -54,7 +54,7 @@ backend automatically.
 - **GPU (recommended)**: NVIDIA Ampere-class or newer (`sm_86+`). Developed for 24–32 GB
   cards (3090 / 4080 / 4090 / L4 / L40S); validated live on an Ada L4 (`sm_89`) and an
   RTX PRO 6000 Blackwell (`sm_120`). A recent NVIDIA driver is required; a CUDA
-  *toolkit* is not — `pip install glq` ships prebuilt kernels (CPython 3.10–3.14,
+  *toolkit* is not — `pip install glq` ships prebuilt kernels (CPython 3.12–3.14,
   x86_64), and `nvcc` is only needed for the from-source fallback (and for FlashInfer's
   sampler JIT on Blackwell — without it `glq-chat` falls back to vLLM's built-in sampler).
 - **CPU-only**: no GPU → the installer sets up vLLM's CPU backend and GLQ's own fused
@@ -78,7 +78,7 @@ backend automatically.
   the NVIDIA CUDA driver should work in principle — untested.
 - **macOS**: not supported. There is no CUDA on Apple hardware, and Docker Desktop on
   macOS cannot pass through an NVIDIA GPU, so a container does not help.
-- **Python**: 3.10–3.14 (the installer creates its own venv).
+- **Python**: 3.12–3.14 (the installer creates its own venv).
 
 ## Quickstart
 

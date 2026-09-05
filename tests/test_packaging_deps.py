@@ -20,6 +20,7 @@ import ast
 import os
 import re
 import sys
+import tomllib
 
 import pytest
 
@@ -45,18 +46,13 @@ _MODULE_TO_DIST = {"torch": "torch", "numpy": "numpy", "triton": "triton"}
 def _core_dependencies() -> set[str]:
     """`[project] dependencies` as bare distribution names.
 
-    Parsed by hand rather than with tomllib, which is 3.11+ while this project supports
-    3.10 — and tomli is not a test dependency worth adding for one array. A TOML array of
-    strings is also a Python list literal, so ast handles it once the brackets are matched.
+    tomllib is stdlib from 3.11 and glq's floor is 3.12, so it needs no fallback.
     """
-    with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as fh:
-        text = fh.read()
-
-    match = re.search(r"^dependencies\s*=\s*(\[.*?\])", text, re.MULTILINE | re.DOTALL)
-    assert match, "no [project] dependencies array in pyproject.toml"
-    deps = ast.literal_eval(match.group(1))
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+        pyproject = tomllib.load(fh)
     # "torch>=2.0" -> "torch"
-    return {re.split(r"[<>=!~;\[ ]", d, maxsplit=1)[0].strip() for d in deps}
+    return {re.split(r"[<>=!~;\[ ]", d, maxsplit=1)[0].strip()
+            for d in pyproject["project"]["dependencies"]}
 
 
 def _module_scope_imports(relpath: str) -> set[str]:

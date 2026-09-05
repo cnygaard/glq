@@ -215,7 +215,7 @@ bash /glq/install.sh --preflight; echo "C_EXIT=$?"
     assert "C_EXIT=0" in out, (
         f"{distro.name}: pre-flight still fails after following its own advice.\n"
         f"This is the bug this suite exists to find — the hint names the wrong packages, "
-        f"or the distro's default python is older than 3.10.\n{out[-3000:]}")
+        f"or the distro's default python is older than 3.12.\n{out[-3000:]}")
 
 
 @pytest.mark.parametrize("distro", DISTROS, ids=lambda d: d.name)

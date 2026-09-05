@@ -135,7 +135,7 @@ pkg_hint() {
         # RHEL 9 family BEFORE fedora: RHEL sets ID_LIKE=fedora, so a fedora-first pattern
         # would swallow it and hand out advice that does not work here. Two differences,
         # both measured in containers rather than assumed:
-        #   * the default python3 is 3.9 — below glq's 3.10 floor — so an explicit
+        #   * the default python3 is 3.9 — below glq's 3.12 floor — so an explicit
         #     python3.12 (in AppStream on UBI9/Alma/Amazon 2023) is required, otherwise
         #     pre-flight refuses again after the user has "fixed" it;
         #   * `curl` CONFLICTS with the preinstalled curl-minimal and aborts the whole dnf
@@ -165,7 +165,7 @@ pkg_hint() {
         # opensuse/tumbleweed: after this hint's own python3-devel gcc-c++ curl which,
         # `python3 -c "import sqlite3"` still fails; adding python3-sqlite3 fixes it.
         *suse*|*sles*)              echo "sudo zypper install -y python3-devel python3-sqlite3 gcc-c++ curl which" ;;
-        *)                          echo "install with your package manager: python3 (>=3.10) + venv, gcc, curl" ;;
+        *)                          echo "install with your package manager: python3 (>=3.12) + venv, gcc, curl" ;;
     esac
 }
 
@@ -204,9 +204,9 @@ preflight() {
 
     # python
     local py="" pyver=""
-    for c in python3.12 python3.11 python3.10 python3; do
+    for c in python3.14 python3.13 python3.12 python3; do
         if command -v "$c" >/dev/null 2>&1 && \
-           "$c" -c 'import sys; raise SystemExit(0 if sys.version_info>=(3,10) else 1)' 2>/dev/null; then
+           "$c" -c 'import sys; raise SystemExit(0 if sys.version_info>=(3,12) else 1)' 2>/dev/null; then
             py="$c"; pyver="$("$c" --version 2>&1)"; break
         fi
     done
@@ -218,7 +218,7 @@ preflight() {
             warn "  venv:    MISSING — the installer cannot create a virtualenv"; blockers=$((blockers+1))
         fi
     else
-        warn "  python:  MISSING or older than 3.10 (glq needs >= 3.10)"; blockers=$((blockers+1))
+        warn "  python:  MISSING or older than 3.12 (glq needs >= 3.12)"; blockers=$((blockers+1))
     fi
 
     command -v curl >/dev/null 2>&1 && say "  curl:    present" || {
@@ -242,7 +242,7 @@ preflight() {
     fi
 
     # A host gcc newer than CUDA accepts. Deliberately NOT a blocker: since 0.8.6 the prebuilt
-    # wheels cover cp310-cp314, so the common path compiles nothing and is unaffected. Only a
+    # wheels cover cp312-cp314, so the common path compiles nothing and is unaffected. Only a
     # source install (--glq-source) reaches nvcc, and for that the fix is a compat compiler
     # plus NVCC_CCBIN — measured to remove the error entirely on fedora:44.
     #
@@ -313,15 +313,15 @@ check_not_root() {
 
 find_python() {
     local py
-    for py in python3.12 python3.11 python3.10 python3; do
+    for py in python3.14 python3.13 python3.12 python3; do
         if command -v "$py" >/dev/null 2>&1; then
-            if "$py" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)'; then
+            if "$py" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)'; then
                 printf '%s' "$py"
                 return 0
             fi
         fi
     done
-    die "no Python >= 3.10 found. Install one, e.g.: sudo apt-get install -y python3"
+    die "no Python >= 3.12 found. Install one, e.g.: sudo apt-get install -y python3"
 }
 
 check_venv_module() {
