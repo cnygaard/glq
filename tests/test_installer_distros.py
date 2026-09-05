@@ -96,7 +96,12 @@ DISTROS = [
     # only thing standing between a user and a dead install — a stronger test of it than
     # 24.04, which comes with a usable interpreter.
     Distro("ubuntu2604", "ubuntu:26.04",                                   "apt-get"),
-    Distro("debian",     "debian:12",                                      "apt-get"),
+    # Debian 13 (trixie), the current stable — 12 is oldstable and its python3 (3.11) is no
+    # longer representative of what a Debian user installs. Verified in the image: no
+    # python3 at all in the base, `ID=debian` with an EMPTY `ID_LIKE` (so the pkg_hint match
+    # rests on ID alone, unlike Ubuntu's `like=debian`), and the advised packages bring
+    # 3.13.5 — after which pre-flight passes.
+    Distro("debian",     "debian:13",                                      "apt-get"),
     # Both current Fedoras, because they differ in the one way that decides whether GLQ can
     # compile at all: 43 ships gcc 15.3.1, 44 ships gcc 16.1.1, and CUDA 13.0's
     # crt/host_config.h refuses anything past 15. 44 is therefore the distro where the

@@ -71,7 +71,7 @@ backend automatically.
   answers and background work, not fast chat. Model recommendations size against
   system RAM.
 - **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
-  pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 12,
+  pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 13,
   Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
   (`tests/test_installer_distros.py`), so other distros are expected to install and run.
 - **Windows**: no native support (no Windows wheels, and vLLM is Linux-only). WSL2 with
