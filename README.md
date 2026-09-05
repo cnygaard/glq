@@ -59,10 +59,17 @@ backend automatically.
   sampler JIT on Blackwell — without it `glq-chat` falls back to vLLM's built-in sampler).
 - **CPU-only**: no GPU → the installer sets up vLLM's CPU backend and GLQ's own fused
   CPU kernels (AVX2 floor, AVX-512 tiers used when present); `--cpu` forces this on a
-  GPU machine. Dense trellis checkpoints only (MoE and e8p/shell need CUDA), and expect
-  single-digit tok/s — e.g. a 3B at ~5–6 tok/s on desktop-class 4–8 core machines
-  (measured); usable for short answers and background work, not fast chat. Model
-  recommendations size against system RAM.
+  GPU machine. Trellis checkpoints only — dense **or MoE** since 0.8.17 (e8p/shell need
+  CUDA) — and expect single-digit tok/s. Measured serving under vLLM on an 8-vCPU
+  Sapphire Rapids (AVX-512-FP16), one request at a time, 64 decoded tokens, vLLM's
+  default core binding: `gemma-4-26B-A4B` trellis-4bpw at **3.0 tok/s**, 0.4 s to first
+  token, 18.6 GiB resident (13.9 GiB weights + a 4 GiB KV pool) — against **2.7 tok/s**
+  for the dense `gemma-4-E4B` on the same box, because an MoE reads only its top-k
+  experts per token. `glq-chat` also gives the kernels the core vLLM holds back
+  (`VLLM_CPU_NUM_OF_RESERVED_CPU=0`), measured at **3.4 tok/s**; decode is
+  memory-bound, so more threads than physical cores add nothing. Usable for short
+  answers and background work, not fast chat. Model recommendations size against
+  system RAM.
 - **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
   pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 12,
   Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
