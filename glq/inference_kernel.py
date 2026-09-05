@@ -335,14 +335,27 @@ def _try_load_cuda_ext():
         _cuda_ext_error = (globals().get('_prebuilt_ext_error') or "") + traceback.format_exc()
         _cuda_ext_available = False
         import warnings
-        warnings.warn(
-            "GLQ CUDA extension failed to build — falling back to the slower path, and "
-            "kernel-only features (trellis serving under vLLM) will not work.\n"
-            f"{_cuda_ext_error}"
-            "GLQ compiles its kernels on first use and needs a CUDA toolchain matching "
-            "the torch build. The bundled CUDA wheels were not sufficient here; install "
-            f"the full toolkit from {CUDA_DOWNLOADS_URL} and try again.",
-            RuntimeWarning, stacklevel=2)
+        # A machine with no CUDA device was never going to build this, and since the CPU
+        # fused kernels shipped it is not degraded either — trellis serves on CPU, dense
+        # and MoE alike. Telling that user their build "failed" and pointing them at a CUDA
+        # toolkit sends them to fix something that is not broken, so say what is true and
+        # point at the CPU extension's own status instead. `device_count()` reports 0
+        # without initializing a context, so this stays cheap and cannot itself raise.
+        if torch.cuda.device_count() == 0:
+            warnings.warn(
+                "GLQ CUDA extension not built: no CUDA device on this machine. Serving on "
+                "the CPU path, which has its own fused kernels — check them with "
+                "glq.inference_kernel_cpu.cpu_ext_status().",
+                RuntimeWarning, stacklevel=2)
+        else:
+            warnings.warn(
+                "GLQ CUDA extension failed to build — falling back to the slower path, and "
+                "kernel-only features (trellis serving under vLLM) will not work.\n"
+                f"{_cuda_ext_error}"
+                "GLQ compiles its kernels on first use and needs a CUDA toolchain matching "
+                "the torch build. The bundled CUDA wheels were not sufficient here; install "
+                f"the full toolkit from {CUDA_DOWNLOADS_URL} and try again.",
+                RuntimeWarning, stacklevel=2)
     return _cuda_ext_available
 
 

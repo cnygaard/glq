@@ -75,6 +75,11 @@ extern uint16_t g_lut16[65536];
 extern float    g_lut32[65536];
 void init_lut();
 
+//: Rows per fused decode-GEMM call. The SIMD tiers keep a fixed 8-deep per-row
+//: accumulator, so this is a hard capability bound, not a tuning knob: a larger batch
+//: must take the decompress-once path instead. GLQ_TRELLIS_CPU_BATCH_MAX overrides it.
+int64_t batch_max();
+
 // ---- decode micro-variant (SIMD tiers implement both; scalar is LUT-only) ---------
 enum DecodeVariant { DECODE_AUTO = 0, DECODE_ARITH = 1, DECODE_LUT = 2 };
 extern DecodeVariant g_decode_variant;

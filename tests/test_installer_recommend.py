@@ -253,11 +253,12 @@ def test_per_command_picks_falls_back_when_vram_is_unknown():
     assert picks == {"code_model": GEMMA26, "chat_model": GEMMA26}
 
 
-# ---- CPU gating: RAM budget fraction + trellis-only + no MoE -----------------------------
+# ---- CPU gating: RAM budget fraction + trellis-only (dense OR MoE) -----------------------
 
 CPU_FLEET = [
     Checkpoint("xv0y5ncu/gemma-4-26B-A4B-moe-4bpw", int(15.0 * GIB), trellis=True,
                moe=True),
+    Checkpoint("xv0y5ncu/old-e8p-moe-4bpw", int(9.0 * GIB), trellis=False, moe=True),
     Checkpoint("xv0y5ncu/dense-9B-trellis-4bpw", int(5.6 * GIB), trellis=True, moe=False),
     Checkpoint("xv0y5ncu/dense-3B-trellis-4bpw", int(1.8 * GIB), trellis=True, moe=False),
     Checkpoint("xv0y5ncu/old-e8p-4bpw", int(1.7 * GIB), trellis=False, moe=False),
@@ -275,29 +276,41 @@ def test_weight_fraction_changes_the_budget():
     assert cpu[0].fits is False
 
 
-def test_cpu_gate_excludes_moe_and_non_trellis_and_unknown():
+def test_cpu_gate_takes_a_trellis_moe():
+    """A trellis MoE serves on the CPU backend since the fused CPU expert kernel landed,
+    and it is the *best* CPU choice at a given footprint: only top-k of its experts are
+    read per token, so it decodes faster than a dense model of the same size."""
     ranked = R.rank(CPU_FLEET, int(32 * GIB), weight_fraction=R.CPU_WEIGHT_FRACTION,
                     require_trellis=True)
     picked = [r for r in ranked if r.recommended]
     assert len(picked) == 1
-    assert picked[0].checkpoint.repo_id == "xv0y5ncu/dense-9B-trellis-4bpw"
+    assert picked[0].checkpoint.repo_id == "xv0y5ncu/gemma-4-26B-A4B-moe-4bpw"
 
 
-def test_cpu_gate_recommends_nothing_rather_than_an_unservable_model():
-    """A fleet of only MoE/e8p/unknown entries must yield NO recommendation on CPU —
-    the menu still lists them, but recommending one would download gigabytes into a
-    hard refusal at serve time."""
-    fleet = [c for c in CPU_FLEET if c.repo_id != "xv0y5ncu/dense-9B-trellis-4bpw"
-             and c.repo_id != "xv0y5ncu/dense-3B-trellis-4bpw"]
+def test_cpu_gate_still_excludes_non_trellis_and_unknown():
+    """e8p/shell — MoE or dense — have no CPU expert path, and an unknown format is not
+    assumed to have one: recommending either downloads gigabytes into a refusal at load."""
+    fleet = [c for c in CPU_FLEET if c.trellis is not True]
     ranked = R.rank(fleet, int(32 * GIB), weight_fraction=R.CPU_WEIGHT_FRACTION,
                     require_trellis=True)
     assert not any(r.recommended for r in ranked)
+    assert {c.repo_id for c in fleet} >= {"xv0y5ncu/old-e8p-moe-4bpw",
+                                          "xv0y5ncu/unknown-traits"}
 
 
-def test_per_command_picks_under_cpu_gating_never_return_moe():
+def test_the_cpu_budget_still_gates_a_moe_by_size():
+    """MoE eligibility is not a bypass of the RAM budget: the same 15 GiB checkpoint that
+    fits in 32 GiB of RAM must not be recommended on a 16 GiB machine (8 GiB budget)."""
+    ranked = R.rank(CPU_FLEET, int(16 * GIB), weight_fraction=R.CPU_WEIGHT_FRACTION,
+                    require_trellis=True)
+    picked = [r for r in ranked if r.recommended]
+    assert picked and picked[0].checkpoint.repo_id == "xv0y5ncu/dense-9B-trellis-4bpw"
+    assert [r.fits for r in ranked if r.checkpoint.moe is True] == [False, False]
+
+
+def test_per_command_picks_under_cpu_gating_prefer_the_gemma_moe_for_chat():
     picks = R.per_command_picks(CPU_FLEET, int(32 * GIB),
                                 fallback="xv0y5ncu/dense-3B-trellis-4bpw",
                                 weight_fraction=R.CPU_WEIGHT_FRACTION,
                                 require_trellis=True)
-    for model in picks.values():
-        assert "moe" not in model
+    assert picks["chat_model"] == "xv0y5ncu/gemma-4-26B-A4B-moe-4bpw"

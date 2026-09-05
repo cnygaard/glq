@@ -7,6 +7,7 @@ active expert instead of materializing dense weights.
 """
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,10 @@ from .linear_method import (
     _detect_block_diag, _pack_block_meta,
 )
 from ._dispatch import _grouped_enabled
+
+#: One-shot latch for the "CPU MoE took the per-expert loop" notice. A 26B-A4B has 30 MoE
+#: layers and decodes one token at a time, so a per-call warning would be unreadable.
+_WARNED_CPU_MOE_FALLBACK = False
 
 
 def _round8(n: int) -> int:
@@ -439,6 +444,61 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             out[token_mask] += y.to(dtype) * ew.unsqueeze(-1)
         return out
 
+    def _apply_trellis_cpu(self, layer, x, topk_weights, topk_ids, activation):
+        """Fused CPU MoE decode — or None when this layer has to take the per-expert loop.
+
+        ``glq_fused_moe_trellis_3inst_cpu`` does the whole block in one extension call
+        (per-expert bracket, gated activation, fixed-k-order reduce) where ``_apply_trellis``
+        runs a Python loop of dense-op calls. Measured at the 26B-A4B's shapes on an 8-vCPU
+        Sapphire Rapids, T=1: 1.09-1.21x over the loop depending on ISA tier.
+
+        The CUDA gate's token cap is deliberately not reused. There it exists so prefill
+        skips a decode-shaped kernel; here the op switches to decompress+GEMM internally
+        above ``glq_cpu::batch_max()``, and the loop it would fall back to bottoms out in
+        the same CPU bracket — so a cap would only cost the grouping win.
+        """
+        import os as _os
+
+        from glq import inference_kernel_cpu as _ikc
+
+        from ._dispatch import moe_cpu_fused_refusal
+
+        meta = layer._glq_trellis_moe_meta
+        m13, m2 = meta['w13'], meta['w2']
+        hidden, inter, w13_out = (layer.glq_hidden_size, layer.glq_intermediate_size,
+                                  layer.glq_w13_out)
+        ext = _ikc._glq_cpu if _ikc._try_load_cpu_ext() else None
+        why = moe_cpu_fused_refusal(
+            fused_shape_ok=bool(getattr(layer, 'glq_trellis_fused_ok', False)),
+            has_stage2=bool(m13['has_s2'] or m2['has_s2']),
+            # The op passes logical dims to its bracket, as the dense CPU entry does; both
+            # rest on trellis' unpadded layout (block-diagonal RHT sized to the layer).
+            unpadded=(m13['n_pad'] == hidden and m13['m_pad'] == w13_out
+                      and m2['n_pad'] == inter and m2['m_pad'] == hidden),
+            activation_type=self._activation_type(activation),
+            ext_has_entry=(ext is not None
+                           and hasattr(ext, 'glq_fused_moe_trellis_3inst_cpu')),
+            force_fallback=_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") != "0",
+            cpu_fused_enabled=_os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0")
+        if why is not None:
+            global _WARNED_CPU_MOE_FALLBACK
+            if not _WARNED_CPU_MOE_FALLBACK:
+                _WARNED_CPU_MOE_FALLBACK = True
+                warnings.warn(f"GLQ trellis MoE on CPU is using the per-expert loop: {why}. "
+                              f"Correct, but slower than the fused CPU op.", RuntimeWarning)
+            return None
+
+        # The op takes activations in any float dtype (it casts to fp32 itself, which is
+        # what the CPU decode runs in) and returns fp32.
+        out = ext.glq_fused_moe_trellis_3inst_cpu(
+            x, topk_ids, topk_weights,
+            layer.w13_trellis_packed, layer.w13_SU, layer.w13_SV, layer.w13_Wscale,
+            layer.w2_trellis_packed, layer.w2_SU, layer.w2_SV, layer.w2_Wscale,
+            hidden, inter, w13_out,
+            m13['_bnm'], m13['_bmm'], m2['_bnm'], m2['_bmm'],
+            self._activation_type(activation))
+        return out.to(x.dtype)
+
     def _process_e8p(self, layer):
         """e8p MoE: cache grids + block-diag RHT tensors + per-expert scalars; collapse
         unused residual sentinels to numel-0. Mirrors linear_method._setup_e8p_weights."""
@@ -700,6 +760,14 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             from glq import inference_kernel as _ik
             activation = getattr(layer, 'activation', None)
             _bd_cap = int(_os.environ.get("GLQ_MOE_BD_MAX_TOKENS", "256"))
+            # CPU platform: capturability is moot (vLLM's CPU backend is eager), so the
+            # question is only which kernel runs. Returns None for layers outside the fused
+            # CPU op's reach, and the per-expert loop below serves those.
+            if x.device.type == 'cpu':
+                out = self._apply_trellis_cpu(layer, x, topk_weights, topk_ids, activation)
+                if out is not None:
+                    return out
+                return self._apply_trellis(layer, x, topk_weights, topk_ids)
             # Fused grouped-trellis op: device-side expert dispatch with no host sync, so
             # the whole MoE decode step is capturable under FULL cudagraph. That, not kernel
             # throughput, is the reason it exists — the fallback loop's topk_ids.unique()

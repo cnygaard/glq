@@ -139,7 +139,7 @@ def _install_open_webui(run: Runner) -> Path | None:
 
     It pins 119 dependencies exactly, including `transformers==5.5.4`, while GLQ needs
     >=5.13.1 to serve gemma-4. Sharing a venv silently downgrades transformers and breaks
-    GLQ. It also requires Python >=3.11,<3.13 where glq supports 3.10.
+    GLQ. It also requires Python >=3.11,<3.13 where glq needs >=3.12.
     """
     webui_venv = GLQ_HOME / "venv-webui"
     print("\n== Open WebUI (separate venv — it pins transformers==5.5.4, which would "
@@ -165,12 +165,31 @@ def _install_picode(run: Runner) -> None:
     print("\n== pi coding agent (installs node via nvm)")
     nvm_sh = Path.home() / ".nvm" / "nvm.sh"
     if not nvm_sh.exists():
+        # GIT_TERMINAL_PROMPT=0: nvm's installer git-clones from github.com, and git asks
+        # for a username whenever GitHub refuses the request (403/404 — most often
+        # unauthenticated rate-limiting from a shared cloud IP), because it cannot tell a
+        # private repo from a missing one. Reported from a real install, where the
+        # installer sat at `Username for 'https://github.com':` waiting for input that a
+        # piped `curl | bash` may never be able to give. Failing fast with git's actual
+        # error is strictly better than hanging, and no GitHub account is ever needed here.
+        # METHOD=script makes nvm's installer fetch nvm.sh over HTTPS instead of running
+        # `git clone`. Diagnosed on a cloud box: git sends `User-Agent: git/2.43.0` and
+        # GitHub answers `HTTP 401 www-authenticate: Basic realm="GitHub"`, while curl to
+        # the SAME endpoint gets 200 — GitHub challenges unauthenticated *git* operations
+        # from some IP ranges. The install then sat at `Username for 'https://github.com':`
+        # forever. No account is needed here, and the script method touches no git at all.
+        # GIT_TERMINAL_PROMPT stays as a backstop for any future path that shells out to git.
         run(["bash", "-c",
              "curl --proto '=https' --tlsv1.2 -fsSL "
-             "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"])
+             "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | "
+             "METHOD=script GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true bash"])
+    # --ignore-scripts: the package declares no install/preinstall/postinstall hook (its
+    # scripts are all build-time) and its bin is plain JS, so nothing it needs runs at
+    # install time — while the flag stops any transitive dependency's postinstall from
+    # executing arbitrary code or making network calls the box may not permit.
     run(["bash", "-c",
          ". ~/.nvm/nvm.sh && nvm install --lts >/dev/null && "
-         "npm install -g --force @earendil-works/pi-coding-agent"])
+         "npm install -g --force --ignore-scripts @earendil-works/pi-coding-agent"])
     # gemma-4's tool template is not in the model checkpoint (its bundled template is
     # plain chat) and not in the vLLM wheel — it lives in vLLM's repo examples. Measured:
     # the printed serve command referenced a path that did not exist and vLLM refused to
@@ -415,14 +434,15 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if device == "cpu":
-        # RAM is the budget; only dense trellis serves on the CPU backend (MoE and
-        # e8p/shell refuse at load), so gate the recommendation accordingly. The menu
-        # still lists everything.
+        # RAM is the budget; trellis serves on the CPU backend (dense or MoE — the fused
+        # CPU expert kernel covers both), e8p/shell still refuse at load. Gate the
+        # recommendation accordingly; the menu still lists everything.
         from .recommend import CPU_WEIGHT_FRACTION
         ranked = rank(checkpoints, ram, weight_fraction=CPU_WEIGHT_FRACTION,
                       require_trellis=True)
-        print("note: MoE and e8p/shell checkpoints do not serve on the CPU backend —"
-              " only dense trellis builds are recommended here.")
+        print("note: e8p/shell checkpoints do not serve on the CPU backend — only trellis"
+              " builds are recommended here (a trellis MoE reads only its top-k experts"
+              " per token, so it is the faster choice at a given size).")
     else:
         ranked = rank(checkpoints, vram)
     print(f"Found {len(checkpoints)} checkpoints in the GLQ collection.")

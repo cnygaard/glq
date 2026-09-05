@@ -7,6 +7,7 @@
  */
 #include "glq_trellis_cpu.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,18 @@ const Kernels* g_tier_tables[TIER_COUNT] = { nullptr, nullptr, nullptr, nullptr 
 const char* const g_tier_names[TIER_COUNT] = { "scalar", "avx2", "avx512", "avx512fp16" };
 
 DecodeVariant g_decode_variant = DECODE_AUTO;
+
+int64_t batch_max() {
+    // Read once. The SIMD tiers hold a fixed 8-deep per-row accumulator, so this is a
+    // capability bound: a caller with more rows must decompress once and use a GEMM
+    // instead. Overriding it upward without widening those accumulators corrupts the
+    // stack rather than running slowly.
+    static const int64_t v = [] {
+        const char* e = std::getenv("GLQ_TRELLIS_CPU_BATCH_MAX");
+        return e ? std::max<int64_t>(1, atoll(e)) : 8;
+    }();
+    return v;
+}
 
 namespace {
 std::atomic<int> g_active{-1};   // -1 = unresolved

@@ -137,3 +137,61 @@ def test_default_device_argv_is_unchanged():
     flat = _pip_commands(("core", "vllm"))
     assert " vllm " in f" {flat} "
     assert "+cpu" not in flat and "--extra-index-url" not in flat
+
+
+def _picode_commands(monkeypatch, home) -> list[str]:
+    """The commands `_install_picode` would run, with HOME pinned.
+
+    HOME decides the branch: the nvm bootstrap runs only when `~/.nvm/nvm.sh` is missing.
+    Leaving that to the host makes the bootstrap assertions vacuous wherever nvm is already
+    installed — which is every GitHub runner, and is how these went green locally and red
+    on CI. Both branches are now chosen on purpose.
+    """
+    monkeypatch.setenv("HOME", str(home))
+    seen: list[str] = []
+    M._install_picode(lambda cmd, **kw: seen.append(" ".join(map(str, cmd))))
+    return seen
+
+
+def test_the_nvm_bootstrap_cannot_block_on_a_git_credential_prompt(monkeypatch, tmp_path):
+    """nvm's installer git-clones from github.com, and git asks for a username whenever
+    GitHub refuses the request (403/404 — commonly unauthenticated rate-limiting from a
+    shared cloud IP). Reported from a real install: the installer sat at
+    `Username for 'https://github.com':` waiting for input a piped `curl | bash` may never
+    be able to supply. No GitHub account is needed here, so failing fast with git's own
+    error beats hanging forever."""
+    seen = _picode_commands(monkeypatch, tmp_path)
+    nvm = [c for c in seen if "nvm-sh/nvm" in c]
+    assert nvm, f"no nvm bootstrap in: {seen}"
+    assert "GIT_TERMINAL_PROMPT=0" in nvm[0], nvm[0]
+
+
+def test_the_nvm_bootstrap_does_not_use_git(monkeypatch, tmp_path):
+    """Diagnosed on a cloud box: git sends `User-Agent: git/2.43.0` and GitHub replies
+    `HTTP 401 www-authenticate: Basic realm="GitHub"`, while curl to the same endpoint
+    gets 200 — GitHub challenges unauthenticated *git* operations from some IP ranges, so
+    the clone hung on a username prompt. METHOD=script fetches nvm.sh over HTTPS instead;
+    verified live, after which pi installed and `glq-setup --verify` went fully green."""
+    seen = _picode_commands(monkeypatch, tmp_path)
+    nvm = [c for c in seen if "nvm-sh/nvm" in c]
+    assert nvm and "METHOD=script" in nvm[0], nvm
+
+
+def test_an_existing_nvm_is_left_alone(monkeypatch, tmp_path):
+    """The other branch, and the reason the two above need a pinned HOME: a machine that
+    already has nvm must not have it reinstalled — but pi still has to be installed."""
+    (tmp_path / ".nvm").mkdir()
+    (tmp_path / ".nvm" / "nvm.sh").write_text("# already here\n")
+    seen = _picode_commands(monkeypatch, tmp_path)
+    assert not [c for c in seen if "nvm-sh/nvm" in c], f"nvm reinstalled over an existing one: {seen}"
+    assert [c for c in seen if "pi-coding-agent" in c], f"pi was never installed: {seen}"
+
+
+def test_pi_is_installed_without_running_dependency_scripts():
+    """The package has no install hooks of its own (all its scripts are build-time) and a
+    plain-JS bin, so --ignore-scripts costs nothing and keeps transitive postinstalls from
+    running arbitrary code."""
+    seen = []
+    M._install_picode(lambda cmd, **kw: seen.append(" ".join(map(str, cmd))))
+    npm = [c for c in seen if "pi-coding-agent" in c]
+    assert npm and "--ignore-scripts" in npm[0], npm

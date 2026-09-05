@@ -54,24 +54,31 @@ backend automatically.
 - **GPU (recommended)**: NVIDIA Ampere-class or newer (`sm_86+`). Developed for 24–32 GB
   cards (3090 / 4080 / 4090 / L4 / L40S); validated live on an Ada L4 (`sm_89`) and an
   RTX PRO 6000 Blackwell (`sm_120`). A recent NVIDIA driver is required; a CUDA
-  *toolkit* is not — `pip install glq` ships prebuilt kernels (CPython 3.10–3.14,
+  *toolkit* is not — `pip install glq` ships prebuilt kernels (CPython 3.12–3.14,
   x86_64), and `nvcc` is only needed for the from-source fallback (and for FlashInfer's
   sampler JIT on Blackwell — without it `glq-chat` falls back to vLLM's built-in sampler).
 - **CPU-only**: no GPU → the installer sets up vLLM's CPU backend and GLQ's own fused
   CPU kernels (AVX2 floor, AVX-512 tiers used when present); `--cpu` forces this on a
-  GPU machine. Dense trellis checkpoints only (MoE and e8p/shell need CUDA), and expect
-  single-digit tok/s — e.g. a 3B at ~5–6 tok/s on desktop-class 4–8 core machines
-  (measured); usable for short answers and background work, not fast chat. Model
-  recommendations size against system RAM.
+  GPU machine. Trellis checkpoints only — dense **or MoE** since 0.8.17 (e8p/shell need
+  CUDA) — and expect single-digit tok/s. Measured serving under vLLM on an 8-vCPU
+  Sapphire Rapids (AVX-512-FP16), one request at a time, 64 decoded tokens, vLLM's
+  default core binding: `gemma-4-26B-A4B` trellis-4bpw at **3.0 tok/s**, 0.4 s to first
+  token, 18.6 GiB resident (13.9 GiB weights + a 4 GiB KV pool) — against **2.7 tok/s**
+  for the dense `gemma-4-E4B` on the same box, because an MoE reads only its top-k
+  experts per token. `glq-chat` also gives the kernels the core vLLM holds back
+  (`VLLM_CPU_NUM_OF_RESERVED_CPU=0`), measured at **3.4 tok/s**; decode is
+  memory-bound, so more threads than physical cores add nothing. Usable for short
+  answers and background work, not fast chat. Model recommendations size against
+  system RAM.
 - **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
-  pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 12,
+  pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 13,
   Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
   (`tests/test_installer_distros.py`), so other distros are expected to install and run.
 - **Windows**: no native support (no Windows wheels, and vLLM is Linux-only). WSL2 with
   the NVIDIA CUDA driver should work in principle — untested.
 - **macOS**: not supported. There is no CUDA on Apple hardware, and Docker Desktop on
   macOS cannot pass through an NVIDIA GPU, so a container does not help.
-- **Python**: 3.10–3.14 (the installer creates its own venv).
+- **Python**: 3.12–3.14 (the installer creates its own venv).
 
 ## Quickstart
 

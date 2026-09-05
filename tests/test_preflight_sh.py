@@ -194,7 +194,7 @@ def test_preflight_is_documented_in_help():
 # Measured in containers on 2026-08-15, not assumed:
 #
 #   UBI9 / AlmaLinux 9 / Amazon Linux 2023   ->  default python3 is **3.9**
-#   glq needs >= 3.10, so `dnf install python3-devel` installs 3.9 headers and
+#   glq needs >= 3.12, so `dnf install python3-devel` installs 3.9 headers and
 #   pre-flight still refuses afterwards — advice that leads nowhere.
 #
 #   `dnf install -y python3.12`  ->  exit 0, Python 3.12.13, venv available
@@ -228,7 +228,7 @@ def test_rhel_family_hint_names_python_312_or_newer(distro, tmp_path):
     assert newest is not None, f"{distro}: hint names no explicit python version: {hint}"
     assert newest >= 12, (
         f"{distro}: hint offers python3.{newest}, but the distro default is 3.9 and glq "
-        f"needs >= 3.10 — name 3.12 or newer explicitly: {hint}")
+        f"needs >= 3.12 — name 3.12 or newer explicitly: {hint}")
 
 
 @pytest.mark.parametrize("distro", ["rhel", "rocky", "almalinux", "amzn"])
@@ -341,7 +341,7 @@ def test_preflight_checks_for_a_cxx_compiler(tmp_path):
 # entirely: 6 "unsupported GNU version" errors with the default gcc 16, 0 with
 # NVCC_CCBIN=/usr/bin/g++-15.
 #
-# It must stay a NOTE. Since 0.8.6 the prebuilt wheels cover cp310-cp314, so a fedora:44 user
+# It must stay a NOTE. Since 0.8.6 the prebuilt wheels cover cp312-cp314, so a fedora:44 user
 # compiles nothing and is unaffected; blocking them would refuse an install that works.
 
 def test_a_too_new_gcc_is_reported(tmp_path):
@@ -490,3 +490,19 @@ def test_the_suse_compat_gcc_advice_is_no_longer_marked_unverified(tmp_path):
     assert suse_line, src
     assert "unverified" not in suse_line[0], suse_line[0]
     assert "gcc${MAX_NVCC_GCC}-c++" in suse_line[0], suse_line[0]
+
+
+def test_suse_is_told_to_install_the_sqlite3_module(tmp_path):
+    """SUSE ships sqlite3 as its own package and vLLM imports it
+    (v1/structured_output/backend_xgrammar.py), so without it the install succeeds and the
+    SERVER dies on `ModuleNotFoundError: No module named 'sqlite3'` — seen in a wheel-mode
+    matrix leg. Measured in opensuse/tumbleweed: after this hint's own
+    `python3-devel gcc-c++ curl which`, `python3 -c "import sqlite3"` still fails; adding
+    python3-sqlite3 fixes it."""
+    assert "python3-sqlite3" in _out(_preflight("opensuse", tmp_path))
+
+
+def test_the_other_distros_are_not_told_about_sqlite3(tmp_path):
+    """Everyone else ships it inside python3 itself; naming it would be noise."""
+    for distro in ("ubuntu", "fedora", "rhel", "arch"):
+        assert "sqlite3" not in _out(_preflight(distro, tmp_path)), distro

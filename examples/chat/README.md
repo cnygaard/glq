@@ -30,7 +30,7 @@ OPENAI_API_BASE_URL=http://127.0.0.1:8000/v1 OPENAI_API_KEY=glq \
 It pins 119 dependencies exactly, among them `transformers==5.5.4`, while GLQ needs
 transformers ≥ 5.13.1 to serve gemma-4 — installing it into the glq venv silently
 downgrades transformers and breaks GLQ. It also requires Python ≥ 3.11, < 3.13 where
-glq supports 3.10. Note its licence is the "Open WebUI License", not an OSI-standard one.
+glq needs ≥ 3.12. Note its licence is the "Open WebUI License", not an OSI-standard one.
 
 `install.sh --chat=openwebui` does the above for you, into that separate venv.
 

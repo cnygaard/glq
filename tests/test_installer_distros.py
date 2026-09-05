@@ -96,7 +96,12 @@ DISTROS = [
     # only thing standing between a user and a dead install — a stronger test of it than
     # 24.04, which comes with a usable interpreter.
     Distro("ubuntu2604", "ubuntu:26.04",                                   "apt-get"),
-    Distro("debian",     "debian:12",                                      "apt-get"),
+    # Debian 13 (trixie), the current stable — 12 is oldstable and its python3 (3.11) is no
+    # longer representative of what a Debian user installs. Verified in the image: no
+    # python3 at all in the base, `ID=debian` with an EMPTY `ID_LIKE` (so the pkg_hint match
+    # rests on ID alone, unlike Ubuntu's `like=debian`), and the advised packages bring
+    # 3.13.5 — after which pre-flight passes.
+    Distro("debian",     "debian:13",                                      "apt-get"),
     # Both current Fedoras, because they differ in the one way that decides whether GLQ can
     # compile at all: 43 ships gcc 15.3.1, 44 ships gcc 16.1.1, and CUDA 13.0's
     # crt/host_config.h refuses anything past 15. 44 is therefore the distro where the
@@ -210,7 +215,7 @@ bash /glq/install.sh --preflight; echo "C_EXIT=$?"
     assert "C_EXIT=0" in out, (
         f"{distro.name}: pre-flight still fails after following its own advice.\n"
         f"This is the bug this suite exists to find — the hint names the wrong packages, "
-        f"or the distro's default python is older than 3.10.\n{out[-3000:]}")
+        f"or the distro's default python is older than 3.12.\n{out[-3000:]}")
 
 
 @pytest.mark.parametrize("distro", DISTROS, ids=lambda d: d.name)
@@ -421,6 +426,18 @@ for _ in $(seq 1 30); do
     sleep 2
 done
 echo "UI_OK:$UI_OK"
+
+# vLLM says "Engine core initialization failed. See root cause above" — and "above" is its
+# OWN log file, which dies with the container. Two separate investigations stalled here for
+# exactly that reason, so dump it whenever the chat did not come up.
+if [ "$READY" != "True" ]; then
+    for f in /tmp/glq-vllm-*.log; do
+        [ -f "$f" ] || continue
+        echo "===VLLM_LOG $f"
+        tail -200 "$f"
+        echo "===VLLM_LOG_END"
+    done
+fi
 
 curl -s http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
     -d "{\"model\": \"$GLQ_SMOKE_MODEL\", \"prompt\": \"The capital of France is\", \
