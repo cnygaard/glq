@@ -696,8 +696,15 @@ def test_the_chat_tells_the_supervisor_how_big_the_checkpoint_is(monkeypatch):
 
 
 def test_naming_a_fraction_skips_the_size_lookup(monkeypatch):
-    """`--gpu-memory-utilization` is the offline/oddball escape hatch; it should not then
-    make an HTTP call to size something it was just told about."""
+    """`--gpu-memory-utilization` is the offline/oddball escape hatch; on a GPU it should
+    not then make an HTTP call to size something it was just told about.
+
+    The device is pinned because this is only true on a GPU: the flag does nothing on the
+    CPU backend, where the KV pool still has to be sized against the weights. Leaving it to
+    the host made the test assert whichever answer the machine running it happened to give
+    — green on a GPU box, red on a CPU one."""
+    import glq.supervisor as sup
+    monkeypatch.setattr(sup, "detect_device", lambda: "cuda")
     chat, _, made, _ = _run_chat(monkeypatch, [])
 
     def boom(_repo):
@@ -1514,12 +1521,98 @@ def test_max_num_seqs_auto_resolves_by_device():
 
 
 def test_plan_cpu_kvcache_tiers():
-    """8 GiB is the validated value; smaller machines scale down, never below 2."""
-    assert sup_mod.plan_cpu_kvcache_gib(None) == 8
+    """With no checkpoint size the pool is a fraction of RAM, now capped: a quarter of a
+    32 GiB box is 7 GiB, which is fine for a 2 GiB model and hangs the machine for a 14 GiB
+    one, and without the size we cannot tell them apart. 8 GiB remains reachable when the
+    weights ARE known to leave room (see the tests below)."""
+    assert sup_mod.plan_cpu_kvcache_gib(None) == 8      # no RAM figure either: old default
     assert sup_mod.plan_cpu_kvcache_gib(16 * GIB) == 4
-    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB) == 8
-    assert sup_mod.plan_cpu_kvcache_gib(64 * GIB) == 8
+    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB) == sup_mod._CPU_KV_UNKNOWN_MAX_GIB == 4
+    assert sup_mod.plan_cpu_kvcache_gib(64 * GIB) == 4
     assert sup_mod.plan_cpu_kvcache_gib(6 * GIB) == 2
+
+
+# ---- the KV pool has to know what the weights already cost ------------------------------
+#
+# On CPU everything shares one pool of RAM: the weights, vLLM's runtime, the KV cache, and
+# the page cache the loader streams the checkpoint through. Sizing the pool from RAM alone
+# ignores the largest term. Reported live on a 30.8 GiB box serving the 13.9 GiB 26B-A4B:
+# the planner asked for 7 GiB, and with no swap configured kswapd0 pinned a core at 100%
+# with 85% iowait and buff/cache squeezed to 100 MiB — the machine stopped answering ssh
+# rather than OOM-killing anything, because with no swap the only reclaimable pages were
+# the mmap'd weights being read back in.
+
+def test_a_large_checkpoint_shrinks_the_pool():
+    """The case that thrashed: 13.9 GiB of weights on a 30.8 GiB box must not also be
+    handed the 7 GiB the RAM-only rule gave it."""
+    ram, weights = int(30.8 * GIB), int(13.9 * GIB)
+    planned = sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights)
+    assert planned < 7, ("a 13.9 GiB model must shrink the pool it shares RAM with; 7 GiB "
+                         "is what the RAM-only rule handed it, and the machine thrashed")
+    assert planned >= sup_mod._CPU_KV_MIN_GIB
+
+
+def test_the_planned_total_leaves_room_for_page_cache():
+    """The invariant behind the number: weights + pool + runtime must leave a real slice of
+    RAM for the page cache, because with no swap that is the ONLY thing the kernel can
+    reclaim. Measured stable at 4 GiB of pool (about 65% of RAM resident); reported
+    thrashing at 7."""
+    ram, weights = int(30.8 * GIB), int(13.9 * GIB)
+    planned = sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights)
+    anon = weights + planned * GIB + sup_mod._CPU_RUNTIME_OVERHEAD_BYTES
+    assert anon <= sup_mod._CPU_ANON_FRACTION * ram + GIB
+
+
+def test_a_small_checkpoint_still_gets_the_full_pool():
+    """The fix must not punish the models CPU serving was already good at: a 1.8 GiB dense
+    3B on the same box leaves plenty of room and keeps the validated 8 GiB."""
+    assert sup_mod.plan_cpu_kvcache_gib(int(30.8 * GIB),
+                                        weights_bytes=int(1.8 * GIB)) == 8
+
+
+def test_a_checkpoint_that_cannot_fit_still_returns_the_floor():
+    """A 13.9 GiB model on a 16 GiB box does not fit however the pool is sized. Return the
+    floor rather than a negative or a crash — the caller warns, and vLLM's own OOM is a
+    clearer message than an arithmetic error here."""
+    assert sup_mod.plan_cpu_kvcache_gib(16 * GIB,
+                                        weights_bytes=int(13.9 * GIB)) == sup_mod._CPU_KV_MIN_GIB
+
+
+def test_gpu_memory_utilization_does_not_suppress_cpu_sizing():
+    """`--gpu-memory-utilization` is a GPU flag; the supervisor even reports it as ignored
+    on CPU. It used to suppress the checkpoint lookup, which on CPU took the KV pool back
+    to the RAM-only rule — restoring the overcommit through a flag that does nothing."""
+    import argparse
+
+    from glq.chat import sizing_weights_bytes
+
+    args = argparse.Namespace(model="xv0y5ncu/some-checkpoint", gpu_memory_utilization=0.9)
+    seen = {}
+
+    import glq.chat as chat_mod
+    real = chat_mod._checkpoint_bytes
+    chat_mod._checkpoint_bytes = lambda repo: seen.setdefault("repo", repo) and 123 or 123
+    try:
+        assert sizing_weights_bytes(args, device="cpu") == 123, "CPU must still size"
+        assert seen["repo"] == "xv0y5ncu/some-checkpoint"
+        assert sizing_weights_bytes(args, device="cuda") is None, (
+            "on a GPU the flag IS the answer, so the lookup stays skipped")
+    finally:
+        chat_mod._checkpoint_bytes = real
+
+
+def test_glq_code_sizes_the_pool_the_same_way():
+    """glq-code serves the same checkpoints on the same machines; the two commands must not
+    drift on this. Both call the one helper."""
+    import glq.code as code_mod
+    from glq.chat import sizing_weights_bytes
+    assert code_mod.sizing_weights_bytes is sizing_weights_bytes
+
+
+def test_the_pool_shrinks_monotonically_with_the_checkpoint():
+    pools = [sup_mod.plan_cpu_kvcache_gib(int(30.8 * GIB), weights_bytes=int(w * GIB))
+             for w in (2, 6, 10, 14, 18)]
+    assert pools == sorted(pools, reverse=True), pools
 
 
 def test_cpu_spawn_env_carries_the_kvcache_pool(monkeypatch):

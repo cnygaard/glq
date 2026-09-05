@@ -256,15 +256,58 @@ def detect_device(vllm_version=_installed_vllm_version, vram=None) -> str:
 _CPU_KV_MIN_GIB, _CPU_KV_MAX_GIB = 2, 8
 
 
-def plan_cpu_kvcache_gib(ram_bytes) -> int:
-    """The CPU KV pool: a quarter of RAM, clamped to [2, 8] GiB; 8 when RAM is unknown."""
+#: What the CPU serving stack costs beyond the weights and the KV pool. Measured on an
+#: 8-vCPU box serving the 13.9 GiB 26B-A4B with a 4 GiB pool: the VLLM::Worker held
+#: 18.56 GiB (so ~0.7 GiB of activations above weights + pool) and the driver and engine
+#: processes another ~1.4 GiB.
+_CPU_RUNTIME_OVERHEAD_BYTES = 2 * 1024 ** 3
+
+#: Share of RAM the *anonymous* demand — weights + pool + runtime — may reach. The rest is
+#: for the page cache, and on CPU that is not a luxury: the loader streams the whole
+#: checkpoint through it, and a box with no swap configured (the AWS default) can reclaim
+#: nothing else. Anchored to two observed configurations on a 30.8 GiB box holding the
+#: 13.9 GiB 26B-A4B: a 4 GiB pool (≈65% anonymous) served for hours across many runs, and
+#: a 7 GiB pool (≈77%) left kswapd0 pinned at 100% with 85% iowait, buff/cache down to
+#: 100 MiB, and sshd unable to complete a banner exchange. 0.70 sits between them, nearer
+#: the configuration that worked. Refine it when the failure is reproduced under
+#: instrumentation — it is bounded by observation, not measured to a knife edge.
+_CPU_ANON_FRACTION = 0.70
+
+#: The ceiling when the checkpoint size could not be looked up, so the arithmetic above is
+#: unavailable. 4 GiB is the pool that served the 13.9 GiB 26B-A4B across every run of this
+#: work without pressure; 8 would be betting that the model is small.
+_CPU_KV_UNKNOWN_MAX_GIB = 4
+
+
+def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None) -> int:
+    """The CPU KV pool in GiB, clamped to [2, 8].
+
+    On a GPU the weights and the KV cache come out of VRAM while the loader, the runtime
+    and the page cache come out of RAM, so sizing the pool against one number works. On CPU
+    they all come out of the *same* RAM, which is why this needs `weights_bytes`: a quarter
+    of RAM is 7 GiB on a 32 GiB box whether the checkpoint is 1.8 GiB or 13.9, and in the
+    second case that overcommits the machine.
+
+    Without a checkpoint size — an unknown repo, a local path we could not measure — it
+    keeps the old fraction-of-RAM answer. That is the input we have, and a pool that is
+    too small costs context rather than the machine.
+    """
     if not ram_bytes:
         return _CPU_KV_MAX_GIB
-    quarter = int(ram_bytes / 2**30) // 4
-    return max(_CPU_KV_MIN_GIB, min(_CPU_KV_MAX_GIB, quarter))
+    if not weights_bytes:
+        # Size unknown — an offline box, a local path, a 404. A quarter of RAM was the old
+        # rule and it is a gamble here: on a 32 GiB machine it hands out 7 GiB whether the
+        # checkpoint is 1.8 GiB or 13.9. Cap the guess at the largest pool observed serving
+        # comfortably, because the two errors are not symmetric — too small costs context,
+        # too large hangs a machine with no swap.
+        quarter = int(ram_bytes / 2**30) // 4
+        return max(_CPU_KV_MIN_GIB, min(_CPU_KV_UNKNOWN_MAX_GIB, quarter))
+    budget = (_CPU_ANON_FRACTION * ram_bytes - weights_bytes
+              - _CPU_RUNTIME_OVERHEAD_BYTES)
+    return max(_CPU_KV_MIN_GIB, min(_CPU_KV_MAX_GIB, int(budget / 2**30)))
 
 
-def child_env(device: str = "cuda", ram_bytes=None) -> dict:
+def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None) -> dict:
     """The environment `vllm serve` is started with.
 
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
@@ -286,7 +329,8 @@ def child_env(device: str = "cuda", ram_bytes=None) -> dict:
         # The CPU backend takes its KV pool from this env var (GiB). A user-set value
         # always wins; the flashinfer probe is skipped — it answers a GPU question with
         # an nvidia-smi subprocess this path has no use for.
-        env.setdefault("VLLM_CPU_KVCACHE_SPACE", str(plan_cpu_kvcache_gib(ram_bytes)))
+        env.setdefault("VLLM_CPU_KVCACHE_SPACE",
+                       str(plan_cpu_kvcache_gib(ram_bytes, weights_bytes)))
         # vLLM's auto CPU binding takes one logical CPU per physical core and then holds
         # one back for itself, so a 4-core machine runs GLQ's kernels on 3. Decode is
         # memory-bound and scales with cores until the bandwidth saturates: serving the
@@ -470,7 +514,23 @@ class VllmSupervisor:
         # with them unflushed.
         if self.fp8_kv:
             self._say("  KV cache in fp8 (vLLM's own) — about twice the context per GiB")
-        env = child_env(device=self.device, ram_bytes=self._ram_bytes)
+        env = child_env(device=self.device, ram_bytes=self._ram_bytes,
+                        weights_bytes=self.weights_bytes)
+        if self.device == "cpu" and self._ram_bytes and self.weights_bytes:
+            # Say the arithmetic out loud. On CPU the weights, the pool, the runtime and the
+            # page cache share one pool of RAM, and when it does not fit there is no swap to
+            # absorb it on a default cloud box — the machine stops answering rather than
+            # OOM-killing one process, which is a much harder failure to read after the fact.
+            pool = int(env["VLLM_CPU_KVCACHE_SPACE"])
+            anon = self.weights_bytes + pool * 2**30 + _CPU_RUNTIME_OVERHEAD_BYTES
+            self._say(f"  RAM plan: {self.weights_bytes / 2**30:.1f} GiB weights + "
+                      f"{pool} GiB KV pool + ~{_CPU_RUNTIME_OVERHEAD_BYTES / 2**30:.0f} GiB "
+                      f"runtime = {anon / 2**30:.1f} of {self._ram_bytes / 2**30:.1f} GiB")
+            if anon > _CPU_ANON_FRACTION * self._ram_bytes:
+                self._say("  warning: that leaves little room for the page cache the loader "
+                          "streams the checkpoint through. If the machine has no swap it may "
+                          "thrash rather than fail cleanly — serve a smaller checkpoint, or "
+                          "set VLLM_CPU_KVCACHE_SPACE lower.")
         if "VLLM_USE_FLASHINFER_SAMPLER" in env:
             self._say("  the NVIDIA CUDA Toolkit is not installed, and FlashInfer ships no "
                       "prebuilt sampler for this GPU, so it")

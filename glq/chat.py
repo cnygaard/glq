@@ -294,6 +294,27 @@ def _checkpoint_bytes(repo_id: str):
         return None
 
 
+def sizing_weights_bytes(args, device=None):
+    """The checkpoint size the supervisor should size against, or None.
+
+    `--gpu-memory-utilization` used to suppress the lookup outright: on a GPU that flag IS
+    the answer weights_bytes would have produced, so the HTTP call was pure cost. On CPU it
+    is a flag that does nothing — the supervisor reports it as ignored — while the KV pool
+    still has to be sized against the weights, because there they share one pool of RAM
+    with the runtime and the page cache. Suppressing the lookup there restores exactly the
+    overcommit that hangs a swapless machine, through a flag that has no effect.
+
+    Shared by glq-chat and glq-code so the two cannot drift apart on it.
+    """
+    if not getattr(args, "model", None):
+        return None
+    if args.gpu_memory_utilization is not None:
+        from glq.supervisor import detect_device
+        if (device or detect_device()) != "cpu":
+            return None
+    return _checkpoint_bytes(args.model)
+
+
 def _display_available() -> bool:
     """Is there a desktop to open a browser on? Over SSH there is not, and `inbrowser=True`
     would either do nothing or launch a text browser in the terminal running the server."""
@@ -387,10 +408,9 @@ def main(argv=None) -> int:
         max_num_seqs=args.max_num_seqs,
         fp8_kv=args.fp8_kv,
         timeout=args.ready_timeout,
-        # Size the KV pool for this checkpoint. Skipped entirely when the user named a
-        # fraction themselves, so `--gpu-memory-utilization` costs no network round trip.
-        weights_bytes=(None if args.gpu_memory_utilization is not None or not args.model
-                       else _checkpoint_bytes(args.model)),
+        # Size the KV pool for this checkpoint — on CPU that is what keeps the pool,
+        # the weights and the page cache inside one RAM budget.
+        weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
     )
 

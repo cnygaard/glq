@@ -69,7 +69,11 @@ backend automatically.
   (`VLLM_CPU_NUM_OF_RESERVED_CPU=0`), measured at **3.4 tok/s**; decode is
   memory-bound, so more threads than physical cores add nothing. Usable for short
   answers and background work, not fast chat. Model recommendations size against
-  system RAM.
+  system RAM, and `glq-chat` sizes the KV pool from the checkpoint — on CPU the
+  weights, the pool, the runtime and the page cache all come out of the same RAM, and
+  a machine with no swap (the cloud default) thrashes rather than failing cleanly when
+  they do not fit. It prints the arithmetic before starting; `VLLM_CPU_KVCACHE_SPACE`
+  overrides it.
 - **Distros**: GLQ has only been tested end-to-end on **Ubuntu**. The installer's
   pre-flight is additionally exercised (Docker + GPU) on Ubuntu 24.04/26.04, Debian 13,
   Fedora 43/44, AlmaLinux 9, Arch and openSUSE Tumbleweed
