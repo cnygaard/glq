@@ -77,3 +77,41 @@ def test_other_codebooks_are_refused_with_the_reason_and_the_fix(codebook):
 def test_an_unknown_codebook_is_refused_rather_than_assumed_to_work():
     """A new codebook must opt in explicitly: serving garbage beats nothing only never."""
     assert D.moe_cpu_refusal("some_future_codebook")
+
+
+# ---- which layers the FUSED CPU MoE op can take ------------------------------------------
+#
+# `glq_fused_moe_trellis_3inst_cpu` is faster than the per-expert loop but narrower: it has
+# no stage-2 (5-8 bpw RVQ) inputs, assumes trellis' unpadded shapes, and needs the same
+# m % 32 / n % 64 alignment the CPU kernel does. Everything it cannot take must land on the
+# loop, which is correct on every shape — so each entry here is a real limit of the op.
+
+FUSED_OK = dict(fused_shape_ok=True, has_stage2=False, unpadded=True, activation_type=1,
+                ext_has_entry=True, force_fallback=False, cpu_fused_enabled=True)
+
+
+def test_a_healthy_trellis_moe_takes_the_fused_cpu_op():
+    assert D.moe_cpu_fused_refusal(**FUSED_OK) is None
+
+
+@pytest.mark.parametrize("override, must_mention", [
+    (dict(has_stage2=True), "5-8"),               # RVQ stage 2: no CPU op takes packed2
+    (dict(unpadded=False), "pad"),                # the op passes logical dims to the bracket
+    (dict(fused_shape_ok=False), "shape"),        # m % 32 / n % 64 / R out of range
+    (dict(activation_type=3), "activation"),      # *_no_mul: the op is gated-only
+    (dict(ext_has_entry=False), "extension"),     # wheel older than the symbol
+    (dict(force_fallback=True), "GLQ_MOE_FORCE_FALLBACK"),
+    (dict(cpu_fused_enabled=False), "GLQ_FUSED_TRELLIS_CPU"),
+])
+def test_each_limit_falls_back_with_a_reason_naming_it(override, must_mention):
+    why = D.moe_cpu_fused_refusal(**{**FUSED_OK, **override})
+    assert why, f"{override} must not take the fused CPU op"
+    assert must_mention.lower() in why.lower(), (
+        f"the reason must name what stopped it; got {why!r}")
+
+
+def test_the_two_switches_are_independent():
+    """Turning off CPU fused decode must not read as 'force the MoE fallback', and vice
+    versa — they are separate A/B levers and a shared one cannot isolate either path."""
+    assert D.moe_cpu_fused_refusal(**{**FUSED_OK, "force_fallback": True}) \
+        != D.moe_cpu_fused_refusal(**{**FUSED_OK, "cpu_fused_enabled": False})
