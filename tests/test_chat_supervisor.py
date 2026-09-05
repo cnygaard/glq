@@ -1514,12 +1514,67 @@ def test_max_num_seqs_auto_resolves_by_device():
 
 
 def test_plan_cpu_kvcache_tiers():
-    """8 GiB is the validated value; smaller machines scale down, never below 2."""
+    """8 GiB is the validated value; smaller machines scale down, never below 2.
+
+    With no checkpoint size to go on this stays a fraction of RAM — it is the only input
+    there is, and a too-small pool serves a short context rather than failing."""
     assert sup_mod.plan_cpu_kvcache_gib(None) == 8
     assert sup_mod.plan_cpu_kvcache_gib(16 * GIB) == 4
     assert sup_mod.plan_cpu_kvcache_gib(32 * GIB) == 8
     assert sup_mod.plan_cpu_kvcache_gib(64 * GIB) == 8
     assert sup_mod.plan_cpu_kvcache_gib(6 * GIB) == 2
+
+
+# ---- the KV pool has to know what the weights already cost ------------------------------
+#
+# On CPU everything shares one pool of RAM: the weights, vLLM's runtime, the KV cache, and
+# the page cache the loader streams the checkpoint through. Sizing the pool from RAM alone
+# ignores the largest term. Reported live on a 30.8 GiB box serving the 13.9 GiB 26B-A4B:
+# the planner asked for 7 GiB, and with no swap configured kswapd0 pinned a core at 100%
+# with 85% iowait and buff/cache squeezed to 100 MiB — the machine stopped answering ssh
+# rather than OOM-killing anything, because with no swap the only reclaimable pages were
+# the mmap'd weights being read back in.
+
+def test_a_large_checkpoint_shrinks_the_pool():
+    """The case that thrashed: 13.9 GiB of weights on a 30.8 GiB box must not also be
+    handed the 7 GiB the RAM-only rule gave it."""
+    ram, weights = int(30.8 * GIB), int(13.9 * GIB)
+    assert sup_mod.plan_cpu_kvcache_gib(ram) == 7, "the RAM-only answer, for contrast"
+    planned = sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights)
+    assert planned < 7, "a 13.9 GiB model must shrink the pool it shares RAM with"
+    assert planned >= sup_mod._CPU_KV_MIN_GIB
+
+
+def test_the_planned_total_leaves_room_for_page_cache():
+    """The invariant behind the number: weights + pool + runtime must leave a real slice of
+    RAM for the page cache, because with no swap that is the ONLY thing the kernel can
+    reclaim. Measured stable at 4 GiB of pool (about 65% of RAM resident); reported
+    thrashing at 7."""
+    ram, weights = int(30.8 * GIB), int(13.9 * GIB)
+    planned = sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights)
+    anon = weights + planned * GIB + sup_mod._CPU_RUNTIME_OVERHEAD_BYTES
+    assert anon <= sup_mod._CPU_ANON_FRACTION * ram + GIB
+
+
+def test_a_small_checkpoint_still_gets_the_full_pool():
+    """The fix must not punish the models CPU serving was already good at: a 1.8 GiB dense
+    3B on the same box leaves plenty of room and keeps the validated 8 GiB."""
+    assert sup_mod.plan_cpu_kvcache_gib(int(30.8 * GIB),
+                                        weights_bytes=int(1.8 * GIB)) == 8
+
+
+def test_a_checkpoint_that_cannot_fit_still_returns_the_floor():
+    """A 13.9 GiB model on a 16 GiB box does not fit however the pool is sized. Return the
+    floor rather than a negative or a crash — the caller warns, and vLLM's own OOM is a
+    clearer message than an arithmetic error here."""
+    assert sup_mod.plan_cpu_kvcache_gib(16 * GIB,
+                                        weights_bytes=int(13.9 * GIB)) == sup_mod._CPU_KV_MIN_GIB
+
+
+def test_the_pool_shrinks_monotonically_with_the_checkpoint():
+    pools = [sup_mod.plan_cpu_kvcache_gib(int(30.8 * GIB), weights_bytes=int(w * GIB))
+             for w in (2, 6, 10, 14, 18)]
+    assert pools == sorted(pools, reverse=True), pools
 
 
 def test_cpu_spawn_env_carries_the_kvcache_pool(monkeypatch):
