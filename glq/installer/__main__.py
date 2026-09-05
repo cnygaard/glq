@@ -434,14 +434,15 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if device == "cpu":
-        # RAM is the budget; only dense trellis serves on the CPU backend (MoE and
-        # e8p/shell refuse at load), so gate the recommendation accordingly. The menu
-        # still lists everything.
+        # RAM is the budget; trellis serves on the CPU backend (dense or MoE — the fused
+        # CPU expert kernel covers both), e8p/shell still refuse at load. Gate the
+        # recommendation accordingly; the menu still lists everything.
         from .recommend import CPU_WEIGHT_FRACTION
         ranked = rank(checkpoints, ram, weight_fraction=CPU_WEIGHT_FRACTION,
                       require_trellis=True)
-        print("note: MoE and e8p/shell checkpoints do not serve on the CPU backend —"
-              " only dense trellis builds are recommended here.")
+        print("note: e8p/shell checkpoints do not serve on the CPU backend — only trellis"
+              " builds are recommended here (a trellis MoE reads only its top-k experts"
+              " per token, so it is the faster choice at a given size).")
     else:
         ranked = rank(checkpoints, vram)
     print(f"Found {len(checkpoints)} checkpoints in the GLQ collection.")

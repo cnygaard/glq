@@ -74,10 +74,12 @@ def rank(checkpoints, vram_bytes: int | None,
     # "fits anywhere", or a broken repo sorts to the top of the recommendation.
     fitting = [c for c in ordered if 0 < c.size_bytes <= budget]
     if require_trellis:
-        # The CPU backend serves dense trellis only (MoE and e8p/shell refuse). Unknown
-        # (None) is ineligible on both axes: recommending gigabytes of download into a
-        # hard refusal at serve time is the worst failure this gate can produce.
-        fitting = [c for c in fitting if c.trellis is True and c.moe is False]
+        # The CPU backend serves trellis — dense or MoE, the latter since the fused CPU
+        # expert kernel landed. e8p/shell still refuse at load (their expert and dequant
+        # paths are CUDA-only), and unknown (None) is ineligible rather than assumed:
+        # recommending gigabytes of download into a hard refusal at serve time is the
+        # worst failure this gate can produce.
+        fitting = [c for c in fitting if c.trellis is True]
     if prefer_family:
         fam = [c for c in fitting if prefer_family.lower() in c.repo_id.lower()]
         if fam:
