@@ -13,9 +13,21 @@ from vllm import LLM, SamplingParams
 
 
 def _rss_gib():
-    """Resident set of this process, which on the CPU backend is where the weights live."""
+    """Resident set of the driver AND its children.
+
+    The weights are not in this process: vLLM's multiproc executor loads them in a
+    `VLLM::Worker` child, so measuring only self reports ~1.5 GiB for a 14 GiB checkpoint.
+    Measured live on the 26B-A4B: driver 1.48 GiB, worker 18.56 GiB.
+    """
     import psutil
-    return psutil.Process(os.getpid()).memory_info().rss / (1 << 30)
+    me = psutil.Process(os.getpid())
+    total = me.memory_info().rss
+    for child in me.children(recursive=True):
+        try:
+            total += child.memory_info().rss
+        except psutil.Error:            # a worker that exited mid-walk
+            pass
+    return total / (1 << 30)
 
 
 def main():
@@ -34,6 +46,9 @@ def main():
     ap.add_argument("--top-k", type=int, default=-1)
     ap.add_argument("--seqs", default="1,8", help="batch sizes for the decode sweep")
     ap.add_argument("--dectok", type=int, default=256, help="tokens per decode-sweep sequence")
+    ap.add_argument("--async-sched", action="store_true",
+                    help="overlap scheduling with decode (EngineArgs async_scheduling)")
+    ap.add_argument("--kv-dtype", default=None, help='e.g. "fp8" to halve the KV pool')
     args = ap.parse_args()
     kw = dict(model=args.model, dtype="bfloat16", trust_remote_code=True,
               max_model_len=2048)
@@ -41,6 +56,10 @@ def main():
         kw["enforce_eager"] = True
     else:
         kw["gpu_memory_utilization"] = 0.9
+    if args.async_sched:
+        kw["async_scheduling"] = True
+    if args.kv_dtype:
+        kw["kv_cache_dtype"] = args.kv_dtype
     if args.quant == "glq":
         kw["quantization"] = "glq"
     if args.mm0:
@@ -49,8 +68,10 @@ def main():
     llm = LLM(**kw)
     t_load = time.perf_counter() - t_load
     if args.cpu:
+        # Summed across processes, so pages shared with a forked child are counted twice —
+        # an upper bound. For the per-process truth read /proc/<VLLM::Worker>/status.
         print(f"LOAD: {t_load:.1f}s   RSS after load: {_rss_gib():.2f} GiB "
-              f"(weights + KV pool + activations)", flush=True)
+              f"(driver + workers, summed)", flush=True)
         t0 = time.perf_counter()
         llm.generate(["Hello"], SamplingParams(max_tokens=1, temperature=0.0), use_tqdm=False)
         print(f"TTFT (1-token prompt, cold): {time.perf_counter() - t0:.2f}s", flush=True)

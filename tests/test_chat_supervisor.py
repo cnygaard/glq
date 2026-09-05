@@ -1543,6 +1543,32 @@ def test_cuda_spawn_env_has_no_kvcache_pool(monkeypatch):
     assert "VLLM_CPU_KVCACHE_SPACE" not in spawned[0].env
 
 
+def test_cpu_spawn_env_claims_the_reserved_core(monkeypatch):
+    """vLLM binds one logical CPU per physical core and reserves one for itself, which on a
+    4-core machine hands the kernels 3. Measured serving the 26B-A4B on an 8-vCPU Sapphire
+    Rapids: 3 cores 3.0 tok/s, 4 cores 3.3. Nothing else is competing for it during a
+    single-stream chat, so take it."""
+    monkeypatch.delenv("VLLM_CPU_NUM_OF_RESERVED_CPU", raising=False)
+    sup, spawned = _sup(device="cpu", healthy_after=2)
+    sup.start()
+    assert spawned[0].env.get("VLLM_CPU_NUM_OF_RESERVED_CPU") == "0"
+
+
+def test_a_user_reserved_cpu_value_survives(monkeypatch):
+    """A busy box may well want a core held back; the default must not overrule that."""
+    monkeypatch.setenv("VLLM_CPU_NUM_OF_RESERVED_CPU", "2")
+    sup, spawned = _sup(device="cpu", healthy_after=2)
+    sup.start()
+    assert spawned[0].env["VLLM_CPU_NUM_OF_RESERVED_CPU"] == "2"
+
+
+def test_cuda_spawn_env_does_not_touch_cpu_core_reservation(monkeypatch):
+    monkeypatch.delenv("VLLM_CPU_NUM_OF_RESERVED_CPU", raising=False)
+    sup, spawned = _sup(device="cuda", healthy_after=2)
+    sup.start()
+    assert "VLLM_CPU_NUM_OF_RESERVED_CPU" not in spawned[0].env
+
+
 def test_cpu_banner_speaks_cpu_not_vram(capsys):
     import io
     buf = io.StringIO()

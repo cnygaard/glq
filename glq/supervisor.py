@@ -287,6 +287,15 @@ def child_env(device: str = "cuda", ram_bytes=None) -> dict:
         # always wins; the flashinfer probe is skipped — it answers a GPU question with
         # an nvidia-smi subprocess this path has no use for.
         env.setdefault("VLLM_CPU_KVCACHE_SPACE", str(plan_cpu_kvcache_gib(ram_bytes)))
+        # vLLM's auto CPU binding takes one logical CPU per physical core and then holds
+        # one back for itself, so a 4-core machine runs GLQ's kernels on 3. Decode is
+        # memory-bound and scales with cores until the bandwidth saturates: serving the
+        # 26B-A4B on an 8-vCPU Sapphire Rapids measured 3.0 tok/s on 3 cores and 3.3 on 4
+        # (binding all 8 logical CPUs added nothing — SMT siblings share the same
+        # bandwidth). Nothing is competing for that core during single-stream chat, which
+        # is what this supervisor serves, so claim it. setdefault: a busy box can hold
+        # cores back by setting this itself.
+        env.setdefault("VLLM_CPU_NUM_OF_RESERVED_CPU", "0")
         return env
     # After PATH, so the probe sees the tools the child will actually have.
     env.update(flashinfer_env())
