@@ -17,9 +17,13 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "infra"))
 
-import spot_hunter as SH  # noqa: E402
-
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "infra", "spot_hunter.py")
+
+# `infra/` is gitignored (it holds the SSH key), so spot_hunter.py is not in the
+# repository — these run for whoever is editing the script locally and skip everywhere
+# else, rather than failing a checkout that legitimately does not contain it.
+SH = pytest.importorskip("spot_hunter",
+                         reason="infra/spot_hunter.py is not present (infra/ is gitignored)")
 
 
 # ---- the lineups are well-formed ---------------------------------------------------------
