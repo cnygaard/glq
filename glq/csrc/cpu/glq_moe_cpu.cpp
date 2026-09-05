@@ -24,6 +24,7 @@
 
 #include <ATen/Parallel.h>
 
+#include <cstring>
 #include <vector>
 
 #include "glq_trellis_cpu.hpp"
@@ -55,6 +56,14 @@ torch::Tensor expert_bracket(const torch::Tensor& rows_in,   // (n, k) fp32 cont
                              float wscale, int64_t m, int64_t k, int R,
                              bool inner_parallel) {
     const int64_t n = rows_in.size(0);
+    // Same contract as the dense entry's kernel_supported(): the tiers consume k in 64-wide
+    // groups and split rows as `m / 32`. Off-contract shapes do not fault — they come back
+    // finite and plausible and WRONG (hidden=96 packs fine and is a legal MoE width), so
+    // this must be an error, not a silent result. The vLLM gate refuses these layers to the
+    // per-expert loop before ever getting here; this is the backstop for every other caller.
+    TORCH_CHECK(m > 0 && k > 0 && m % 32 == 0 && k % 64 == 0,
+                "CPU trellis kernel needs m % 32 == 0 and k % 64 == 0, got (", m, ", ", k,
+                ")");
     auto xr = (rows_in * sv.to(torch::kFloat32)).contiguous();
     auto mn = meta_n.contiguous();
     glq_cpu::blockdiag_fht_rows(xr.data_ptr<float>(), n, k, mn.data_ptr<int32_t>(),
@@ -205,9 +214,19 @@ torch::Tensor fused_moe_trellis_3inst_cpu(
                                 w2_Wscale[e].item<float>(), hidden, inter, R2,
                                 inner_parallel);
 
-        auto dst = torch::from_blob(const_cast<int64_t*>(rs.data()), {n},
-                                    torch::dtype(torch::kLong));
-        expert_out.index_copy_(0, dst, z);
+        // Scatter this expert's rows with a plain copy rather than index_copy_. Under vLLM
+        // the whole forward runs in InferenceMode, so `expert_out` is an inference tensor —
+        // and ATen's parallel workers do NOT inherit that TLS, which makes a dispatched
+        // in-place write from inside the parallel region an error ("Inplace update to
+        // inference tensor outside InferenceMode"). Raw pointers sidestep the dispatcher
+        // entirely, so this is correct in either mode, on any thread. Each routing row
+        // belongs to exactly one expert, so the writes cannot race.
+        const auto zc = z.contiguous();          // named: a temporary here would dangle
+        const float* zp = zc.data_ptr<float>();
+        float* eo = expert_out.data_ptr<float>();
+        for (int64_t i = 0; i < n; ++i)
+            std::memcpy(eo + rs[(size_t)i] * hidden, zp + i * hidden,
+                        (size_t)hidden * sizeof(float));
     };
 
     if (expert_parallel) {

@@ -305,3 +305,36 @@ def test_single_expert_equals_the_dense_bracket():
         float(w.w2_Wscale[0]), w.inter, w.hidden, w.inter, w.hidden)
     ids, wts = torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1)
     assert torch.equal(_fused(w, x, ids, wts), z)
+
+
+def test_the_op_runs_under_inference_mode():
+    """Every vLLM forward runs inside ``torch.inference_mode()``, and tensors the op
+    allocates there are inference tensors — but ATen's parallel workers do not inherit that
+    TLS, so an in-place ATen write from one of them raised "Inplace update to inference
+    tensor outside InferenceMode" and took the engine down on the first token. The unit
+    tests never saw it because they run in normal mode, where the same tensor is ordinary.
+
+    Routed experts must be at least the thread count, or the op stays on its serial branch
+    and the parallel one goes untested."""
+    E = max(8, torch.get_num_threads())
+    w = MoEWeights(E=E)
+    x = torch.randn(E, w.hidden)
+    ids = torch.arange(E, dtype=torch.long).unsqueeze(1)      # every expert gets a routing
+    wts = torch.ones(E, 1)
+    with torch.inference_mode():
+        out = _fused(w, x, ids, wts)
+    assert out.shape == (E, w.hidden) and torch.isfinite(out).all()
+    assert torch.equal(out, moe_oracle(w, x, ids, wts)), \
+        "inference mode must not change the numbers, only the tensor flags"
+
+
+def test_a_shape_the_kernel_cannot_take_raises_instead_of_computing_garbage():
+    """The kernel consumes k in 64-wide groups and splits rows as ``m / 32``; the dense
+    entry checks both, the MoE entry did not — and hidden=96 (which packs fine, and is a
+    perfectly legal MoE width) came back finite, plausible and wrong. A wrong answer that
+    looks right is the worst outcome this op has, so it must refuse the shape."""
+    w = MoEWeights(E=2, hidden=96, inter=64)
+    x = torch.randn(2, w.hidden)
+    ids, wts = _route(2, w.E, 2)
+    with pytest.raises(RuntimeError, match=r"m % 32|k % 64"):
+        _fused(w, x, ids, wts)
