@@ -273,6 +273,11 @@ _CPU_RUNTIME_OVERHEAD_BYTES = 2 * 1024 ** 3
 #: instrumentation — it is bounded by observation, not measured to a knife edge.
 _CPU_ANON_FRACTION = 0.70
 
+#: The ceiling when the checkpoint size could not be looked up, so the arithmetic above is
+#: unavailable. 4 GiB is the pool that served the 13.9 GiB 26B-A4B across every run of this
+#: work without pressure; 8 would be betting that the model is small.
+_CPU_KV_UNKNOWN_MAX_GIB = 4
+
 
 def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None) -> int:
     """The CPU KV pool in GiB, clamped to [2, 8].
@@ -290,8 +295,13 @@ def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None) -> int:
     if not ram_bytes:
         return _CPU_KV_MAX_GIB
     if not weights_bytes:
+        # Size unknown — an offline box, a local path, a 404. A quarter of RAM was the old
+        # rule and it is a gamble here: on a 32 GiB machine it hands out 7 GiB whether the
+        # checkpoint is 1.8 GiB or 13.9. Cap the guess at the largest pool observed serving
+        # comfortably, because the two errors are not symmetric — too small costs context,
+        # too large hangs a machine with no swap.
         quarter = int(ram_bytes / 2**30) // 4
-        return max(_CPU_KV_MIN_GIB, min(_CPU_KV_MAX_GIB, quarter))
+        return max(_CPU_KV_MIN_GIB, min(_CPU_KV_UNKNOWN_MAX_GIB, quarter))
     budget = (_CPU_ANON_FRACTION * ram_bytes - weights_bytes
               - _CPU_RUNTIME_OVERHEAD_BYTES)
     return max(_CPU_KV_MIN_GIB, min(_CPU_KV_MAX_GIB, int(budget / 2**30)))

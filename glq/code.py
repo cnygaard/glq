@@ -22,9 +22,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from glq.chat import (DEFAULT_BASE_URL, _checkpoint_bytes, _installed_config,
-                      _model_max_len, _server_port, _vram_bytes, default_model,
-                      positive_seconds)
+from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
+                      _server_port, _vram_bytes, default_model,
+                      positive_seconds, sizing_weights_bytes)
 from glq.installer.configure import write_pi_models
 from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
@@ -120,8 +120,7 @@ def main(argv=None) -> int:
         max_num_seqs=args.max_num_seqs,
         timeout=args.ready_timeout,
         extra_args=tool_args,
-        weights_bytes=(None if args.gpu_memory_utilization is not None or not args.model
-                       else _checkpoint_bytes(args.model)),
+        weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
     )
 

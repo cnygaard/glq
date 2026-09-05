@@ -696,8 +696,15 @@ def test_the_chat_tells_the_supervisor_how_big_the_checkpoint_is(monkeypatch):
 
 
 def test_naming_a_fraction_skips_the_size_lookup(monkeypatch):
-    """`--gpu-memory-utilization` is the offline/oddball escape hatch; it should not then
-    make an HTTP call to size something it was just told about."""
+    """`--gpu-memory-utilization` is the offline/oddball escape hatch; on a GPU it should
+    not then make an HTTP call to size something it was just told about.
+
+    The device is pinned because this is only true on a GPU: the flag does nothing on the
+    CPU backend, where the KV pool still has to be sized against the weights. Leaving it to
+    the host made the test assert whichever answer the machine running it happened to give
+    — green on a GPU box, red on a CPU one."""
+    import glq.supervisor as sup
+    monkeypatch.setattr(sup, "detect_device", lambda: "cuda")
     chat, _, made, _ = _run_chat(monkeypatch, [])
 
     def boom(_repo):
@@ -1514,14 +1521,14 @@ def test_max_num_seqs_auto_resolves_by_device():
 
 
 def test_plan_cpu_kvcache_tiers():
-    """8 GiB is the validated value; smaller machines scale down, never below 2.
-
-    With no checkpoint size to go on this stays a fraction of RAM — it is the only input
-    there is, and a too-small pool serves a short context rather than failing."""
-    assert sup_mod.plan_cpu_kvcache_gib(None) == 8
+    """With no checkpoint size the pool is a fraction of RAM, now capped: a quarter of a
+    32 GiB box is 7 GiB, which is fine for a 2 GiB model and hangs the machine for a 14 GiB
+    one, and without the size we cannot tell them apart. 8 GiB remains reachable when the
+    weights ARE known to leave room (see the tests below)."""
+    assert sup_mod.plan_cpu_kvcache_gib(None) == 8      # no RAM figure either: old default
     assert sup_mod.plan_cpu_kvcache_gib(16 * GIB) == 4
-    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB) == 8
-    assert sup_mod.plan_cpu_kvcache_gib(64 * GIB) == 8
+    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB) == sup_mod._CPU_KV_UNKNOWN_MAX_GIB == 4
+    assert sup_mod.plan_cpu_kvcache_gib(64 * GIB) == 4
     assert sup_mod.plan_cpu_kvcache_gib(6 * GIB) == 2
 
 
@@ -1539,9 +1546,9 @@ def test_a_large_checkpoint_shrinks_the_pool():
     """The case that thrashed: 13.9 GiB of weights on a 30.8 GiB box must not also be
     handed the 7 GiB the RAM-only rule gave it."""
     ram, weights = int(30.8 * GIB), int(13.9 * GIB)
-    assert sup_mod.plan_cpu_kvcache_gib(ram) == 7, "the RAM-only answer, for contrast"
     planned = sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights)
-    assert planned < 7, "a 13.9 GiB model must shrink the pool it shares RAM with"
+    assert planned < 7, ("a 13.9 GiB model must shrink the pool it shares RAM with; 7 GiB "
+                         "is what the RAM-only rule handed it, and the machine thrashed")
     assert planned >= sup_mod._CPU_KV_MIN_GIB
 
 
@@ -1569,6 +1576,37 @@ def test_a_checkpoint_that_cannot_fit_still_returns_the_floor():
     clearer message than an arithmetic error here."""
     assert sup_mod.plan_cpu_kvcache_gib(16 * GIB,
                                         weights_bytes=int(13.9 * GIB)) == sup_mod._CPU_KV_MIN_GIB
+
+
+def test_gpu_memory_utilization_does_not_suppress_cpu_sizing():
+    """`--gpu-memory-utilization` is a GPU flag; the supervisor even reports it as ignored
+    on CPU. It used to suppress the checkpoint lookup, which on CPU took the KV pool back
+    to the RAM-only rule — restoring the overcommit through a flag that does nothing."""
+    import argparse
+
+    from glq.chat import sizing_weights_bytes
+
+    args = argparse.Namespace(model="xv0y5ncu/some-checkpoint", gpu_memory_utilization=0.9)
+    seen = {}
+
+    import glq.chat as chat_mod
+    real = chat_mod._checkpoint_bytes
+    chat_mod._checkpoint_bytes = lambda repo: seen.setdefault("repo", repo) and 123 or 123
+    try:
+        assert sizing_weights_bytes(args, device="cpu") == 123, "CPU must still size"
+        assert seen["repo"] == "xv0y5ncu/some-checkpoint"
+        assert sizing_weights_bytes(args, device="cuda") is None, (
+            "on a GPU the flag IS the answer, so the lookup stays skipped")
+    finally:
+        chat_mod._checkpoint_bytes = real
+
+
+def test_glq_code_sizes_the_pool_the_same_way():
+    """glq-code serves the same checkpoints on the same machines; the two commands must not
+    drift on this. Both call the one helper."""
+    import glq.code as code_mod
+    from glq.chat import sizing_weights_bytes
+    assert code_mod.sizing_weights_bytes is sizing_weights_bytes
 
 
 def test_the_pool_shrinks_monotonically_with_the_checkpoint():
