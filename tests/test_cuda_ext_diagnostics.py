@@ -37,8 +37,8 @@ torch = pytest.importorskip("torch")
 import glq.inference_kernel as ik  # noqa: E402
 
 #: A verbatim line from the container run, so the assertions pin something real.
-BOOM = "fatal error: nv/target: No such file or directory"
-BUILD_ERROR = f"Error building extension 'glq_cuda'\n{BOOM}"
+NVCC_ERROR_LINE = "fatal error: nv/target: No such file or directory"
+BUILD_ERROR = f"Error building extension 'glq_cuda'\n{NVCC_ERROR_LINE}"
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +68,11 @@ def _make_build_fail(monkeypatch, exc=None):
         raise exc or RuntimeError(BUILD_ERROR)
 
     monkeypatch.setattr(cpp, "load", _raise)
+    # The scenario this file documents is a machine WITH a GPU whose build failed — that is
+    # where the compiler's reason is the actionable thing. A machine with no CUDA device is
+    # a supported CPU install and gets a different message, pinned by
+    # test_a_machine_with_no_cuda_device_is_not_told_its_build_failed.
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
 
 
 def _make_build_succeed(monkeypatch):
@@ -88,7 +93,7 @@ def test_a_failed_build_records_the_compiler_error(monkeypatch):
     available, error = ik.cuda_ext_status()
     assert available is False
     assert error, "the build failed and no reason was retained"
-    assert BOOM in error, f"the compiler's own message was lost; got: {error!r}"
+    assert NVCC_ERROR_LINE in error, f"the compiler's own message was lost; got: {error!r}"
 
 
 def test_the_reason_survives_repeated_calls(monkeypatch):
@@ -104,7 +109,7 @@ def test_the_reason_survives_repeated_calls(monkeypatch):
     for _ in range(3):
         available, error = ik.cuda_ext_status()
         assert available is False
-        assert error and BOOM in error
+        assert error and NVCC_ERROR_LINE in error
 
 
 def test_the_build_is_attempted_only_once(monkeypatch):
@@ -136,7 +141,7 @@ def test_the_user_is_warned_rather_than_silently_downgraded(monkeypatch):
 
     messages = [str(w.message) for w in caught]
     assert messages, "the build failed and nothing was warned"
-    assert any(BOOM in m for m in messages), (
+    assert any(NVCC_ERROR_LINE in m for m in messages), (
         f"warned, but without the compiler's reason — the actionable part. got: {messages}")
 
 
@@ -162,7 +167,7 @@ def test_it_warns_once_not_on_every_call(monkeypatch):
         for _ in range(3):
             ik._try_load_cuda_ext()
 
-    relevant = [w for w in caught if BOOM in str(w.message)]
+    relevant = [w for w in caught if NVCC_ERROR_LINE in str(w.message)]
     assert len(relevant) == 1, f"warned {len(relevant)} times for one failure"
 
 
@@ -207,6 +212,27 @@ def test_the_failure_points_at_the_official_toolkit(monkeypatch):
     joined = " ".join(str(w.message) for w in caught)
     assert "developer.nvidia.com/cuda-downloads" in joined, (
         f"no route forward offered after a failed build: {joined!r}")
+
+
+def test_a_machine_with_no_cuda_device_is_not_told_its_build_failed(monkeypatch):
+    """CPU-only is a supported install, not a broken GPU one: GLQ serves trellis there —
+    dense and MoE — on its own CPU kernels. Handing that user a compiler traceback and a
+    CUDA-toolkit link sends them to fix something that was never going to exist, and the
+    old wording went further and said vLLM trellis serving 'will not work', which is the
+    thing they are doing. The compiler's reason is still recorded for anyone diagnosing."""
+    _make_build_fail(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ik._try_load_cuda_ext()
+
+    joined = " ".join(str(w.message) for w in caught)
+    assert joined, "silence is worse: the user still needs to know which path is running"
+    assert "no CUDA device" in joined and "CPU" in joined
+    assert "developer.nvidia.com" not in joined, "no toolkit errand on a CPU-only machine"
+    assert NVCC_ERROR_LINE not in joined, "a compiler reason is noise where no build was expected"
+    assert NVCC_ERROR_LINE in (ik._cuda_ext_error or ""), "but it must still be recorded"
 
 
 # --------------------------------------------------- the libcudart.so the wheels omit
@@ -524,7 +550,7 @@ def test_requiring_a_symbol_reports_the_build_failure(monkeypatch):
         ik.require_cuda_ext("glq_fused_linear_trellis_3inst_yrht_cuda")
 
     message = str(excinfo.value)
-    assert BOOM in message, f"the build reason is missing from the error: {message}"
+    assert NVCC_ERROR_LINE in message, f"the build reason is missing from the error: {message}"
     assert "developer.nvidia.com/cuda-downloads" in message
     assert "NoneType" not in message
 
@@ -754,7 +780,7 @@ def test_a_prebuilt_that_cannot_load_records_why(monkeypatch):
     assert "glq._C" in error, (
         f"the prebuilt extension failed to import and the reason was discarded; "
         f"error only says: {error!r}")
-    assert BOOM in error, "the JIT reason must survive too — both failed, say both"
+    assert NVCC_ERROR_LINE in error, "the JIT reason must survive too — both failed, say both"
 
 
 def test_a_working_jit_does_not_report_the_missing_prebuilt(monkeypatch):
