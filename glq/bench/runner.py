@@ -46,8 +46,19 @@ def _task_config(spec, *, n, budget, avg_k=1, overrides=None) -> dict:
     # sampling and the system message differ per chat template (SmolLM3 wants 0.6/no
     # system message, gemma-4 wants 1.0/0.95/64), and a task-level default cannot be right
     # for both. Applied last so an explicit override always wins.
+    #
+    # Two forms, and a multi-task run needs both. Flat keys apply to every task; a key
+    # that names a task carries a block for that task alone, applied after the flat ones
+    # so the more specific statement wins. Without the nested form a sweep running MRCR
+    # (greedy, because it scores verbatim reproduction) alongside AIME (the model card's
+    # 0.6/0.95/20) can only state one temperature, and silently mis-samples the other —
+    # which reads as a quality result rather than the configuration mistake it is.
     if overrides:
-        cfg.update(overrides)
+        from .tasks.registry import TASKS
+        blocks = {k: v for k, v in overrides.items()
+                  if isinstance(v, dict) and k in TASKS}
+        cfg.update({k: v for k, v in overrides.items() if k not in blocks})
+        cfg.update(blocks.get(spec.name, {}))
     return cfg
 
 

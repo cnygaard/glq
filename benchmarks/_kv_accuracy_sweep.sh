@@ -40,6 +40,24 @@ AVG_K=${AVG_K:-4}
 export HF_HOME PYTHONPATH="$REPO"
 export VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 
+# Sampling comes from the model's card, and the Qwen3 cards are explicit: thinking
+# models take 0.6 / 0.95 / 20 / min_p 0 and must NOT be run greedy, which degrades
+# them into endless repetitions. Instruct-2507 is 0.7 / 0.8 / 20.
+#
+# That interacts with MRCR, whose own default is greedy — right for a non-thinking
+# model, because the task scores verbatim reproduction and sampling only adds
+# variance, but wrong for a thinking one, where it produces looping output that
+# scores ~0 and reads as a cache failure. So MRCR inherits the card's sampling
+# exactly when the served model is a thinking model, and stays greedy otherwise.
+# `truncated` in the MRCR record is the check on this: near-zero score with most
+# items truncated means sampling, not retrieval.
+case "$MODEL" in
+    *Thinking*|*-A3B) CARD_SAMPLING=',"temperature":0.6,"top_p":0.95,"top_k":20'
+                      MRCR_SAMPLING="$CARD_SAMPLING" ;;
+    *)                CARD_SAMPLING=',"temperature":0.7,"top_p":0.8,"top_k":20'
+                      MRCR_SAMPLING='' ;;
+esac
+
 BIN="$VENV/bin"
 mkdir -p "$OUT"
 
@@ -81,9 +99,11 @@ run_arm() {
 
     log "=== ARM $arm ==="
     log "  env: ${envs:-none}"
-    # Per-task config: MRCR wants the bucket size and needle count; AIME wants
-    # avg@k, because a single pass at n=30 has variance that swamps any KV effect.
-    local cfg="{\"mrcr\":{\"per_bucket\":$PER_BUCKET,\"needles\":$NEEDLES,\"max_ctx\":$MAXLEN},\"aime_2026\":{\"avg_k\":$AVG_K}}"
+    # Per-task config, keyed by task name: MRCR wants the bucket size and needle
+    # count, AIME wants avg@k (a single pass at n=30 has variance that swamps any KV
+    # effect). They also need *different sampling*, which is why this is nested and
+    # not flat — one flat dict holds one temperature.
+    local cfg="{\"mrcr\":{\"per_bucket\":$PER_BUCKET,\"needles\":$NEEDLES,\"max_ctx\":$MAXLEN$MRCR_SAMPLING},\"aime_2026\":{\"avg_k\":$AVG_K$CARD_SAMPLING},\"aime_2025\":{\"avg_k\":$AVG_K$CARD_SAMPLING}}"
 
     local kvd=${ARM_KVDTYPE[$arm]:-} kvflag=()
     [ -n "$kvd" ] && kvflag=(--kv-cache-dtype "$kvd")

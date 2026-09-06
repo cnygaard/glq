@@ -15,10 +15,55 @@ import math
 
 import pytest
 
+from glq.bench.tasks import mrcr
 from glq.bench.tasks.mrcr import auc, grade
 
 
 PREFIX = "a1b2c3d4e5"
+
+
+class _Completion:
+    def __init__(self, text, finish_reason="stop"):
+        self.text = text
+        self.finish_reason = finish_reason
+
+
+class _Out:
+    def __init__(self, text, finish_reason="stop"):
+        self.outputs = [_Completion(text, finish_reason)]
+
+
+class _Llm:
+    def __init__(self, outs):
+        self._outs = outs
+
+    def chat(self, msgs, sp, use_tqdm=False):
+        return self._outs
+
+
+class _Handle:
+    def __init__(self, outs):
+        self.llm = _Llm(outs)
+        self.tokenizer = None
+        self.max_model_len = 32768
+
+
+class _Ctx:
+    def __init__(self, outs):
+        self.handle = _Handle(outs)
+
+
+class _Sp:
+    """Stands in for vLLM's SamplingParams — not importable on a CPU box, and the
+    graded quantities do not depend on it."""
+    temperature = 0.0
+    top_p = 1.0
+    seed = 0
+
+
+@pytest.fixture
+def no_vllm_sampling(monkeypatch):
+    monkeypatch.setattr(mrcr, "sampling", lambda cfg, budget, **kw: _Sp())
 
 
 def test_exact_match_with_prefix_scores_one():
@@ -78,6 +123,37 @@ def test_auc_of_one_bucket_is_its_score():
 
 def test_auc_is_empty_safe():
     assert auc({}) == 0.0
+
+
+def test_truncation_is_counted_separately_from_retrieval_failure(
+        monkeypatch, no_vllm_sampling):
+    """Two failures score zero and need opposite responses.
+
+    A model that retrieved the wrong text stops normally and scores low — a real
+    result. A model that ran to the token cap was rambling or looping, which is what
+    greedy decoding does to a thinking model (Qwen's card warns of exactly this) and
+    is a *sampling* mistake. Both land at a near-zero score, and only this counter
+    separates them — without it a mis-sampled arm reads as KV corruption.
+    """
+    monkeypatch.setattr(mrcr, "_rows", lambda *a, **k: {
+        (4096, 8192): [([{"role": "user", "content": "q"}], PREFIX + "answer",
+                        PREFIX, 5000)] * 2})
+    ctx = _Ctx([_Out(PREFIX + "looping " * 50, finish_reason="length"),
+                _Out(PREFIX + "answer")])
+
+    res, _ = mrcr.run(ctx, {"per_bucket": 2, "needles": 8})
+
+    assert res.extra["truncated"] == 1
+    assert res.extra["prefix_misses"] == 0, "both followed the instruction"
+
+
+def test_truncation_counter_is_zero_on_a_clean_run(monkeypatch, no_vllm_sampling):
+    monkeypatch.setattr(mrcr, "_rows", lambda *a, **k: {
+        (4096, 8192): [([{"role": "user", "content": "q"}], PREFIX + "answer",
+                        PREFIX, 5000)]})
+    res, _ = mrcr.run(_Ctx([_Out(PREFIX + "answer")]), {"per_bucket": 1})
+    assert res.extra["truncated"] == 0
+    assert res.value == pytest.approx(1.0)
 
 
 def test_auc_matches_a_hand_computed_trapezoid():
