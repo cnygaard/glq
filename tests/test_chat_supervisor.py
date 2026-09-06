@@ -1563,6 +1563,55 @@ def test_the_planned_total_leaves_room_for_page_cache():
     assert anon <= sup_mod._CPU_ANON_FRACTION * ram + GIB
 
 
+# ---- the budget is what is FREE, not what is installed ----------------------------------
+#
+# Sizing against MemTotal assumes the machine is idle. It is not: a desktop with a browser
+# open can be 10 GiB down before glq-chat starts, and on CPU that 10 GiB comes out of the
+# same pool as the weights. MemAvailable is the kernel's own reclaim-aware estimate of what
+# a new process can have without swapping — the right input, and better than
+# `free - buff/cache`, which throws away page cache that IS reclaimable.
+
+def test_a_busy_machine_gets_a_smaller_pool_than_an_idle_one():
+    """Same box, same checkpoint, 10 GiB already in use elsewhere."""
+    total, weights = 32 * GIB, int(13.9 * GIB)
+    idle = sup_mod.plan_cpu_kvcache_gib(total, weights_bytes=weights,
+                                        available_bytes=31 * GIB)
+    busy = sup_mod.plan_cpu_kvcache_gib(total, weights_bytes=weights,
+                                        available_bytes=21 * GIB)
+    assert busy < idle, f"a busy machine must not be planned as if it were idle: {busy} vs {idle}"
+
+
+def test_a_machine_with_no_room_left_clamps_to_the_floor():
+    """13.9 GiB of weights plus ~7 GiB of runtime does not fit in 20 GiB whatever the pool
+    is. Return the floor; the supervisor warns, and vLLM's own failure is clearer than a
+    pool sized from memory that was never there."""
+    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB, weights_bytes=int(13.9 * GIB),
+                                        available_bytes=20 * GIB) == sup_mod._CPU_KV_MIN_GIB
+
+
+def test_an_idle_machine_still_reproduces_the_measured_pool():
+    """The measured-good configuration came from an idle box, and must not move."""
+    assert sup_mod.plan_cpu_kvcache_gib(int(30.81 * GIB), weights_bytes=int(13.9 * GIB),
+                                        available_bytes=int(30.0 * GIB)) == 5
+
+
+def test_unknown_availability_falls_back_to_the_total():
+    """/proc/meminfo without MemAvailable (very old kernels), or a caller that does not
+    pass it: keep the total-based answer rather than refusing to plan."""
+    assert (sup_mod.plan_cpu_kvcache_gib(int(30.81 * GIB), weights_bytes=int(13.9 * GIB))
+            == sup_mod.plan_cpu_kvcache_gib(int(30.81 * GIB), weights_bytes=int(13.9 * GIB),
+                                            available_bytes=None) == 5)
+
+
+def test_available_ram_is_read_from_meminfo():
+    from glq.installer.hardware import available_ram_bytes
+    meminfo = ("MemTotal:       32311412 kB\n"
+               "MemFree:          206200 kB\n"
+               "MemAvailable:   20480000 kB\n")
+    assert available_ram_bytes(read=lambda: meminfo) == 20480000 * 1024
+    assert available_ram_bytes(read=lambda: "MemTotal: 123 kB\n") is None
+
+
 def test_the_two_measured_configurations_are_reproduced():
     """The constants are a fit to two observations, so pin both.
 
