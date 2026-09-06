@@ -611,6 +611,60 @@ def enable_sidecar() -> None:
     _sidecar_enabled = True
 
 
+#: Impl subclasses built by ``_make_compressed_impl``, one per (base class, bpw).
+#: vLLM calls ``get_impl_cls()`` per layer, and a fresh subclass each time would
+#: defeat isinstance checks and bloat the class cache.
+_compressed_impl_cache: dict = {}
+
+
+def _make_compressed_impl(base_cls, *, bpw: int):
+    """An attention-impl subclass that reports the COMPRESSED per-side width
+    as ``head_size``.
+
+    vLLM gets its K/V views with, verbatim (triton_attn.py):
+
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+
+    ``self.head_size`` is the model's dense head size, so on a compressed
+    content dim that split returns ONE chunk and the unpack raises
+    "not enough values to unpack (expected 2, got 1)". Reporting the compressed
+    width makes it return the two sides the E8 layout actually stores.
+
+    Yes, this uses ``head_size`` against its name. It is the price of not owning
+    the backend, and it is safe *in this vLLM* for a checked reason: within
+    ``TritonAttentionImpl`` the attribute is read only by those splits (three
+    sites), and the sole reader outside the class is an ``extra_repr`` string.
+    The real value stays on ``glq_real_head_size`` for the E8 kernel, which needs
+    the true geometry. ``tests/test_e8_kv_spec.py`` pins both halves — that the
+    split yields two sides at the compressed width, and that it would not at the
+    dense one — so a vLLM that starts using ``head_size`` for anything else fails
+    a unit test rather than serving wrong attention.
+
+    The durable fix is GLQ's own backend via
+    ``register_backend(AttentionBackendEnum.CUSTOM)``; it is deferred until the
+    benchmark says E8-KV earns its keep against fp8.
+    """
+    key = (base_cls, bpw)
+    cached = _compressed_impl_cache.get(key)
+    if cached is not None:
+        return cached
+
+    from glq_vllm.e8_kv_spec import compressed_side_width
+
+    class _GLQE8CompressedImpl(base_cls):  # type: ignore[valid-type, misc]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            real = self.head_size
+            self.glq_real_head_size = real
+            if real % 8 == 0:
+                self.head_size = compressed_side_width(real, bpw, dtype_size=2)
+
+    _GLQE8CompressedImpl.__name__ = f"GLQE8{base_cls.__name__}"
+    _GLQE8CompressedImpl.__qualname__ = _GLQE8CompressedImpl.__name__
+    _compressed_impl_cache[key] = _GLQE8CompressedImpl
+    return _GLQE8CompressedImpl
+
+
 def enable_sidecar_read() -> None:
     """Stage 2c-1: route attention K/V reads through the sidecar.
 
@@ -1061,6 +1115,21 @@ def enable_compressed_allocation() -> None:
                 bpw=bpw, dtype_size=2)
 
         backend_cls.get_kv_cache_shape = _hooked_shape
+
+        # The other half of the compressed layout: vLLM splits K from V at
+        # ``impl.head_size``, which is the dense width and would return a single
+        # chunk. Hand it an impl subclass that reports the compressed one.
+        _orig_get_impl = backend_cls.get_impl_cls
+
+        @staticmethod
+        def _hooked_impl_cls():
+            base = _orig_get_impl()
+            bpw = _active_config.get("bpw")
+            if bpw is None or bpw not in (2, 3, 4, 5, 6, 7):
+                return base
+            return _make_compressed_impl(base, bpw=bpw)
+
+        backend_cls.get_impl_cls = _hooked_impl_cls
         backend_cls._glq_shape_hooked = True
         if os.environ.get("GLQ_KV_E8_DEBUG_SHAPE"):
             print(f"[glq DEBUG] installed compressed-shape hook on resolved "

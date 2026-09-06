@@ -71,6 +71,28 @@ def compressed_page_size_bytes(*, block_size: int, num_kv_heads: int,
     return 2 * block_size * num_kv_heads * n_groups * E8_BYTES_PER_GROUP[bpw]
 
 
+def compressed_side_width(head_size: int, bpw: int, dtype_size: int = 2) -> int:
+    """Elements of the cache dtype that one side (K or V) occupies per
+    (token, head) at this bpw — the ``C`` in the packed content dim ``2 * C``.
+
+    The single source of truth for that width. The cache shape is built from it,
+    and the Triton backend is told to split K from V at it (see
+    ``kv_compression``): vLLM's own code splits at ``self.head_size``, which is
+    the dense width and would return one chunk instead of two.
+    """
+    if head_size % 8 != 0:
+        raise ValueError(f"head_size {head_size} must be a multiple of 8")
+    if bpw not in E8_BYTES_PER_GROUP:
+        raise ValueError(
+            f"bpw {bpw} not in E8 ladder; allowed {sorted(E8_BYTES_PER_GROUP)}")
+    elem_bytes = (head_size // 8) * E8_BYTES_PER_GROUP[bpw]
+    if elem_bytes % dtype_size != 0:
+        raise ValueError(
+            f"compressed bytes per (tok, head) {elem_bytes} not a multiple of "
+            f"dtype_size {dtype_size}")
+    return elem_bytes // dtype_size
+
+
 def compressed_kv_cache_shape(num_blocks: int, block_size: int,
                               num_kv_heads: int, head_size: int,
                               bpw: int, dtype_size: int = 2
@@ -104,20 +126,9 @@ def compressed_kv_cache_shape(num_blocks: int, block_size: int,
     ``head_size`` from the input ``key`` / ``q`` tensors (which the
     model produces at full size) instead.
     """
-    if head_size % 8 != 0:
-        raise ValueError(f"head_size {head_size} must be a multiple of 8")
-    n_groups = head_size // 8
-    bytes_per_group = E8_BYTES_PER_GROUP[bpw]
-    # Total bytes per (token, head): n_groups * bytes_per_group.
-    elem_bytes_per_tok_per_head = n_groups * bytes_per_group
-    if elem_bytes_per_tok_per_head % dtype_size != 0:
-        raise ValueError(
-            f"compressed bytes per (tok, head) {elem_bytes_per_tok_per_head} "
-            f"not a multiple of dtype_size {dtype_size}")
-    compressed_elems_per_tok_per_head = elem_bytes_per_tok_per_head // dtype_size
     return (
         num_blocks, num_kv_heads, block_size,
-        2 * compressed_elems_per_tok_per_head,
+        2 * compressed_side_width(head_size, bpw, dtype_size),
     )
 
 
