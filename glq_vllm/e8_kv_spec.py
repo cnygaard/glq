@@ -3,9 +3,21 @@
 vLLM's allocator uses ``kv_cache_spec.page_size_bytes`` (via the
 ``KVCacheTensor.size`` it derives at config time) to decide how many
 bytes to ``torch.zeros`` per layer. Standard ``FullAttentionSpec`` /
-``SlidingWindowSpec`` report the fp16 page size; if we override
-``real_page_size_bytes`` to the compressed size, vLLM allocates a
-smaller buffer.
+``SlidingWindowSpec`` report the fp16 page size; declaring the packed
+cell size makes vLLM's own arithmetic yield a smaller buffer.
+
+The hook is ``state_content_bytes`` — "C in bytes when packed" — which
+``AttentionSpec.state_content_size_bytes`` returns unconditionally, and
+which ``page_size_bytes`` reaches via
+``num_heads * storage_block_size * state_content_size_bytes``.
+
+Overriding ``real_page_size_bytes`` (what this module used to do) no
+longer works: in vLLM 0.28 that property is documented as an *alias* of
+``unpadded_page_size_bytes`` and ``page_size_bytes`` never calls it, so
+the override was dead and the engine allocated full-size pages — a
+20480 B block where the compressed page is 7680 B, which surfaces as
+``RuntimeError: shape '[...]' is invalid for input of size N`` when the
+backend's compressed shape meets the uncompressed buffer.
 
 Required co-changes:
 
@@ -113,6 +125,32 @@ def compressed_kv_cache_shape(num_blocks: int, block_size: int,
 # Spec subclasses
 # --------------------------------------------------------------------------- #
 
+def _declare_packed_cell(spec) -> None:
+    """Set ``state_content_bytes`` — the packed bytes per (head slot, state)
+    cell — so vLLM's own page-size arithmetic lands on the compressed page.
+
+    vLLM's default for this is ``(head_size + head_size_v) * dtype_size``, i.e.
+    K and V for one token of one head; ours is the same quantity in the E8
+    layout, ``2 * n_groups * bytes_per_group``. Feeding it through
+    ``num_heads * storage_block_size * C`` reproduces
+    ``compressed_page_size_bytes`` exactly, which the tests pin.
+
+    Only filled when unset, and that is load-bearing. ``FullAttentionSpec.merge``
+    forwards ``state_content_bytes=specs[0].state_content_bytes`` into a fresh
+    ``cls(...)`` that does **not** carry ``bpw`` — it defaults to 2 — and then
+    asserts every input spec equals the merged one field by field. Recomputing
+    unconditionally would overwrite the correctly forwarded value with a 2-bpw
+    cell size and trip that assertion ("All attention layers in the same KV
+    cache group must have the same attention spec") for every bpw != 2. The
+    merge override restores ``bpw`` afterwards, so the pair stays consistent.
+    """
+    if spec.state_content_bytes is not None:
+        return
+    n_groups = spec.head_size // 8
+    object.__setattr__(spec, "state_content_bytes",
+                       2 * n_groups * E8_BYTES_PER_GROUP[spec.bpw])
+
+
 def _make_spec_subclasses():
     """Build E8FullAttentionSpec / E8SlidingWindowSpec at import time
     (vllm is an optional import — keep the failure local)."""
@@ -129,14 +167,9 @@ def _make_spec_subclasses():
         """FullAttentionSpec that declares the compressed page size."""
         bpw: int = 2
 
-        @property
-        def real_page_size_bytes(self) -> int:
-            return compressed_page_size_bytes(
-                block_size=self.block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                bpw=self.bpw,
-            )
+        def __post_init__(self):
+            super().__post_init__()
+            _declare_packed_cell(self)
 
         @classmethod
         def merge(cls, specs):
@@ -146,12 +179,17 @@ def _make_spec_subclasses():
             # silently differ from the input specs at bpw != 2. Restore
             # ``bpw`` after the parent merge (all specs in a group must
             # share the same bpw).
-            merged = super().merge(specs)
+            # Checked BEFORE delegating: a differing bpw now also means a
+            # differing state_content_bytes, so the parent's field-equality
+            # assertion would fire first and report the generic "must have the
+            # same attention spec" instead of naming bpw as the thing that
+            # differs. Same rejection either way; this one is diagnosable.
             bpws = {s.bpw for s in specs}
             if len(bpws) != 1:
                 raise ValueError(
                     f"All E8FullAttentionSpec in a KV cache group must share "
                     f"the same bpw; got {sorted(bpws)}.")
+            merged = super().merge(specs)
             return replace(merged, bpw=bpws.pop())
 
     @dataclass(frozen=True, kw_only=True)
@@ -159,14 +197,9 @@ def _make_spec_subclasses():
         """SlidingWindowSpec that declares the compressed page size."""
         bpw: int = 2
 
-        @property
-        def real_page_size_bytes(self) -> int:
-            return compressed_page_size_bytes(
-                block_size=self.block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                bpw=self.bpw,
-            )
+        def __post_init__(self):
+            super().__post_init__()
+            _declare_packed_cell(self)
 
         # ``SlidingWindowSpec`` inherits ``KVCacheSpec.merge`` which uses
         # ``copy.deepcopy(specs[0])`` — that preserves our subclass and
