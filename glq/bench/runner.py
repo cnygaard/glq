@@ -54,6 +54,7 @@ def _task_config(spec, *, n, budget, avg_k=1, overrides=None) -> dict:
 def run(*, model: str, tasks: list[str], quant: str | None = None,
         runtime: str = "vllm", n: int | None = None, budget: int | None = None,
         avg_k: int = 1, gpu_mem_util: float = 0.9, max_model_len: int | None = None,
+        kv_cache_dtype: str | None = None,
         hf_token: str | None = None,
         task_config: dict | None = None) -> list[BenchRecord]:
     """Run ``tasks`` on ``model`` and return one ``BenchRecord`` per task."""
@@ -106,7 +107,8 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
                f"(max_model_len={mml})…")
         t0 = time.time()
         ctx.handle = rt.load(model, quant=eff_quant, max_model_len=mml,
-                             gpu_mem_util=gpu_mem_util, arch=mm.architecture)
+                             gpu_mem_util=gpu_mem_util, arch=mm.architecture,
+                             kv_cache_dtype=kv_cache_dtype)
         log_ts(f"engine ready: weights {ctx.handle.serving.load_gpu_mem_gib} GiB "
                f"loaded in {_fmt(time.time() - t0)}")
         for i, s in enumerate(quality, 1):
