@@ -57,6 +57,19 @@ TASKS: dict[str, TaskSpec] = {
     "aime_2026": TaskSpec(
         "aime_2026", "glq.bench.tasks.aime", metric="accuracy", standardized=True,
         defaults={"sets": ["2026"], "n": 30, "budget": 65536, "thinking": True}),
+    # Long-context retrieval, the instrument for KV-cache work: the answer sits far
+    # back in the context, so cache quantization error surfaces as retrieval failure
+    # at exactly the lengths a smaller cache is meant to unlock. Reported as AUC over
+    # log2(context) — a method that holds to 32k and fails at 128k must not average
+    # out to "fine".
+    #
+    # standardized=False: the quality index compares checkpoints, and this measures a
+    # serving *configuration* (KV dtype, window) as much as the weights. 8 per bucket
+    # is a screening size, not the dataset card's 100 — enough to separate "retrieves"
+    # from "does not", not enough to rank two methods a few points apart.
+    "mrcr": TaskSpec(
+        "mrcr", "glq.bench.tasks.mrcr", metric="auc", standardized=False,
+        defaults={"needles": 8, "per_bucket": 8, "max_tokens": 1024}),
     # kind="hf", matching the adapter's docstring: perplexity isn't natural through vLLM's
     # generate API, so it loads its own HF model. Registered as "quality" it landed in the
     # shared-engine group and the runner spun up a vLLM engine beside it that nothing used
