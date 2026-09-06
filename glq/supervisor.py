@@ -256,22 +256,32 @@ def detect_device(vllm_version=_installed_vllm_version, vram=None) -> str:
 _CPU_KV_MIN_GIB, _CPU_KV_MAX_GIB = 2, 8
 
 
-#: What the CPU serving stack costs beyond the weights and the KV pool. Measured on an
-#: 8-vCPU box serving the 13.9 GiB 26B-A4B with a 4 GiB pool: the VLLM::Worker held
-#: 18.56 GiB (so ~0.7 GiB of activations above weights + pool) and the driver and engine
-#: processes another ~1.4 GiB.
-_CPU_RUNTIME_OVERHEAD_BYTES = 2 * 1024 ** 3
+#: What the CPU serving stack costs beyond the weights and the KV pool. Measured at steady
+#: state with `glq-chat` serving the 13.9 GiB 26B-A4B on an 8-vCPU box (per-process PSS from
+#: smaps_rollup, summed against /proc/meminfo AnonPages, which agreed to 0.1 GiB):
+#:
+#:     VLLM::Worker      22.56 GiB  = 13.9 weights + 5.0 pool + 3.7 activations
+#:     chat/gradio UI     2.09 GiB  — same machine, and glq-chat starts it
+#:     EngineCore + API   1.06 GiB
+#:     ------------------------------------------------------------------
+#:     beyond weights + pool: 6.8 GiB, rounded up
+#:
+#: An earlier 2 GiB here came from reading one worker's RSS and forgetting that the UI and
+#: the engine processes live in the same RAM. It under-counted by 4.7 GiB.
+_CPU_RUNTIME_OVERHEAD_BYTES = 7 * 1024 ** 3
 
 #: Share of RAM the *anonymous* demand — weights + pool + runtime — may reach. The rest is
 #: for the page cache, and on CPU that is not a luxury: the loader streams the whole
-#: checkpoint through it, and a box with no swap configured (the AWS default) can reclaim
-#: nothing else. Anchored to two observed configurations on a 30.8 GiB box holding the
-#: 13.9 GiB 26B-A4B: a 4 GiB pool (≈65% anonymous) served for hours across many runs, and
-#: a 7 GiB pool (≈77%) left kswapd0 pinned at 100% with 85% iowait, buff/cache down to
-#: 100 MiB, and sshd unable to complete a banner exchange. 0.70 sits between them, nearer
-#: the configuration that worked. Refine it when the failure is reproduced under
-#: instrumentation — it is bounded by observation, not measured to a knife edge.
-_CPU_ANON_FRACTION = 0.70
+#: checkpoint through it, and a box with no swap configured (the cloud default) can reclaim
+#: nothing else. Measured on a 30.8 GiB box holding the 13.9 GiB 26B-A4B, with the real
+#: overhead above:
+#:
+#:     pool 7 GiB -> 27.7 GiB anonymous = 90%  kswapd0 at 100%, 85% iowait,
+#:                                             buff/cache 100 MiB, ssh unreachable
+#:     pool 5 GiB -> 25.7 GiB anonymous = 83%  served fine, 4.42 GiB still available
+#:
+#: 0.85 admits the configuration that worked and refuses the one that did not.
+_CPU_ANON_FRACTION = 0.85
 
 #: The ceiling when the checkpoint size could not be looked up, so the arithmetic above is
 #: unavailable. 4 GiB is the pool that served the 13.9 GiB 26B-A4B across every run of this

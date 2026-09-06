@@ -1563,6 +1563,28 @@ def test_the_planned_total_leaves_room_for_page_cache():
     assert anon <= sup_mod._CPU_ANON_FRACTION * ram + GIB
 
 
+def test_the_two_measured_configurations_are_reproduced():
+    """The constants are a fit to two observations, so pin both.
+
+    Measured with glq-chat serving the 13.9 GiB 26B-A4B on a 30.8 GiB box, per-process PSS
+    summed against /proc/meminfo AnonPages:
+
+        pool 7 GiB -> 27.7 GiB anonymous (90%)  kswapd0 100%, 85% iowait, ssh unreachable
+        pool 5 GiB -> 25.7 GiB anonymous (83%)  served fine, 4.42 GiB still available
+
+    A change that admits 7 again, or that stops admitting 5, has broken the thing this
+    number exists for."""
+    ram, weights = int(30.81 * GIB), int(13.9 * GIB)
+    assert sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights) == 5
+
+    def anon(pool_gib):
+        return weights + pool_gib * GIB + sup_mod._CPU_RUNTIME_OVERHEAD_BYTES
+
+    ceiling = sup_mod._CPU_ANON_FRACTION * ram
+    assert anon(5) <= ceiling, "the configuration that served must stay admissible"
+    assert anon(7) > ceiling, "the configuration that thrashed must stay refused"
+
+
 def test_a_small_checkpoint_still_gets_the_full_pool():
     """The fix must not punish the models CPU serving was already good at: a 1.8 GiB dense
     3B on the same box leaves plenty of room and keeps the validated 8 GiB."""
