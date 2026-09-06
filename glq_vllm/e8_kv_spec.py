@@ -62,21 +62,35 @@ def compressed_page_size_bytes(*, block_size: int, num_kv_heads: int,
 def compressed_kv_cache_shape(num_blocks: int, block_size: int,
                               num_kv_heads: int, head_size: int,
                               bpw: int, dtype_size: int = 2
-                              ) -> tuple[int, int, int, int, int]:
+                              ) -> tuple[int, int, int, int]:
     """Shape that ``get_kv_cache_shape`` should report when the spec
     declares the compressed page size.
 
-    Returned as 5-D ``(num_blocks, 2, block_size, num_kv_heads,
-    compressed_elems_per_tok_per_head)`` to match the standard
-    Triton backend's stride-order shape (5 entries). Only the final
-    dim shrinks vs the fp16 layout, so ``kv_cache.unbind(1)`` still
-    yields tensors whose first three "real" dims (num_blocks,
-    block_size, num_kv_heads) line up.
+    Returned as 4-D ``(num_blocks, num_kv_heads, block_size,
+    2 * compressed_elems_per_tok_per_head)``, mirroring the Triton
+    backend's own ``(num_blocks, num_kv_heads, block_size,
+    2 * head_size)``: **K and V share the content dim**, K in
+    ``[..., :C]`` and V in ``[..., C:]``.
 
-    Note: ``key_cache.shape[-1]`` now reports the *compressed* elem
-    count, not the real ``head_size``. The patched read/write hooks
-    must derive ``head_size`` from the input ``key`` / ``q`` tensors
-    (which the model produces at full size) instead.
+    This was 5-D ``(num_blocks, 2, block_size, num_kv_heads, C)`` until
+    vLLM's "[6/N] Standardize KV cache layout" refactor packed K and V
+    into the content dim and took the backend's shape to 4-D. The rank
+    is load-bearing, not cosmetic: ``_reshape_kv_cache`` asserts
+    ``len(get_kv_cache_stride_order()) == len(shape)`` and the
+    surrounding ``try`` catches only AttributeError/NotImplementedError,
+    so a stale rank escapes as an AssertionError that takes EngineCore
+    down at startup. ``tests/test_e8_kv_spec.py`` pins it.
+
+    Consumers get their per-side views the way vLLM does —
+    ``kv_cache.transpose(1, 2).split(C, dim=-1)`` — which yields
+    ``(num_blocks, block_size, num_kv_heads, C)`` tensors whose byte
+    strides already encode the packing, which is what
+    ``E8PagedKVCache.from_paged_storage`` relies on.
+
+    Note: the per-side width is the *compressed* elem count, not the
+    real ``head_size``. The patched read/write hooks must derive
+    ``head_size`` from the input ``key`` / ``q`` tensors (which the
+    model produces at full size) instead.
     """
     if head_size % 8 != 0:
         raise ValueError(f"head_size {head_size} must be a multiple of 8")
@@ -90,8 +104,8 @@ def compressed_kv_cache_shape(num_blocks: int, block_size: int,
             f"not a multiple of dtype_size {dtype_size}")
     compressed_elems_per_tok_per_head = elem_bytes_per_tok_per_head // dtype_size
     return (
-        num_blocks, 2, block_size, num_kv_heads,
-        compressed_elems_per_tok_per_head,
+        num_blocks, num_kv_heads, block_size,
+        2 * compressed_elems_per_tok_per_head,
     )
 
 

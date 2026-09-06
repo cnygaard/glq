@@ -173,14 +173,16 @@ def test_from_paged_storage_bit_exact_with_alloc(relaxed, bpw):
     quant = _build_quantizer(relaxed, bpw)
     num_blocks, block_size, num_kv_heads, head_size = 4, 16, 2, 128
     dtype = torch.bfloat16
-    # vLLM's allocated buffer for one layer is [num_blocks, 2, block_size,
-    # num_kv_heads, compressed_elems_per_tok_per_head].
+    # vLLM's allocated buffer for one layer is [num_blocks, num_kv_heads,
+    # block_size, 2 * compressed_elems_per_tok_per_head] — K and V share the
+    # content dim. Take the per-side views exactly as the Triton backend does
+    # (triton_attn.py: `kv_cache.transpose(1, 2).split(width, dim=-1)`), so this
+    # test exercises the real layout rather than an independent guess at it.
     shape = compressed_kv_cache_shape(
         num_blocks, block_size, num_kv_heads, head_size,
         bpw=bpw, dtype_size=2)
     raw = torch.zeros(shape, dtype=dtype, device="cpu")
-    k_buf = raw[:, 0]
-    v_buf = raw[:, 1]
+    k_buf, v_buf = raw.transpose(1, 2).split(shape[-1] // 2, dim=-1)
     # Built directly on the vLLM-style buffer (views into raw).
     shared = E8PagedKVCache.from_paged_storage(
         k_buf, v_buf, head_size=head_size, bpw=bpw, dtype=dtype)

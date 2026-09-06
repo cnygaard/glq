@@ -140,3 +140,85 @@ def test_full_and_sliding_page_sizes_align_after_unification(bpw):
         f"full={full_merged.page_size_bytes} "
         f"sliding={sliding_merged.page_size_bytes}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The compressed cache SHAPE must match the backend's stride order
+# --------------------------------------------------------------------------- #
+#
+# vLLM asserts this itself, in `_reshape_kv_cache`:
+#
+#     kv_cache_stride_order = group.backend.get_kv_cache_stride_order()
+#     assert len(kv_cache_stride_order) == len(kv_cache_shape)
+#
+# and the surrounding `try` catches only AttributeError/NotImplementedError, so
+# a mismatch escapes as an AssertionError that takes EngineCore down at startup.
+#
+# It broke exactly that way: vLLM's "[6/N] Standardize KV cache layout" refactor
+# packed K and V into the content dim, taking the Triton backend's shape from 5-D
+# to 4-D `(num_blocks, num_kv_heads, block_size, 2 * head_size)`, while
+# `compressed_kv_cache_shape` still returned the 5-D `(num_blocks, 2, block_size,
+# num_kv_heads, C)` it had been written to match. Asserting the invariant here
+# makes the next such refactor a fast unit-test failure instead of a boot crash.
+
+@pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
+def test_compressed_shape_rank_matches_backend_stride_order(bpw, monkeypatch):
+    from glq_vllm.e8_kv_spec import compressed_kv_cache_shape
+
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+    except ImportError:
+        pytest.skip("TritonAttentionBackend not importable in this vllm")
+
+    # get_kv_cache_stride_order -> get_kv_cache_layout, which otherwise needs a
+    # live VllmConfig. The layout only picks the permutation; the RANK — the thing
+    # under test — is the same for NHD and HND.
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+
+    shape = compressed_kv_cache_shape(
+        num_blocks=128, block_size=16, num_kv_heads=4, head_size=64,
+        bpw=bpw, dtype_size=2)
+    stride_order = TritonAttentionBackend.get_kv_cache_stride_order()
+    assert len(shape) == len(stride_order), (
+        f"bpw={bpw}: compressed shape {shape} has rank {len(shape)}, but the "
+        f"Triton backend's stride order {stride_order} has {len(stride_order)} "
+        f"entries — vLLM asserts these are equal and dies at startup")
+
+
+@pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
+def test_compressed_shape_agrees_with_the_declared_page_size(bpw):
+    """The shape and the page size are two views of one allocation; if they
+    disagree, vLLM reserves a buffer that the E8 layout cannot address."""
+    from glq_vllm.e8_kv_spec import compressed_kv_cache_shape
+
+    num_blocks, block_size, num_kv_heads, head_size, dtype_size = 128, 16, 4, 64, 2
+    shape = compressed_kv_cache_shape(
+        num_blocks=num_blocks, block_size=block_size, num_kv_heads=num_kv_heads,
+        head_size=head_size, bpw=bpw, dtype_size=dtype_size)
+
+    elems = 1
+    for d in shape:
+        elems *= d
+    page_bytes = compressed_page_size_bytes(
+        block_size=block_size, num_kv_heads=num_kv_heads,
+        head_size=head_size, bpw=bpw)
+    assert elems * dtype_size == num_blocks * page_bytes, (
+        f"bpw={bpw}: shape {shape} is {elems * dtype_size} bytes but the spec "
+        f"declares {num_blocks * page_bytes}")
+
+
+@pytest.mark.parametrize("bpw", [2, 4, 7])
+def test_k_and_v_are_packed_in_the_content_dim(bpw):
+    """vLLM splits the content dim to get K and V — `kv_cache.transpose(1, 2)
+    .split(width, dim=-1)` — so the last dim must be exactly twice the per-side
+    compressed width, and the middle dims must be (num_kv_heads, block_size)."""
+    from glq_vllm.e8_kv_spec import compressed_kv_cache_shape
+
+    num_blocks, block_size, num_kv_heads, head_size = 128, 16, 4, 64
+    shape = compressed_kv_cache_shape(
+        num_blocks=num_blocks, block_size=block_size, num_kv_heads=num_kv_heads,
+        head_size=head_size, bpw=bpw, dtype_size=2)
+    assert shape[0] == num_blocks
+    assert shape[1] == num_kv_heads, "vLLM's layout is (B, H, N, 2*width)"
+    assert shape[2] == block_size
+    assert shape[3] % 2 == 0, "K and V share the content dim, so it must be even"
