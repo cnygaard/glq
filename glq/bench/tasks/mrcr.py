@@ -147,6 +147,7 @@ def run(ctx, config: dict):
     per_bucket_scores: dict = {}
     per_item: list = []
     prefix_misses = 0
+    truncated = 0
     t0 = time.time()
 
     for b in sorted(buckets):
@@ -158,6 +159,8 @@ def run(ctx, config: dict):
             s = grade(text, answer, prefix)
             if not text.startswith(prefix):
                 prefix_misses += 1
+            if getattr(out.outputs[0], "finish_reason", None) == "length":
+                truncated += 1
             scores.append(s)
             per_item.append({"bucket": b[1], "tokens": n_tok, "score": round(s, 4)})
         per_bucket_scores[b] = sum(scores) / len(scores)
@@ -182,6 +185,13 @@ def run(ctx, config: dict):
             # Prefix misses are instruction-following failures, not retrieval
             # failures; both score 0 and only this number separates them.
             "prefix_misses": prefix_misses,
+            # Ran to the token cap rather than stopping: rambling or looping, not a
+            # retrieval result. Greedy decoding on a thinking model produces exactly
+            # this (Qwen's card warns of "endless repetitions"), and the greedy
+            # default below is right for a non-thinking model and wrong for that one.
+            # A near-zero score with most items truncated is a sampling mistake; the
+            # same score with none truncated is the cache losing the needle.
+            "truncated": truncated,
             "elapsed_s": round(dt, 1),
             "per_item": per_item,
         },

@@ -236,6 +236,48 @@ def test_runner_task_config_merges():
     assert cfg["n"] == 20 and cfg["budget"] == 8192
 
 
+def test_task_config_nested_by_task_name_applies_to_that_task_only():
+    """A multi-task sweep needs per-task sampling, and the flat form cannot express it.
+
+    MRCR scores verbatim reproduction and wants greedy; AIME wants the model card's
+    0.6/0.95/20. One flat dict holds one `temperature`, so a sweep running both tasks
+    in one invocation silently applies the wrong sampling to one of them.
+    """
+    overrides = {"mrcr": {"per_bucket": 2, "temperature": 0.0},
+                 "aime_2025": {"temperature": 0.6, "top_k": 20}}
+    cfg = runner._task_config(registry.get_task("mrcr"), n=None, budget=None,
+                              overrides=overrides)
+    assert cfg["per_bucket"] == 2 and cfg["temperature"] == 0.0
+    # The other task's block must not leak in, under its own name or flattened.
+    assert "aime_2025" not in cfg and cfg.get("top_k") != 20
+
+    cfg = runner._task_config(registry.get_task("aime_2025"), n=None, budget=None,
+                              overrides=overrides)
+    assert cfg["temperature"] == 0.6 and cfg["top_k"] == 20
+    assert "per_bucket" not in cfg and "mrcr" not in cfg
+
+
+def test_task_config_nested_beats_flat_for_the_named_task():
+    """Flat keys stay the sweep-wide default; the named block is the more specific
+    statement and wins for its own task."""
+    overrides = {"temperature": 1.0, "mrcr": {"temperature": 0.0}}
+    mrcr = runner._task_config(registry.get_task("mrcr"), n=None, budget=None,
+                               overrides=overrides)
+    aime = runner._task_config(registry.get_task("aime_2025"), n=None, budget=None,
+                               overrides=overrides)
+    assert mrcr["temperature"] == 0.0
+    assert aime["temperature"] == 1.0
+
+
+def test_task_config_dict_under_a_non_task_key_stays_a_value():
+    """Only real task names are treated as per-task blocks. A dict-valued setting that
+    happens to be a dict must survive as its own value, or this feature would eat it."""
+    overrides = {"system": {"role": "system", "content": "/no_think"}}
+    cfg = runner._task_config(registry.get_task("aime_2025"), n=None, budget=None,
+                              overrides=overrides)
+    assert cfg["system"] == {"role": "system", "content": "/no_think"}
+
+
 def test_bench_engines_cap_max_num_seqs():
     """vLLM's default is 1024 — a batch-server number. On hybrid-GDN models every decode
     sequence reserves a Mamba cache block up front, and the bf16 27B arm refused to start:
@@ -268,3 +310,26 @@ def test_kv_cache_dtype_is_absent_when_not_asked_for():
     kw = runtime.build_llm_kwargs("org/M", quant="none")
     assert "kv_cache_dtype" not in kw
     assert "--kv-cache-dtype" not in runtime.serving_command("org/M", kw)
+
+
+def test_serving_command_carries_the_glq_kv_env(monkeypatch):
+    """The command string is the reproduction recipe. GLQ's KV cache is selected by
+    environment, not engine flags, so a command without it reproduces a *bf16* KV
+    run while claiming to be the E8 one — silently, which is the failure mode that
+    matters. The env belongs in front of the command, as you would type it."""
+    monkeypatch.setenv("GLQ_KV_QUANT", "e8_relaxed:2")
+    monkeypatch.setenv("GLQ_KV_E8_COMPRESSED_ALLOC", "1")
+    kw = runtime.build_llm_kwargs("org/M", quant="none")
+    cmd = runtime.serving_command("org/M", kw)
+    assert cmd.startswith("GLQ_KV_QUANT=e8_relaxed:2 ") or "GLQ_KV_QUANT=e8_relaxed:2" in cmd
+    assert "GLQ_KV_E8_COMPRESSED_ALLOC=1" in cmd
+    assert "vllm serve org/M" in cmd
+
+
+def test_serving_command_is_unchanged_without_glq_env(monkeypatch):
+    """A plain run must keep the plain command — no empty env prefix."""
+    for k in list(__import__("os").environ):
+        if k.startswith("GLQ_"):
+            monkeypatch.delenv(k, raising=False)
+    kw = runtime.build_llm_kwargs("org/M", quant="none")
+    assert runtime.serving_command("org/M", kw).startswith("vllm serve org/M")

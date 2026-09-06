@@ -89,7 +89,17 @@ def serving_command(model: str, kw: dict) -> str:
         parts += ["--trust-remote-code"]
     if kw.get("limit_mm_per_prompt"):
         parts += ["--limit-mm-per-prompt", json.dumps(kw["limit_mm_per_prompt"])]
-    return " ".join(shlex.quote(p) for p in parts)
+    cmd = " ".join(shlex.quote(p) for p in parts)
+
+    # GLQ's KV-cache path is selected by environment, not by an engine flag, so a
+    # bare `vllm serve …` reproduces a *bf16* KV run while claiming to be the E8
+    # one. The env is recorded separately in EnvMeta.glq_env, but this string is
+    # what someone copies, so it has to stand alone. Prefixed as you would type it.
+    from glq.bench.provenance import _glq_env
+    env = _glq_env() or {}
+    if env:
+        cmd = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())) + " " + cmd
+    return cmd
 
 
 @contextmanager
