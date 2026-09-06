@@ -244,8 +244,9 @@ def test_write_kv_fused_from_paged_storage_large_nb(
         num_blocks, block_size, num_kv_heads, head_size,
         bpw=bpw, dtype_size=2)
     raw = torch.zeros(shape, dtype=dtype, device="cuda")
-    k_buf = raw[:, 0]
-    v_buf = raw[:, 1]
+    # Per-side views the way the Triton backend takes them: K and V share the
+    # content dim, so transpose to (B, N, H, ...) and split it.
+    k_buf, v_buf = raw.transpose(1, 2).split(shape[-1] // 2, dim=-1)
     cache = E8PagedKVCache.from_paged_storage(
         k_buf, v_buf, head_size=head_size, bpw=bpw, dtype=dtype)
 
