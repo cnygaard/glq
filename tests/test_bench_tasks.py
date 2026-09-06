@@ -247,3 +247,24 @@ def test_bench_engines_cap_max_num_seqs():
     assert kw["max_num_seqs"] == 16
     assert "--max-num-seqs 64" in runtime.serving_command(
         "org/M", runtime.build_llm_kwargs("org/M"))
+
+
+def test_kv_cache_dtype_reaches_the_engine():
+    """A KV-quantization sweep varies exactly one thing, and it has to arrive.
+
+    vLLM has no VLLM_KV_CACHE_DTYPE env var — the setting is an engine argument —
+    so a sweep that tries to select fp8 or turboquant through the environment runs
+    every arm as bf16 and reports the result as if the KV dtype had changed. That
+    is a silent wrong answer, not a crash, so it is pinned here.
+    """
+    kw = runtime.build_llm_kwargs("org/M", quant="none", kv_cache_dtype="fp8")
+    assert kw["kv_cache_dtype"] == "fp8"
+    assert "--kv-cache-dtype fp8" in runtime.serving_command("org/M", kw)
+
+
+def test_kv_cache_dtype_is_absent_when_not_asked_for():
+    """Default must stay off: passing kv_cache_dtype='auto' explicitly to older
+    engines is not the same as omitting it."""
+    kw = runtime.build_llm_kwargs("org/M", quant="none")
+    assert "kv_cache_dtype" not in kw
+    assert "--kv-cache-dtype" not in runtime.serving_command("org/M", kw)

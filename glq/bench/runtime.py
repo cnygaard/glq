@@ -41,7 +41,8 @@ def is_multimodal(arch: str | None) -> bool:
 def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
                      max_model_len: int | None = None, gpu_mem_util: float = 0.9,
                      multimodal: bool = False, cudagraph: bool = True,
-                     max_num_seqs: int = 64) -> dict:
+                     max_num_seqs: int = 64,
+                     kv_cache_dtype: str | None = None) -> dict:
     # vLLM's max_num_seqs default is 1024 — a batch-server number. On hybrid-GDN models
     # every decode sequence reserves a Mamba cache block before a single request exists,
     # and the bf16 Qwen3.8-27B arm refused to start at 0.75 util on a 96 GiB card:
@@ -59,6 +60,12 @@ def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bflo
         kw["limit_mm_per_prompt"] = dict(_TEXT_ONLY_MM)
     if cudagraph:
         kw["compilation_config"] = dict(_DEFAULT_CUDAGRAPH)
+    # KV cache dtype is an ENGINE argument — vLLM exposes no env var for it, so a
+    # sweep that selects fp8/turboquant any other way silently runs bf16 and
+    # reports it as a KV result. Omitted entirely when unset rather than passed as
+    # "auto", which is not the same thing to every engine version.
+    if kv_cache_dtype and kv_cache_dtype != "auto":
+        kw["kv_cache_dtype"] = kv_cache_dtype
     return kw
 
 
@@ -74,6 +81,10 @@ def serving_command(model: str, kw: dict) -> str:
         parts += ["--max-model-len", str(kw["max_model_len"])]
     if kw.get("dtype"):
         parts += ["--dtype", str(kw["dtype"])]
+    # Recorded with the run: a KV-quantization result is meaningless without the
+    # dtype that produced it, and this command string is what the record shows.
+    if kw.get("kv_cache_dtype"):
+        parts += ["--kv-cache-dtype", str(kw["kv_cache_dtype"])]
     if kw.get("trust_remote_code"):
         parts += ["--trust-remote-code"]
     if kw.get("limit_mm_per_prompt"):
@@ -159,13 +170,15 @@ class LoadedModel:
 
 def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
          max_model_len: int | None = None, gpu_mem_util: float = 0.9,
-         arch: str | None = None, multimodal: bool | None = None) -> LoadedModel:
+         arch: str | None = None, multimodal: bool | None = None,
+         kv_cache_dtype: str | None = None) -> LoadedModel:
     """Construct the vLLM engine and capture load footprint + serving command."""
     from vllm import LLM
     if multimodal is None:
         multimodal = is_multimodal(arch)
     kw = build_llm_kwargs(model, quant=quant, dtype=dtype, max_model_len=max_model_len,
-                          gpu_mem_util=gpu_mem_util, multimodal=multimodal)
+                          gpu_mem_util=gpu_mem_util, multimodal=multimodal,
+                          kv_cache_dtype=kv_cache_dtype)
 
     # vLLM emits "Model loading took X GiB" (the weights footprint) at INFO from the
     # EngineCore subprocess, on *stdout* once we pin the logging config. Capture both
