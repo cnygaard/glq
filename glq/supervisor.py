@@ -256,22 +256,38 @@ def detect_device(vllm_version=_installed_vllm_version, vram=None) -> str:
 _CPU_KV_MIN_GIB, _CPU_KV_MAX_GIB = 2, 8
 
 
-#: What the CPU serving stack costs beyond the weights and the KV pool. Measured on an
-#: 8-vCPU box serving the 13.9 GiB 26B-A4B with a 4 GiB pool: the VLLM::Worker held
-#: 18.56 GiB (so ~0.7 GiB of activations above weights + pool) and the driver and engine
-#: processes another ~1.4 GiB.
-_CPU_RUNTIME_OVERHEAD_BYTES = 2 * 1024 ** 3
+#: What the CPU serving stack costs beyond the weights and the KV pool. Measured at steady
+#: state with `glq-chat` serving the 13.9 GiB 26B-A4B on an 8-vCPU box (per-process PSS from
+#: smaps_rollup, summed against /proc/meminfo AnonPages, which agreed to 0.1 GiB):
+#:
+#:     VLLM::Worker      22.56 GiB  = 13.9 weights + 5.0 pool + 3.7 activations
+#:     chat/gradio UI     2.09 GiB  — same machine, and glq-chat starts it
+#:     EngineCore + API   1.06 GiB
+#:     ------------------------------------------------------------------
+#:     beyond weights + pool: 6.8 GiB, rounded up
+#:
+#: An earlier 2 GiB here came from reading one worker's RSS and forgetting that the UI and
+#: the engine processes live in the same RAM. It under-counted by 4.7 GiB.
+_CPU_RUNTIME_OVERHEAD_BYTES = 7 * 1024 ** 3
 
 #: Share of RAM the *anonymous* demand — weights + pool + runtime — may reach. The rest is
 #: for the page cache, and on CPU that is not a luxury: the loader streams the whole
-#: checkpoint through it, and a box with no swap configured (the AWS default) can reclaim
-#: nothing else. Anchored to two observed configurations on a 30.8 GiB box holding the
-#: 13.9 GiB 26B-A4B: a 4 GiB pool (≈65% anonymous) served for hours across many runs, and
-#: a 7 GiB pool (≈77%) left kswapd0 pinned at 100% with 85% iowait, buff/cache down to
-#: 100 MiB, and sshd unable to complete a banner exchange. 0.70 sits between them, nearer
-#: the configuration that worked. Refine it when the failure is reproduced under
-#: instrumentation — it is bounded by observation, not measured to a knife edge.
-_CPU_ANON_FRACTION = 0.70
+#: checkpoint through it, and a box with no swap configured (the cloud default) can reclaim
+#: nothing else. Measured on a 30.8 GiB box holding the 13.9 GiB 26B-A4B, with the real
+#: overhead above:
+#:
+#:     pool 7 GiB -> 27.7 GiB anonymous = 90%  kswapd0 at 100%, 85% iowait,
+#:                                             buff/cache 100 MiB, ssh unreachable
+#:     pool 5 GiB -> 25.7 GiB anonymous = 83%  served fine, 4.42 GiB still available
+#:
+#: 0.85 admits the configuration that worked and refuses the one that did not.
+_CPU_ANON_FRACTION = 0.85
+
+#: What to leave free on a machine that is already busy, beyond the weights, the pool and
+#: the runtime. The healthy measured run finished with 4.42 GiB still available, so this is
+#: that observation rounded down: enough page cache to stream a checkpoint without evicting
+#: it in a loop, and enough slack that the rest of the desktop is not pushed into reclaim.
+_CPU_HEADROOM_BYTES = 4 * 1024 ** 3
 
 #: The ceiling when the checkpoint size could not be looked up, so the arithmetic above is
 #: unavailable. 4 GiB is the pool that served the 13.9 GiB 26B-A4B across every run of this
@@ -279,7 +295,7 @@ _CPU_ANON_FRACTION = 0.70
 _CPU_KV_UNKNOWN_MAX_GIB = 4
 
 
-def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None) -> int:
+def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None, available_bytes=None) -> int:
     """The CPU KV pool in GiB, clamped to [2, 8].
 
     On a GPU the weights and the KV cache come out of VRAM while the loader, the runtime
@@ -302,12 +318,25 @@ def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None) -> int:
         # too large hangs a machine with no swap.
         quarter = int(ram_bytes / 2**30) // 4
         return max(_CPU_KV_MIN_GIB, min(_CPU_KV_UNKNOWN_MAX_GIB, quarter))
-    budget = (_CPU_ANON_FRACTION * ram_bytes - weights_bytes
-              - _CPU_RUNTIME_OVERHEAD_BYTES)
-    return max(_CPU_KV_MIN_GIB, min(_CPU_KV_MAX_GIB, int(budget / 2**30)))
+    # Two bounds, and the tighter one wins.
+    #
+    #   * a share of what is INSTALLED — the measured ceiling, which keeps a slice of RAM
+    #     for the page cache the loader streams the checkpoint through;
+    #   * what is actually FREE right now, less the headroom the healthy run was measured
+    #     to leave. Sizing against MemTotal assumes an idle machine, and a desktop with a
+    #     browser open can be 10 GiB down before this starts. On CPU that 10 GiB comes out
+    #     of the same pool as the weights, so planning as if it were not there is how a
+    #     plan that looks fine on paper takes the machine down.
+    budget = _CPU_ANON_FRACTION * ram_bytes
+    if available_bytes:
+        budget = min(budget, available_bytes - _CPU_HEADROOM_BYTES)
+    return max(_CPU_KV_MIN_GIB,
+               min(_CPU_KV_MAX_GIB,
+                   int((budget - weights_bytes - _CPU_RUNTIME_OVERHEAD_BYTES) / 2**30)))
 
 
-def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None) -> dict:
+def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
+              available_bytes=None) -> dict:
     """The environment `vllm serve` is started with.
 
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
@@ -330,7 +359,7 @@ def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None) -> dict:
         # always wins; the flashinfer probe is skipped — it answers a GPU question with
         # an nvidia-smi subprocess this path has no use for.
         env.setdefault("VLLM_CPU_KVCACHE_SPACE",
-                       str(plan_cpu_kvcache_gib(ram_bytes, weights_bytes)))
+                       str(plan_cpu_kvcache_gib(ram_bytes, weights_bytes, available_bytes)))
         # vLLM's auto CPU binding takes one logical CPU per physical core and then holds
         # one back for itself, so a 4-core machine runs GLQ's kernels on 3. Decode is
         # memory-bound and scales with cores until the bandwidth saturates: serving the
@@ -412,10 +441,16 @@ class VllmSupervisor:
         # but the wheel in THIS venv is what actually serves — so live detection is the
         # default even then).
         self.device = device if device in ("cpu", "cuda") else detect_device()
+        self._available_bytes = None
         if self.device == "cpu" and ram_bytes is None:
             try:
-                from glq.installer.hardware import ram_bytes as _ram
+                from glq.installer.hardware import (available_ram_bytes as _avail,
+                                                    ram_bytes as _ram)
                 ram_bytes = _ram()
+                # Read at start, because that is when the decision is made: what the
+                # machine has free now is what this server can have. A browser opened
+                # afterwards is not something any plan can anticipate.
+                self._available_bytes = _avail()
             except Exception:                            # noqa: BLE001 - pool falls to 8 GiB
                 ram_bytes = None
         self._ram_bytes = ram_bytes
@@ -515,7 +550,8 @@ class VllmSupervisor:
         if self.fp8_kv:
             self._say("  KV cache in fp8 (vLLM's own) — about twice the context per GiB")
         env = child_env(device=self.device, ram_bytes=self._ram_bytes,
-                        weights_bytes=self.weights_bytes)
+                        weights_bytes=self.weights_bytes,
+                        available_bytes=self._available_bytes)
         if self.device == "cpu" and self._ram_bytes and self.weights_bytes:
             # Say the arithmetic out loud. On CPU the weights, the pool, the runtime and the
             # page cache share one pool of RAM, and when it does not fit there is no swap to
@@ -523,14 +559,21 @@ class VllmSupervisor:
             # OOM-killing one process, which is a much harder failure to read after the fact.
             pool = int(env["VLLM_CPU_KVCACHE_SPACE"])
             anon = self.weights_bytes + pool * 2**30 + _CPU_RUNTIME_OVERHEAD_BYTES
+            budget = (f"{self._available_bytes / 2**30:.1f} GiB free"
+                      if self._available_bytes
+                      else f"{self._ram_bytes / 2**30:.1f} GiB total")
             self._say(f"  RAM plan: {self.weights_bytes / 2**30:.1f} GiB weights + "
                       f"{pool} GiB KV pool + ~{_CPU_RUNTIME_OVERHEAD_BYTES / 2**30:.0f} GiB "
-                      f"runtime = {anon / 2**30:.1f} of {self._ram_bytes / 2**30:.1f} GiB")
-            if anon > _CPU_ANON_FRACTION * self._ram_bytes:
-                self._say("  warning: that leaves little room for the page cache the loader "
-                          "streams the checkpoint through. If the machine has no swap it may "
-                          "thrash rather than fail cleanly — serve a smaller checkpoint, or "
-                          "set VLLM_CPU_KVCACHE_SPACE lower.")
+                      f"runtime = {anon / 2**30:.1f} GiB, against {budget}")
+            ceiling = _CPU_ANON_FRACTION * self._ram_bytes
+            if self._available_bytes:
+                ceiling = min(ceiling, self._available_bytes - _CPU_HEADROOM_BYTES)
+            if anon > ceiling:
+                self._say(f"  warning: that is {(anon - ceiling) / 2**30:.1f} GiB more than "
+                          f"this machine has room for. Close what else is running, serve a "
+                          f"smaller checkpoint, or set VLLM_CPU_KVCACHE_SPACE lower — on CPU "
+                          f"the weights, the pool and the page cache share one pool of RAM, "
+                          f"and a machine with no swap thrashes rather than failing cleanly.")
         if "VLLM_USE_FLASHINFER_SAMPLER" in env:
             self._say("  the NVIDIA CUDA Toolkit is not installed, and FlashInfer ships no "
                       "prebuilt sampler for this GPU, so it")

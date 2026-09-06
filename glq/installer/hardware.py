@@ -57,6 +57,31 @@ def _read_meminfo() -> str:
         return fh.read()
 
 
+def available_ram_bytes(read=_read_meminfo) -> int | None:
+    """RAM a new process can have *without swapping*, or None if unknown.
+
+    `MemAvailable` is the kernel's own reclaim-aware estimate: free memory plus the page
+    cache and slab it expects to be able to reclaim. It is the right budget for CPU
+    serving, where a machine is rarely idle — a desktop with a browser open can be 10 GiB
+    down before glq-chat starts, and on CPU that comes out of the same pool as the weights.
+    MemTotal answers a different question, and `MemFree` (or `free`'s used column) answers a
+    worse one: it discards page cache that would have been reclaimed happily.
+
+    Present since Linux 3.14. Absent means an ancient kernel or a container runtime that
+    hides it, and callers fall back to the total.
+    """
+    try:
+        for line in read().splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1]) * 1024          # meminfo reports kB
+                return None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def ram_bytes(read=_read_meminfo) -> int | None:
     """Total system RAM, or None if it can't be determined.
 

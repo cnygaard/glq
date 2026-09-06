@@ -1563,6 +1563,85 @@ def test_the_planned_total_leaves_room_for_page_cache():
     assert anon <= sup_mod._CPU_ANON_FRACTION * ram + GIB
 
 
+# ---- the budget is what is FREE, not what is installed ----------------------------------
+#
+# Sizing against MemTotal assumes the machine is idle. It is not: a desktop with a browser
+# open can be 10 GiB down before glq-chat starts, and on CPU that 10 GiB comes out of the
+# same pool as the weights. MemAvailable is the kernel's own reclaim-aware estimate of what
+# a new process can have without swapping — the right input, and better than
+# `free - buff/cache`, which throws away page cache that IS reclaimable.
+
+def test_a_busy_machine_gets_a_smaller_pool_than_an_idle_one():
+    """Same box, same checkpoint, 10 GiB already in use elsewhere."""
+    total, weights = 32 * GIB, int(13.9 * GIB)
+    idle = sup_mod.plan_cpu_kvcache_gib(total, weights_bytes=weights,
+                                        available_bytes=31 * GIB)
+    busy = sup_mod.plan_cpu_kvcache_gib(total, weights_bytes=weights,
+                                        available_bytes=21 * GIB)
+    assert busy < idle, f"a busy machine must not be planned as if it were idle: {busy} vs {idle}"
+
+
+def test_a_machine_with_no_room_left_clamps_to_the_floor():
+    """13.9 GiB of weights plus ~7 GiB of runtime does not fit in 20 GiB whatever the pool
+    is. Return the floor; the supervisor warns, and vLLM's own failure is clearer than a
+    pool sized from memory that was never there."""
+    assert sup_mod.plan_cpu_kvcache_gib(32 * GIB, weights_bytes=int(13.9 * GIB),
+                                        available_bytes=20 * GIB) == sup_mod._CPU_KV_MIN_GIB
+
+
+def test_an_idle_machine_lands_in_the_measured_band():
+    """The measured-good configuration was a 5 GiB pool (83% anonymous, 4.42 GiB left).
+
+    A band, not a number: the answer depends on how much is free at the moment of asking,
+    and an idle box is not a fixed quantity — measured live on that machine it planned 4,
+    because 29.8 GiB free less 4 GiB headroom is tighter than 85% of 30.8 GiB installed.
+    Both 4 and 5 leave the machine healthy; asserting one integer would be fitting to a
+    single observation, which is what produced the wrong constants in the first place."""
+    for available in (int(29.5 * GIB), int(30.0 * GIB), int(30.5 * GIB)):
+        pool = sup_mod.plan_cpu_kvcache_gib(int(30.81 * GIB), weights_bytes=int(13.9 * GIB),
+                                            available_bytes=available)
+        assert pool in (4, 5), f"{available / GIB:.1f} GiB free planned {pool} GiB"
+
+
+def test_unknown_availability_falls_back_to_the_total():
+    """/proc/meminfo without MemAvailable (very old kernels), or a caller that does not
+    pass it: keep the total-based answer rather than refusing to plan."""
+    assert (sup_mod.plan_cpu_kvcache_gib(int(30.81 * GIB), weights_bytes=int(13.9 * GIB))
+            == sup_mod.plan_cpu_kvcache_gib(int(30.81 * GIB), weights_bytes=int(13.9 * GIB),
+                                            available_bytes=None) == 5)
+
+
+def test_available_ram_is_read_from_meminfo():
+    from glq.installer.hardware import available_ram_bytes
+    meminfo = ("MemTotal:       32311412 kB\n"
+               "MemFree:          206200 kB\n"
+               "MemAvailable:   20480000 kB\n")
+    assert available_ram_bytes(read=lambda: meminfo) == 20480000 * 1024
+    assert available_ram_bytes(read=lambda: "MemTotal: 123 kB\n") is None
+
+
+def test_the_two_measured_configurations_are_reproduced():
+    """The constants are a fit to two observations, so pin both.
+
+    Measured with glq-chat serving the 13.9 GiB 26B-A4B on a 30.8 GiB box, per-process PSS
+    summed against /proc/meminfo AnonPages:
+
+        pool 7 GiB -> 27.7 GiB anonymous (90%)  kswapd0 100%, 85% iowait, ssh unreachable
+        pool 5 GiB -> 25.7 GiB anonymous (83%)  served fine, 4.42 GiB still available
+
+    A change that admits 7 again, or that stops admitting 5, has broken the thing this
+    number exists for."""
+    ram, weights = int(30.81 * GIB), int(13.9 * GIB)
+    assert sup_mod.plan_cpu_kvcache_gib(ram, weights_bytes=weights) == 5
+
+    def anon(pool_gib):
+        return weights + pool_gib * GIB + sup_mod._CPU_RUNTIME_OVERHEAD_BYTES
+
+    ceiling = sup_mod._CPU_ANON_FRACTION * ram
+    assert anon(5) <= ceiling, "the configuration that served must stay admissible"
+    assert anon(7) > ceiling, "the configuration that thrashed must stay refused"
+
+
 def test_a_small_checkpoint_still_gets_the_full_pool():
     """The fix must not punish the models CPU serving was already good at: a 1.8 GiB dense
     3B on the same box leaves plenty of room and keeps the validated 8 GiB."""
