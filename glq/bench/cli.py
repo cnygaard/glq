@@ -51,7 +51,8 @@ def _cmd_run(args) -> int:
     recs = runner.run(
         model=args.model, tasks=tasks, quant=args.quant, runtime=args.runtime,
         n=args.n, budget=args.budget, avg_k=args.avg_k, gpu_mem_util=args.gpu_mem_util,
-        max_model_len=args.max_model_len, hf_token=None, task_config=task_config,
+        max_model_len=args.max_model_len, kv_cache_dtype=args.kv_cache_dtype,
+        hf_token=None, task_config=task_config,
     )
     from .record import write_jsonl
     out = args.out or "bench_records.jsonl"
@@ -157,6 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="samples per problem for avg@k scoring (aime); default 1 = pass@1")
     r.add_argument("--gpu-mem-util", dest="gpu_mem_util", type=float, default=0.9)
     r.add_argument("--max-model-len", dest="max_model_len", type=int, default=None)
+    # An engine argument, not an env var: selecting a KV dtype any other way
+    # runs bf16 and reports it as a KV-quantization result.
+    r.add_argument("--kv-cache-dtype", dest="kv_cache_dtype", default=None,
+                   help="fp8 | turboquant_4bit_nc | ... (default: engine default)")
     r.add_argument("--task-config", dest="task_config", default=None,
                    help='JSON merged into every task config, last word. Model-level knobs '
                         'live here because they belong to the chat template, not the task '
