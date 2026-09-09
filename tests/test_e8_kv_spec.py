@@ -37,10 +37,10 @@ def torch_bf16():
     return torch.bfloat16
 
 
-def _full_spec(*, bpw, block_size=16, head_size=512):
+def _full_spec(*, bpw, block_size=16, head_size=512, num_kv_heads=2):
     return E8FullAttentionSpec(
         block_size=block_size,
-        num_kv_heads=2,
+        num_kv_heads=num_kv_heads,
         head_size=head_size,
         dtype=__import__("torch").bfloat16,
         sliding_window=None,
@@ -143,46 +143,58 @@ def test_full_and_sliding_page_sizes_align_after_unification(bpw):
 
 
 # --------------------------------------------------------------------------- #
-# The compressed cache SHAPE must match the backend's stride order
+# The compressed cache SHAPE must have the rank vLLM allocates
 # --------------------------------------------------------------------------- #
 #
-# vLLM asserts this itself, in `_reshape_kv_cache`:
+# How this broke: vLLM's "[6/N] Standardize KV cache layout" refactor packed K and V
+# into the content dimension, taking the layer shape from 5-D `(num_blocks, 2,
+# block_size, num_kv_heads, C)` to 4-D `(num_blocks, num_kv_heads, block_size,
+# 2 * head_size)`, while `compressed_kv_cache_shape` still returned the 5-D form it had
+# been written against. A rank mismatch is not a subtly wrong number: vLLM asserts on it
+# and EngineCore goes down at startup.
 #
-#     kv_cache_stride_order = group.backend.get_kv_cache_stride_order()
-#     assert len(kv_cache_stride_order) == len(kv_cache_shape)
-#
-# and the surrounding `try` catches only AttributeError/NotImplementedError, so
-# a mismatch escapes as an AssertionError that takes EngineCore down at startup.
-#
-# It broke exactly that way: vLLM's "[6/N] Standardize KV cache layout" refactor
-# packed K and V into the content dim, taking the Triton backend's shape from 5-D
-# to 4-D `(num_blocks, num_kv_heads, block_size, 2 * head_size)`, while
-# `compressed_kv_cache_shape` still returned the 5-D `(num_blocks, 2, block_size,
-# num_kv_heads, C)` it had been written to match. Asserting the invariant here
-# makes the next such refactor a fast unit-test failure instead of a boot crash.
+# The same refactor moved WHERE the shape comes from. Before 0.28 the backend answered
+# `get_kv_cache_stride_order()` and `_reshape_kv_cache` asserted its length against the
+# shape; in 0.28 that classmethod is gone, backends expose no shape at all, and the spec
+# owns the layout. So the invariant is asserted against
+# `compute_layer_kv_cache_shape_bytes` — the function vLLM's own allocator calls — which
+# is both version-correct and a stronger statement than the stride order was.
 
 @pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
-def test_compressed_shape_rank_matches_backend_stride_order(bpw, monkeypatch):
+def test_compressed_shape_rank_matches_what_vllm_allocates(bpw, monkeypatch):
+    """The rank of our compressed shape must equal the rank vLLM allocates for the layer.
+
+    This is the invariant the 4-D change exists for: the pre-0.28 layout was 5-D
+    ``(blocks, 2, block_size, heads, elems)`` and 0.28 packs K and V into the content
+    dimension, giving 4-D. A rank mismatch is not a wrong number somewhere — vLLM
+    asserts on it and EngineCore dies at startup.
+
+    Checked against ``compute_layer_kv_cache_shape_bytes``, which is the function vLLM's
+    own allocator calls. An earlier version of this test asked
+    ``TritonAttentionBackend.get_kv_cache_stride_order()``; that classmethod was removed in
+    0.28's layout standardization and the backend no longer exposes any shape at all — the
+    spec owns it now. Asserting against the allocator is both version-correct and a
+    stronger statement than the stride order was.
+    """
     from glq_vllm.e8_kv_spec import compressed_kv_cache_shape
 
     try:
-        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+        from vllm.v1.kv_cache_interface import compute_layer_kv_cache_shape_bytes
     except ImportError:
-        pytest.skip("TritonAttentionBackend not importable in this vllm")
+        pytest.skip("compute_layer_kv_cache_shape_bytes not in this vllm")
 
-    # get_kv_cache_stride_order -> get_kv_cache_layout, which otherwise needs a
-    # live VllmConfig. The layout only picks the permutation; the RANK — the thing
-    # under test — is the same for NHD and HND.
+    # The layout only picks the permutation; the RANK under test is the same either way.
     monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
 
-    shape = compressed_kv_cache_shape(
+    spec = _full_spec(bpw=bpw, num_kv_heads=4, head_size=64, block_size=16)
+    ours = compressed_kv_cache_shape(
         num_blocks=128, block_size=16, num_kv_heads=4, head_size=64,
         bpw=bpw, dtype_size=2)
-    stride_order = TritonAttentionBackend.get_kv_cache_stride_order()
-    assert len(shape) == len(stride_order), (
-        f"bpw={bpw}: compressed shape {shape} has rank {len(shape)}, but the "
-        f"Triton backend's stride order {stride_order} has {len(stride_order)} "
-        f"entries — vLLM asserts these are equal and dies at startup")
+    allocated = compute_layer_kv_cache_shape_bytes(spec, 128)
+    assert len(ours) == len(allocated), (
+        f"bpw={bpw}: compressed shape {ours} has rank {len(ours)}, but vLLM allocates "
+        f"rank {len(allocated)} ({allocated}) for the same layer — vLLM asserts these "
+        f"match and EngineCore dies at startup")
 
 
 @pytest.mark.parametrize("bpw", [2, 3, 4, 5, 6, 7])
