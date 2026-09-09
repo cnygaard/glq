@@ -3,9 +3,21 @@
 vLLM's allocator uses ``kv_cache_spec.page_size_bytes`` (via the
 ``KVCacheTensor.size`` it derives at config time) to decide how many
 bytes to ``torch.zeros`` per layer. Standard ``FullAttentionSpec`` /
-``SlidingWindowSpec`` report the fp16 page size; if we override
-``real_page_size_bytes`` to the compressed size, vLLM allocates a
-smaller buffer.
+``SlidingWindowSpec`` report the fp16 page size; declaring the packed
+cell size makes vLLM's own arithmetic yield a smaller buffer.
+
+The hook is ``state_content_bytes`` — "C in bytes when packed" — which
+``AttentionSpec.state_content_size_bytes`` returns unconditionally, and
+which ``page_size_bytes`` reaches via
+``num_heads * storage_block_size * state_content_size_bytes``.
+
+Overriding ``real_page_size_bytes`` (what this module used to do) no
+longer works: in vLLM 0.28 that property is documented as an *alias* of
+``unpadded_page_size_bytes`` and ``page_size_bytes`` never calls it, so
+the override was dead and the engine allocated full-size pages — a
+20480 B block where the compressed page is 7680 B, which surfaces as
+``RuntimeError: shape '[...]' is invalid for input of size N`` when the
+backend's compressed shape meets the uncompressed buffer.
 
 Required co-changes:
 
@@ -59,45 +71,96 @@ def compressed_page_size_bytes(*, block_size: int, num_kv_heads: int,
     return 2 * block_size * num_kv_heads * n_groups * E8_BYTES_PER_GROUP[bpw]
 
 
-def compressed_kv_cache_shape(num_blocks: int, block_size: int,
-                              num_kv_heads: int, head_size: int,
-                              bpw: int, dtype_size: int = 2
-                              ) -> tuple[int, int, int, int, int]:
-    """Shape that ``get_kv_cache_shape`` should report when the spec
-    declares the compressed page size.
+def compressed_side_width(head_size: int, bpw: int, dtype_size: int = 2) -> int:
+    """Elements of the cache dtype that one side (K or V) occupies per
+    (token, head) at this bpw — the ``C`` in the packed content dim ``2 * C``.
 
-    Returned as 5-D ``(num_blocks, 2, block_size, num_kv_heads,
-    compressed_elems_per_tok_per_head)`` to match the standard
-    Triton backend's stride-order shape (5 entries). Only the final
-    dim shrinks vs the fp16 layout, so ``kv_cache.unbind(1)`` still
-    yields tensors whose first three "real" dims (num_blocks,
-    block_size, num_kv_heads) line up.
-
-    Note: ``key_cache.shape[-1]`` now reports the *compressed* elem
-    count, not the real ``head_size``. The patched read/write hooks
-    must derive ``head_size`` from the input ``key`` / ``q`` tensors
-    (which the model produces at full size) instead.
+    The single source of truth for that width. The cache shape is built from it,
+    and the Triton backend is told to split K from V at it (see
+    ``kv_compression``): vLLM's own code splits at ``self.head_size``, which is
+    the dense width and would return one chunk instead of two.
     """
     if head_size % 8 != 0:
         raise ValueError(f"head_size {head_size} must be a multiple of 8")
-    n_groups = head_size // 8
-    bytes_per_group = E8_BYTES_PER_GROUP[bpw]
-    # Total bytes per (token, head): n_groups * bytes_per_group.
-    elem_bytes_per_tok_per_head = n_groups * bytes_per_group
-    if elem_bytes_per_tok_per_head % dtype_size != 0:
+    if bpw not in E8_BYTES_PER_GROUP:
         raise ValueError(
-            f"compressed bytes per (tok, head) {elem_bytes_per_tok_per_head} "
-            f"not a multiple of dtype_size {dtype_size}")
-    compressed_elems_per_tok_per_head = elem_bytes_per_tok_per_head // dtype_size
+            f"bpw {bpw} not in E8 ladder; allowed {sorted(E8_BYTES_PER_GROUP)}")
+    elem_bytes = (head_size // 8) * E8_BYTES_PER_GROUP[bpw]
+    if elem_bytes % dtype_size != 0:
+        raise ValueError(
+            f"compressed bytes per (tok, head) {elem_bytes} not a multiple of "
+            f"dtype_size {dtype_size}")
+    return elem_bytes // dtype_size
+
+
+def compressed_kv_cache_shape(num_blocks: int, block_size: int,
+                              num_kv_heads: int, head_size: int,
+                              bpw: int, dtype_size: int = 2
+                              ) -> tuple[int, int, int, int]:
+    """Shape that ``get_kv_cache_shape`` should report when the spec
+    declares the compressed page size.
+
+    Returned as 4-D ``(num_blocks, num_kv_heads, block_size,
+    2 * compressed_elems_per_tok_per_head)``, mirroring the Triton
+    backend's own ``(num_blocks, num_kv_heads, block_size,
+    2 * head_size)``: **K and V share the content dim**, K in
+    ``[..., :C]`` and V in ``[..., C:]``.
+
+    This was 5-D ``(num_blocks, 2, block_size, num_kv_heads, C)`` until
+    vLLM's "[6/N] Standardize KV cache layout" refactor packed K and V
+    into the content dim and took the backend's shape to 4-D. The rank
+    is load-bearing, not cosmetic: ``_reshape_kv_cache`` asserts
+    ``len(get_kv_cache_stride_order()) == len(shape)`` and the
+    surrounding ``try`` catches only AttributeError/NotImplementedError,
+    so a stale rank escapes as an AssertionError that takes EngineCore
+    down at startup. ``tests/test_e8_kv_spec.py`` pins it.
+
+    Consumers get their per-side views the way vLLM does —
+    ``kv_cache.transpose(1, 2).split(C, dim=-1)`` — which yields
+    ``(num_blocks, block_size, num_kv_heads, C)`` tensors whose byte
+    strides already encode the packing, which is what
+    ``E8PagedKVCache.from_paged_storage`` relies on.
+
+    Note: the per-side width is the *compressed* elem count, not the
+    real ``head_size``. The patched read/write hooks must derive
+    ``head_size`` from the input ``key`` / ``q`` tensors (which the
+    model produces at full size) instead.
+    """
     return (
-        num_blocks, 2, block_size, num_kv_heads,
-        compressed_elems_per_tok_per_head,
+        num_blocks, num_kv_heads, block_size,
+        2 * compressed_side_width(head_size, bpw, dtype_size),
     )
 
 
 # --------------------------------------------------------------------------- #
 # Spec subclasses
 # --------------------------------------------------------------------------- #
+
+def _declare_packed_cell(spec) -> None:
+    """Set ``state_content_bytes`` — the packed bytes per (head slot, state)
+    cell — so vLLM's own page-size arithmetic lands on the compressed page.
+
+    vLLM's default for this is ``(head_size + head_size_v) * dtype_size``, i.e.
+    K and V for one token of one head; ours is the same quantity in the E8
+    layout, ``2 * n_groups * bytes_per_group``. Feeding it through
+    ``num_heads * storage_block_size * C`` reproduces
+    ``compressed_page_size_bytes`` exactly, which the tests pin.
+
+    Only filled when unset, and that is load-bearing. ``FullAttentionSpec.merge``
+    forwards ``state_content_bytes=specs[0].state_content_bytes`` into a fresh
+    ``cls(...)`` that does **not** carry ``bpw`` — it defaults to 2 — and then
+    asserts every input spec equals the merged one field by field. Recomputing
+    unconditionally would overwrite the correctly forwarded value with a 2-bpw
+    cell size and trip that assertion ("All attention layers in the same KV
+    cache group must have the same attention spec") for every bpw != 2. The
+    merge override restores ``bpw`` afterwards, so the pair stays consistent.
+    """
+    if spec.state_content_bytes is not None:
+        return
+    n_groups = spec.head_size // 8
+    object.__setattr__(spec, "state_content_bytes",
+                       2 * n_groups * E8_BYTES_PER_GROUP[spec.bpw])
+
 
 def _make_spec_subclasses():
     """Build E8FullAttentionSpec / E8SlidingWindowSpec at import time
@@ -115,14 +178,9 @@ def _make_spec_subclasses():
         """FullAttentionSpec that declares the compressed page size."""
         bpw: int = 2
 
-        @property
-        def real_page_size_bytes(self) -> int:
-            return compressed_page_size_bytes(
-                block_size=self.block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                bpw=self.bpw,
-            )
+        def __post_init__(self):
+            super().__post_init__()
+            _declare_packed_cell(self)
 
         @classmethod
         def merge(cls, specs):
@@ -132,12 +190,17 @@ def _make_spec_subclasses():
             # silently differ from the input specs at bpw != 2. Restore
             # ``bpw`` after the parent merge (all specs in a group must
             # share the same bpw).
-            merged = super().merge(specs)
+            # Checked BEFORE delegating: a differing bpw now also means a
+            # differing state_content_bytes, so the parent's field-equality
+            # assertion would fire first and report the generic "must have the
+            # same attention spec" instead of naming bpw as the thing that
+            # differs. Same rejection either way; this one is diagnosable.
             bpws = {s.bpw for s in specs}
             if len(bpws) != 1:
                 raise ValueError(
                     f"All E8FullAttentionSpec in a KV cache group must share "
                     f"the same bpw; got {sorted(bpws)}.")
+            merged = super().merge(specs)
             return replace(merged, bpw=bpws.pop())
 
     @dataclass(frozen=True, kw_only=True)
@@ -145,14 +208,9 @@ def _make_spec_subclasses():
         """SlidingWindowSpec that declares the compressed page size."""
         bpw: int = 2
 
-        @property
-        def real_page_size_bytes(self) -> int:
-            return compressed_page_size_bytes(
-                block_size=self.block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                bpw=self.bpw,
-            )
+        def __post_init__(self):
+            super().__post_init__()
+            _declare_packed_cell(self)
 
         # ``SlidingWindowSpec`` inherits ``KVCacheSpec.merge`` which uses
         # ``copy.deepcopy(specs[0])`` — that preserves our subclass and
