@@ -545,6 +545,26 @@ def _uses_mrope(cfg) -> bool:
     return bool(section)
 
 
+def _apply_hc_expansion(hidden_states, cfg):
+    """Widen calibration activations to the model's parallel residual streams.
+
+    Qwen4Exp carries ``hc_count`` hyper-connection streams: the text model does
+    ``hidden_states.repeat(1, 1, config.hc_count)`` between the embedding and the decoder
+    loop, and every block then consumes ``hc_count * hidden_size`` features. Feeding plain
+    embeddings raises
+
+        ValueError: Expected 10240 hyper-connection features, got 2560.
+
+    Driven off the config, so architectures without ``hc_count`` are untouched — this is a
+    property of the model, not of its name.
+    """
+    inner = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    hc = getattr(inner, "hc_count", 1) or 1
+    if hc <= 1:
+        return hidden_states
+    return hidden_states.repeat(1, 1, hc)
+
+
 def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
                           per_layer_inputs=None, sample_idx=None,
                           shared_kv_cache=None):
@@ -1385,6 +1405,9 @@ def quantize(
     # the decoder layers are cast to `dtype` — without this the first layer's
     # matmul hits a float-vs-bf16 dtype mismatch. No-op for bf16/fp16 models.
     hidden_states = torch.cat(hidden_states, dim=0).to(dtype)
+    # Architectures with parallel residual streams (Qwen4Exp's hyper-connections) expect
+    # hc_count * hidden_size into the first block; no-op everywhere else.
+    hidden_states = _apply_hc_expansion(hidden_states, cfg)
 
     # ---- Gemma-4 Per-Layer Embedding (PLE) precomputation ----
     # E2B / E4B have hidden_size_per_layer_input > 0 and feed each decoder

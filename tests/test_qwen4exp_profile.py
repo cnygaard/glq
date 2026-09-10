@@ -143,3 +143,45 @@ def test_non_mrope_models_keep_two_axis_position_ids():
     h = torch.zeros(1, 8, 4)
     kw = qm._build_forward_kwargs({}, h, _PlainRotary(), layer_idx=0, cfg=_Cfg(mrope=False))
     assert kw["position_ids"].dim() == 2
+
+
+# ---- hyper-connections: the decoder consumes hc_count parallel residual streams --------
+
+def test_hc_expansion_widens_the_calibration_states():
+    """Qwen4Exp keeps hc_count=4 parallel residual streams. transformers does
+    `hidden_states.repeat(1, 1, config.hc_count)` between the embedding and the layer loop
+    (modeling_qwen4_exp.py:1480), so the layers see 4*hidden_size.
+
+    Feeding them plain embeddings fails with
+
+        ValueError: Expected 10240 hyper-connection features, got 2560.
+
+    which is what a 335 GiB run hit 22 s in, on the second attempt.
+    """
+    class _HC:
+        hc_count = 4
+    h = torch.zeros(2, 8, 2560)
+    out = qm._apply_hc_expansion(h, _HC())
+    assert out.shape == (2, 8, 10240)
+    # It must be a repeat of the same stream, not zeros or a broadcast view.
+    ref = torch.arange(4.0).reshape(1, 1, 4)
+    got = qm._apply_hc_expansion(ref, _HC())
+    assert torch.equal(got, ref.repeat(1, 1, 4))
+
+
+def test_hc_expansion_is_a_no_op_without_hc_count():
+    """Every other architecture must be untouched."""
+    class _Plain:
+        pass
+    h = torch.zeros(2, 8, 2560)
+    assert qm._apply_hc_expansion(h, _Plain()).shape == (2, 8, 2560)
+    assert qm._apply_hc_expansion(h, None).shape == (2, 8, 2560)
+
+
+def test_hc_expansion_ignores_hc_count_of_one():
+    """hc_count == 1 means a single stream; repeating would still be a no-op but the
+    guard keeps the intent explicit."""
+    class _One:
+        hc_count = 1
+    h = torch.zeros(1, 4, 16)
+    assert qm._apply_hc_expansion(h, _One()).shape == (1, 4, 16)
