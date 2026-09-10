@@ -96,3 +96,50 @@ def test_default_profile_does_not_opt_in():
 def test_gemma4_still_opts_in_without_a_flag():
     """Back-compat: gemma-4 was detected by name and must keep working unchanged."""
     assert qm._stacked_experts_enabled("Gemma4ForConditionalGeneration", {}) is True
+
+
+# ---- mRoPE: position_ids must carry the 3 rope axes ------------------------------------
+
+class _Cfg:
+    """Minimal stand-in: only what _build_forward_kwargs reads."""
+    def __init__(self, mrope):
+        self.text_config = self
+        self.rope_parameters = {"mrope_section": [11, 11, 10]} if mrope else {}
+        self.layer_types = ["linear_attention"]
+        self.hidden_size_per_layer_input = 0
+        self.num_kv_shared_layers = 0
+
+
+class _Rotary:
+    """Reproduces the real failure: qwen4_exp indexes position_ids[:, :, None, :]."""
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, x, position_ids=None, **kw):
+        self.seen = tuple(position_ids.shape)
+        if position_ids.dim() != 3:
+            raise IndexError("too many indices for tensor of dimension 2")
+        return (torch.zeros(1), torch.zeros(1))
+
+
+def test_mrope_models_get_three_axis_position_ids():
+    """Qwen4Exp uses mRoPE (mrope_section [11,11,10]), so modeling_qwen4_exp does
+    `position_ids[:, :, None, :]` and a 2-D tensor raises IndexError. Measured live: the
+    335 GiB run died here 46 s into quantization, after a 4-minute download."""
+    rot = _Rotary()
+    h = torch.zeros(1, 8, 4)
+    kw = qm._build_forward_kwargs({}, h, rot, layer_idx=0, cfg=_Cfg(mrope=True))
+    assert kw["position_ids"].dim() == 3, f"position_ids is {kw['position_ids'].shape}"
+    assert kw["position_ids"].shape[0] == 3, "one row per rope axis (t/h/w)"
+    assert rot.seen[0] == 3
+
+
+def test_non_mrope_models_keep_two_axis_position_ids():
+    """Standard rope must be untouched — every other architecture depends on it."""
+    class _PlainRotary:
+        def __call__(self, x, position_ids=None, **kw):
+            assert position_ids.dim() == 2, "standard rope expects 2-D"
+            return (torch.zeros(1), torch.zeros(1))
+    h = torch.zeros(1, 8, 4)
+    kw = qm._build_forward_kwargs({}, h, _PlainRotary(), layer_idx=0, cfg=_Cfg(mrope=False))
+    assert kw["position_ids"].dim() == 2

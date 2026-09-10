@@ -526,6 +526,25 @@ def get_rotary_emb(text_model, profile=None):
     return None
 
 
+def _uses_mrope(cfg) -> bool:
+    """True when the model's rope is multi-axis (mRoPE), so position_ids must be 3-D.
+
+    Detected from ``rope_parameters.mrope_section`` rather than the architecture name: it
+    is a property of the rope configuration, and any arch adopting mRoPE needs the same
+    treatment. Tolerant of both dict and attribute-style rope configs, and of models with
+    no rope config at all.
+    """
+    if cfg is None:
+        return False
+    inner = getattr(cfg, "text_config", cfg)
+    rp = getattr(inner, "rope_parameters", None) or getattr(inner, "rope_scaling", None)
+    if rp is None:
+        return False
+    section = rp.get("mrope_section") if isinstance(rp, dict) else getattr(
+        rp, "mrope_section", None)
+    return bool(section)
+
+
 def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
                           per_layer_inputs=None, sample_idx=None,
                           shared_kv_cache=None):
@@ -585,6 +604,14 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
         )
 
     position_ids = cache_position.unsqueeze(0)
+    # mRoPE (Qwen4Exp and other multimodal Qwen variants) splits rope across three axes —
+    # temporal/height/width, `mrope_section` — and its forward does
+    # `position_ids[:, :, None, :]`, so a 2-D tensor raises "too many indices for tensor of
+    # dimension 2". Text-only calibration has no image grid, so all three axes carry the
+    # same positions. Driven off the config rather than the architecture name, because this
+    # is a property of the rope configuration and other archs will adopt it.
+    if _uses_mrope(cfg):
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
     kwargs = dict(position_ids=position_ids, cache_position=cache_position,
                   use_cache=False)
     if rotary_emb is not None:
