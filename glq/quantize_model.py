@@ -257,6 +257,45 @@ _MODEL_PROFILES = {
         'multimodal_text': True,
         'skip_linears': ('.in_proj_b', '.in_proj_a'),
     },
+    'Qwen4ExpForConditionalGeneration': {
+        # Qwen3.8-Flash-Next (model_type `qwen4_exp`): a vision+text multimodal wrapper
+        # around a hybrid text tower — 36 `linear_attention` blocks and 12
+        # `qwen_sparse_attention` blocks (note: there is no `full_attention` layer type
+        # despite the config's `full_attention_interval`) — plus an MTP head, a sparse
+        # attention indexer, hyper-connections, and a PLE n-gram table.
+        #
+        # Mass, measured from the safetensors headers: 225 GiB of fused MoE experts (67%),
+        # 96 GiB of PLE n-gram embeddings (29%), ~14 GiB everything else. The experts are
+        # stacked 3-D Parameters, hence `stacked_experts` — without it the walk misses
+        # two thirds of the model and says nothing. The n-gram table is an Embedding and
+        # stays bf16, so a 4 bpw run lands near 166 GiB, not 84.
+        #
+        # skip_linears — every one measured on the meta-instantiated model, and every one
+        # fails the trellis out%32 serving gate, so a quantized version could never serve:
+        #   .in_proj_b / .in_proj_a   [48, 2560]    GDN delta-rule dynamics (48%32=16).
+        #                                           Qwen3.5's are 16 rows; this arch's are
+        #                                           48, so the number is not transferable.
+        #   .shared_expert_gate       [1, 2560]     MoE shared-expert router.
+        #   .block_inject_weight      [4, 10240]    hyper-connection injection.
+        # `.indexer.` is skipped for a different reason: at [640, 2560] it would quantize
+        # fine, but it selects which tokens attend at all, and perturbing that changes the
+        # sparse pattern rather than merely adding weight noise. ~20M params total.
+        # `mlp.gate` needs no entry — it is not an nn.Linear, so the walk never sees it.
+        #
+        # STREAMING IS MANDATORY: `mtp` is absent from the meta-instantiated class
+        # (transformers drops it via _keys_to_ignore_on_load_unexpected), so a
+        # non-streaming save would silently drop the MTP head — the Qwen3.5 failure.
+        'layers_attr': 'model.language_model.layers',
+        'embed_attr': 'model.language_model.embed_tokens',
+        'rotary_attr': 'model.language_model.rotary_emb',
+        'sd_prefix': 'model.language_model.layers',
+        'trust_remote_code': False,
+        'forward_kwargs': 'default',
+        'multimodal_text': True,
+        'stacked_experts': True,
+        'skip_linears': ('.in_proj_b', '.in_proj_a', '.shared_expert_gate',
+                         '.block_inject_weight', '.indexer.'),
+    },
     'SarvamMoEForCausalLM': {
         # sarvam-30b (model_type `sarvam_moe`, trust_remote_code): a dense-text
         # MoE. Standard `model.layers.*` layout; embeddings at
@@ -369,6 +408,37 @@ def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None, multimodal
             raise
         return AutoModelForImageTextToText.from_config(
             cfg, trust_remote_code=trust_remote_code, dtype=dtype)
+
+
+def _stacked_experts_enabled(arch, profile=None):
+    """True when this architecture stores routed MoE experts as stacked 3-D Parameters.
+
+    Those tensors are invisible to the ``nn.Linear`` walk, so an architecture that has them
+    and does not opt in here is silently under-quantized: the run finishes, reports success,
+    and leaves the experts bf16. On Qwen4Exp that is 67% of a 335 GiB model — a "4 bpw"
+    checkpoint still weighing ~290 GiB, with nothing raising.
+
+    Gemma-4 was detected by substring and keeps working that way; new architectures opt in
+    with ``'stacked_experts': True`` in their profile, the same declarative route
+    ``_is_multimodal_text`` uses, so this stays a capability rather than a list of names.
+    """
+    if profile and profile.get('stacked_experts'):
+        return True
+    return "Gemma4" in arch and "ForConditionalGeneration" in arch
+
+
+def _collect_stacked_experts(layer):
+    """[(module_name, module)] for every fused-expert container in the block.
+
+    Detected by structure — a 3-D ``gate_up_proj`` Parameter — not by name, so it covers
+    Gemma4TextExperts and Qwen4Exp's container without knowing either.
+    """
+    out = []
+    for mn, mod in layer.named_modules():
+        gup = getattr(mod, 'gate_up_proj', None)
+        if isinstance(gup, nn.Parameter) and gup.dim() == 3:
+            out.append((mn, mod))
+    return out
 
 
 def _collect_linears(layer, profile):
@@ -1549,13 +1619,13 @@ def quantize(
         gemma4_experts = []        # list of (module_name, experts_module)
         moe_expert_hessians = {}   # virtual_name -> accumulated input Gram (GPU)
         moe_hooks = []
-        if is_gemma4:
+        # Capability, not a name: architectures with stacked experts opt in through the
+        # profile (see _stacked_experts_enabled). Gated on `is_gemma4` alone, Qwen4Exp
+        # walked straight past 67% of its own weights and reported success.
+        if _stacked_experts_enabled(arch, profile):
             linears = {n: m for n, m in linears.items()
                        if not n.endswith('router.proj')}
-            for mn, mod in layer.named_modules():
-                gup = getattr(mod, 'gate_up_proj', None)
-                if isinstance(gup, nn.Parameter) and gup.dim() == 3:
-                    gemma4_experts.append((mn, mod))
+            gemma4_experts = _collect_stacked_experts(layer)
 
             def _make_expert_hook(mn, emod):
                 n_exp = emod.gate_up_proj.shape[0]
