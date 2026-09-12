@@ -53,6 +53,64 @@ _GLQ_TRELLIS_CUDAGRAPH_MAX_B = int(os.environ.get("GLQ_TRELLIS_CUDAGRAPH_MAX_B",
 _VitGraph = namedtuple("_VitGraph", "graph x_buf overlap_buf out_buf")
 
 
+def _fused_step_fallback_allowed(capturing: bool) -> bool:
+    """Whether viterbi's fused-step handler may run its eager fallback.
+
+    Outside capture: yes — a Triton compile/launch failure must not kill a quantize, and the
+    compiled update is bit-exact. Inside a CUDA-graph capture: no. The fallback would launch
+    a kernel into a region that is already failing, so the capture handler would never see a
+    clean error and the context would be poisoned twice. Re-raise instead and let the
+    capture handler recover.
+    """
+    return not capturing
+
+
+def _is_capturing() -> bool:
+    """True while this thread's stream is capturing a CUDA graph."""
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:                            # noqa: BLE001 - no CUDA / old torch
+        return False
+
+
+def _recover_cuda_context() -> bool:
+    """Bring the CUDA context back to a usable state after a failed graph capture.
+
+    A capture that raises part-way leaves the context in an error state. Anything launched
+    next — including the eager path the capture handler advertises as its fallback — fails
+    with `device-side assert triggered`, several frames from the real cause. That is exactly
+    how a 335 GiB quantize died: the warning said "using the per-pass path" and the next
+    line was the assert.
+
+    Synchronizing surfaces any deferred error here, where it can be attributed, instead of
+    at the caller's first kernel. Returns True when the context looks usable.
+
+    No CUDA (CPU-only box, or torch built without it) means nothing to recover: True, so the
+    caller's error path does not itself fail.
+    """
+    if not torch.cuda.is_available():
+        return True
+    try:
+        torch.cuda.synchronize()
+        return True
+    except Exception:                            # noqa: BLE001 - context is unusable
+        return False
+
+
+def _disable_cudagraph_capture(reason: str) -> None:
+    """Stop attempting capture for the rest of the process.
+
+    The per-shape None sentinel is not enough: a context that has already been poisoned once
+    is not shape-specific, and retrying on the next shape risks compounding the failure.
+    Costs speed on later shapes, which is the right trade against a crash.
+    """
+    global _GLQ_TRELLIS_CUDAGRAPH_ENABLED
+    _GLQ_TRELLIS_CUDAGRAPH_ENABLED = False
+    warnings.warn(
+        f"trellis CUDA-graph capture disabled for this process after a failure: {reason}",
+        RuntimeWarning, stacklevel=3)
+
+
 def _trellis_cudagraph_on():
     return (_GLQ_TRELLIS_CUDAGRAPH_ENABLED
             and not os.environ.get("GLQ_TRELLIS_NO_CUDAGRAPH")
@@ -276,6 +334,12 @@ class bitshift_codebook(nn.Module):
                     # a Triton compile/launch failure must not kill quantization — the
                     # compiled update is bit-exact. Nothing was written for this step
                     # (the failure precedes the kernel's stores), so redoing it is safe.
+                    #
+                    # EXCEPT while capturing a CUDA graph: launching the fallback into a
+                    # region that is already failing poisons the context a second time and
+                    # denies the capture handler a clean error. Re-raise; it recovers.
+                    if not _fused_step_fallback_allowed(_is_capturing()):
+                        raise
                     global _GLQ_TRELLIS_FUSED_STEP_ENABLED
                     _GLQ_TRELLIS_FUSED_STEP_ENABLED = False
                     use_fused = False
@@ -342,16 +406,28 @@ class bitshift_codebook(nn.Module):
         overlap host dispatch, which the graph has already collapsed to one launch."""
         key = (int(X.shape[0]), int(X.shape[1]), overlap is not None)  # (T, B, has_overlap)
         with self._vit_lock:
+            if not _GLQ_TRELLIS_CUDAGRAPH_ENABLED:   # see _pair_graphed
+                return self.viterbi(X, overlap)
             if key not in self._vit_graphs:
                 try:
                     self._vit_graphs[key] = self._capture_viterbi(X, overlap)
                 except Exception as e:
-                    # Fall back to eager for THIS shape only (a None sentinel, not a retry) and
-                    # WARN — a silent global disable previously hid a real capture bug.
+                    # WARN rather than fail silently — a silent global disable previously hid
+                    # a real capture bug. But the eager fallback promised here can only run if
+                    # the context survived the failed capture, so recover first and drop the
+                    # shared pool (the pair path uses it too).
+                    self._vit_graph_pool = None
+                    self._vit_graphs[key] = None
+                    if not _recover_cuda_context():
+                        raise RuntimeError(
+                            f"trellis Viterbi CUDA-graph capture failed for {key} and the CUDA "
+                            f"context could not be recovered, so the eager fallback cannot "
+                            f"run. Re-run with GLQ_TRELLIS_NO_CUDAGRAPH=1. "
+                            f"Original error: {type(e).__name__}: {e}") from e
                     warnings.warn(
                         f"trellis Viterbi CUDA-graph capture failed for {key}; using eager for "
                         f"this shape. {type(e).__name__}: {e}", RuntimeWarning, stacklevel=2)
-                    self._vit_graphs[key] = None
+                    _disable_cudagraph_capture(f"viterbi capture {key}")
             entry = self._vit_graphs[key]
             if entry is None:                      # capture failed for this shape → eager
                 return self.viterbi(X, overlap)
@@ -397,15 +473,30 @@ class bitshift_codebook(nn.Module):
         `_viterbi_graphed` — capture is process-global and the static buffers are shared."""
         key = ("pair", int(X.shape[0]), int(X.shape[1]))
         with self._vit_lock:
+            # A previous failure disables capture process-wide; honour that here, not only
+            # at the call site, or the next shape attempts capture on a context that has
+            # already proven unable to support it.
+            if not _GLQ_TRELLIS_CUDAGRAPH_ENABLED:
+                return None
             if key not in self._vit_graphs:
                 try:
                     self._vit_graphs[key] = self._capture_pair(X)
                 except Exception as e:
+                    # Drop the shared pool: both capture paths use it, so one poisoned by
+                    # this failure would taint the other.
+                    self._vit_graph_pool = None
+                    self._vit_graphs[key] = None
+                    if not _recover_cuda_context():
+                        raise RuntimeError(
+                            f"trellis pair CUDA-graph capture failed for {key} and the CUDA "
+                            f"context could not be recovered, so the per-pass fallback "
+                            f"cannot run. Re-run with GLQ_TRELLIS_NO_CUDAGRAPH=1. "
+                            f"Original error: {type(e).__name__}: {e}") from e
                     warnings.warn(
                         f"trellis pair CUDA-graph capture failed for {key}; using the "
                         f"per-pass path. {type(e).__name__}: {e}", RuntimeWarning,
                         stacklevel=2)
-                    self._vit_graphs[key] = None
+                    _disable_cudagraph_capture(f"pair capture {key}")
             entry = self._vit_graphs[key]
             if entry is None:
                 return None
