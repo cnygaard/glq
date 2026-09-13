@@ -487,6 +487,36 @@ def _fmt_secs(sec: float) -> str:
     return f"{h}h{m:02d}m{s:02d}s" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
 
 
+def _prewarm_expert_graphs(linears, expert_names, codebook, device):
+    """Capture one trellis CUDA graph per distinct expert shape, single-threaded.
+
+    Must run before the ThreadPoolExecutor is constructed, not merely before the first
+    submit: capture is process-global, and any worker kernel in flight invalidates it.
+    """
+    from glq import trellis as _tr
+    prewarm = getattr(_tr, "prewarm_codebook", None)
+    if prewarm is None or str(device).startswith("cpu"):
+        return
+    # The captured shape is NOT the weight's transpose. LDLQ feeds the codebook TILES:
+    # trellis_ldlq does `tiles = WXWX.reshape(m // TD, TD * TD)` with TD=16, so every
+    # capture is (T=256, B=rows//16) — traced live as ('pair', 256, 80) for a 1280-row
+    # expert and ('pair', 256, 160) for a 2560-row one. Enumerating weight shapes instead
+    # prewarmed keys nothing ever replays while the real ones still captured inside the
+    # pool, which is the bug this exists to remove.
+    from glq.trellis import TD
+    seen = set()
+    for name in expert_names:
+        mod = linears.get(name)
+        if mod is None:
+            continue
+        rows = int(mod.weight.data.shape[0])
+        b_tiles = rows // TD
+        if b_tiles <= 0 or b_tiles in seen:
+            continue
+        seen.add(b_tiles)
+        prewarm(codebook, TD * TD, b_tiles, device=device)
+
+
 def _stacked_experts_enabled(arch, profile=None):
     """True when this architecture stores routed MoE experts as stacked 3-D Parameters.
 
@@ -2159,6 +2189,14 @@ def quantize(
                                      len(expert_names))
                     print(f"  quantizing {len(expert_names)} experts "
                           f"({n_parallel} workers) ...", flush=True)
+                    # Capture the CUDA graphs BEFORE the pool exists. Capture is
+                    # process-global and exclusive, so a sibling worker's RHT/LDLQ kernel
+                    # invalidates one in flight (cudaErrorStreamCaptureInvalidated) — which
+                    # is what killed capture on the first expert of a 1024-expert layer.
+                    # Experts in a group share a shape, so one capture serves all of them
+                    # and the pool then only replays, which IS safe concurrently.
+                    # quantize() transposes: a weight (out, in) captures as (T=in, B=out).
+                    _prewarm_expert_graphs(linears, expert_names, codebook, device)
                     progress = _ExpertProgress(len(expert_names))
                     with ThreadPoolExecutor(max_workers=n_parallel) as expert_pool:
                         futures = {}

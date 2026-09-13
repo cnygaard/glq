@@ -73,6 +73,25 @@ def _is_capturing() -> bool:
         return False
 
 
+def prewarm_codebook(codebook, T_dim, B, device, dtype=torch.float16):
+    """Prewarm every RVQ stage of a GLQ codebook.
+
+    A 4 bpw run builds several codebooks (`rvq_stages`), and each carries its OWN graph
+    cache, pool and lock — capture being process-global does not make them share state.
+    Prewarming only the primary leaves the residual stages capturing inside the pool, which
+    is the same failure with fewer occurrences.
+
+    Accepts a TrellisCodebook (wrapping `.cb`) or a bare bitshift_codebook, and is a no-op
+    for codebooks that have no capture path at all (e8p / shell).
+    """
+    stages = getattr(codebook, "rvq_stages", None) or [codebook]
+    for stage in stages:
+        inner = getattr(stage, "cb", stage)
+        fn = getattr(inner, "prewarm_shape", None)
+        if fn is not None:
+            fn(T_dim, B, device=device, dtype=dtype)
+
+
 def _recover_cuda_context() -> bool:
     """Bring the CUDA context back to a usable state after a failed graph capture.
 
@@ -465,6 +484,57 @@ class bitshift_codebook(nn.Module):
         with torch.cuda.graph(graph, pool=self._vit_graph_pool):
             out_buf = self._pair_body(x_buf)
         return _VitGraph(graph, x_buf, None, out_buf)
+
+    @torch.no_grad()
+    def prewarm_shape(self, T_dim, B, device, dtype=torch.float16):
+        """Capture the pair graph for (T_dim, B) now, single-threaded.
+
+        CUDA-graph capture is process-global and exclusive: a kernel launched by any other
+        thread while a capture is in flight invalidates it
+        (`cudaErrorStreamCaptureInvalidated`). `_vit_lock` serialises threads entering
+        `_pair_graphed`, but the MoE expert pool's other workers are inside
+        `quantize_layer_e8_shell_rht` running RHT/LDLQ kernels and hold no lock — which is
+        exactly how a 1024-expert layer killed capture on the first expert.
+
+        Every expert in a group is identically shaped, so one capture here serves all of
+        them and the pool only ever REPLAYS. Replay under concurrency is safe, and is what
+        `_vit_lock` genuinely suffices for.
+
+        The gate is deliberately the same expression `quantize` applies before calling
+        `_pair_graphed`: prewarming a shape the lazy path would reject holds a graph nothing
+        replays, and skipping one it accepts leaves that shape capturing inside the pool —
+        the bug this exists to remove.
+        """
+        # Normalize: callers pass "cuda", torch.device("cuda") or a tensor's .device, and
+        # `getattr(device, "type", None)` silently returns None for the string form — which
+        # made prewarm a no-op that looked like it had run.
+        device = torch.device(device) if not isinstance(device, torch.device) else device
+        if device.type != "cuda" or not _trellis_cudagraph_on():
+            return
+        if B > min(self._chunk_b(device), _GLQ_TRELLIS_CUDAGRAPH_MAX_B):
+            return
+        key = ("pair", int(T_dim), int(B))
+        with self._vit_lock:
+            if key in self._vit_graphs:
+                return
+            try:
+                X = torch.empty(int(T_dim), int(B), device=device, dtype=dtype)
+                self._vit_graphs[key] = self._capture_pair(X)
+            except Exception as e:                       # noqa: BLE001
+                # Identical recovery to the lazy path: a failed capture poisons the context,
+                # so the pool must not be handed a half-broken one.
+                self._vit_graph_pool = None
+                self._vit_graphs[key] = None
+                if not _recover_cuda_context():
+                    raise RuntimeError(
+                        f"trellis prewarm capture failed for {key} and the CUDA context "
+                        f"could not be recovered. Re-run with GLQ_TRELLIS_NO_CUDAGRAPH=1. "
+                        f"Original error: {type(e).__name__}: {e}") from e
+                warnings.warn(
+                    f"trellis prewarm capture failed for {key}; quantization continues on "
+                    f"the per-pass path. {type(e).__name__}: {e}",
+                    RuntimeWarning, stacklevel=2)
+                _disable_cudagraph_capture(f"prewarm {key}")
 
     @torch.no_grad()
     def _pair_graphed(self, X):
