@@ -112,7 +112,7 @@ def test_boto3_is_declared_by_the_extra_that_uses_it():
     a run that only exists because the box is ephemeral. Hit live on a 335 GiB job.
     """
     import tomllib
-    with open("pyproject.toml", "rb") as fh:
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
         extras = tomllib.load(fh)["project"]["optional-dependencies"]
     assert any("boto3" in d for d in extras.get("quantize", [])), (
         "boto3 missing from the `quantize` extra; --resume-bucket cannot work without it")
@@ -121,6 +121,6 @@ def test_boto3_is_declared_by_the_extra_that_uses_it():
 def test_boto3_stays_out_of_the_core_dependencies():
     """It must remain optional: a CPU or GPU serving install has no use for S3."""
     import tomllib
-    with open("pyproject.toml", "rb") as fh:
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
         core = tomllib.load(fh)["project"]["dependencies"]
     assert not any("boto3" in d for d in core), "boto3 does not belong in core deps"
