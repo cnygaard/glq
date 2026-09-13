@@ -410,6 +410,113 @@ def _meta_model_from_config(cfg, trust_remote_code=False, dtype=None, multimodal
             cfg, trust_remote_code=trust_remote_code, dtype=dtype)
 
 
+class _ExpertProgress:
+    """Throttled progress for routed-MoE expert quantization.
+
+    Routed experts dominate a MoE layer — Qwen3.8-Flash-Next is 512 experts x 2 matrices =
+    1024 quantizations per layer, ~2.5B parameters against ~34M for every other sublayer
+    combined — and the expert branches report only a summary when all of them finish. That
+    left a layer looking hung for minutes, with the incidental "no activations" notices the
+    only output: those are emitted BEFORE quantization and only for unrouted experts, so
+    they read like progress without being it.
+
+    Periodic rather than per-expert: one line each would be ~49,000 lines for that model.
+    No carriage returns either — these runs are nohup'd to a file, where a redrawing bar is
+    unreadable.
+
+    ``clock`` and ``emit`` are injected so the throttling and ETA arithmetic are testable
+    without sleeping. Call ``update`` only from the collecting thread; calling it from
+    workers would interleave output.
+    """
+
+    def __init__(self, total, interval=None, clock=None, emit=None, label="experts"):
+        if interval is None:
+            try:
+                interval = float(os.environ.get("GLQ_QUANT_PROGRESS_SEC", "30"))
+            except ValueError:
+                interval = 30.0
+        self.total = total
+        self.interval = max(0.0, interval)
+        self._clock = clock or time.perf_counter
+        self._emit = emit or (lambda line: print(line, flush=True))
+        self.label = label
+        self.done = 0
+        self._sqnr_sum = 0.0
+        self._sqnr_n = 0
+        self._t0 = self._clock()
+        self._last = self._t0
+
+    def update(self, sqnr=None, n=1):
+        """Record ``n`` finished experts; emit a line if the interval has elapsed."""
+        self.done += n
+        if sqnr is not None:
+            self._sqnr_sum += float(sqnr)
+            self._sqnr_n += 1
+        if not self.interval:
+            return
+        now = self._clock()
+        if now - self._last >= self.interval and self.done < self.total:
+            self._last = now
+            self._emit(self._line(now))
+
+    def finish(self):
+        """Emit the closing line, so a layer shorter than one interval is not silent."""
+        if self.interval and self.done:
+            self._emit(self._line(self._clock()))
+
+    def _line(self, now):
+        elapsed = now - self._t0
+        pct = (100.0 * self.done / self.total) if self.total else 100.0
+        eta = ""
+        if self.done and self.done < self.total:
+            remaining = (elapsed / self.done) * (self.total - self.done)
+            eta = f"  ETA {_fmt_secs(remaining)}"
+        avg = ""
+        if self._sqnr_n:
+            avg = f"  avg SQNR {self._sqnr_sum / self._sqnr_n:.1f}dB"
+        return (f"  {self.label} {self.done}/{self.total} ({pct:.0f}%)  "
+                f"{elapsed:.1f}s elapsed{eta}{avg}")
+
+
+def _fmt_secs(sec: float) -> str:
+    """h/m/s duration, matching glq/bench/progress.py:_fmt. Duplicated rather than imported
+    because glq.bench pulls the benchmarking stack, which the quantize path does not need."""
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def _prewarm_expert_graphs(linears, expert_names, codebook, device):
+    """Capture one trellis CUDA graph per distinct expert shape, single-threaded.
+
+    Must run before the ThreadPoolExecutor is constructed, not merely before the first
+    submit: capture is process-global, and any worker kernel in flight invalidates it.
+    """
+    from glq import trellis as _tr
+    prewarm = getattr(_tr, "prewarm_codebook", None)
+    if prewarm is None or str(device).startswith("cpu"):
+        return
+    # The captured shape is NOT the weight's transpose. LDLQ feeds the codebook TILES:
+    # trellis_ldlq does `tiles = WXWX.reshape(m // TD, TD * TD)` with TD=16, so every
+    # capture is (T=256, B=rows//16) — traced live as ('pair', 256, 80) for a 1280-row
+    # expert and ('pair', 256, 160) for a 2560-row one. Enumerating weight shapes instead
+    # prewarmed keys nothing ever replays while the real ones still captured inside the
+    # pool, which is the bug this exists to remove.
+    from glq.trellis import TD
+    seen = set()
+    for name in expert_names:
+        mod = linears.get(name)
+        if mod is None:
+            continue
+        rows = int(mod.weight.data.shape[0])
+        b_tiles = rows // TD
+        if b_tiles <= 0 or b_tiles in seen:
+            continue
+        seen.add(b_tiles)
+        prewarm(codebook, TD * TD, b_tiles, device=device)
+
+
 def _stacked_experts_enabled(arch, profile=None):
     """True when this architecture stores routed MoE experts as stacked 3-D Parameters.
 
@@ -2043,6 +2150,9 @@ def quantize(
                         groups.setdefault(key, []).append(name)
 
                     chunk = max(1, int(os.environ.get("GLQ_QUANT_EXPERT_BATCH", "32")))
+                    print(f"  quantizing {len(expert_names)} experts "
+                          f"(batched, chunk={chunk}) ...", flush=True)
+                    progress = _ExpertProgress(len(expert_names))
                     n_batches = 0
                     for (_shape, sub_bpw), names in groups.items():
                         for i in range(0, len(names), chunk):
@@ -2059,11 +2169,13 @@ def quantize(
                                 artifacts_cpu = {k: v.cpu() for k, v in artifacts.items()}
                                 _collect_result(nm, W_hat, artifacts_cpu, metrics)
                                 expert_sqnrs.append(metrics['sqnr'])
+                                progress.update(sqnr=metrics['sqnr'])
                             del batch
                             n_batches += 1
                             if use_gpu:
                                 torch.cuda.empty_cache()
 
+                    progress.finish()
                     dt_experts = time.perf_counter() - t0_experts
                     avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
                     print(f"  {len(expert_names)} experts in {dt_experts:.1f}s "
@@ -2072,18 +2184,36 @@ def quantize(
                 else:
                     # Shell codebook: keep the proven per-expert ThreadPool until a
                     # shell quantize_fast-batches parity test lands.
-                    from concurrent.futures import ThreadPoolExecutor
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
                     n_parallel = min(int(os.environ.get("GLQ_QUANT_EXPERT_WORKERS", "8")),
                                      len(expert_names))
+                    print(f"  quantizing {len(expert_names)} experts "
+                          f"({n_parallel} workers) ...", flush=True)
+                    # Capture the CUDA graphs BEFORE the pool exists. Capture is
+                    # process-global and exclusive, so a sibling worker's RHT/LDLQ kernel
+                    # invalidates one in flight (cudaErrorStreamCaptureInvalidated) — which
+                    # is what killed capture on the first expert of a 1024-expert layer.
+                    # Experts in a group share a shape, so one capture serves all of them
+                    # and the pool then only replays, which IS safe concurrently.
+                    # quantize() transposes: a weight (out, in) captures as (T=in, B=out).
+                    _prewarm_expert_graphs(linears, expert_names, codebook, device)
+                    progress = _ExpertProgress(len(expert_names))
                     with ThreadPoolExecutor(max_workers=n_parallel) as expert_pool:
                         futures = {}
                         for name in expert_names:
                             f = expert_pool.submit(_quantize_one, name)
                             futures[f] = name
-                        for f in futures:
+                        # as_completed, not `for f in futures`: dict order is SUBMISSION
+                        # order, so the collector blocked on expert 0 even when hundreds
+                        # had finished — no progress could be reported, and a slow early
+                        # future stalled collection. _collect_result is keyed by name, so
+                        # arrival order does not affect what is stored.
+                        for f in as_completed(futures):
                             name, W_hat, artifacts_cpu, metrics = f.result()
                             _collect_result(name, W_hat, artifacts_cpu, metrics)
                             expert_sqnrs.append(metrics['sqnr'])
+                            progress.update(sqnr=metrics['sqnr'])
+                    progress.finish()
 
                     dt_experts = time.perf_counter() - t0_experts
                     avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
