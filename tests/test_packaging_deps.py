@@ -100,3 +100,27 @@ def test_scipy_stays_out_of_the_core_dependencies():
     serving install must not be made to carry it."""
     assert "scipy" not in _core_dependencies()
     assert "scipy" not in _module_scope_imports("glq/trellis.py")
+
+
+def test_boto3_is_declared_by_the_extra_that_uses_it():
+    """`glq-quantize --resume-bucket` is the only feature that needs boto3, and it lives in
+    the `quantize` extra — so that extra must carry it.
+
+    boto3 is imported lazily in glq/resume.py precisely so a plain install stays light, and
+    that is right. What was wrong is that no extra declared it either, so
+    `glq-quantize -r --resume-bucket ...` died with a bare ModuleNotFoundError partway into
+    a run that only exists because the box is ephemeral. Hit live on a 335 GiB job.
+    """
+    import tomllib
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+        extras = tomllib.load(fh)["project"]["optional-dependencies"]
+    assert any("boto3" in d for d in extras.get("quantize", [])), (
+        "boto3 missing from the `quantize` extra; --resume-bucket cannot work without it")
+
+
+def test_boto3_stays_out_of_the_core_dependencies():
+    """It must remain optional: a CPU or GPU serving install has no use for S3."""
+    import tomllib
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+        core = tomllib.load(fh)["project"]["dependencies"]
+    assert not any("boto3" in d for d in core), "boto3 does not belong in core deps"

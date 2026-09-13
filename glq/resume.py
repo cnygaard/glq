@@ -66,7 +66,16 @@ class _S3Backend:
     """Thin boto3 wrapper. Imported lazily so boto3 stays an optional dependency."""
 
     def __init__(self, bucket):
-        import boto3                                   # noqa: PLC0415 — optional dep
+        try:
+            import boto3                               # noqa: PLC0415 — optional dep
+        except ImportError as e:                       # pragma: no cover - env-dependent
+            # Declared by the `quantize` extra, but a venv assembled by hand can still
+            # miss it. Failing with a bare ModuleNotFoundError here costs whatever the
+            # run had already done, so name the fix.
+            raise RuntimeError(
+                "--resume-bucket needs boto3, which is not installed. "
+                "Install it with:  pip install 'glq[quantize]'  (or: pip install boto3)"
+            ) from e
         self.bucket = bucket
         self._c = boto3.client("s3")
 

@@ -29,7 +29,12 @@ classifiers = [
 hf = ["transformers", "accelerate"]
 cuda = ["triton"]
 dev = ["pytest"]
-quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepiece"]
+# boto3: `glq-quantize -r --resume-bucket` persists per-layer shards to S3, which is what
+# makes a multi-hour quantize survive losing a spot box. glq/resume.py imports it lazily so
+# a serving install stays light, but nothing declared it anywhere either — so the flag died
+# with a bare ModuleNotFoundError partway into a 335 GiB run. It belongs to this extra.
+quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepiece",
+            "boto3"]
 # card generation + HF upload for the batch quantizer (scripts/batch_quantization.py)
 hub = ["jinja2", "huggingface_hub", "pyyaml"]
 # examples/chat — Gradio UI talking to vLLM's OpenAI-compatible endpoint
