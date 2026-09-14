@@ -7,7 +7,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .hadamard import fast_hadamard_transform
+from .hadamard import block_diagonal_fht, fast_hadamard_transform
 
 try:
     import triton
@@ -1407,6 +1407,51 @@ def _dequant_embedding_rows(
         out_dtype = sv.dtype
     out = deq[..., :embedding_dim].to(out_dtype)
     return out.reshape(*input_ids.shape, embedding_dim)
+
+
+def _dequant_embedding_rows_trellis(
+    input_ids: torch.Tensor,
+    trellis_packed: torch.Tensor,
+    sv: torch.Tensor,
+    wscale: torch.Tensor,
+    codebook,
+    blocks_n,
+    embedding_dim: int,
+    embed_scale: float = 1.0,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Per-row gather + trellis decode + inverse block-diagonal RHT.
+
+    The trellis analogue of :func:`_dequant_embedding_rows`, and like it the single source
+    of truth for both the HF module and the vLLM method so the two cannot drift.
+
+    Each row of the table is its own tail-biting sequence of length ``embedding_dim``, so a
+    gather is ``index_select`` on axis 0 and nothing else — no tile is shared between rows.
+    That is the difference from the 16x16 weight layout, where decoding one row would mean
+    decoding the sixteen it is tiled with.
+
+    The RHT is block-diagonal, which is what keeps a 160-wide row unpadded; the shell path's
+    full Hadamard would round it to 256. Inverse is column-FHT then SV, matching
+    ``RHT.inverse_transform_weights`` under ``apply_left=False``.
+    """
+    dev = trellis_packed.device
+    flat_ids = input_ids.reshape(-1).to(dev)
+    cb = getattr(codebook, "cb", codebook)
+
+    rows = trellis_packed.index_select(0, flat_ids)          # [B, ceil(T*K/16)]
+    state = cb.unpack_trellis(rows, embedding_dim)           # [B, T//V]
+    # recons mirrors quantize(): lut[:, state] is (V, T//V, B) and V interleaves along T.
+    deq = cb.recons(state.T.contiguous())                    # (V, T//V, B)
+    deq = deq.transpose(0, 1).reshape(embedding_dim, flat_ids.shape[0]).T.float()
+
+    deq = deq * wscale.index_select(0, flat_ids).unsqueeze(-1).float()
+    deq = block_diagonal_fht(deq, blocks_n) * sv.float()
+    if embed_scale != 1.0:
+        deq = deq * embed_scale
+
+    if out_dtype is None:
+        out_dtype = sv.dtype
+    return deq.to(out_dtype).reshape(*input_ids.shape, embedding_dim)
 
 
 class E8RHTEmbedding(nn.Module):
