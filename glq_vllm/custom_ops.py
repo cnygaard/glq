@@ -53,6 +53,20 @@ def _register_embedding_dequant(dispatch_key):
     _glq_lib.impl("embedding_dequant", _dequant_embedding_rows, dispatch_key)
     _glq_lib._register_fake("embedding_dequant", _embedding_dequant_fake)
 
+    # Trellis-coded tables (non-power-of-two widths, where shell's full Hadamard would pad
+    # the row). Fully functional signature -- lut plus the rate parameters -- because a
+    # schema cannot carry a TrellisCodebook. Same reason for wrapping it: block_diagonal_fht
+    # is untraceable, so one opaque node keeps the lookup compiling and graph-capturing.
+    from glq.quantized_linear import _dequant_embedding_rows_trellis_fn
+    _glq_lib.define(
+        "embedding_dequant_trellis(Tensor input_ids, Tensor trellis_packed, Tensor sv, "
+        "Tensor wscale, Tensor lut, Tensor blocks_n, int embedding_dim, "
+        "int L, int K, int V, float embed_scale, ScalarType? out_dtype) -> Tensor")
+    _glq_lib.impl("embedding_dequant_trellis",
+                  _dequant_embedding_rows_trellis_fn, dispatch_key)
+    _glq_lib._register_fake("embedding_dequant_trellis",
+                            _embedding_dequant_trellis_fake)
+
 
 def _ensure_registered():
     """Register GLQ CUDA C kernels as torch custom ops. Idempotent."""
@@ -524,6 +538,15 @@ def _embedding_dequant_fake(input_ids, qidxs, sv, wscale, codebook, qidxs2,
                             embed_scale, out_dtype):
     # Output: [*input_ids.shape, embedding_dim] in out_dtype (default sv.dtype),
     # on input_ids' device — matches _dequant_embedding_rows' real return.
+    dt = out_dtype if out_dtype is not None else sv.dtype
+    return input_ids.new_empty((*input_ids.shape, embedding_dim), dtype=dt)
+
+
+def _embedding_dequant_trellis_fake(input_ids, trellis_packed, sv, wscale, lut,
+                                    blocks_n, embedding_dim, L, K, V,
+                                    embed_scale, out_dtype):
+    # Same contract as the shell fake: [*input_ids.shape, embedding_dim] on input_ids'
+    # device, defaulting to sv.dtype.
     dt = out_dtype if out_dtype is not None else sv.dtype
     return input_ids.new_empty((*input_ids.shape, embedding_dim), dtype=dt)
 

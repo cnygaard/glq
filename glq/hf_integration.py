@@ -39,10 +39,16 @@ class GLQConfig(QuantizationConfigMixin):
         trust_remote_code: bool = False,
         variant: str = "hyb",
         trellis_layout: str = None,
+        ple_codebook: str = None,
         **kwargs,
     ):
         self.quant_method = "glq"
         self.codebook = codebook
+        # Codebook of the per-layer-embedding table, when it differs from the run's.
+        # vLLM's create_weights registers buffers BEFORE the checkpoint loads, and shell and
+        # trellis need different ones, so the choice cannot be read off the tensor keys there.
+        # None means shell, so checkpoints predating this keep an unchanged config.json.
+        self.ple_codebook = ple_codebook
         # Trellis codebook variant (hyb/3inst); only meaningful when codebook=="trellis".
         self.variant = variant
         # Trellis storage-layout marker ("kernel"); absent on checkpoints from before the
@@ -72,6 +78,8 @@ class GLQConfig(QuantizationConfigMixin):
             d["variant"] = self.variant
             if self.trellis_layout is not None:
                 d["trellis_layout"] = self.trellis_layout
+        if self.ple_codebook is not None:
+            d["ple_codebook"] = self.ple_codebook
         if self.layer_bpw:
             d["layer_bpw"] = self.layer_bpw
         if self.kv_cache_bits != 16:

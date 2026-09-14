@@ -2974,6 +2974,12 @@ def quantize(
         # would silently scramble under a kernel-layout decoder — the loader guards on this.
         config_dict["quantization_config"]["trellis_layout"] = (
             "kernel" if getattr(codebook, "has_kernel", True) else "natural")
+    if _ple_sp is not None and _ple_sp['codebook'] != 'shell':
+        # The serving side registers embedding buffers before the checkpoint loads, so it
+        # cannot read the codebook off the tensor keys. Emitted only when it differs from
+        # shell, so existing gemma-4 checkpoints keep an unchanged config.json.
+        config_dict["quantization_config"]["ple_codebook"] = _ple_sp['codebook']
+        config_dict["quantization_config"]["ple_bpw"] = int(_ple_sp['bpw'])
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:

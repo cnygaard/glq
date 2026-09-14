@@ -92,3 +92,26 @@ def test_every_ple_spec_is_complete(arch):
         assert key in spec, f"{arch} missing {key}"
     assert spec["codebook"] in ("shell", "trellis")
     assert isinstance(spec["bpw"], int) and 2 <= spec["bpw"] <= 8
+
+
+# ---- the serving marker ------------------------------------------------------------------
+
+def test_the_ple_codebook_round_trips_through_the_config():
+    """vLLM must know the table's codebook BEFORE weights load.
+
+    `create_weights` registers buffers up front, and shell and trellis need different ones
+    (Qidxs [vocab, n_pad/8] vs trellis_packed [vocab, ceil(width*K/16)]). The checkpoint's
+    tensor keys settle it, but they are not available at that point — so the marker rides in
+    config.json -> quantization_config, the same place `variant` and `trellis_layout` do.
+    """
+    from glq.hf_integration import GLQConfig
+    cfg = GLQConfig(codebook="trellis", variant="3inst", ple_codebook="trellis")
+    assert cfg.to_dict()["ple_codebook"] == "trellis"
+
+
+def test_a_shell_ple_does_not_emit_the_marker():
+    """Absent means shell, so existing gemma-4 checkpoints keep byte-identical config.json
+    rather than gaining a key that changes their hash."""
+    from glq.hf_integration import GLQConfig
+    assert "ple_codebook" not in GLQConfig(codebook="trellis", variant="3inst").to_dict()
+    assert "ple_codebook" not in GLQConfig(codebook="e8_shell").to_dict()

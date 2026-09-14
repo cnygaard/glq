@@ -240,6 +240,26 @@ def _make_hyb_tlut(tlut_bits=9, seed=0):
 # ---------------------------------------------------------------------------
 # bitshift trellis codebook (QTIP bitshift.py, tqdm/train paths stripped)
 # ---------------------------------------------------------------------------
+def unpack_trellis_windowed(packed, T, L, K, V):
+    """Decode packed tail-biting states without needing a codebook instance.
+
+    The one implementation of the sliding window; ``bitshift_codebook.unpack_trellis``
+    delegates here, and the embedding decode path (which must be expressible as a torch
+    custom op, so it cannot hold a codebook object) calls it directly. Kept in one place
+    because two copies of a bit-layout routine drift silently.
+    """
+    p = packed.view(torch.uint16).to(torch.int32)
+    uint_mask = (2 ** torch.arange(16, dtype=torch.int32, device=p.device)).flip(0)
+    bf = (p.unsqueeze(-1) & uint_mask) > 0
+    pad_amt = math.ceil(T * K / 16) * 16 - T * K
+    bf = bf.reshape(p.shape[0], T * K + pad_amt)[:, :T * K]
+    # Tail-biting wrap: the last windows run off the end and read the opening bits.
+    bf = torch.cat([bf, bf[:, :L - K * V]], dim=-1)
+    L_mask = (2 ** torch.arange(L, dtype=torch.int32, device=p.device)).flip(0)
+    win = bf.unfold(1, L, K * V)[:, :T // V, :]
+    return (win.int() * L_mask).sum(dim=-1)
+
+
 class bitshift_codebook(nn.Module):
 
     def __init__(self, L=16, K=2, V=2, tlut_bits=9, decode_mode="quantlut_sym", tlut=None):
@@ -685,19 +705,7 @@ class bitshift_codebook(nn.Module):
         against the sequential form verbatim, and asserts the op count no longer grows
         with T.
         """
-        packed = packed.view(torch.uint16).to(torch.int32)
-        uint_mask = (2 ** torch.arange(16, dtype=torch.int32, device=packed.device)).flip(
-            dims=(-1,)).unsqueeze(0).unsqueeze(0)
-        bf = (packed.unsqueeze(-1) & uint_mask) > 0
-        pad_amt = math.ceil(T * self.K / 16) * 16 - T * self.K
-        bf = bf.reshape(-1, (T * self.K + pad_amt))[:, :T * self.K]
-        # Tail-biting wrap: the last windows run off the end and read the opening bits.
-        bf = torch.concat([bf, bf[:, :self.L - self.K * self.V]], dim=-1)
-        L_mask = (2 ** torch.arange(self.L, dtype=torch.int32, device=packed.device).flip(dims=(-1,))).unsqueeze(0)
-        # (B, T//V, L): every L-wide window, stride K*V. unfold is a view, so the only
-        # materialized tensor is the weighted sum below.
-        win = bf.unfold(1, self.L, self.K * self.V)[:, :T // self.V, :]
-        return (win.int() * L_mask.unsqueeze(0)).sum(dim=-1)
+        return unpack_trellis_windowed(packed, T, self.L, self.K, self.V)
 
 
 # ---------------------------------------------------------------------------

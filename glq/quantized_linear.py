@@ -1434,24 +1434,58 @@ def _dequant_embedding_rows_trellis(
     full Hadamard would round it to 256. Inverse is column-FHT then SV, matching
     ``RHT.inverse_transform_weights`` under ``apply_left=False``.
     """
+    cb = getattr(codebook, "cb", codebook)
+    return _dequant_embedding_rows_trellis_fn(
+        input_ids, trellis_packed, sv, wscale, cb.lut,
+        torch.as_tensor([int(b) for b in blocks_n], dtype=torch.int32),
+        embedding_dim, int(cb.L), int(cb.K), int(cb.V), embed_scale, out_dtype)
+
+
+def _dequant_embedding_rows_trellis_fn(
+    input_ids: torch.Tensor,
+    trellis_packed: torch.Tensor,
+    sv: torch.Tensor,
+    wscale: torch.Tensor,
+    lut: torch.Tensor,
+    blocks_n: torch.Tensor,
+    embedding_dim: int,
+    L: int,
+    K: int,
+    V: int,
+    embed_scale: float = 1.0,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Functional form of the trellis row decode: tensors and ints only.
+
+    Split out from the codebook-object version so it can be registered as a torch custom op
+    for vLLM — a schema cannot carry a TrellisCodebook. The op wrapper matters because
+    ``block_diagonal_fht`` is a kernel dynamo cannot trace, which is what made the GLQ
+    embedding the last path breaking vLLM's torch.compile; one opaque node fixes that.
+
+    ``lut`` is the codebook's (V, 2**L) table; L/K/V are its rate parameters.
+    """
     dev = trellis_packed.device
     flat_ids = input_ids.reshape(-1).to(dev)
-    cb = getattr(codebook, "cb", codebook)
+    B = flat_ids.shape[0]
 
     rows = trellis_packed.index_select(0, flat_ids)          # [B, ceil(T*K/16)]
-    state = cb.unpack_trellis(rows, embedding_dim)           # [B, T//V]
-    # recons mirrors quantize(): lut[:, state] is (V, T//V, B) and V interleaves along T.
-    deq = cb.recons(state.T.contiguous())                    # (V, T//V, B)
-    deq = deq.transpose(0, 1).reshape(embedding_dim, flat_ids.shape[0]).T.float()
+    from .trellis import unpack_trellis_windowed
+    state = unpack_trellis_windowed(rows, embedding_dim, L, K, V)   # [B, T//V]
+    # Mirrors quantize(): lut[:, state] is (V, T//V, B) and V interleaves along T.
+    deq = lut.to(dev)[:, state.T.contiguous().int()]
+    deq = deq.transpose(0, 1).reshape(embedding_dim, B).T.float()
 
     deq = deq * wscale.index_select(0, flat_ids).unsqueeze(-1).float()
-    deq = block_diagonal_fht(deq, blocks_n) * sv.float()
+    deq = block_diagonal_fht(deq, [int(b) for b in blocks_n.tolist()]) * sv.float()
     if embed_scale != 1.0:
         deq = deq * embed_scale
 
     if out_dtype is None:
         out_dtype = sv.dtype
     return deq.to(out_dtype).reshape(*input_ids.shape, embedding_dim)
+
+
+
 
 
 def _pow2_blocks(n: int) -> list[int]:

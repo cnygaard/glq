@@ -177,7 +177,14 @@ class GLQvLLMConfig(QuantizationConfig):
             bpw = self._lookup_bpw(prefix)
             if bpw is None:
                 return UnquantizedEmbeddingMethod()
-            return GLQEmbeddingMethod(self, bpw=bpw)
+            # ple_codebook marks a table coded differently from the run's codebook
+            # (absent == shell, so existing checkpoints are unaffected). It has to come
+            # from config.json: create_weights runs before any tensor key is visible.
+            ple_cb = getattr(self, "ple_codebook", None) or "shell"
+            ple_bpw = getattr(self, "ple_bpw", None) or bpw
+            return GLQEmbeddingMethod(
+                self, bpw=(ple_bpw if ple_cb == "trellis" else bpw),
+                codebook=ple_cb, variant=self.variant)
 
         # FusedMoE layers — lazy import to avoid circular deps. vLLM 0.25 split the
         # 0.23 `FusedMoE` nn.Module into a factory *function* (returns a MoERunner)
