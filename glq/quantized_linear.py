@@ -1454,6 +1454,106 @@ def _dequant_embedding_rows_trellis(
     return deq.to(out_dtype).reshape(*input_ids.shape, embedding_dim)
 
 
+def _pow2_blocks(n: int) -> list[int]:
+    """Greedy power-of-two decomposition, matching ``RHT``'s block-diagonal layout.
+
+    160 -> [128, 32]. This is what lets a non-power-of-two width be transformed without
+    padding; the full-Hadamard alternative would round 160 up to 256.
+    """
+    blocks, rem = [], int(n)
+    while rem > 0:
+        b = 1 << (rem.bit_length() - 1)
+        blocks.append(b)
+        rem -= b
+    return blocks
+
+
+class TrellisRHTEmbedding(nn.Module):
+    """``nn.Embedding`` equivalent backed by a trellis-coded table.
+
+    The trellis counterpart of :class:`E8RHTEmbedding`, for tables whose width is not a
+    power of two. Shell decodes through a full Hadamard and so pads the row: gemma-4's PLE
+    width already is a power of two and pays nothing, but Qwen4Exp's 160 rounds to 256 — a
+    1.6x tax on a table that is 95.4 GiB before quantization. Block-diagonal RHT leaves 160
+    alone, and that unpadded layout is the one the trellis path requires.
+
+    Each row is an independent tail-biting sequence of length ``embedding_dim``, so a lookup
+    decodes only the rows asked for. Storage at K bits/weight is
+    ``ceil(embedding_dim*K/16)`` int16 per row — 60 B at width 160, K=3 — plus a per-row
+    fp16 scale (fp32 would add 1.19 GiB over 320M rows).
+
+    ``K`` is not stored anywhere but the packed width, and is recovered from it on load;
+    guessing it decodes noise of exactly the right shape.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, bpw: int = 3,
+                 embed_scale: float = 1.0, variant: str = "3inst"):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.embed_scale = float(embed_scale)
+        self.variant = variant
+        self.K = int(bpw)
+
+        self.register_buffer('trellis_packed', torch.zeros(
+            num_embeddings, math.ceil(embedding_dim * self.K / 16), dtype=torch.int16))
+        self.register_buffer('Wscale', torch.ones(num_embeddings, dtype=torch.float16))
+        self.register_buffer('SV', torch.ones(embedding_dim, dtype=torch.float16))
+        # Block sizes of the block-diagonal RHT. Stored rather than re-derived so a
+        # non-power-of-two width cannot be decomposed one way at encode and another at load.
+        self.register_buffer('rht_blocks', torch.tensor(
+            _pow2_blocks(embedding_dim), dtype=torch.int32))
+        # HYB carries a learned tlut; 3INST is lookup-free and carries none.
+        self.register_buffer('tlut', None)
+        self.codebook = None
+
+    def set_codebook(self, codebook, codebook2=None):
+        """Attach a shared TrellisCodebook. Mirrors the E8RHTEmbedding API."""
+        self.codebook = codebook
+
+    def _ensure_codebook(self):
+        if self.codebook is None:
+            from .trellis import TrellisCodebook
+            self.codebook = TrellisCodebook(
+                variant=self.variant, K=self.K, device=self.trellis_packed.device,
+                tlut=self.tlut)
+        return self.codebook
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        """Recover K from the packed width and resize before the copy.
+
+        cols == ceil(embedding_dim*K/16) is a checkpoint's only record of the rate, the same
+        way ``tr_bits_from_packed`` recovers it for linear layers. A module built with the
+        wrong default would otherwise fail the size check, or silently decode at the wrong
+        rate if the sizes happened to agree.
+        """
+        key = prefix + 'trellis_packed'
+        if key in state_dict:
+            cols = state_dict[key].shape[-1]
+            self.K = max(1, round(cols * 16 / self.embedding_dim))
+            if tuple(self.trellis_packed.shape) != tuple(state_dict[key].shape):
+                self.trellis_packed = torch.zeros_like(state_dict[key])
+        tl = prefix + 'tlut'
+        if tl in state_dict and state_dict[tl] is not None:
+            self.tlut = torch.zeros_like(state_dict[tl])
+        self.codebook = None        # rebuilt against the loaded rate/tlut
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return _dequant_embedding_rows_trellis(
+            input_ids, self.trellis_packed, self.SV, self.Wscale,
+            self._ensure_codebook(), [int(b) for b in self.rht_blocks.tolist()],
+            embedding_dim=self.embedding_dim, embed_scale=self.embed_scale,
+            out_dtype=getattr(self, "_compute_dtype", self.SV.dtype))
+
+    def extra_repr(self) -> str:
+        return (f'num_embeddings={self.num_embeddings}, '
+                f'embedding_dim={self.embedding_dim}, K={self.K}')
+
+
 class E8RHTEmbedding(nn.Module):
     """nn.Embedding equivalent with E8 + right-side-only RHT compressed weight.
 

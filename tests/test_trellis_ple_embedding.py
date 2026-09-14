@@ -114,3 +114,112 @@ def test_quantization_actually_preserves_the_table():
         arts["_codebook"], arts["_blocks_n"], WIDTH).float()
     sqnr = 10 * torch.log10(W.pow(2).sum() / (W - got).pow(2).sum())
     assert sqnr > 12.0, f"SQNR {sqnr:.1f} dB — decode is not reconstructing the table"
+
+
+# ---- the nn.Module wrapper ----------------------------------------------------------------
+
+def _build_module(rows=64, bpw=3):
+    """Quantize a table, then load it into a fresh module the way a checkpoint would."""
+    from glq.quantized_linear import TrellisRHTEmbedding
+    W = _table(rows=rows)
+    arts, w_hat = _quantize_ple_chunk_trellis(W, bpw=bpw, device="cpu")
+    mod = TrellisRHTEmbedding(rows, WIDTH)
+    sd = {k: v for k, v in arts.items() if not k.startswith("_")}
+    sd["rht_blocks"] = torch.tensor(arts["_blocks_n"], dtype=torch.int32)
+    missing, unexpected = mod.load_state_dict(sd, strict=False)
+    return mod, W, w_hat, missing, unexpected
+
+
+def test_the_module_loads_a_checkpoint_shaped_state_dict():
+    mod, _, _, missing, unexpected = _build_module()
+    assert not unexpected, f"checkpoint keys the module does not declare: {unexpected}"
+    assert not [m for m in missing if not m.startswith("_")], f"missing: {missing}"
+
+
+def test_the_module_reproduces_the_encoder():
+    """Module forward and the encoder's W_hat must agree, or the checkpoint and the
+    in-memory result have quietly diverged."""
+    mod, _, w_hat, _, _ = _build_module()
+    out = mod(torch.arange(64))
+    assert torch.allclose(out.float(), w_hat.float(), atol=1e-3)
+
+
+def test_the_module_infers_the_rate_from_the_packed_shape():
+    """cols == ceil(width*K/16) is the only record of K in a checkpoint. Guessing it wrong
+    decodes garbage that still has the right shape."""
+    for bpw in (2, 3, 4):
+        mod, _, _, _, _ = _build_module(bpw=bpw)
+        assert mod.K == bpw, f"inferred K={mod.K} for a {bpw} bpw table"
+
+
+def test_a_gather_through_the_module_matches_a_full_decode():
+    mod, _, _, _, _ = _build_module()
+    ids = torch.tensor([9, 2, 63, 2])
+    assert torch.equal(mod(ids), mod(torch.arange(64))[ids])
+
+
+def test_embed_scale_is_applied():
+    """Scaled-word-embedding archs multiply lookups inside their own forward; a substituted
+    module has to reproduce that or every downstream activation is off by sqrt(dim)."""
+    from glq.quantized_linear import TrellisRHTEmbedding
+    mod, _, _, _, _ = _build_module()
+    plain = mod(torch.arange(8)).float()
+    mod2 = TrellisRHTEmbedding(64, WIDTH, embed_scale=2.0)
+    mod2.load_state_dict(mod.state_dict(), strict=False)
+    mod2.set_codebook(mod.codebook)
+    assert torch.allclose(mod2(torch.arange(8)).float(), plain * 2.0, atol=1e-3)
+
+
+@pytest.mark.parametrize("n", [160, 256, 320, 2560, 96, 1536])
+def test_the_modules_default_block_layout_matches_the_rht(n):
+    """`_pow2_blocks` is the module's pre-load default for the inverse transform. If it ever
+    disagreed with RHT's own decomposition — in composition OR order — a module used before
+    a checkpoint overwrote `rht_blocks` would inverse-transform against the wrong block
+    structure and return plausible-looking noise."""
+    from glq.rht import RHT
+    from glq.quantized_linear import _pow2_blocks
+    rht = RHT(8, n, device="cpu", block_diagonal=True, apply_left=False, e8p=False)
+    assert list(rht.blocks_n) == _pow2_blocks(n)
+
+
+# ---- HF substitution ----------------------------------------------------------------------
+
+def test_a_trellis_payload_selects_the_trellis_module(tmp_path):
+    """Which module replaces an nn.Embedding is decided by what the checkpoint actually
+    stores, not by the run's --codebook.
+
+    A checkpoint records its PLE payload as `.trellis_packed` or `.Qidxs`, and picking the
+    wrong module is not a graceful failure: the shell module would look for Qidxs that is
+    not there, or size a full-Hadamard buffer for an unpadded row.
+    """
+    import torch.nn as nn
+    from glq.hf_integration import replace_with_glq_embedding
+    from glq.quantized_linear import E8RHTEmbedding, TrellisRHTEmbedding
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ple = nn.Embedding(64, WIDTH)
+            self.other = nn.Embedding(64, WIDTH)
+
+    m = _M()
+    replace_with_glq_embedding(m, quantized_layers={"ple", "other"},
+                               trellis_layers={"ple"})
+    assert isinstance(m.ple, TrellisRHTEmbedding), type(m.ple)
+    assert isinstance(m.other, E8RHTEmbedding), "non-trellis payload must stay on shell"
+
+
+def test_no_trellis_set_keeps_every_embedding_on_shell():
+    """Back-compat: existing gemma-4 checkpoints pass no trellis set and must be untouched."""
+    import torch.nn as nn
+    from glq.hf_integration import replace_with_glq_embedding
+    from glq.quantized_linear import E8RHTEmbedding
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ple = nn.Embedding(32, 256)
+
+    m = _M()
+    replace_with_glq_embedding(m, quantized_layers={"ple"})
+    assert isinstance(m.ple, E8RHTEmbedding)
