@@ -666,22 +666,38 @@ class bitshift_codebook(nn.Module):
         return (bf.to(torch.int32) * uint_mask).sum(dim=-1).to(torch.uint16).view(torch.int16)
 
     def unpack_trellis(self, packed, T):
-        """Inverse of ``pack_trellis``: (B, ceil(T*K/16)) int16 → (B, T//V) int trellis."""
+        """Inverse of ``pack_trellis``: (B, ceil(T*K/16)) int16 → (B, T//V) int trellis.
+
+        The defining recurrence looks sequential::
+
+            trellis[:, i] = ((trellis[:, i-1] << K*V) & (2**L - 1))
+                            + bits[L + (i-1)*K*V : L + i*K*V]
+
+        but ``<< K*V`` masked to L bits is a shift register: it discards the top K*V bits
+        and admits K*V fresh ones. By induction ``trellis[:, i]`` is just the L-wide window
+        of the (tail-biting) bitstream at offset ``i*K*V``, so every step is independent and
+        the whole thing is one strided ``unfold``.
+
+        Worth the rewrite because embedding decode puts this on the per-token path, where
+        the loop form is launch-bound rather than work-bound: measured on an RTX PRO 6000
+        at T=160, it cost ~8.1 ms at *any* batch size (160 tiny kernels) against 0.11 ms
+        here — 74x at B=8, 47x at B=4096. ``tests/test_trellis_storage.py`` pins the output
+        against the sequential form verbatim, and asserts the op count no longer grows
+        with T.
+        """
         packed = packed.view(torch.uint16).to(torch.int32)
         uint_mask = (2 ** torch.arange(16, dtype=torch.int32, device=packed.device)).flip(
             dims=(-1,)).unsqueeze(0).unsqueeze(0)
         bf = (packed.unsqueeze(-1) & uint_mask) > 0
         pad_amt = math.ceil(T * self.K / 16) * 16 - T * self.K
         bf = bf.reshape(-1, (T * self.K + pad_amt))[:, :T * self.K]
+        # Tail-biting wrap: the last windows run off the end and read the opening bits.
         bf = torch.concat([bf, bf[:, :self.L - self.K * self.V]], dim=-1)
         L_mask = (2 ** torch.arange(self.L, dtype=torch.int32, device=packed.device).flip(dims=(-1,))).unsqueeze(0)
-        K_mask = (2 ** torch.arange(self.K * self.V, dtype=torch.int32, device=packed.device).flip(dims=(-1,))).unsqueeze(0)
-        trellis = torch.zeros(bf.shape[0], T // self.V, dtype=torch.int32, device=bf.device)
-        trellis[:, 0] = (bf[:, :self.L].int() * L_mask).sum(dim=-1)
-        for i in range(1, T // self.V):
-            trellis[:, i] = ((trellis[:, i - 1] << (self.K * self.V)) & ((1 << self.L) - 1)) + \
-                (bf[:, self.L + (i - 1) * self.K * self.V:self.L + i * self.K * self.V].int() * K_mask).sum(dim=-1)
-        return trellis
+        # (B, T//V, L): every L-wide window, stride K*V. unfold is a view, so the only
+        # materialized tensor is the weighted sum below.
+        win = bf.unfold(1, self.L, self.K * self.V)[:, :T // self.V, :]
+        return (win.int() * L_mask.unsqueeze(0)).sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------

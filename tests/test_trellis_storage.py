@@ -252,3 +252,107 @@ def test_sqnr_strictly_improves_with_rate():
     # mean the extra bits are not reaching the Viterbi.
     assert sqnr[3] - sqnr[2] > 3.0, sqnr
     assert sqnr[4] - sqnr[3] > 3.0, sqnr
+
+
+# ---------------------------------------------------------------------------
+# 4. unpack_trellis is a sliding window, not a sequential recursion
+# ---------------------------------------------------------------------------
+#
+# The published form carries state across T//V steps:
+#
+#     trellis[:, i] = ((trellis[:, i-1] << K*V) & (2**L - 1)) + bits[L+(i-1)*K*V : L+i*K*V]
+#
+# which reads as a dependency chain and was implemented as a Python loop — T//V tiny kernels
+# per call. But `<< K*V` masked to L bits is a shift register: it drops the top K*V bits and
+# admits K*V new ones, so by induction trellis[:, i] is simply the L-wide window of the
+# (tail-biting) bitstream at offset i*K*V. Every step is therefore independent.
+#
+# That matters because embedding decode puts this on the per-token path: measured on an
+# RTX PRO 6000, the loop cost ~8.1 ms at ANY batch size (launch-bound), against 0.11 ms
+# windowed — 74x at B=8.
+#
+# _reference_unpack below is the original loop, kept as the oracle so the fast path is
+# pinned against the definition rather than against itself.
+
+
+def _reference_unpack(cb, packed, T):
+    """The sequential form, verbatim, as the correctness oracle."""
+    packed = packed.view(torch.uint16).to(torch.int32)
+    uint_mask = (2 ** torch.arange(16, dtype=torch.int32)).flip(dims=(-1,))[None, None]
+    bf = (packed.unsqueeze(-1) & uint_mask) > 0
+    pad_amt = math.ceil(T * cb.K / 16) * 16 - T * cb.K
+    bf = bf.reshape(-1, (T * cb.K + pad_amt))[:, :T * cb.K]
+    bf = torch.concat([bf, bf[:, :cb.L - cb.K * cb.V]], dim=-1)
+    L_mask = (2 ** torch.arange(cb.L, dtype=torch.int32)).flip(dims=(-1,))[None]
+    K_mask = (2 ** torch.arange(cb.K * cb.V, dtype=torch.int32)).flip(dims=(-1,))[None]
+    out = torch.zeros(bf.shape[0], T // cb.V, dtype=torch.int32)
+    out[:, 0] = (bf[:, :cb.L].int() * L_mask).sum(dim=-1)
+    for i in range(1, T // cb.V):
+        out[:, i] = ((out[:, i - 1] << (cb.K * cb.V)) & ((1 << cb.L) - 1)) + \
+            (bf[:, cb.L + (i - 1) * cb.K * cb.V:cb.L + i * cb.K * cb.V].int()
+             * K_mask).sum(dim=-1)
+    return out
+
+
+def _rand_packed(cb, T, rows=5, seed=3):
+    g = torch.Generator().manual_seed(seed)
+    cols = math.ceil(T * cb.K / 16)
+    return torch.randint(-32768, 32767, (rows, cols), generator=g,
+                         dtype=torch.int16)
+
+
+@pytest.mark.parametrize("K", KS)
+@pytest.mark.parametrize("maker,name", [(_hyb_cb, "hyb"), (_3inst_cb, "3inst")])
+@pytest.mark.parametrize("T", [256, 160])
+def test_unpack_matches_the_sequential_definition(K, maker, name, T):
+    """Both V=2 (hyb) and V=1 (3inst), and both the 16x16 tile length and the 160-wide
+    embedding row length."""
+    cb = maker(K=K).cb if hasattr(maker(K=K), "cb") else maker(K=K)
+    if T % cb.V:
+        pytest.skip(f"T={T} not divisible by V={cb.V}")
+    packed = _rand_packed(cb, T)
+    assert torch.equal(cb.unpack_trellis(packed, T).to(torch.int32),
+                       _reference_unpack(cb, packed, T)), name
+
+
+@pytest.mark.parametrize("K", KS)
+def test_unpack_roundtrips_real_encoder_state_at_row_length(K):
+    """T=160 is the PLE row length: each embedding row is its own tail-biting sequence,
+    which is what makes a row-subset gather decodable without touching its neighbours."""
+    cb = _3inst_cb(K=K).cb
+    torch.manual_seed(1)
+    _, state = cb.quantize(torch.randn(8, 160) * 0.02)
+    packed = cb.pack_trellis(state)
+    assert torch.equal(cb.unpack_trellis(packed, 160).to(torch.int32),
+                       state.to(torch.int32))
+
+
+def test_unpack_work_does_not_grow_with_sequence_length():
+    """The mechanism, asserted without a stopwatch.
+
+    A per-step loop issues work proportional to T//V; a windowed implementation issues the
+    same fixed set of ops whatever T is. Counting dispatched aten calls distinguishes the
+    two deterministically, so this cannot pass via a fallback that is merely fast today.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _Count(TorchDispatchMode):
+        def __init__(self):
+            self.n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    cb = _3inst_cb(K=3).cb
+
+    def count(T):
+        packed = _rand_packed(cb, T)
+        c = _Count()
+        with c:
+            cb.unpack_trellis(packed, T)
+        return c.n
+
+    small, big = count(256), count(2560)      # 10x the sequence length
+    assert big == small, (
+        f"op count grew {small} -> {big} with T: still per-step, not windowed")
