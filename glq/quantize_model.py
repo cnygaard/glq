@@ -255,6 +255,10 @@ _MODEL_PROFILES = {
         'trust_remote_code': False,
         'forward_kwargs': 'default',
         'multimodal_text': True,
+        # Qwen3_5TextRotaryEmbedding expands to 3 rope grids unconditionally, without the
+        # config declaring mrope_section, so the 3-D position_ids cannot be detected from
+        # rope_parameters the way Qwen4Exp's are.
+        'mrope_position_ids': True,
         'skip_linears': ('.in_proj_b', '.in_proj_a'),
     },
     'Qwen4ExpForConditionalGeneration': {
@@ -692,14 +696,26 @@ def get_rotary_emb(text_model, profile=None):
     return None
 
 
-def _uses_mrope(cfg) -> bool:
-    """True when the model's rope is multi-axis (mRoPE), so position_ids must be 3-D.
+def _uses_mrope(cfg, profile=None) -> bool:
+    """True when the rotary expects 3-D (multi-axis) position_ids.
 
-    Detected from ``rope_parameters.mrope_section`` rather than the architecture name: it
-    is a property of the rope configuration, and any arch adopting mRoPE needs the same
-    treatment. Tolerant of both dict and attribute-style rope configs, and of models with
-    no rope config at all.
+    Two routes, because the config alone is not sufficient:
+
+    * ``rope_parameters.mrope_section`` — the honest signal, and what Qwen4Exp declares.
+      Preferred, since any arch adopting mRoPE gets the right treatment for free.
+    * ``'mrope_position_ids': True`` on the profile — for models that need 3-D position_ids
+      while declaring no mrope_section at all. Qwen3.5 is one: its rope_parameters are a
+      plain ``{partial_rotary_factor, rope_theta, rope_type: 'default'}``, but
+      ``Qwen3_5TextRotaryEmbedding.forward`` expands unconditionally
+      (``inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)``) because,
+      in its own words, "Qwen3_5Text has different position ids for the grids".
+
+    Missing the second route is not cosmetic: on transformers >= 5.16 a Qwen3.5 streaming
+    quantize dies with "too many indices for tensor of dimension 2" before the first layer.
+    Since qwen4_exp needs >= 5.16, without this no single environment quantizes both.
     """
+    if profile and profile.get('mrope_position_ids'):
+        return True
     if cfg is None:
         return False
     inner = getattr(cfg, "text_config", cfg)
@@ -794,9 +810,9 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
     # temporal/height/width, `mrope_section` — and its forward does
     # `position_ids[:, :, None, :]`, so a 2-D tensor raises "too many indices for tensor of
     # dimension 2". Text-only calibration has no image grid, so all three axes carry the
-    # same positions. Driven off the config rather than the architecture name, because this
-    # is a property of the rope configuration and other archs will adopt it.
-    if _uses_mrope(cfg):
+    # same positions. Driven off the rope config where the model declares mrope_section,
+    # and off a profile flag where it does not (Qwen3.5 expands to 3 grids regardless).
+    if _uses_mrope(cfg, profile):
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
     kwargs = dict(position_ids=position_ids, cache_position=cache_position,
                   use_cache=False)

@@ -218,3 +218,61 @@ def test_input_ids_are_omitted_when_not_supplied():
     kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), rot, layer_idx=0,
                                   cfg=_Cfg(mrope=True))
     assert "input_ids" not in kw
+
+
+def test_qwen3_5_gets_three_axis_position_ids_without_declaring_mrope_section():
+    """Qwen3.5 needs 3-D position_ids but its config never says so.
+
+    `Qwen3_5TextRotaryEmbedding.forward` expands unconditionally --
+    `inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)` with the comment
+    "Qwen3_5Text has different position ids for the grids" -- while its rope_parameters are
+    plain `{partial_rotary_factor, rope_theta, rope_type: 'default'}` with no mrope_section.
+
+    So config-driven detection alone returns False and the streaming quantize dies with
+    "too many indices for tensor of dimension 2" on transformers >= 5.16. That matters
+    because qwen4_exp needs >= 5.16, so without this no single environment can quantize both
+    families. Verified on the box against transformers 5.17.0.
+    """
+    class _PlainCfg:
+        def __init__(self):
+            self.text_config = self
+            self.rope_parameters = {"partial_rotary_factor": 0.25,
+                                    "rope_theta": 10000.0, "rope_type": "default"}
+            self.layer_types = ["full_attention"]
+            self.hidden_size_per_layer_input = 0
+            self.num_kv_shared_layers = 0
+
+    profile = qm._MODEL_PROFILES["Qwen3_5ForConditionalGeneration"]
+    rot = _Rotary()
+    kw = qm._build_forward_kwargs(profile, torch.zeros(1, 8, 4), rot,
+                                  layer_idx=0, cfg=_PlainCfg())
+    assert kw["position_ids"].dim() == 3, (
+        "Qwen3.5 rotary indexes position_ids[:, :, None, :]")
+    assert rot.seen[0] == 3
+
+
+def test_the_three_axes_carry_identical_positions():
+    """Text-only calibration has no image grid, so t/h/w must all be the plain positions.
+    Distinct values here would silently calibrate against rope phases the model never sees
+    at inference."""
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), _Rotary(),
+                                  layer_idx=0, cfg=_Cfg(mrope=True))
+    pos = kw["position_ids"]
+    assert torch.equal(pos[0], pos[1]) and torch.equal(pos[1], pos[2])
+
+
+def test_a_profile_without_the_flag_is_unaffected():
+    """The default path must not acquire 3-D position_ids by accident."""
+    class _PlainRotary:
+        def __init__(self):
+            self.seen = None
+
+        def __call__(self, x, position_ids=None, **kw):
+            self.seen = tuple(position_ids.shape)
+            return (torch.zeros(1), torch.zeros(1))
+
+    rot = _PlainRotary()
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), rot, layer_idx=0,
+                                  cfg=_Cfg(mrope=False))
+    assert kw["position_ids"].dim() == 2
+    assert rot.seen[0] == 1
