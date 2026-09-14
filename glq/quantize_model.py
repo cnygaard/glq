@@ -2690,6 +2690,8 @@ def quantize(
         chunk_rows = 16384
         ple_qidxs_chunks = []
         ple_qidxs2_chunks = []
+        ple_packed_chunks = []          # trellis path
+        ple_blocks_n = None
         H_id = torch.eye(embed_dim_ple, dtype=torch.float32, device=device)
         ple_sv = None  # SV is RHT-seeded identically for every chunk
         ple_su = None
@@ -2725,6 +2727,24 @@ def quantize(
         for r0 in range(0, vocab_size_ple, chunk_rows):
             r1 = min(r0 + chunk_rows, vocab_size_ple)
             chunk = ple_read(r0, r1).to(device=device, dtype=torch.float32)
+            if ple_spec['codebook'] == 'trellis':
+                # Row-wise: each row is its own tail-biting sequence, so a gathered row
+                # decodes without touching its neighbours. Scale is genuinely per row here
+                # (the shell path below calibrates per chunk and stores it per row).
+                arts_chunk, hat_chunk = _quantize_ple_chunk_trellis(
+                    chunk, bpw=ple_embed_bpw, device=device, codebook=ple_codebook)
+                ple_packed_chunks.append(arts_chunk['trellis_packed'])
+                ple_wscale_per_row[r0:r1] = arts_chunk['Wscale'].float()
+                if ple_sv is None:
+                    ple_sv = arts_chunk['SV']
+                    ple_blocks_n = arts_chunk['_blocks_n']
+                err = (chunk - hat_chunk.to(chunk.dtype)).pow(2).sum()
+                ple_sqnr_chunks.append(float(
+                    10 * torch.log10(chunk.pow(2).sum() / err.clamp_min(1e-30))))
+                del chunk, hat_chunk, arts_chunk
+                if use_gpu:
+                    torch.cuda.empty_cache()
+                continue
             _, arts_chunk, met_chunk = quantize_layer_e8_shell_rht(
                 chunk, H_id, ple_codebook,
                 bpw=ple_embed_bpw, tune_iters=0,
@@ -2744,21 +2764,37 @@ def quantize(
             del chunk
             if use_gpu:
                 torch.cuda.empty_cache()
-        ple_arts = {
-            'SV': ple_sv,
-            'SU': ple_su,
-            'Wscale': ple_wscale_per_row,           # [vocab] not scalar
-            'Qidxs': torch.cat(ple_qidxs_chunks, dim=0),
-        }
-        if ple_qidxs2_chunks:
-            ple_arts['Qidxs2'] = torch.cat(ple_qidxs2_chunks, dim=0)
-            ple_arts['inv_resid_scale'] = ple_inv_rs_per_row  # [vocab]
+        if ple_spec['codebook'] == 'trellis':
+            ple_arts = {
+                'SV': ple_sv,
+                # fp16: fp32 over 320M rows would add 1.19 GiB for no measured gain.
+                'Wscale': ple_wscale_per_row.to(torch.float16),
+                'trellis_packed': torch.cat(ple_packed_chunks, dim=0),
+                # The decoder rebuilds the codebook from the tlut deterministically — no
+                # kmeans at load. 3INST is lookup-free and carries none, hence the guard.
+                **({'tlut': ple_codebook.cb.tlut.cpu()}
+                   if getattr(ple_codebook.cb, 'tlut', None) is not None else {}),
+                # Block sizes the inverse RHT needs. A real tensor, not a runtime handle:
+                # the save loop writes every artifact value straight into the state dict, and
+                # the loader must not have to re-derive the decomposition of a non-pow2 width.
+                'rht_blocks': torch.tensor(ple_blocks_n, dtype=torch.int32),
+            }
+        else:
+            ple_arts = {
+                'SV': ple_sv,
+                'SU': ple_su,
+                'Wscale': ple_wscale_per_row,           # [vocab] not scalar
+                'Qidxs': torch.cat(ple_qidxs_chunks, dim=0),
+            }
+            if ple_qidxs2_chunks:
+                ple_arts['Qidxs2'] = torch.cat(ple_qidxs2_chunks, dim=0)
+                ple_arts['inv_resid_scale'] = ple_inv_rs_per_row  # [vocab]
         avg_chunk_sqnr = sum(ple_sqnr_chunks) / len(ple_sqnr_chunks)
         print(f"  PLE embed avg SQNR={avg_chunk_sqnr:.2f} dB "
               f"({len(ple_qidxs_chunks)} chunks, per-row Wscale)")
         all_artifacts[ple_embed_prefix] = ple_arts
         all_sqnr.append(avg_chunk_sqnr)
-        del H_id, ple_qidxs_chunks, ple_qidxs2_chunks, ple_codebook
+        del H_id, ple_qidxs_chunks, ple_qidxs2_chunks, ple_packed_chunks, ple_codebook
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
@@ -2901,13 +2937,17 @@ def quantize(
     #   - any layer the allocator hadn't profiled yet (defensive).
     # Default the bpw for those to ``ple_embed_bpw=4`` for the embedding
     # and to the global ``bpw`` for everything else.
-    PLE_PREFIX = "model.language_model.embed_tokens_per_layer"
+    # The PLE entry, whatever this architecture calls it and whatever bpw its descriptor
+    # asked for. Hardcoding gemma-4's name and 4 here would leave Qwen4Exp's table out of the
+    # map, and a quantized layer absent from it loads as bf16 and KeyErrors on its indices.
+    _ple_sp = _ple_embed_spec(arch, profile, cfg)
+    PLE_PREFIX = _ple_sp['prefix'] if _ple_sp else None
     layer_bpw_out: dict[str, int] = {}
     for p in all_artifacts.keys():
         if bpw_map is not None and p in bpw_map:
             layer_bpw_out[p] = int(bpw_map[p])
-        elif p == PLE_PREFIX:
-            layer_bpw_out[p] = 4  # matches ple_embed_bpw above
+        elif PLE_PREFIX is not None and p == PLE_PREFIX:
+            layer_bpw_out[p] = int(_ple_sp['bpw'])
         else:
             layer_bpw_out[p] = int(bpw)
     # Record the RHT layout so the runtime sizes the weight buffers correctly.
