@@ -115,3 +115,46 @@ def test_a_shell_ple_does_not_emit_the_marker():
     from glq.hf_integration import GLQConfig
     assert "ple_codebook" not in GLQConfig(codebook="trellis", variant="3inst").to_dict()
     assert "ple_codebook" not in GLQConfig(codebook="e8_shell").to_dict()
+
+
+# ---- the opt-in codebook override ---------------------------------------------------------
+
+def test_the_override_is_off_by_default():
+    """The gemma-4 byte-identical gate depends on this. An override that changed the default
+    would silently alter every published gemma-4 checkpoint."""
+    spec = _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg())
+    assert spec["codebook"] == "shell" and spec["block_diagonal"] is False
+
+
+def test_the_override_routes_a_shell_table_to_trellis(monkeypatch):
+    """Lets a small model with a PLE exercise the trellis serving path in minutes rather than
+    after an 11-hour run — and is useful on its own: gemma-4's PLE is 8960 wide, which the
+    shell path's full Hadamard pads to 16384 (1.83x), while block-diagonal splits it exactly
+    as [8192, 512, 256]."""
+    monkeypatch.setenv("GLQ_PLE_CODEBOOK", "trellis")
+    spec = _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg())
+    assert spec["codebook"] == "trellis"
+
+
+def test_overriding_to_trellis_also_turns_off_the_padding(monkeypatch):
+    """Not independent knobs: the trellis layout cannot use a padded full-Hadamard RHT, and
+    the quantize path asserts on exactly that. Flipping the codebook without the transform
+    would fail deep into a run instead of here."""
+    monkeypatch.setenv("GLQ_PLE_CODEBOOK", "trellis")
+    spec = _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg())
+    assert spec["block_diagonal"] is True
+
+
+def test_the_override_does_not_invent_a_table(monkeypatch):
+    """An architecture with no PLE must stay that way however the env is set."""
+    monkeypatch.setenv("GLQ_PLE_CODEBOOK", "trellis")
+    assert _ple_embed_spec("LlamaForCausalLM", {}, SimpleNamespace()) is None
+    assert _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg(ple_dim=0)) is None
+
+
+def test_an_unknown_override_value_is_refused(monkeypatch):
+    """Silently ignoring a typo would produce a shell checkpoint while the operator believed
+    they had asked for trellis — and the difference only shows up as footprint."""
+    monkeypatch.setenv("GLQ_PLE_CODEBOOK", "trelis")
+    with pytest.raises(ValueError, match="GLQ_PLE_CODEBOOK"):
+        _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg())

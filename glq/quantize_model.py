@@ -594,7 +594,27 @@ def _ple_embed_spec(arch, profile=None, cfg=None):
     text_cfg = getattr(cfg, 'text_config', None) if cfg is not None else None
     if not getattr(text_cfg, 'hidden_size_per_layer_input', 0):
         return None
-    return dict(spec)
+    spec = dict(spec)
+
+    # Opt-in override. Two uses: exercising the trellis serving path on a small model in
+    # minutes instead of after a multi-hour run, and the footprint itself — gemma-4's PLE is
+    # 8960 wide, which shell's full Hadamard pads to 16384 (1.83x), while block-diagonal
+    # splits 8960 exactly as [8192, 512, 256]. Deliberately NOT the default: changing it
+    # would alter every published gemma-4 checkpoint.
+    override = os.environ.get('GLQ_PLE_CODEBOOK')
+    if override:
+        if override not in ('shell', 'trellis'):
+            raise ValueError(
+                f"GLQ_PLE_CODEBOOK={override!r}: expected 'shell' or 'trellis'. Ignoring a "
+                f"typo here would quietly produce the other codebook, and the difference "
+                f"only shows up as footprint.")
+        spec['codebook'] = override
+        if override == 'trellis':
+            # Not independent knobs: the trellis layout cannot use a padded full-Hadamard
+            # RHT, and the quantize path asserts on precisely that. Flipping one without the
+            # other would fail deep into a run rather than here.
+            spec['block_diagonal'] = True
+    return spec
 
 
 def _collect_stacked_experts(layer):
