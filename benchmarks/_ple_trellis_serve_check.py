@@ -27,12 +27,20 @@ def check_config(path: str) -> dict:
     print("  quantization_config.codebook     :", qc.get("codebook"))
     print("  quantization_config.ple_codebook :", qc.get("ple_codebook"))
     print("  quantization_config.ple_bpw      :", qc.get("ple_bpw"))
-    assert qc.get("ple_codebook") == "trellis", (
-        "the marker vLLM dispatches on is absent — create_weights would build shell buffers")
+    if not os.environ.get("GLQ_CHECK_CONTROL"):
+        assert qc.get("ple_codebook") == "trellis", (
+            "the marker vLLM dispatches on is absent — create_weights would build shell "
+            "buffers")
     return qc
 
 
 def check_hf(path: str) -> None:
+    # REQUIRED, and its absence is quiet: this import is what registers quant_method="glq"
+    # with transformers (@register_quantization_config / @register_quantizer). Without it
+    # from_pretrained loads the architecture, finds none of the GLQ tensors, reports every
+    # weight as newly initialized, and hands back a randomly-weighted model that still
+    # generates text. Importing glq.quantized_linear alone is not enough.
+    import glq.hf_integration  # noqa: F401
     from transformers import AutoModelForImageTextToText, AutoTokenizer
     from glq.quantized_linear import E8RHTEmbedding, TrellisRHTEmbedding
 
@@ -40,22 +48,36 @@ def check_hf(path: str) -> None:
     model = AutoModelForImageTextToText.from_pretrained(
         path, dtype=torch.bfloat16, device_map="cuda")
 
+    control = bool(os.environ.get("GLQ_CHECK_CONTROL"))
     tre = [n for n, m in model.named_modules() if isinstance(m, TrellisRHTEmbedding)]
     shell = [n for n, m in model.named_modules() if isinstance(m, E8RHTEmbedding)]
     print(f"  TrellisRHTEmbedding modules: {len(tre)} {tre[:2]}")
     print(f"  E8RHTEmbedding modules     : {len(shell)} {shell[:2]}")
-    assert tre, "no TrellisRHTEmbedding was substituted — the PLE fell back to shell"
+    if control:
+        # Control arm: the shell build of the same model, same prompt and sampling. If this
+        # also produces nothing, the empty output is the harness, not the trellis path.
+        assert shell, "control checkpoint has no GLQ embedding either"
+    else:
+        assert tre, "no TrellisRHTEmbedding was substituted — the PLE fell back to shell"
 
-    mod = dict(model.named_modules())[tre[0]]
-    print(f"  recovered rate K={mod.K}, packed {tuple(mod.trellis_packed.shape)}, "
-          f"blocks {[int(b) for b in mod.rht_blocks.tolist()]}")
-    assert sum(int(b) for b in mod.rht_blocks.tolist()) == mod.embedding_dim, (
-        "block sizes do not sum to the width — the row would inverse-transform wrongly")
+    mod = dict(model.named_modules())[(tre or shell)[0]]
+    if tre:
+        print(f"  recovered rate K={mod.K}, packed {tuple(mod.trellis_packed.shape)}, "
+              f"blocks {[int(b) for b in mod.rht_blocks.tolist()]}")
+        assert sum(int(b) for b in mod.rht_blocks.tolist()) == mod.embedding_dim, (
+            "block sizes do not sum to the width — the row would inverse-transform wrongly")
 
-    ids = tok(PROMPT, return_tensors="pt").to("cuda")
-    out = model.generate(**ids, max_new_tokens=48, do_sample=False)
+    # Chat template + the model card's sampling, NOT greedy. gemma-4 is RL-collapsed and
+    # produces nothing at temperature 0 — reproduced in this project before (700/700 tokens,
+    # no content). Greedy here would read as a broken checkpoint when it is a sampling
+    # mistake, which is the whole failure mode this script exists to avoid.
+    msgs = [{"role": "user", "content": PROMPT}]
+    ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                  return_tensors="pt", return_dict=True).to("cuda")
+    out = model.generate(**ids, max_new_tokens=64,
+                         do_sample=True, temperature=1.0, top_p=0.95, top_k=64)
     text = tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
-    print(f"  HF generation: {text.strip()[:200]!r}")
+    print(f"  HF generation: {text.strip()[:220]!r}")
     assert text.strip(), "empty generation"
 
 

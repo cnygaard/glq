@@ -223,3 +223,36 @@ def test_no_trellis_set_keeps_every_embedding_on_shell():
     m = _M()
     replace_with_glq_embedding(m, quantized_layers={"ple"})
     assert isinstance(m.ple, E8RHTEmbedding)
+
+
+def test_the_rate_survives_assign_style_loading():
+    """K must be read from the buffer, not cached at load time.
+
+    transformers assigns checkpoint tensors straight onto the module (`assign=True`), which
+    swaps the buffer and never calls `_load_from_state_dict`. A rate recovered only in that
+    hook then keeps the constructor's default while the buffer holds a different rate, and
+    the unpack reshapes to the wrong width — observed live as
+    "shape '[10, 26880]' is invalid for input of size 358400" when a K=4 table met K=3.
+    """
+    from glq.quantized_linear import TrellisRHTEmbedding
+    W = _table(rows=32)
+    arts, w_hat = _quantize_ple_chunk_trellis(W, bpw=4, device="cpu")
+
+    mod = TrellisRHTEmbedding(32, WIDTH, bpw=3)          # deliberately the WRONG default
+    mod.trellis_packed = arts["trellis_packed"]          # assign, as transformers does
+    mod.Wscale = arts["Wscale"]
+    mod.SV = arts["SV"]
+    mod.rht_blocks = torch.tensor(arts["_blocks_n"], dtype=torch.int32)
+
+    assert mod.K == 4, f"rate not recovered from the buffer: got {mod.K}"
+    out = mod(torch.arange(32))
+    assert torch.allclose(out.float(), w_hat.float(), atol=1e-3)
+
+
+@pytest.mark.parametrize("bpw", [2, 3, 4, 6])
+def test_the_rate_is_read_from_the_buffer_at_every_rate(bpw):
+    from glq.quantized_linear import TrellisRHTEmbedding
+    arts, _ = _quantize_ple_chunk_trellis(_table(rows=16), bpw=bpw, device="cpu")
+    mod = TrellisRHTEmbedding(16, WIDTH, bpw=3)
+    mod.trellis_packed = arts["trellis_packed"]
+    assert mod.K == bpw

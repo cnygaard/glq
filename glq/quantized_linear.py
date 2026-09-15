@@ -1527,10 +1527,9 @@ class TrellisRHTEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.embed_scale = float(embed_scale)
         self.variant = variant
-        self.K = int(bpw)
 
         self.register_buffer('trellis_packed', torch.zeros(
-            num_embeddings, math.ceil(embedding_dim * self.K / 16), dtype=torch.int16))
+            num_embeddings, math.ceil(embedding_dim * int(bpw) / 16), dtype=torch.int16))
         self.register_buffer('Wscale', torch.ones(num_embeddings, dtype=torch.float16))
         self.register_buffer('SV', torch.ones(embedding_dim, dtype=torch.float16))
         # Block sizes of the block-diagonal RHT. Stored rather than re-derived so a
@@ -1540,6 +1539,20 @@ class TrellisRHTEmbedding(nn.Module):
         # HYB carries a learned tlut; 3INST is lookup-free and carries none.
         self.register_buffer('tlut', None)
         self.codebook = None
+
+    @property
+    def K(self) -> int:
+        """Bits per weight, read from the packed width every time rather than cached.
+
+        ``cols == ceil(embedding_dim*K/16)`` is a checkpoint's only record of the rate, and
+        the buffer is the only thing guaranteed to be current: transformers assigns
+        checkpoint tensors straight onto the module, swapping the buffer without ever
+        calling ``_load_from_state_dict``. A rate captured in that hook silently keeps the
+        constructor default while the data says otherwise, and the unpack then reshapes to
+        the wrong width.
+        """
+        cols = self.trellis_packed.shape[-1]
+        return max(1, round(cols * 16 / self.embedding_dim))
 
     def set_codebook(self, codebook, codebook2=None):
         """Attach a shared TrellisCodebook. Mirrors the E8RHTEmbedding API."""
@@ -1555,17 +1568,13 @@ class TrellisRHTEmbedding(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys, error_msgs):
-        """Recover K from the packed width and resize before the copy.
+        """Resize the packed buffer so a differently-rated checkpoint copies in.
 
-        cols == ceil(embedding_dim*K/16) is a checkpoint's only record of the rate, the same
-        way ``tr_bits_from_packed`` recovers it for linear layers. A module built with the
-        wrong default would otherwise fail the size check, or silently decode at the wrong
-        rate if the sizes happened to agree.
+        The rate itself is not cached here — see :attr:`K`, which reads it from the buffer,
+        because this hook does not run on every loader path.
         """
         key = prefix + 'trellis_packed'
         if key in state_dict:
-            cols = state_dict[key].shape[-1]
-            self.K = max(1, round(cols * 16 / self.embedding_dim))
             if tuple(self.trellis_packed.shape) != tuple(state_dict[key].shape):
                 self.trellis_packed = torch.zeros_like(state_dict[key])
         tl = prefix + 'tlut'
