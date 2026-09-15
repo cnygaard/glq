@@ -22,6 +22,10 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# CI installs only torch + numpy. These write real safetensors files rather than mocking
+# the reader, because the shard-offset arithmetic is exactly what is under test.
+pytest.importorskip("safetensors", reason="safetensors not installed")
+
 from glq.quantize_model import _ple_row_reader  # noqa: E402
 
 PREFIX = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"

@@ -192,6 +192,9 @@ def test_a_trellis_payload_selects_the_trellis_module(tmp_path):
     wrong module is not a graceful failure: the shell module would look for Qidxs that is
     not there, or size a full-Hadamard buffer for an unpadded row.
     """
+    # glq.hf_integration imports transformers at module scope (it registers the
+    # quantizer), so this cannot run in the torch-only CI environment.
+    pytest.importorskip("transformers", reason="not installed in CI")
     import torch.nn as nn
     from glq.hf_integration import replace_with_glq_embedding
     from glq.quantized_linear import E8RHTEmbedding, TrellisRHTEmbedding
@@ -211,6 +214,9 @@ def test_a_trellis_payload_selects_the_trellis_module(tmp_path):
 
 def test_no_trellis_set_keeps_every_embedding_on_shell():
     """Back-compat: existing gemma-4 checkpoints pass no trellis set and must be untouched."""
+    # glq.hf_integration imports transformers at module scope (it registers the
+    # quantizer), so this cannot run in the torch-only CI environment.
+    pytest.importorskip("transformers", reason="not installed in CI")
     import torch.nn as nn
     from glq.hf_integration import replace_with_glq_embedding
     from glq.quantized_linear import E8RHTEmbedding

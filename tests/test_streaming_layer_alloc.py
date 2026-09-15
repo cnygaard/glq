@@ -19,10 +19,15 @@ Two halves to the fix, both asserted here:
 """
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
-from glq import quantize_model as qm
+# CI installs only torch + numpy; these build real sharded safetensors to exercise the
+# bulk loader, so there is nothing to test without it.
+pytest.importorskip("safetensors", reason="safetensors not installed")
+
+from glq import quantize_model as qm  # noqa: E402
 
 
 class _HugeEmbedBlock(nn.Module):

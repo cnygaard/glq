@@ -104,6 +104,9 @@ def test_the_ple_codebook_round_trips_through_the_config():
     tensor keys settle it, but they are not available at that point — so the marker rides in
     config.json -> quantization_config, the same place `variant` and `trellis_layout` do.
     """
+    # glq.hf_integration imports transformers at module scope (it registers the
+    # quantizer), so this cannot run in the torch-only CI environment.
+    pytest.importorskip("transformers", reason="not installed in CI")
     from glq.hf_integration import GLQConfig
     cfg = GLQConfig(codebook="trellis", variant="3inst", ple_codebook="trellis")
     assert cfg.to_dict()["ple_codebook"] == "trellis"
@@ -112,6 +115,9 @@ def test_the_ple_codebook_round_trips_through_the_config():
 def test_a_shell_ple_does_not_emit_the_marker():
     """Absent means shell, so existing gemma-4 checkpoints keep byte-identical config.json
     rather than gaining a key that changes their hash."""
+    # glq.hf_integration imports transformers at module scope (it registers the
+    # quantizer), so this cannot run in the torch-only CI environment.
+    pytest.importorskip("transformers", reason="not installed in CI")
     from glq.hf_integration import GLQConfig
     assert "ple_codebook" not in GLQConfig(codebook="trellis", variant="3inst").to_dict()
     assert "ple_codebook" not in GLQConfig(codebook="e8_shell").to_dict()
