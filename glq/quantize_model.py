@@ -2689,6 +2689,16 @@ def quantize(
         del hidden_states
         if per_layer_inputs is not None:
             del per_layer_inputs
+        # Release the Viterbi CUDA-graph pools built up over the layer loop. They are keyed
+        # by (T, B) shapes the PLE step will never reuse — its sequence length is the table
+        # width, not a 16x16 tile — and torch does not reclaim a graph's private pool while
+        # the graph is alive. Measured on an L40S quantizing gemma-4's PLE: 20.8 GiB of a
+        # 44 GiB card still held by those pools when the embedding step began, on top of
+        # which it then tried to allocate from_state.
+        for _cb_obj in (codebook, getattr(codebook, 'cb', None)):
+            _free = getattr(_cb_obj, 'free_viterbi_graphs', None)
+            if _free is not None:
+                _free()
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
@@ -2744,6 +2754,7 @@ def quantize(
                             if (getattr(codebook, 'is_e8p', False)
                                 or type(codebook).__name__ == "TrellisCodebook")
                             else codebook)
+        _ple_t0 = time.perf_counter()
         for r0 in range(0, vocab_size_ple, chunk_rows):
             r1 = min(r0 + chunk_rows, vocab_size_ple)
             chunk = ple_read(r0, r1).to(device=device, dtype=torch.float32)
@@ -2761,6 +2772,16 @@ def quantize(
                 err = (chunk - hat_chunk.to(chunk.dtype)).pow(2).sum()
                 ple_sqnr_chunks.append(float(
                     10 * torch.log10(chunk.pow(2).sum() / err.clamp_min(1e-30))))
+                # Progress, because this step can run for many minutes and used to print
+                # nothing until it finished. Viterbi is O(T) sequential per call and the
+                # chunk cap shrinks B as the table widens, so cost grows roughly with
+                # width^2: gemma-4's 8960-wide PLE is ~1150x the sequential work of a
+                # 160-wide one. Silence there is indistinguishable from a hang.
+                _done, _total = len(ple_sqnr_chunks), -(-vocab_size_ple // chunk_rows)
+                _el = time.perf_counter() - _ple_t0
+                print(f"    PLE chunk {_done}/{_total}  SQNR {ple_sqnr_chunks[-1]:.2f} dB  "
+                      f"{_el:.0f}s elapsed  ETA {_el / _done * (_total - _done):.0f}s",
+                      flush=True)
                 del chunk, hat_chunk, arts_chunk
                 if use_gpu:
                     torch.cuda.empty_cache()

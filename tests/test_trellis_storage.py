@@ -356,3 +356,90 @@ def test_unpack_work_does_not_grow_with_sequence_length():
     small, big = count(256), count(2560)      # 10x the sequence length
     assert big == small, (
         f"op count grew {small} -> {big} with T: still per-step, not windowed")
+
+
+# ---------------------------------------------------------------------------
+# 5. chunk sizing must account for the sequence length
+# ---------------------------------------------------------------------------
+#
+# viterbi allocates
+#     from_state = empty(T//V, B, 2**(L - K*V))
+# which scales with T, but _chunk_b picked B from L2 and the *cost* tensor alone
+# (per_row = 2*4*2**L) and never saw T. Fine for a 256-element weight tile; for an
+# 8960-wide embedding row it asks for 8960*144*4096*4 = 21.1 GB in one allocation and
+# OOMs a 46 GB card. Measured exactly that on an L40S quantizing gemma-4's PLE.
+#
+# The cap must be DETERMINISTIC — derived from T and fixed constants, never from free
+# memory. A B that varied with machine state would make checkpoints vary with it too,
+# and byte-identical encoding is a hard requirement.
+
+
+def _cb_for_chunk(K=4):
+    """3INST, because that is the variant that OOM'd and the shipped default.
+
+    The variant matters here: HYB has V=2, so from_state's last axis is 2**(L-K*V) = 2**8,
+    sixteen times smaller than 3INST's 2**12 at V=1. The cap correctly does not bind for HYB
+    (see the companion test) — testing this on HYB would assert nothing.
+    """
+    return _3inst_cb(K=K).cb
+
+
+def test_short_sequences_keep_the_previous_chunk_size():
+    """The shipped weight path encodes 16x16 tiles (T=256). If the new cap bound there it
+    would change B, and B changes are exactly what a byte-identical checkpoint cannot
+    survive."""
+    cb = _cb_for_chunk()
+    assert cb._chunk_b("cpu", T=256) == cb._chunk_b("cpu")
+
+
+def test_a_long_sequence_gets_a_smaller_chunk():
+    """8960 is gemma-4's PLE width (num_layers * ple_dim)."""
+    cb = _cb_for_chunk()
+    assert cb._chunk_b("cpu", T=8960) < cb._chunk_b("cpu", T=256)
+
+
+def test_the_long_sequence_allocation_stays_bounded():
+    """The property that matters, stated as bytes rather than as a chunk count."""
+    cb = _cb_for_chunk()
+    for T in (2560, 8960, 32768):
+        B = cb._chunk_b("cpu", T=T)
+        nbytes = (T // cb.V) * B * 2 ** (cb.L - cb.K * cb.V) * 4
+        assert nbytes <= 4 * 2 ** 30, f"T={T}: from_state would be {nbytes / 2**30:.1f} GiB"
+
+
+def test_chunk_size_is_deterministic():
+    """Two calls must agree, and must not consult free memory: a checkpoint whose bytes
+    depend on what else was running is not reproducible."""
+    cb = _cb_for_chunk()
+    assert cb._chunk_b("cpu", T=8960) == cb._chunk_b("cpu", T=8960)
+    assert cb._chunk_b("cpu", T=8960) >= 1
+
+
+def test_the_env_override_still_wins():
+    """GLQ_TRELLIS_CHUNK_B is the escape hatch for a box where the heuristic is wrong."""
+    import os
+    cb = _cb_for_chunk()
+    os.environ["GLQ_TRELLIS_CHUNK_B"] = "7"
+    try:
+        assert cb._chunk_b("cpu", T=8960) == 7
+    finally:
+        del os.environ["GLQ_TRELLIS_CHUNK_B"]
+
+
+def test_hyb_is_not_capped_at_the_same_width():
+    """V=2 quarters the state axis twice over, so HYB at 8960 stays inside the budget and
+    keeps its full chunk. The cap is a response to an allocation size, not to T alone."""
+    cb = _hyb_cb(K=4).cb
+    assert cb.V == 2
+    assert cb._chunk_b("cpu", T=8960) == cb._chunk_b("cpu")
+
+
+def test_the_cap_never_moves_weight_tile_chunking(monkeypatch):
+    """B straddles the CUDA-graph threshold — graphed at or below _GLQ_TRELLIS_CUDAGRAPH_MAX_B,
+    eager above. So a cap that lowered weight-path B could move the shipped encode onto a
+    different code path even though B itself is output-invariant. Simulate a large-VRAM
+    device and assert T=256 is untouched."""
+    cb = _3inst_cb(K=4).cb
+    monkeypatch.setattr(type(cb), "_state_budget", lambda self, dev: 11 << 30)
+    assert cb._chunk_b("cpu", T=256) == cb._chunk_b("cpu")
+    assert cb._chunk_b("cpu", T=8960) < cb._chunk_b("cpu"), "should still bind when wide"

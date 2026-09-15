@@ -599,15 +599,31 @@ class bitshift_codebook(nn.Module):
         self._vit_graphs.clear()
         self._vit_graph_pool = None
 
-    def _chunk_b(self, device):
+    def _chunk_b(self, device, T=None):
         """Viterbi rows per call on this device: the largest B whose cost ping-pong still
-        sits in L2, floored at 16 and capped at the historical 2^(24-L)."""
+        sits in L2, floored at 16 and capped at the historical 2^(24-L).
+
+        ``T`` (the sequence length) additionally caps B, because ``viterbi`` allocates::
+
+            from_state = empty(T // V, B, 2 ** (L - K*V))
+
+        which the L2 heuristic above does not model — it sizes B from the *cost* ping-pong
+        alone. For the 16x16 weight tiles this codebook was built for (T=256) that is
+        harmless, but an embedding row is the whole table width: gemma-4's PLE is 8960 wide,
+        and at the L2-derived B=144 that single allocation is 8960*144*4096*4 = **19.7 GiB**,
+        which OOMs a 46 GB card. Measured exactly that on an L40S.
+
+        The cap is deliberately derived from T and fixed constants, never from free memory:
+        a B that moved with machine state would make the encoded checkpoint move with it too,
+        and byte-identical encoding is a hard requirement. For T=256 the cap does not bind,
+        so the shipped weight path is unchanged.
+        """
         env = os.environ.get("GLQ_TRELLIS_CHUNK_B")
         if env:
             return max(1, int(env))
         hard_cap = 2 ** (24 - self.L)
         if getattr(device, "type", None) != "cuda":
-            return hard_cap
+            return self._cap_b_for_T(hard_cap, T, device)
         idx = torch.cuda.current_device() if device.index is None else device.index
         key = (idx, self.L)
         if key not in _chunk_b_cache:
@@ -621,14 +637,57 @@ class bitshift_codebook(nn.Module):
                 _chunk_b_cache[key] = max(16, min(hard_cap, b))
             else:                                        # unknown L2 → historical behaviour
                 _chunk_b_cache[key] = hard_cap
-        return _chunk_b_cache[key]
+        return self._cap_b_for_T(_chunk_b_cache[key], T, device)
+
+    #: Fallback ceiling on the single ``from_state`` allocation, used when the device's
+    #: capacity is unknown (CPU, or a driver that will not report it).
+    _STATE_BUDGET_BYTES = 2 << 30
+
+    #: Share of a GPU's TOTAL memory `from_state` may take. Total, not free: total is a
+    #: property of the card, so the chunk size is reproducible on the same hardware, whereas
+    #: free memory moves with whatever else is resident.
+    _STATE_BUDGET_FRACTION = 0.25
+
+    def _state_budget(self, device):
+        try:
+            if getattr(device, "type", None) == "cuda" or str(device).startswith("cuda"):
+                idx = torch.cuda.current_device()
+                total = torch.cuda.get_device_properties(idx).total_memory
+                return max(self._STATE_BUDGET_BYTES,
+                           int(total * self._STATE_BUDGET_FRACTION))
+        except Exception:                                    # noqa: BLE001
+            pass
+        return self._STATE_BUDGET_BYTES
+
+    def _cap_b_for_T(self, b, T, device=None):
+        """Cap B so ``from_state`` fits the budget.
+
+        Safe to size generously: B is **output-invariant**. ``quantize_seq`` chunks over NO,
+        and those are independent tail-biting sequences, so a row's Viterbi cannot depend on
+        its batch-mates — verified by encoding the same table at B in {96, 48, 16, 7, 1} and
+        getting identical state, packed bytes and W_hat. Time, though, is inversely
+        proportional to B: the work is (rows/B) sequential Viterbi calls of T steps each, so
+        an over-tight cap costs directly. A 2 GiB budget on a 44 GiB card left B=14 for a
+        8960-wide table and made the step take tens of minutes.
+
+        The cap only ever LOWERS B, and only when the budget actually binds — which for a
+        256-element weight tile it does not. That matters beyond tidiness: B straddles the
+        CUDA-graph threshold (graphed at or below it, eager above), so clamping weight-path B
+        would silently move the shipped encode between two different code paths. It must be
+        free to stay where it is.
+        """
+        if T is None:
+            return b
+        per_row = (T // self.V) * 2 ** (self.L - self.K * self.V) * 4
+        capped = self._state_budget(device) // max(1, per_row)
+        return max(1, min(b, capped))
 
     def quantize_seq(self, X, overlap=None):
         T, NO = X.shape
         # Balanced chunks: take the fewest chunks that respect the device width, then even
         # them out. Rounding NO up to a multiple of the width instead would process 288 rows
         # for a 160-row layer at width 144 — slower than not chunking at all.
-        cap = min(self._chunk_b(X.device), NO)
+        cap = min(self._chunk_b(X.device, T=T), NO)
         nchunks = math.ceil(NO / cap)
         bs = math.ceil(NO / nchunks)
         pad_amt = nchunks * bs - NO
@@ -654,7 +713,8 @@ class bitshift_codebook(nn.Module):
         # per-pass path below; so does a failed pair capture (None from _pair_graphed).
         state = None
         if (X.is_cuda and _trellis_cudagraph_on()
-                and NO <= min(self._chunk_b(X.device), _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
+                and NO <= min(self._chunk_b(X.device, T=T),
+                              _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
             state = self._pair_graphed(X)
         if state is None:
             roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
