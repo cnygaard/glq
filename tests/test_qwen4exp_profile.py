@@ -185,3 +185,36 @@ def test_hc_expansion_ignores_hc_count_of_one():
         hc_count = 1
     h = torch.zeros(1, 4, 16)
     assert qm._apply_hc_expansion(h, _One()).shape == (1, 4, 16)
+
+
+# ---- input_ids for token-lookup layers (PLE) -------------------------------------------
+
+def test_input_ids_are_passed_when_the_layer_needs_them():
+    """Qwen4Exp layer 1 does `hidden_states + self.ple(...)`, and the PLE does a TOKEN
+    lookup: `self.ple_embedding(input_ids, ...)` -> `input_ids.long()`. GLQ's calibration
+    passed hidden states and rotary kwargs but never input_ids, so layer 1 died with
+
+        AttributeError: 'NoneType' object has no attribute 'long'
+
+    after layer 0 had already taken 13 minutes. The ids exist — `calib_ids` is sliced per
+    sample for the embedding — they were simply never handed to the layer.
+    """
+    rot = _Rotary()
+    h = torch.zeros(1, 8, 4)
+    ids = torch.arange(16).reshape(2, 8)
+    kw = qm._build_forward_kwargs({}, h, rot, layer_idx=1, cfg=_Cfg(mrope=True),
+                                  sample_idx=1, calib_ids=ids)
+    # The parameter is `ple_input_ids`. Passing `input_ids` is swallowed by the layer's
+    # **kwargs and the PLE still sees its default None — the same AttributeError, one fix
+    # later. Verified against the real signature, not guessed.
+    assert "ple_input_ids" in kw, "PLE layers cannot run without ple_input_ids"
+    assert "input_ids" not in kw, "the layer's parameter is ple_input_ids"
+    assert torch.equal(kw["ple_input_ids"], ids[1:2]), "must be THIS sample's row"
+
+
+def test_input_ids_are_omitted_when_not_supplied():
+    """Architectures with no token-lookup layer must not get an unexpected kwarg."""
+    rot = _Rotary()
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), rot, layer_idx=0,
+                                  cfg=_Cfg(mrope=True))
+    assert "input_ids" not in kw

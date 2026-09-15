@@ -674,7 +674,7 @@ def _apply_hc_expansion(hidden_states, cfg):
 
 def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
                           per_layer_inputs=None, sample_idx=None,
-                          shared_kv_cache=None):
+                          shared_kv_cache=None, calib_ids=None):
     """Build layer forward kwargs based on model profile.
 
     For Gemma 4, the rotary embedding is per-layer-type ("sliding_attention" vs
@@ -741,6 +741,13 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
     kwargs = dict(position_ids=position_ids, cache_position=cache_position,
                   use_cache=False)
+    # Token-lookup layers need the ids, not just the hidden states: Qwen4Exp's PLE layer
+    # does `self.ple_embedding(ple_input_ids, ...)` -> `.long()`, an AttributeError on None.
+    # The decoder layer's parameter is `ple_input_ids`; passing `input_ids` is silently
+    # swallowed by **kwargs and the PLE still sees its default None. Only sent when the
+    # caller supplies calib_ids, so architectures without such a layer get no extra kwarg.
+    if calib_ids is not None and sample_idx is not None:
+        kwargs['ple_input_ids'] = calib_ids[sample_idx:sample_idx + 1].to(h.device)
     if rotary_emb is not None:
         kwargs['position_embeddings'] = rotary_emb(h, position_ids=position_ids)
     return kwargs
@@ -1088,6 +1095,181 @@ def quantize_experts_e8_shell_rht_batched(W_stack, H_stack, codebook, bpw=2,
 
 # ---- main quantization pipeline ----
 
+#: Tensors that are never quantized but ARE read by the calibration forward, and are large
+#: enough that the default handling breaks. Qwen4Exp's PLE n-gram table is 128 shards of
+#: [2500012, 160] bf16 = 95.4 GiB (190.7 GiB once nn.Embedding builds it at the default
+#: fp32, which killed a run at layer 1 of 47 on a 128 GiB box).
+#:
+#: It cannot be skipped: layer 1's forward is `hidden_states + self.ple(...)`, and the PLE
+#: hashes token ids into the full 320,001,536 rows. Empty storage yields an IndexError or
+#: garbage, and dropping the term would silently change the calibration activations for
+#: every one of the 46 downstream layers.
+#:
+#: So it is loaded for real, to CPU, and held there: `ple_embedding(...)` is a sparse
+#: gather (a 128 x 2048 calibration set touches ~262k rows, ~80 MB), so the cost is one
+#: host-side gather per forward instead of 95.4 GiB of VRAM the card does not have.
+_UNQUANTIZED_BULK = (".ngram_embedding.",)
+
+
+def _install_cpu_gather_bridge(module, device):
+    """Let a CPU-resident module be called with tensors that live on `device`."""
+    if str(device).startswith("cpu"):
+        return module
+
+    def _pre(mod, args, kwargs):
+        args = tuple(a.to("cpu") if torch.is_tensor(a) else a for a in args)
+        kwargs = {k: (v.to("cpu") if torch.is_tensor(v) else v)
+                  for k, v in kwargs.items()}
+        return args, kwargs
+
+    def _post(mod, args, kwargs, output):
+        if torch.is_tensor(output):
+            return output.to(device)
+        if isinstance(output, tuple):
+            return tuple(o.to(device) if torch.is_tensor(o) else o for o in output)
+        return output
+
+    module.register_forward_pre_hook(_pre, with_kwargs=True)
+    module.register_forward_hook(_post, with_kwargs=True)
+    return module
+
+
+def _is_bulk_module_name(name: str) -> bool:
+    """True for submodules holding tensors too large to put on the GPU.
+
+    Matches both forms the n-gram table takes: the model builds one
+    `ple_embedding.ngram_embedding.weight` while the checkpoint stores 128 `shard_N`
+    tensors under the same path.
+    """
+    return any(marker.strip(".") in name for marker in _UNQUANTIZED_BULK)
+
+
+def _move_layer_keeping_bulk_on_cpu(layer, device, dtype):
+    """Move a layer to `device`, leaving bulk tensors on CPU.
+
+    Qwen4Exp's PLE n-gram table is 95.37 GiB, so `layer.to(device)` OOMs a 95 GiB card.
+    It cannot simply be dropped: layer 1's forward does
+    `hidden_states = hidden_states + self.ple(...)`, and skipping that would silently change
+    the calibration activations for every downstream layer.
+
+    It does not need to be on the GPU either. `ple_embedding(input_ids, ...)` is a sparse
+    lookup — 128 samples x 2048 tokens gathers ~262k rows of 160 (~80 MB) — so keeping the
+    table in CPU RAM costs one host-side gather per forward instead of 95 GiB of VRAM.
+    """
+    bulk = [(n, m) for n, m in layer.named_modules() if _is_bulk_module_name(n)]
+    detached = []
+    for name, mod in bulk:
+        parent = layer
+        *path, leaf = name.split(".")
+        for part in path:
+            parent = getattr(parent, part)
+        detached.append((parent, leaf, mod))
+        setattr(parent, leaf, torch.nn.Identity())
+    layer.to(device, dtype=dtype)
+    for parent, leaf, mod in detached:
+        # Back in place, still on CPU, cast to the compute dtype so the gathered rows match.
+        # dtype= would cast integer tables too; move device only and let floating
+        # submodules keep whatever dtype they already carry.
+        mod = mod.to("cpu")
+        # An Embedding gathers on ITS OWN device, so cuda indices into a cpu table raise
+        # "Expected all tensors to be on the same device". Bridge it: indices down to CPU,
+        # gathered rows back up. Only the rows the batch touches cross the bus — ~262k x 160
+        # for a 128 x 2048 calibration set, ~80 MB, against 95 GiB of resident table.
+        _install_cpu_gather_bridge(mod, device)
+        setattr(parent, leaf, mod)
+    return layer
+
+
+def _fill_bulk_from_shards(layer, weight_map, shard_paths, layer_idx, sd_prefix, dtype):
+    """Load the skipped bulk tensors into the meta-constructed layer, one shard at a time.
+
+    The model builds ONE `ngram_embedding.weight` of [320001536, 160] while the checkpoint
+    stores 128 shards of [2500012, 160]; 128 x 2500012 == 320001536, so the shards ARE that
+    tensor, in order. Allocating the destination once and copying each shard into its row
+    range keeps the peak at (table + one shard) rather than (table + all shards), which on a
+    124 GiB box with 95.4 GiB of table is the difference between fitting and an OOM with no
+    swap to absorb it.
+    """
+    from safetensors import safe_open
+
+    prefix = f"{sd_prefix}.{layer_idx}."
+    bulk_keys = sorted(
+        (k for k in weight_map
+         if k.startswith(prefix) and not _should_load_for_quantize(k)),
+        key=lambda k: int(k.rsplit("shard_", 1)[1].split(".")[0])
+        if "shard_" in k else 0)
+    if not bulk_keys:
+        return
+
+    by_module = {}
+    for key in bulk_keys:
+        local = key[len(prefix):]
+        # ".../ngram_embedding.shard_7.weight" -> the module holding the real tensor
+        mod_path = local.rsplit(".shard_", 1)[0] if ".shard_" in local else \
+            local.rsplit(".", 1)[0]
+        by_module.setdefault(mod_path, []).append(key)
+
+    for mod_path, keys in by_module.items():
+        target = layer
+        for part in mod_path.split("."):
+            target = getattr(target, part)
+        dest = target.weight
+        if dest.is_meta:
+            dest = torch.nn.Parameter(
+                torch.empty(dest.shape, dtype=dtype, device="cpu"),
+                requires_grad=False)
+            target.weight = dest
+        row = 0
+        for key in keys:
+            shard_file = shard_paths[weight_map[key]]
+            with safe_open(shard_file, framework="pt") as f:
+                t = f.get_tensor(key)
+            n = t.shape[0]
+            dest.data[row:row + n].copy_(t.to(dtype))
+            row += n
+            del t
+        print(f"    loaded {mod_path}: {row:,} rows "
+              f"({dest.numel() * dest.element_size() / 2**30:.1f} GiB, CPU)", flush=True)
+
+
+def _materialize_meta_params(module, dtype):
+    """Replace any still-meta parameter/buffer with empty real storage.
+
+    A backstop for tensors the checkpoint does not supply at all. Bulk tensors are filled by
+    `_fill_bulk_from_shards` before this runs, so anything reaching here is genuinely absent
+    rather than deliberately skipped.
+    """
+    for name, param in list(module.named_parameters(recurse=True)):
+        if not param.is_meta:
+            continue
+        parent = module
+        *path, leaf = name.split(".")
+        for part in path:
+            parent = getattr(parent, part)
+        # Keep the parameter's OWN dtype: casting everything to the compute dtype turned
+        # integer n-gram tables into bfloat16, and the PLE's hash then died with
+        # `"bitwise_xor_cuda" not implemented for 'BFloat16'`. Only floating-point tensors
+        # take the compute dtype.
+        p_dtype = dtype if param.dtype.is_floating_point else param.dtype
+        setattr(parent, leaf, torch.nn.Parameter(
+            torch.empty(param.shape, dtype=p_dtype, device="cpu"),
+            requires_grad=False))
+    for name, buf in list(module.named_buffers(recurse=True)):
+        if not buf.is_meta:
+            continue
+        parent = module
+        *path, leaf = name.split(".")
+        for part in path:
+            parent = getattr(parent, part)
+        b_dtype = dtype if buf.dtype.is_floating_point else buf.dtype
+        parent.register_buffer(leaf, torch.empty(buf.shape, dtype=b_dtype, device="cpu"))
+
+
+def _should_load_for_quantize(key: str) -> bool:
+    """False for tensors that are neither quantized nor needed by calibration."""
+    return not any(marker in key for marker in _UNQUANTIZED_BULK)
+
+
 def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
     """Load all tensors for a single layer from sharded safetensors.
 
@@ -1099,7 +1281,8 @@ def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
     from safetensors import safe_open
 
     prefix = f"{sd_prefix}.{layer_idx}."
-    layer_keys = [k for k in weight_map if k.startswith(prefix)]
+    layer_keys = [k for k in weight_map
+                  if k.startswith(prefix) and _should_load_for_quantize(k)]
 
     state = {}
     shard_to_keys = defaultdict(list)
@@ -1688,7 +1871,7 @@ def quantize(
                 kwargs = _build_forward_kwargs(
                     profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg,
                     per_layer_inputs=per_layer_inputs, sample_idx=i,
-                    shared_kv_cache=shared_kv_cache)
+                    shared_kv_cache=shared_kv_cache, calib_ids=calib_ids)
                 out = layer(h, **kwargs)
                 new_hidden.append(out[0] if isinstance(out, tuple) else out)
                 # Capture K/V from a producer layer's post-quantization forward.
@@ -1712,14 +1895,29 @@ def quantize(
             layer_state = _load_layer_state(
                 weight_map, shard_paths, layer_idx, sd_prefix)
             layer_cfg = _text_config(cfg, is_mm_text)
-            layer = BlockClass(layer_cfg, layer_idx)
-            layer.load_state_dict(layer_state, strict=False)
+            # Construct on meta: `BlockClass(...)` allocates every parameter eagerly at the
+            # default dtype, and Qwen4Exp's PLE n-gram embedding is 190.7 GiB that way — the
+            # module build, not the weight load, is what --streaming does not cover. The
+            # same pattern is used for whole-model construction above. `assign=True` then
+            # adopts the loaded tensors rather than copying into (meta) storage.
+            with torch.device("meta"):
+                layer = BlockClass(layer_cfg, layer_idx)
+            layer.load_state_dict(layer_state, strict=False, assign=True)
+            # Anything still on meta was deliberately not loaded (see _UNQUANTIZED_BULK) or
+            # is absent from this checkpoint; give it real storage so the forward does not
+            # trip over a meta tensor.
+            # Bulk tensors were held out of layer_state (they would have been read into
+            # RAM twice); stream them straight into the meta layer's storage instead.
+            _fill_bulk_from_shards(layer, weight_map, shard_paths, layer_idx,
+                                   sd_prefix, dtype)
+            _materialize_meta_params(layer, dtype)
             del layer_state
             # The dtype cast must happen on CPU too: BlockClass() builds fp32 params,
             # load_state_dict casts the bf16 checkpoint UP into them, and the calibration
             # hidden states are bf16 — F.linear then dies on the dtype mismatch. Only the
             # device move is GPU-conditional.
-            layer.to(device if use_gpu else "cpu", dtype=dtype)
+            _move_layer_keeping_bulk_on_cpu(
+                layer, device if use_gpu else "cpu", dtype)
             layer.eval()
         else:
             layer = decoder_layers[layer_idx]
@@ -1831,7 +2029,7 @@ def quantize(
                 kwargs = _build_forward_kwargs(
                     profile, h, rotary_emb, layer_idx=layer_idx, cfg=cfg,
                     per_layer_inputs=per_layer_inputs, sample_idx=i,
-                    shared_kv_cache=shared_kv_cache)
+                    shared_kv_cache=shared_kv_cache, calib_ids=calib_ids)
                 layer(h, **kwargs)
 
         # Finalize Hessians to CPU to free GPU for quantization
