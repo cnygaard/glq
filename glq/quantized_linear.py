@@ -7,7 +7,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .hadamard import fast_hadamard_transform
+from .hadamard import block_diagonal_fht, fast_hadamard_transform
 
 try:
     import triton
@@ -1407,6 +1407,194 @@ def _dequant_embedding_rows(
         out_dtype = sv.dtype
     out = deq[..., :embedding_dim].to(out_dtype)
     return out.reshape(*input_ids.shape, embedding_dim)
+
+
+def _dequant_embedding_rows_trellis(
+    input_ids: torch.Tensor,
+    trellis_packed: torch.Tensor,
+    sv: torch.Tensor,
+    wscale: torch.Tensor,
+    codebook,
+    blocks_n,
+    embedding_dim: int,
+    embed_scale: float = 1.0,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Per-row gather + trellis decode + inverse block-diagonal RHT.
+
+    The trellis analogue of :func:`_dequant_embedding_rows`, and like it the single source
+    of truth for both the HF module and the vLLM method so the two cannot drift.
+
+    Each row of the table is its own tail-biting sequence of length ``embedding_dim``, so a
+    gather is ``index_select`` on axis 0 and nothing else — no tile is shared between rows.
+    That is the difference from the 16x16 weight layout, where decoding one row would mean
+    decoding the sixteen it is tiled with.
+
+    The RHT is block-diagonal, which is what keeps a 160-wide row unpadded; the shell path's
+    full Hadamard would round it to 256. Inverse is column-FHT then SV, matching
+    ``RHT.inverse_transform_weights`` under ``apply_left=False``.
+    """
+    cb = getattr(codebook, "cb", codebook)
+    return _dequant_embedding_rows_trellis_fn(
+        input_ids, trellis_packed, sv, wscale, cb.lut,
+        torch.as_tensor([int(b) for b in blocks_n], dtype=torch.int32),
+        embedding_dim, int(cb.L), int(cb.K), int(cb.V), embed_scale, out_dtype)
+
+
+def _dequant_embedding_rows_trellis_fn(
+    input_ids: torch.Tensor,
+    trellis_packed: torch.Tensor,
+    sv: torch.Tensor,
+    wscale: torch.Tensor,
+    lut: torch.Tensor,
+    blocks_n: torch.Tensor,
+    embedding_dim: int,
+    L: int,
+    K: int,
+    V: int,
+    embed_scale: float = 1.0,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Functional form of the trellis row decode: tensors and ints only.
+
+    Split out from the codebook-object version so it can be registered as a torch custom op
+    for vLLM — a schema cannot carry a TrellisCodebook. The op wrapper matters because
+    ``block_diagonal_fht`` is a kernel dynamo cannot trace, which is what made the GLQ
+    embedding the last path breaking vLLM's torch.compile; one opaque node fixes that.
+
+    ``lut`` is the codebook's (V, 2**L) table; L/K/V are its rate parameters.
+    """
+    dev = trellis_packed.device
+    flat_ids = input_ids.reshape(-1).to(dev)
+    B = flat_ids.shape[0]
+
+    rows = trellis_packed.index_select(0, flat_ids)          # [B, ceil(T*K/16)]
+    from .trellis import unpack_trellis_windowed
+    state = unpack_trellis_windowed(rows, embedding_dim, L, K, V)   # [B, T//V]
+    # Mirrors quantize(): lut[:, state] is (V, T//V, B) and V interleaves along T.
+    deq = lut.to(dev)[:, state.T.contiguous().int()]
+    deq = deq.transpose(0, 1).reshape(embedding_dim, B).T.float()
+
+    deq = deq * wscale.index_select(0, flat_ids).unsqueeze(-1).float()
+    deq = block_diagonal_fht(deq, [int(b) for b in blocks_n.tolist()]) * sv.float()
+    if embed_scale != 1.0:
+        deq = deq * embed_scale
+
+    if out_dtype is None:
+        out_dtype = sv.dtype
+    return deq.to(out_dtype).reshape(*input_ids.shape, embedding_dim)
+
+
+
+
+
+def _pow2_blocks(n: int) -> list[int]:
+    """Greedy power-of-two decomposition, matching ``RHT``'s block-diagonal layout.
+
+    160 -> [128, 32]. This is what lets a non-power-of-two width be transformed without
+    padding; the full-Hadamard alternative would round 160 up to 256.
+    """
+    blocks, rem = [], int(n)
+    while rem > 0:
+        b = 1 << (rem.bit_length() - 1)
+        blocks.append(b)
+        rem -= b
+    return blocks
+
+
+class TrellisRHTEmbedding(nn.Module):
+    """``nn.Embedding`` equivalent backed by a trellis-coded table.
+
+    The trellis counterpart of :class:`E8RHTEmbedding`, for tables whose width is not a
+    power of two. Shell decodes through a full Hadamard and so pads the row: gemma-4's PLE
+    width already is a power of two and pays nothing, but Qwen4Exp's 160 rounds to 256 — a
+    1.6x tax on a table that is 95.4 GiB before quantization. Block-diagonal RHT leaves 160
+    alone, and that unpadded layout is the one the trellis path requires.
+
+    Each row is an independent tail-biting sequence of length ``embedding_dim``, so a lookup
+    decodes only the rows asked for. Storage at K bits/weight is
+    ``ceil(embedding_dim*K/16)`` int16 per row — 60 B at width 160, K=3 — plus a per-row
+    fp16 scale (fp32 would add 1.19 GiB over 320M rows).
+
+    ``K`` is not stored anywhere but the packed width, and is recovered from it on load;
+    guessing it decodes noise of exactly the right shape.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, bpw: int = 3,
+                 embed_scale: float = 1.0, variant: str = "3inst"):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.embed_scale = float(embed_scale)
+        self.variant = variant
+
+        self.register_buffer('trellis_packed', torch.zeros(
+            num_embeddings, math.ceil(embedding_dim * int(bpw) / 16), dtype=torch.int16))
+        self.register_buffer('Wscale', torch.ones(num_embeddings, dtype=torch.float16))
+        self.register_buffer('SV', torch.ones(embedding_dim, dtype=torch.float16))
+        # Block sizes of the block-diagonal RHT. Stored rather than re-derived so a
+        # non-power-of-two width cannot be decomposed one way at encode and another at load.
+        self.register_buffer('rht_blocks', torch.tensor(
+            _pow2_blocks(embedding_dim), dtype=torch.int32))
+        # HYB carries a learned tlut; 3INST is lookup-free and carries none.
+        self.register_buffer('tlut', None)
+        self.codebook = None
+
+    @property
+    def K(self) -> int:
+        """Bits per weight, read from the packed width every time rather than cached.
+
+        ``cols == ceil(embedding_dim*K/16)`` is a checkpoint's only record of the rate, and
+        the buffer is the only thing guaranteed to be current: transformers assigns
+        checkpoint tensors straight onto the module, swapping the buffer without ever
+        calling ``_load_from_state_dict``. A rate captured in that hook silently keeps the
+        constructor default while the data says otherwise, and the unpack then reshapes to
+        the wrong width.
+        """
+        cols = self.trellis_packed.shape[-1]
+        return max(1, round(cols * 16 / self.embedding_dim))
+
+    def set_codebook(self, codebook, codebook2=None):
+        """Attach a shared TrellisCodebook. Mirrors the E8RHTEmbedding API."""
+        self.codebook = codebook
+
+    def _ensure_codebook(self):
+        if self.codebook is None:
+            from .trellis import TrellisCodebook
+            self.codebook = TrellisCodebook(
+                variant=self.variant, K=self.K, device=self.trellis_packed.device,
+                tlut=self.tlut)
+        return self.codebook
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        """Resize the packed buffer so a differently-rated checkpoint copies in.
+
+        The rate itself is not cached here — see :attr:`K`, which reads it from the buffer,
+        because this hook does not run on every loader path.
+        """
+        key = prefix + 'trellis_packed'
+        if key in state_dict:
+            if tuple(self.trellis_packed.shape) != tuple(state_dict[key].shape):
+                self.trellis_packed = torch.zeros_like(state_dict[key])
+        tl = prefix + 'tlut'
+        if tl in state_dict and state_dict[tl] is not None:
+            self.tlut = torch.zeros_like(state_dict[tl])
+        self.codebook = None        # rebuilt against the loaded rate/tlut
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return _dequant_embedding_rows_trellis(
+            input_ids, self.trellis_packed, self.SV, self.Wscale,
+            self._ensure_codebook(), [int(b) for b in self.rht_blocks.tolist()],
+            embedding_dim=self.embedding_dim, embed_scale=self.embed_scale,
+            out_dtype=getattr(self, "_compute_dtype", self.SV.dtype))
+
+    def extra_repr(self) -> str:
+        return (f'num_embeddings={self.num_embeddings}, '
+                f'embedding_dim={self.embedding_dim}, K={self.K}')
 
 
 class E8RHTEmbedding(nn.Module):

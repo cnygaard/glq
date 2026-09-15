@@ -185,3 +185,94 @@ def test_hc_expansion_ignores_hc_count_of_one():
         hc_count = 1
     h = torch.zeros(1, 4, 16)
     assert qm._apply_hc_expansion(h, _One()).shape == (1, 4, 16)
+
+
+# ---- input_ids for token-lookup layers (PLE) -------------------------------------------
+
+def test_input_ids_are_passed_when_the_layer_needs_them():
+    """Qwen4Exp layer 1 does `hidden_states + self.ple(...)`, and the PLE does a TOKEN
+    lookup: `self.ple_embedding(input_ids, ...)` -> `input_ids.long()`. GLQ's calibration
+    passed hidden states and rotary kwargs but never input_ids, so layer 1 died with
+
+        AttributeError: 'NoneType' object has no attribute 'long'
+
+    after layer 0 had already taken 13 minutes. The ids exist — `calib_ids` is sliced per
+    sample for the embedding — they were simply never handed to the layer.
+    """
+    rot = _Rotary()
+    h = torch.zeros(1, 8, 4)
+    ids = torch.arange(16).reshape(2, 8)
+    kw = qm._build_forward_kwargs({}, h, rot, layer_idx=1, cfg=_Cfg(mrope=True),
+                                  sample_idx=1, calib_ids=ids)
+    # The parameter is `ple_input_ids`. Passing `input_ids` is swallowed by the layer's
+    # **kwargs and the PLE still sees its default None — the same AttributeError, one fix
+    # later. Verified against the real signature, not guessed.
+    assert "ple_input_ids" in kw, "PLE layers cannot run without ple_input_ids"
+    assert "input_ids" not in kw, "the layer's parameter is ple_input_ids"
+    assert torch.equal(kw["ple_input_ids"], ids[1:2]), "must be THIS sample's row"
+
+
+def test_input_ids_are_omitted_when_not_supplied():
+    """Architectures with no token-lookup layer must not get an unexpected kwarg."""
+    rot = _Rotary()
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), rot, layer_idx=0,
+                                  cfg=_Cfg(mrope=True))
+    assert "input_ids" not in kw
+
+
+def test_qwen3_5_gets_three_axis_position_ids_without_declaring_mrope_section():
+    """Qwen3.5 needs 3-D position_ids but its config never says so.
+
+    `Qwen3_5TextRotaryEmbedding.forward` expands unconditionally --
+    `inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)` with the comment
+    "Qwen3_5Text has different position ids for the grids" -- while its rope_parameters are
+    plain `{partial_rotary_factor, rope_theta, rope_type: 'default'}` with no mrope_section.
+
+    So config-driven detection alone returns False and the streaming quantize dies with
+    "too many indices for tensor of dimension 2" on transformers >= 5.16. That matters
+    because qwen4_exp needs >= 5.16, so without this no single environment can quantize both
+    families. Verified on the box against transformers 5.17.0.
+    """
+    class _PlainCfg:
+        def __init__(self):
+            self.text_config = self
+            self.rope_parameters = {"partial_rotary_factor": 0.25,
+                                    "rope_theta": 10000.0, "rope_type": "default"}
+            self.layer_types = ["full_attention"]
+            self.hidden_size_per_layer_input = 0
+            self.num_kv_shared_layers = 0
+
+    profile = qm._MODEL_PROFILES["Qwen3_5ForConditionalGeneration"]
+    rot = _Rotary()
+    kw = qm._build_forward_kwargs(profile, torch.zeros(1, 8, 4), rot,
+                                  layer_idx=0, cfg=_PlainCfg())
+    assert kw["position_ids"].dim() == 3, (
+        "Qwen3.5 rotary indexes position_ids[:, :, None, :]")
+    assert rot.seen[0] == 3
+
+
+def test_the_three_axes_carry_identical_positions():
+    """Text-only calibration has no image grid, so t/h/w must all be the plain positions.
+    Distinct values here would silently calibrate against rope phases the model never sees
+    at inference."""
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), _Rotary(),
+                                  layer_idx=0, cfg=_Cfg(mrope=True))
+    pos = kw["position_ids"]
+    assert torch.equal(pos[0], pos[1]) and torch.equal(pos[1], pos[2])
+
+
+def test_a_profile_without_the_flag_is_unaffected():
+    """The default path must not acquire 3-D position_ids by accident."""
+    class _PlainRotary:
+        def __init__(self):
+            self.seen = None
+
+        def __call__(self, x, position_ids=None, **kw):
+            self.seen = tuple(position_ids.shape)
+            return (torch.zeros(1), torch.zeros(1))
+
+    rot = _PlainRotary()
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), rot, layer_idx=0,
+                                  cfg=_Cfg(mrope=False))
+    assert kw["position_ids"].dim() == 2
+    assert rot.seen[0] == 1

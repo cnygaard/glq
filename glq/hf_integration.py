@@ -17,7 +17,8 @@ from transformers.quantizers.auto import register_quantization_config, register_
 from transformers.quantizers.base import HfQuantizer
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
-from .quantized_linear import E8RHTLinear, E8RHTEmbedding
+from .quantized_linear import (E8RHTLinear, E8RHTEmbedding,
+                               TrellisRHTEmbedding)
 from .codebook import E8ShellCodebook
 
 
@@ -38,10 +39,16 @@ class GLQConfig(QuantizationConfigMixin):
         trust_remote_code: bool = False,
         variant: str = "hyb",
         trellis_layout: str = None,
+        ple_codebook: str = None,
         **kwargs,
     ):
         self.quant_method = "glq"
         self.codebook = codebook
+        # Codebook of the per-layer-embedding table, when it differs from the run's.
+        # vLLM's create_weights registers buffers BEFORE the checkpoint loads, and shell and
+        # trellis need different ones, so the choice cannot be read off the tensor keys there.
+        # None means shell, so checkpoints predating this keep an unchanged config.json.
+        self.ple_codebook = ple_codebook
         # Trellis codebook variant (hyb/3inst); only meaningful when codebook=="trellis".
         self.variant = variant
         # Trellis storage-layout marker ("kernel"); absent on checkpoints from before the
@@ -71,6 +78,8 @@ class GLQConfig(QuantizationConfigMixin):
             d["variant"] = self.variant
             if self.trellis_layout is not None:
                 d["trellis_layout"] = self.trellis_layout
+        if self.ple_codebook is not None:
+            d["ple_codebook"] = self.ple_codebook
         if self.layer_bpw:
             d["layer_bpw"] = self.layer_bpw
         if self.kv_cache_bits != 16:
@@ -185,9 +194,26 @@ def _collect_quantized_layer_names(pretrained_path):
     return out
 
 
-def replace_with_glq_embedding(model, quantized_layers=None):
-    """Replace nn.Embedding modules with E8RHTEmbedding when checkpoint has GLQ
-    payload for them.
+def _collect_trellis_embedding_names(pretrained_path):
+    """Names whose GLQ payload is trellis-coded (``.trellis_packed``) rather than shell.
+
+    Which module replaces an nn.Embedding has to follow what the checkpoint actually stores,
+    not the run's ``--codebook``: a PLE table can be trellis-coded in a shell run and vice
+    versa, and the two layouts are not interchangeable — the shell module would look for a
+    Qidxs that is absent, and would size a full-Hadamard buffer for an unpadded row.
+    """
+    keys, _ = _peek_qidxs_keys(pretrained_path)
+    if not keys:
+        return set()
+    return {k[:-len(".trellis_packed")] for k in keys if k.endswith(".trellis_packed")}
+
+
+def replace_with_glq_embedding(model, quantized_layers=None, trellis_layers=None):
+    """Replace nn.Embedding modules with a GLQ embedding when the checkpoint has payload.
+
+    ``trellis_layers`` names the subset whose payload is trellis-coded; those become
+    :class:`TrellisRHTEmbedding` and the rest :class:`E8RHTEmbedding`. Omitting it keeps
+    every embedding on shell, which is what existing gemma-4 checkpoints expect.
 
     Used by Gemma-4 E2B/E4B where ``embed_tokens_per_layer`` (a [vocab × ~9k]
     table) gets right-side-only RHT-quantized to cut its 4 GB bf16 footprint
@@ -224,8 +250,10 @@ def replace_with_glq_embedding(model, quantized_layers=None):
                     embed_scale = 1.0
         else:
             embed_scale = float(raw_scale)
+        is_trellis = bool(trellis_layers) and name in trellis_layers
+        cls = TrellisRHTEmbedding if is_trellis else E8RHTEmbedding
         with torch.device("meta"):
-            new_module = E8RHTEmbedding(
+            new_module = cls(
                 num_embeddings=module.num_embeddings,
                 embedding_dim=module.embedding_dim,
                 embed_scale=embed_scale,
@@ -478,7 +506,10 @@ class GLQQuantizer(HfQuantizer):
         # Gemma-4 PLE embedding (and any other quantized nn.Embedding) gets
         # swapped to E8RHTEmbedding when the saved checkpoint has its GLQ
         # payload. No-op for older single-modal checkpoints.
-        replace_with_glq_embedding(model, quantized_layers=quantized_layers)
+        replace_with_glq_embedding(
+            model, quantized_layers=quantized_layers,
+            trellis_layers=(_collect_trellis_embedding_names(pretrained_path)
+                            if pretrained_path else None))
         if not replaced and not n_fused:
             import logging
             logging.getLogger(__name__).warning(
@@ -594,15 +625,24 @@ class GLQQuantizer(HfQuantizer):
         if isinstance(compute_dtype, str):
             compute_dtype = getattr(torch, compute_dtype, torch.bfloat16)
 
-        # E8RHTEmbedding always decodes via the shell E8 lookup; under e8p and
-        # trellis the PLE is shell-quantized (see quantize_model), so give
-        # embeddings a shell codebook (full-shell stage-2 for the 4bpw PLE) while
-        # the linears keep their own. Shell/relaxed models reuse one codebook.
+        # E8RHTEmbedding always decodes via the shell E8 lookup. Under e8p, and under
+        # trellis for any architecture whose PLE descriptor asks for shell, the table is
+        # shell-quantized (see quantize_model), so give those embeddings a shell codebook
+        # (full-shell stage-2 for the 4bpw PLE) while the linears keep their own.
+        # Shell/relaxed models reuse one codebook. A trellis-coded table is handled below.
         emb_shell_cb = (_resolve_shell_codebook(pretrained_path)
                         if cb_type in ("e8p", "trellis") else None)
         emb_cb, emb_cb2 = _embedding_codebooks(cb_type, codebook, codebook2, emb_shell_cb)
+        # A trellis-coded embedding builds its own codebook from the rate recovered off the
+        # packed width plus the stored tlut, so it needs the variant (3INST is lookup-free
+        # and carries no tlut; HYB's is meaningless without knowing which it is) and the
+        # compute dtype — but not the shell codebook above.
+        emb_variant = getattr(self.quantization_config, "variant", "hyb")
         for module in model.modules():
-            if isinstance(module, E8RHTEmbedding):
+            if isinstance(module, TrellisRHTEmbedding):
+                module.variant = emb_variant
+                module._compute_dtype = compute_dtype
+            elif isinstance(module, E8RHTEmbedding):
                 module.set_codebook(emb_cb, codebook2=emb_cb2)
                 module._compute_dtype = compute_dtype
             elif isinstance(module, E8RHTLinear):

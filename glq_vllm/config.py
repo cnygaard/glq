@@ -39,11 +39,20 @@ class GLQvLLMConfig(QuantizationConfig):
 
     def __init__(self, bpw: int = 2, layer_bpw: dict | None = None,
                  codebook: str = "e8_shell", block_diagonal: bool = True,
-                 variant: str = "hyb", trellis_layout: str | None = None):
+                 variant: str = "hyb", trellis_layout: str | None = None,
+                 ple_codebook: str | None = None, ple_bpw: int | None = None):
         super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
         self.codebook = codebook
+        # Codebook and rate of the per-layer-embedding table, which need not match the
+        # weights': a 3 bpw model can carry a 4 bpw table, and a shell run can carry a
+        # trellis one. create_weights registers embedding buffers before any checkpoint
+        # tensor is visible, so this cannot be recovered from the tensor keys there — get it
+        # wrong and the only symptom is a bare shape assertion inside vLLM's embedding
+        # loader, with nothing pointing at GLQ. None means shell.
+        self.ple_codebook = ple_codebook
+        self.ple_bpw = ple_bpw
         # Trellis codebook variant. Both "hyb" (tlut kernels) and "3inst" (lookup-free
         # <R, IS_3INST> kernels) serve; anything else has no CUDA kernel and vLLM has no
         # pure-torch decode fallback, so refuse up front rather than serve garbage.
@@ -92,6 +101,10 @@ class GLQvLLMConfig(QuantizationConfig):
             block_diagonal=config.get("block_diagonal", True),
             variant=config.get("variant", "hyb"),
             trellis_layout=config.get("trellis_layout", None),
+            # PLE markers. Absent means shell, which is what every checkpoint written before
+            # these keys existed implies — so older gemma-4 builds load unchanged.
+            ple_codebook=config.get("ple_codebook", None),
+            ple_bpw=config.get("ple_bpw", None),
         )
 
     def _lookup_bpw(self, prefix: str) -> int | None:
@@ -177,7 +190,14 @@ class GLQvLLMConfig(QuantizationConfig):
             bpw = self._lookup_bpw(prefix)
             if bpw is None:
                 return UnquantizedEmbeddingMethod()
-            return GLQEmbeddingMethod(self, bpw=bpw)
+            # ple_codebook marks a table coded differently from the run's codebook
+            # (absent == shell, so existing checkpoints are unaffected). It has to come
+            # from config.json: create_weights runs before any tensor key is visible.
+            ple_cb = getattr(self, "ple_codebook", None) or "shell"
+            ple_bpw = getattr(self, "ple_bpw", None) or bpw
+            return GLQEmbeddingMethod(
+                self, bpw=(ple_bpw if ple_cb == "trellis" else bpw),
+                codebook=ple_cb, variant=self.variant)
 
         # FusedMoE layers — lazy import to avoid circular deps. vLLM 0.25 split the
         # 0.23 `FusedMoE` nn.Module into a factory *function* (returns a MoERunner)
