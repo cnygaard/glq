@@ -103,8 +103,16 @@ def check_vllm(path: str) -> None:
     try:
         llm = LLM(model=path, dtype="bfloat16", max_model_len=2048,
                   gpu_memory_utilization=0.55, enforce_eager=True)
-        outs = llm.generate([PROMPT], SamplingParams(temperature=0.0, max_tokens=48))
-        print(f"  vLLM generation: {outs[0].outputs[0].text.strip()[:200]!r}")
+        tok = llm.get_tokenizer()
+        prompt = tok.apply_chat_template([{"role": "user", "content": PROMPT}],
+                                         add_generation_prompt=True, tokenize=False)
+        # The model card's sampling, not greedy — same reason as the HF arm: gemma-4 emits
+        # nothing at temperature 0, and an empty string would sail past a check that only
+        # counts op dispatches.
+        outs = llm.generate([prompt], SamplingParams(temperature=1.0, top_p=0.95,
+                                                     top_k=64, max_tokens=64))
+        text = outs[0].outputs[0].text
+        print(f"  vLLM generation: {text.strip()[:220]!r}")
     finally:
         torch.ops.glq.embedding_dequant_trellis = real_t                # type: ignore[assignment]
         torch.ops.glq.embedding_dequant = real_s                        # type: ignore[assignment]
@@ -113,6 +121,10 @@ def check_vllm(path: str) -> None:
           f"embedding_dequant(shell)={calls['shell']}")
     assert calls["trellis"] > 0, (
         "the trellis embedding op never ran — coherent text here came from somewhere else")
+    assert calls["shell"] == 0, "the shell embedding op ran too — both paths were active"
+    # Both halves are required. Op counts alone would pass on an empty string; text alone
+    # would pass on a silent fallback to shell.
+    assert text.strip(), "empty generation despite the trellis op running"
 
 
 def footprint(path: str) -> float:
