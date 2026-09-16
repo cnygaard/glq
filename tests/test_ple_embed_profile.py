@@ -164,3 +164,37 @@ def test_an_unknown_override_value_is_refused(monkeypatch):
     monkeypatch.setenv("GLQ_PLE_CODEBOOK", "trelis")
     with pytest.raises(ValueError, match="GLQ_PLE_CODEBOOK"):
         _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg())
+
+
+def test_the_ple_bpw_can_be_overridden(monkeypatch):
+    """The table's rate is independent of the weights'.
+
+    Qwen4Exp's PLE is 60% of its checkpoint, so its bpw is the dominant footprint lever and
+    deserves to be set separately from --bpw. The descriptor's 3 was chosen before the table
+    had ever been measured; on real rows 3 bpw is 17.5 dB against ~23.3 dB at 4, for 6 GiB.
+    Left as an override rather than a new default, because no quality evidence separates the
+    two rungs yet — only SQNR.
+    """
+    monkeypatch.setenv("GLQ_PLE_BPW", "4")
+    spec = _ple_embed_spec(QWEN4EXP, _MODEL_PROFILES[QWEN4EXP], _cfg(ple_dim=160))
+    assert spec["bpw"] == 4
+
+
+def test_the_ple_bpw_default_is_unchanged(monkeypatch):
+    """Absent the override, every profile keeps the bpw it declares — so existing runs and
+    the gemma-4 byte-identical gate are untouched."""
+    monkeypatch.delenv("GLQ_PLE_BPW", raising=False)
+    assert _ple_embed_spec(QWEN4EXP, _MODEL_PROFILES[QWEN4EXP], _cfg(ple_dim=160))["bpw"] == 3
+    assert _ple_embed_spec(GEMMA4, _MODEL_PROFILES[GEMMA4], _cfg())["bpw"] == 4
+
+
+@pytest.mark.parametrize("bad", ["0", "9", "three", ""])
+def test_a_nonsensical_ple_bpw_is_refused(monkeypatch, bad):
+    """A typo must not silently fall back to the descriptor: the operator would get a
+    different-sized table than they asked for and only notice from the footprint."""
+    monkeypatch.setenv("GLQ_PLE_BPW", bad)
+    if bad == "":
+        assert _ple_embed_spec(QWEN4EXP, _MODEL_PROFILES[QWEN4EXP], _cfg(ple_dim=160))["bpw"] == 3
+    else:
+        with pytest.raises(ValueError, match="GLQ_PLE_BPW"):
+            _ple_embed_spec(QWEN4EXP, _MODEL_PROFILES[QWEN4EXP], _cfg(ple_dim=160))

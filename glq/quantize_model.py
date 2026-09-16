@@ -614,6 +614,22 @@ def _ple_embed_spec(arch, profile=None, cfg=None):
             # RHT, and the quantize path asserts on precisely that. Flipping one without the
             # other would fail deep into a run rather than here.
             spec['block_diagonal'] = True
+
+    # The table's rate, independently of --bpw. On Qwen4Exp the PLE is 60% of the checkpoint,
+    # so this is the dominant footprint lever: 3 bpw measured 17.5 dB on real rows against
+    # ~23.3 dB at 4, for 6 GiB more. An override rather than a new default because no quality
+    # evidence separates the rungs yet — only SQNR — and changing a descriptor's declared bpw
+    # would silently alter what existing commands produce.
+    bpw_override = os.environ.get('GLQ_PLE_BPW')
+    if bpw_override:
+        try:
+            v = int(bpw_override)
+        except ValueError:
+            raise ValueError(
+                f"GLQ_PLE_BPW={bpw_override!r}: expected an integer 2-8") from None
+        if not 2 <= v <= 8:
+            raise ValueError(f"GLQ_PLE_BPW={v}: expected 2-8")
+        spec['bpw'] = v
     return spec
 
 
