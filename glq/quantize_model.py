@@ -297,6 +297,11 @@ _MODEL_PROFILES = {
         'forward_kwargs': 'default',
         'multimodal_text': True,
         'stacked_experts': True,
+        # The 12 qwen_sparse_attention layers run an indexer that dereferences
+        # attention_mask unconditionally ("the mask is never None here", per its own
+        # comment), so calling a layer directly with None raises. The model builds it with
+        # create_causal_mask(allow_is_causal_skip=False); we must supply the same thing.
+        'causal_mask': True,
         # The n-gram table: 128 shards of [2500012, 160] = [320001536, 160] bf16 = 95.4 GiB,
         # 60% of a 4 bpw checkpoint on its own. Trellis rather than shell because 160 is not
         # a power of two: shell's full Hadamard would pad every row to 256 (a 1.6x tax),
@@ -783,6 +788,38 @@ def _apply_hc_expansion(hidden_states, cfg):
     return hidden_states.repeat(1, 1, hc)
 
 
+def _causal_mask_for(h, cfg, position_ids):
+    """A 4-D causal mask shaped as the sparse-attention indexer expects.
+
+    Uses transformers' ``create_causal_mask`` with ``allow_is_causal_skip=False``, which is
+    exactly what the model's own forward does -- the skip is disabled there deliberately
+    "due to the indexer", and a skipped (None) mask is what crashes it. Falls back to an
+    explicit lower-triangular bool mask if that helper is unavailable, which is the same
+    thing the sdpa branch consumes.
+    """
+    inner = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    # The mask builder wants the 2-D text positions, not the 3-D mRoPE stack.
+    pos = position_ids[0] if position_ids is not None and position_ids.dim() == 3 \
+        else position_ids
+    try:
+        from transformers.masking_utils import create_causal_mask
+        m = create_causal_mask(config=inner, inputs_embeds=h, attention_mask=None,
+                               past_key_values=None, position_ids=pos,
+                               allow_is_causal_skip=False)
+    except Exception:                                        # noqa: BLE001
+        m = None
+    if m is not None:
+        return m
+    # create_causal_mask returns None whenever it judges the mask skippable — measured
+    # against the real Qwen4Exp config, it does so even with allow_is_causal_skip=False.
+    # That is fine for attention kernels that infer causality themselves, and fatal for the
+    # indexer, which indexes the mask directly. So build it explicitly: lower-triangular
+    # bool is what the sdpa branch consumes, True = visible.
+    seq = h.shape[1]
+    return torch.tril(torch.ones(seq, seq, dtype=torch.bool,
+                                 device=h.device))[None, None]
+
+
 def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
                           per_layer_inputs=None, sample_idx=None,
                           shared_kv_cache=None, calib_ids=None):
@@ -852,6 +889,13 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
     kwargs = dict(position_ids=position_ids, cache_position=cache_position,
                   use_cache=False)
+    # Sparse-attention layers need a real 4-D causal mask. Built with the model's own
+    # create_causal_mask rather than a hand-rolled tril so the semantics match exactly --
+    # and CAUSAL, not all-visible: an all-visible mask does not raise, it silently lets the
+    # indexer select future tokens, so every downstream Hessian would be fitted to
+    # activations the model never produces at inference.
+    if profile and profile.get('causal_mask'):
+        kwargs['attention_mask'] = _causal_mask_for(h, cfg, position_ids)
     # Token-lookup layers need the ids, not just the hidden states: Qwen4Exp's PLE layer
     # does `self.ple_embedding(ple_input_ids, ...)` -> `.long()`, an AttributeError on None.
     # The decoder layer's parameter is `ple_input_ids`; passing `input_ids` is silently
