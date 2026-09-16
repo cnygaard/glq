@@ -262,3 +262,39 @@ def test_the_rate_is_read_from_the_buffer_at_every_rate(bpw):
     mod = TrellisRHTEmbedding(16, WIDTH, bpw=3)
     mod.trellis_packed = arts["trellis_packed"]
     assert mod.K == bpw
+
+
+def test_the_decode_returns_a_contiguous_tensor():
+    """The op's real output must match what its fake/meta kernel promises.
+
+    The fake returns `input_ids.new_empty((*shape, dim))` — contiguous. The real decode
+    builds its result via `.reshape(dim, B).T`, which is stride (1, dim), and `.to(dtype)`
+    preserves memory format by default, so the transposed layout reached the return.
+    torch.compile compares the two and refuses:
+
+        assert_size_stride(buf26, (s72, 10752), (10752, 1),
+                           'torch.ops.glq.embedding_dequant_trellis.default')
+        AssertionError: expected ... stride 1==10752 at dim=0
+
+    Eager execution never checks this, which is why an `enforce_eager=True` serve test
+    passed while vLLM's compiled path could not start at all.
+    """
+    W = _table(rows=64)
+    arts, _ = _quantize_ple_chunk_trellis(W, bpw=3, device="cpu")
+    out = _dequant_embedding_rows_trellis(
+        torch.arange(64), arts["trellis_packed"], arts["SV"], arts["Wscale"],
+        arts["_codebook"], arts["_blocks_n"], WIDTH)
+    assert out.is_contiguous(), f"non-contiguous output, strides {out.stride()}"
+
+
+def test_the_decode_matches_its_fake_kernels_shape_and_stride():
+    """Pin the contract directly against the fake, since that is what torch.compile uses."""
+    W = _table(rows=32)
+    arts, _ = _quantize_ple_chunk_trellis(W, bpw=3, device="cpu")
+    ids = torch.randint(0, 32, (5,))
+    real = _dequant_embedding_rows_trellis(
+        ids, arts["trellis_packed"], arts["SV"], arts["Wscale"],
+        arts["_codebook"], arts["_blocks_n"], WIDTH)
+    fake = ids.new_empty((*ids.shape, WIDTH), dtype=real.dtype)
+    assert real.shape == fake.shape, (real.shape, fake.shape)
+    assert real.stride() == fake.stride(), (real.stride(), fake.stride())

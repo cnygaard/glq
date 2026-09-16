@@ -1482,7 +1482,13 @@ def _dequant_embedding_rows_trellis_fn(
 
     if out_dtype is None:
         out_dtype = sv.dtype
-    return deq.to(out_dtype).reshape(*input_ids.shape, embedding_dim)
+    # .contiguous() is load-bearing, not tidiness. deq is built through `.reshape(dim, B).T`,
+    # so its stride is (1, dim), and `.to(dtype)` defaults to memory_format=preserve_format —
+    # the transposed layout would otherwise reach the caller. The registered fake kernel
+    # promises a contiguous `new_empty`, and torch.compile checks the two against each other:
+    #     assert_size_stride(buf26, (s72, 10752), (10752, 1), ... embedding_dequant_trellis)
+    # Eager never compares them, so this is invisible until vLLM compiles the graph.
+    return deq.to(out_dtype).reshape(*input_ids.shape, embedding_dim).contiguous()
 
 
 
