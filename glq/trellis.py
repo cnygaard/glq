@@ -240,6 +240,26 @@ def _make_hyb_tlut(tlut_bits=9, seed=0):
 # ---------------------------------------------------------------------------
 # bitshift trellis codebook (QTIP bitshift.py, tqdm/train paths stripped)
 # ---------------------------------------------------------------------------
+def unpack_trellis_windowed(packed, T, L, K, V):
+    """Decode packed tail-biting states without needing a codebook instance.
+
+    The one implementation of the sliding window; ``bitshift_codebook.unpack_trellis``
+    delegates here, and the embedding decode path (which must be expressible as a torch
+    custom op, so it cannot hold a codebook object) calls it directly. Kept in one place
+    because two copies of a bit-layout routine drift silently.
+    """
+    p = packed.view(torch.uint16).to(torch.int32)
+    uint_mask = (2 ** torch.arange(16, dtype=torch.int32, device=p.device)).flip(0)
+    bf = (p.unsqueeze(-1) & uint_mask) > 0
+    pad_amt = math.ceil(T * K / 16) * 16 - T * K
+    bf = bf.reshape(p.shape[0], T * K + pad_amt)[:, :T * K]
+    # Tail-biting wrap: the last windows run off the end and read the opening bits.
+    bf = torch.cat([bf, bf[:, :L - K * V]], dim=-1)
+    L_mask = (2 ** torch.arange(L, dtype=torch.int32, device=p.device)).flip(0)
+    win = bf.unfold(1, L, K * V)[:, :T // V, :]
+    return (win.int() * L_mask).sum(dim=-1)
+
+
 class bitshift_codebook(nn.Module):
 
     def __init__(self, L=16, K=2, V=2, tlut_bits=9, decode_mode="quantlut_sym", tlut=None):
@@ -579,15 +599,31 @@ class bitshift_codebook(nn.Module):
         self._vit_graphs.clear()
         self._vit_graph_pool = None
 
-    def _chunk_b(self, device):
+    def _chunk_b(self, device, T=None):
         """Viterbi rows per call on this device: the largest B whose cost ping-pong still
-        sits in L2, floored at 16 and capped at the historical 2^(24-L)."""
+        sits in L2, floored at 16 and capped at the historical 2^(24-L).
+
+        ``T`` (the sequence length) additionally caps B, because ``viterbi`` allocates::
+
+            from_state = empty(T // V, B, 2 ** (L - K*V))
+
+        which the L2 heuristic above does not model — it sizes B from the *cost* ping-pong
+        alone. For the 16x16 weight tiles this codebook was built for (T=256) that is
+        harmless, but an embedding row is the whole table width: gemma-4's PLE is 8960 wide,
+        and at the L2-derived B=144 that single allocation is 8960*144*4096*4 = **19.7 GiB**,
+        which OOMs a 46 GB card. Measured exactly that on an L40S.
+
+        The cap is deliberately derived from T and fixed constants, never from free memory:
+        a B that moved with machine state would make the encoded checkpoint move with it too,
+        and byte-identical encoding is a hard requirement. For T=256 the cap does not bind,
+        so the shipped weight path is unchanged.
+        """
         env = os.environ.get("GLQ_TRELLIS_CHUNK_B")
         if env:
             return max(1, int(env))
         hard_cap = 2 ** (24 - self.L)
         if getattr(device, "type", None) != "cuda":
-            return hard_cap
+            return self._cap_b_for_T(hard_cap, T, device)
         idx = torch.cuda.current_device() if device.index is None else device.index
         key = (idx, self.L)
         if key not in _chunk_b_cache:
@@ -601,14 +637,57 @@ class bitshift_codebook(nn.Module):
                 _chunk_b_cache[key] = max(16, min(hard_cap, b))
             else:                                        # unknown L2 → historical behaviour
                 _chunk_b_cache[key] = hard_cap
-        return _chunk_b_cache[key]
+        return self._cap_b_for_T(_chunk_b_cache[key], T, device)
+
+    #: Fallback ceiling on the single ``from_state`` allocation, used when the device's
+    #: capacity is unknown (CPU, or a driver that will not report it).
+    _STATE_BUDGET_BYTES = 2 << 30
+
+    #: Share of a GPU's TOTAL memory `from_state` may take. Total, not free: total is a
+    #: property of the card, so the chunk size is reproducible on the same hardware, whereas
+    #: free memory moves with whatever else is resident.
+    _STATE_BUDGET_FRACTION = 0.25
+
+    def _state_budget(self, device):
+        try:
+            if getattr(device, "type", None) == "cuda" or str(device).startswith("cuda"):
+                idx = torch.cuda.current_device()
+                total = torch.cuda.get_device_properties(idx).total_memory
+                return max(self._STATE_BUDGET_BYTES,
+                           int(total * self._STATE_BUDGET_FRACTION))
+        except Exception:                                    # noqa: BLE001
+            pass
+        return self._STATE_BUDGET_BYTES
+
+    def _cap_b_for_T(self, b, T, device=None):
+        """Cap B so ``from_state`` fits the budget.
+
+        Safe to size generously: B is **output-invariant**. ``quantize_seq`` chunks over NO,
+        and those are independent tail-biting sequences, so a row's Viterbi cannot depend on
+        its batch-mates — verified by encoding the same table at B in {96, 48, 16, 7, 1} and
+        getting identical state, packed bytes and W_hat. Time, though, is inversely
+        proportional to B: the work is (rows/B) sequential Viterbi calls of T steps each, so
+        an over-tight cap costs directly. A 2 GiB budget on a 44 GiB card left B=14 for a
+        8960-wide table and made the step take tens of minutes.
+
+        The cap only ever LOWERS B, and only when the budget actually binds — which for a
+        256-element weight tile it does not. That matters beyond tidiness: B straddles the
+        CUDA-graph threshold (graphed at or below it, eager above), so clamping weight-path B
+        would silently move the shipped encode between two different code paths. It must be
+        free to stay where it is.
+        """
+        if T is None:
+            return b
+        per_row = (T // self.V) * 2 ** (self.L - self.K * self.V) * 4
+        capped = self._state_budget(device) // max(1, per_row)
+        return max(1, min(b, capped))
 
     def quantize_seq(self, X, overlap=None):
         T, NO = X.shape
         # Balanced chunks: take the fewest chunks that respect the device width, then even
         # them out. Rounding NO up to a multiple of the width instead would process 288 rows
         # for a 160-row layer at width 144 — slower than not chunking at all.
-        cap = min(self._chunk_b(X.device), NO)
+        cap = min(self._chunk_b(X.device, T=T), NO)
         nchunks = math.ceil(NO / cap)
         bs = math.ceil(NO / nchunks)
         pad_amt = nchunks * bs - NO
@@ -634,7 +713,8 @@ class bitshift_codebook(nn.Module):
         # per-pass path below; so does a failed pair capture (None from _pair_graphed).
         state = None
         if (X.is_cuda and _trellis_cudagraph_on()
-                and NO <= min(self._chunk_b(X.device), _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
+                and NO <= min(self._chunk_b(X.device, T=T),
+                              _GLQ_TRELLIS_CUDAGRAPH_MAX_B)):
             state = self._pair_graphed(X)
         if state is None:
             roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
@@ -666,22 +746,26 @@ class bitshift_codebook(nn.Module):
         return (bf.to(torch.int32) * uint_mask).sum(dim=-1).to(torch.uint16).view(torch.int16)
 
     def unpack_trellis(self, packed, T):
-        """Inverse of ``pack_trellis``: (B, ceil(T*K/16)) int16 → (B, T//V) int trellis."""
-        packed = packed.view(torch.uint16).to(torch.int32)
-        uint_mask = (2 ** torch.arange(16, dtype=torch.int32, device=packed.device)).flip(
-            dims=(-1,)).unsqueeze(0).unsqueeze(0)
-        bf = (packed.unsqueeze(-1) & uint_mask) > 0
-        pad_amt = math.ceil(T * self.K / 16) * 16 - T * self.K
-        bf = bf.reshape(-1, (T * self.K + pad_amt))[:, :T * self.K]
-        bf = torch.concat([bf, bf[:, :self.L - self.K * self.V]], dim=-1)
-        L_mask = (2 ** torch.arange(self.L, dtype=torch.int32, device=packed.device).flip(dims=(-1,))).unsqueeze(0)
-        K_mask = (2 ** torch.arange(self.K * self.V, dtype=torch.int32, device=packed.device).flip(dims=(-1,))).unsqueeze(0)
-        trellis = torch.zeros(bf.shape[0], T // self.V, dtype=torch.int32, device=bf.device)
-        trellis[:, 0] = (bf[:, :self.L].int() * L_mask).sum(dim=-1)
-        for i in range(1, T // self.V):
-            trellis[:, i] = ((trellis[:, i - 1] << (self.K * self.V)) & ((1 << self.L) - 1)) + \
-                (bf[:, self.L + (i - 1) * self.K * self.V:self.L + i * self.K * self.V].int() * K_mask).sum(dim=-1)
-        return trellis
+        """Inverse of ``pack_trellis``: (B, ceil(T*K/16)) int16 → (B, T//V) int trellis.
+
+        The defining recurrence looks sequential::
+
+            trellis[:, i] = ((trellis[:, i-1] << K*V) & (2**L - 1))
+                            + bits[L + (i-1)*K*V : L + i*K*V]
+
+        but ``<< K*V`` masked to L bits is a shift register: it discards the top K*V bits
+        and admits K*V fresh ones. By induction ``trellis[:, i]`` is just the L-wide window
+        of the (tail-biting) bitstream at offset ``i*K*V``, so every step is independent and
+        the whole thing is one strided ``unfold``.
+
+        Worth the rewrite because embedding decode puts this on the per-token path, where
+        the loop form is launch-bound rather than work-bound: measured on an RTX PRO 6000
+        at T=160, it cost ~8.1 ms at *any* batch size (160 tiny kernels) against 0.11 ms
+        here — 74x at B=8, 47x at B=4096. ``tests/test_trellis_storage.py`` pins the output
+        against the sequential form verbatim, and asserts the op count no longer grows
+        with T.
+        """
+        return unpack_trellis_windowed(packed, T, self.L, self.K, self.V)
 
 
 # ---------------------------------------------------------------------------

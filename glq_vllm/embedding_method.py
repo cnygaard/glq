@@ -12,6 +12,8 @@ Per-row dequant is delegated to ``glq.quantized_linear._dequant_embedding_rows``
 one math path.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -51,9 +53,16 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
     E8Shell table, lazily moved to the input device on first call.
     """
 
-    def __init__(self, quant_config, bpw: int):
+    def __init__(self, quant_config, bpw: int, codebook: str = "shell",
+                 variant: str = "3inst"):
         self.quant_config = quant_config
         self.bpw = int(bpw)
+        # Which codebook the TABLE was coded with, which is not always the run's codebook:
+        # a PLE can be trellis-coded in an otherwise-shell checkpoint and vice versa. It has
+        # to be known here because create_weights registers buffers before the checkpoint
+        # loads, and the two layouts have different shapes and dtypes.
+        self.codebook = codebook
+        self.variant = variant
 
     # ------------------------------------------------------------------
     # vLLM contract
@@ -85,6 +94,28 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
         if weight_loader is None:
             from vllm.model_executor.utils import default_weight_loader
             weight_loader = default_weight_loader
+
+        if self.codebook == "trellis":
+            # Block-diagonal RHT, so the row is NOT padded to a power of two: the buffer is
+            # embedding_dim wide, not n_pad. ceil(width*K/16) int16 per row -- 60 B at
+            # width 160, K=3, against shell's 64 B for the same row padded to 256.
+            from glq.quantized_linear import _pow2_blocks
+            layer.trellis_packed = _make_param(
+                torch.empty(vocab_per_rank,
+                            math.ceil(embedding_dim * self.bpw / 16), dtype=torch.int16),
+                weight_loader, output_dim=0)
+            layer.Wscale = _make_param(
+                torch.ones(vocab_per_rank, dtype=torch.float16),
+                weight_loader, output_dim=0)
+            layer.SV = _make_param(
+                torch.ones(embedding_dim, dtype=torch.float16),
+                weight_loader, output_dim=None)
+            layer.rht_blocks = _make_param(
+                torch.tensor(_pow2_blocks(embedding_dim), dtype=torch.int32),
+                weight_loader, output_dim=None)
+            layer.glq_embedding_dim = embedding_dim
+            layer.glq_out_dtype = params_dtype
+            return
 
         # Vocab-sharded buffers (output_dim=0)
         layer.Qidxs = _make_param(
@@ -147,6 +178,18 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
         the GLQ-quantized Gemma-4 PLE embedding was the one path still breaking
         compile with ``dynamo.exc.Unsupported: posix.stat``).
         """
+        if self.codebook == "trellis":
+            # Rebuild the codebook once, at load, and keep only its lut on the layer: the
+            # per-forward path must stay free of construction and host syncs so vLLM can
+            # trace and graph-capture it.
+            from glq.trellis import TrellisCodebook
+            dev = layer.trellis_packed.device
+            tlut = getattr(layer, "tlut", None)
+            cb = TrellisCodebook(variant=self.variant, K=self.bpw, device=dev,
+                                 tlut=tlut)
+            layer.glq_trellis_lut = cb.cb.lut.to(dev)
+            layer.glq_trellis_LKV = (int(cb.cb.L), int(cb.cb.K), int(cb.cb.V))
+            return
         dev = layer.Qidxs.device
         cb1, cb2 = _get_codebook_pair(self.bpw, dev)
         layer.glq_cb1 = cb1
@@ -170,6 +213,14 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
         (``process_weights_after_loading``), so this path has no os.stat/disk/host
         sync — it compiles + CUDA-graph-captures cleanly.
         """
+        if self.codebook == "trellis":
+            if getattr(layer, "glq_trellis_lut", None) is None:
+                self.process_weights_after_loading(layer)
+            L, K, V = layer.glq_trellis_LKV
+            return torch.ops.glq.embedding_dequant_trellis(
+                input_ids, layer.trellis_packed, layer.SV, layer.Wscale,
+                layer.glq_trellis_lut, layer.rht_blocks,
+                layer.glq_embedding_dim, L, K, V, 1.0, layer.glq_out_dtype)
         # Cached at load time; defensive lazy-fill for a direct (non-vLLM) call.
         cb1 = getattr(layer, "glq_cb1", None)
         if cb1 is None:

@@ -255,6 +255,10 @@ _MODEL_PROFILES = {
         'trust_remote_code': False,
         'forward_kwargs': 'default',
         'multimodal_text': True,
+        # Qwen3_5TextRotaryEmbedding expands to 3 rope grids unconditionally, without the
+        # config declaring mrope_section, so the 3-D position_ids cannot be detected from
+        # rope_parameters the way Qwen4Exp's are.
+        'mrope_position_ids': True,
         'skip_linears': ('.in_proj_b', '.in_proj_a'),
     },
     'Qwen4ExpForConditionalGeneration': {
@@ -293,6 +297,21 @@ _MODEL_PROFILES = {
         'forward_kwargs': 'default',
         'multimodal_text': True,
         'stacked_experts': True,
+        # The n-gram table: 128 shards of [2500012, 160] = [320001536, 160] bf16 = 95.4 GiB,
+        # 60% of a 4 bpw checkpoint on its own. Trellis rather than shell because 160 is not
+        # a power of two: shell's full Hadamard would pad every row to 256 (a 1.6x tax),
+        # while block-diagonal RHT leaves 160 exactly. Measured on real rows, the tiling
+        # choice costs nothing in quality (17.49 dB row-tiled per-row vs 17.39 dB 16x16 —
+        # benchmarks/_ple_tiling_sqnr.py), and a gathered row decodes in 0.049 ms against
+        # shell's 0.079 ms.
+        'ple_embed': {
+            'prefix': ('model.language_model.layers.1.ple.ple_embedding'
+                       '.ngram_embedding'),
+            'codebook': 'trellis',
+            'bpw': 3,
+            'block_diagonal': True,
+            'shards': 128,
+        },
         'skip_linears': ('.in_proj_b', '.in_proj_a', '.shared_expert_gate',
                          '.block_inject_weight', '.indexer.'),
     },
@@ -534,6 +553,70 @@ def _stacked_experts_enabled(arch, profile=None):
     return "Gemma4" in arch and "ForConditionalGeneration" in arch
 
 
+#: Gemma-4's PLE settings, previously four literals inline in the streaming save path.
+#: Kept here verbatim so the descriptor refactor cannot drift published checkpoints:
+#: shell codebook, fixed 4 bpw (2 stages, ~half the disk of 2 bpw for noticeably better
+#: SQNR), full Hadamard.
+_GEMMA4_PLE = {
+    'prefix': 'model.language_model.embed_tokens_per_layer',
+    'codebook': 'shell',
+    'bpw': 4,
+    'block_diagonal': False,
+}
+
+
+def _ple_embed_spec(arch, profile=None, cfg=None):
+    """How to quantize this architecture's per-layer-embedding table, or None.
+
+    A PLE table is an ``nn.Embedding``, so the ``nn.Linear`` walk never sees it and it is
+    left bf16 unless something asks for it explicitly. That is not a rounding error:
+    Qwen3.8-Flash-Next's n-gram table is 95.4 GiB — 60% of its own 4 bpw checkpoint, the
+    difference between needing one 96 GiB card and two.
+
+    Returns ``{prefix, codebook, bpw, block_diagonal, shards}``. ``shards`` is set when the
+    checkpoint stores the table as N ``shard_K`` tensors rather than one (Qwen4Exp splits
+    [320001536, 160] across 128 of them).
+
+    ``codebook`` is not cosmetic. Shell decodes a row through a full Hadamard, which pads to
+    the next power of two — free for gemma-4, whose PLE width already is one, but a 1.6x tax
+    on a 160-wide row. That padding is also exactly why 0.7.2 had to route trellis runs' PLE
+    to shell: the trellis layout forbids the padded RHT. Block-diagonal RHT leaves 160 alone,
+    which is what lets Qwen4Exp use trellis here.
+    """
+    spec = (profile or {}).get('ple_embed')
+    if spec is None and "Gemma4" in arch and "ForConditionalGeneration" in arch:
+        spec = _GEMMA4_PLE
+    if spec is None:
+        return None
+    # A PLE table only exists when the text config declares a per-layer width. gemma4_unified
+    # shares gemma-4's module layout but is dense (hidden_size_per_layer_input == 0), and
+    # quantizing a table it does not have would fail deep inside the save path.
+    text_cfg = getattr(cfg, 'text_config', None) if cfg is not None else None
+    if not getattr(text_cfg, 'hidden_size_per_layer_input', 0):
+        return None
+    spec = dict(spec)
+
+    # Opt-in override. Two uses: exercising the trellis serving path on a small model in
+    # minutes instead of after a multi-hour run, and the footprint itself — gemma-4's PLE is
+    # 8960 wide, which shell's full Hadamard pads to 16384 (1.83x), while block-diagonal
+    # splits 8960 exactly as [8192, 512, 256]. Deliberately NOT the default: changing it
+    # would alter every published gemma-4 checkpoint.
+    override = os.environ.get('GLQ_PLE_CODEBOOK')
+    if override:
+        if override not in ('shell', 'trellis'):
+            raise ValueError(
+                f"GLQ_PLE_CODEBOOK={override!r}: expected 'shell' or 'trellis'. Ignoring a "
+                f"typo here would quietly produce the other codebook, and the difference "
+                f"only shows up as footprint.")
+        spec['codebook'] = override
+        if override == 'trellis':
+            # Not independent knobs: the trellis layout cannot use a padded full-Hadamard
+            # RHT, and the quantize path asserts on precisely that. Flipping one without the
+            # other would fail deep into a run rather than here.
+            spec['block_diagonal'] = True
+    return spec
+
+
 def _collect_stacked_experts(layer):
     """[(module_name, module)] for every fused-expert container in the block.
 
@@ -633,14 +716,26 @@ def get_rotary_emb(text_model, profile=None):
     return None
 
 
-def _uses_mrope(cfg) -> bool:
-    """True when the model's rope is multi-axis (mRoPE), so position_ids must be 3-D.
+def _uses_mrope(cfg, profile=None) -> bool:
+    """True when the rotary expects 3-D (multi-axis) position_ids.
 
-    Detected from ``rope_parameters.mrope_section`` rather than the architecture name: it
-    is a property of the rope configuration, and any arch adopting mRoPE needs the same
-    treatment. Tolerant of both dict and attribute-style rope configs, and of models with
-    no rope config at all.
+    Two routes, because the config alone is not sufficient:
+
+    * ``rope_parameters.mrope_section`` — the honest signal, and what Qwen4Exp declares.
+      Preferred, since any arch adopting mRoPE gets the right treatment for free.
+    * ``'mrope_position_ids': True`` on the profile — for models that need 3-D position_ids
+      while declaring no mrope_section at all. Qwen3.5 is one: its rope_parameters are a
+      plain ``{partial_rotary_factor, rope_theta, rope_type: 'default'}``, but
+      ``Qwen3_5TextRotaryEmbedding.forward`` expands unconditionally
+      (``inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)``) because,
+      in its own words, "Qwen3_5Text has different position ids for the grids".
+
+    Missing the second route is not cosmetic: on transformers >= 5.16 a Qwen3.5 streaming
+    quantize dies with "too many indices for tensor of dimension 2" before the first layer.
+    Since qwen4_exp needs >= 5.16, without this no single environment quantizes both.
     """
+    if profile and profile.get('mrope_position_ids'):
+        return True
     if cfg is None:
         return False
     inner = getattr(cfg, "text_config", cfg)
@@ -735,9 +830,9 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
     # temporal/height/width, `mrope_section` — and its forward does
     # `position_ids[:, :, None, :]`, so a 2-D tensor raises "too many indices for tensor of
     # dimension 2". Text-only calibration has no image grid, so all three axes carry the
-    # same positions. Driven off the config rather than the architecture name, because this
-    # is a property of the rope configuration and other archs will adopt it.
-    if _uses_mrope(cfg):
+    # same positions. Driven off the rope config where the model declares mrope_section,
+    # and off a profile flag where it does not (Qwen3.5 expands to 3 grids regardless).
+    if _uses_mrope(cfg, profile):
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
     kwargs = dict(position_ids=position_ids, cache_position=cache_position,
                   use_cache=False)
@@ -1320,6 +1415,97 @@ def _load_tensor_from_shards(weight_map, shard_paths, key):
     shard = weight_map[key]
     with safe_open(shard_paths[shard], framework="pt") as f:
         return f.get_tensor(key)
+
+
+def _quantize_ple_chunk_trellis(chunk, bpw, device, codebook=None, rht=None):
+    """Encode one row-chunk of a PLE table with the trellis codebook.
+
+    Laid out so each **row** is an independent tail-biting sequence: ``quantize(X)``
+    transposes, so passing (rows, width) makes the width the sequence length and the rows
+    the batch. A gathered row then decodes on its own — unlike the 16x16 weight tiling,
+    where one row is entangled with the fifteen beside it.
+
+    Block-diagonal RHT, right-side only: ``apply_left=False`` keeps rows independent, and
+    block-diagonal leaves a 160-wide row unpadded where a full Hadamard would round it to
+    256 (a 1.6x tax, and the layout the trellis path cannot use at all).
+
+    Scale is per row rather than per chunk. On real PLE rows that measured 17.49 dB against
+    17.39 dB for the 16x16/scalar status quo — not a difference worth chasing on its own,
+    but it costs 2 B/row at fp16 and matches how E8RHTEmbedding already stores scales.
+
+    Returns ``(artifacts, W_hat)``. Keys starting with ``_`` are runtime handles (the
+    codebook, the RHT block sizes), not checkpoint tensors.
+    """
+    from .rht import RHT
+    from .trellis import TrellisCodebook
+
+    m, n = chunk.shape
+    cb = codebook or TrellisCodebook(
+        variant=os.environ.get('GLQ_TRELLIS_VARIANT', '3inst'), K=bpw, device=device)
+    rht = rht or RHT(m, n, device=device, block_diagonal=True,
+                     apply_left=False, e8p=False)
+    W_t = rht.transform_weights(chunk.to(device=device, dtype=torch.float32))
+    assert W_t.shape == (m, n), (
+        f"RHT padded {n} -> {W_t.shape[1]}: block-diagonal failed, and the trellis layout "
+        f"cannot use a padded row")
+
+    per_row = W_t.pow(2).mean(dim=1, keepdim=True).sqrt() * cb.opt_scale
+    hat_t, state = cb.cb.quantize(W_t / per_row)
+    arts = {
+        'trellis_packed': cb.cb.pack_trellis(state).cpu(),
+        # fp16: fp32 per-row scales would add 1.19 GiB over 320M rows for no measured gain.
+        'Wscale': per_row.squeeze(-1).to(torch.float16).cpu(),
+        'SV': rht.sv.to(torch.float16).cpu(),
+        '_codebook': cb,
+        '_blocks_n': rht.blocks_n,
+    }
+    return arts, rht.inverse_transform_weights(hat_t.float() * per_row)
+
+
+def _ple_row_reader(weight_map, shard_paths, spec):
+    """``(n_rows, width, read(r0, r1))`` for a PLE table, without holding it in RAM.
+
+    ``_load_tensor_from_shards`` calls ``get_tensor``, which materializes the whole tensor.
+    That is fine for gemma-4's ~4 GB PLE and fatal for Qwen4Exp's 95.4 GiB: an earlier run
+    died exactly there, and with no swap the box became unreachable rather than raising. So
+    rows are read through ``get_slice``, which touches only the requested range of the
+    mmap'd file, and the peak is one chunk rather than the table.
+
+    Handles both layouts behind one interface: a single tensor (gemma-4), and N ``shard_K``
+    tensors that concatenate, in index order, into the table the model builds (Qwen4Exp
+    stores [320001536, 160] as 128 x [2500012, 160]).
+    """
+    from safetensors import safe_open
+
+    prefix = spec['prefix']
+    n_shards = spec.get('shards')
+    keys = ([f"{prefix}.shard_{i}.weight" for i in range(n_shards)] if n_shards
+            else [f"{prefix}.weight"])
+
+    # (key, first_global_row, n_rows). One open per shard to read the header; safe_open is
+    # a handle onto the mmap, so this does not read the payload.
+    parts, total, width = [], 0, None
+    handles = {}
+    for key in keys:
+        path = shard_paths[weight_map[key]]
+        if path not in handles:
+            handles[path] = safe_open(path, framework="pt")
+        shape = handles[path].get_slice(key).get_shape()
+        parts.append((path, key, total, shape[0]))
+        total += shape[0]
+        width = shape[1]
+
+    def read(r0, r1):
+        out = []
+        for path, key, start, n in parts:
+            lo, hi = max(r0, start), min(r1, start + n)
+            if lo < hi:
+                out.append(handles[path].get_slice(key)[lo - start:hi - start, :])
+        if not out:
+            return torch.empty(0, width)
+        return out[0] if len(out) == 1 else torch.cat(out, dim=0)
+
+    return total, width, read
 
 
 def _download_snapshot(model_id):
@@ -2487,28 +2673,44 @@ def quantize(
         print(f"\nProfiling pass completed in {total_time/60:.1f}m")
         return 0
 
-    # ---- Gemma-4 PLE embedding quantization ----
-    # E2B / E4B keep a [vocab × num_layers·ple_dim] embedding (~4.4 GB at bf16
-    # on E2B). We quantize it independently after the main loop using the
-    # same E8 codebook but right-only RHT so per-row gather at inference is
-    # trivial. Skipped on profiling passes (they uniformly use 2 bpw and
-    # exit early before reaching here).
-    if (streaming and is_gemma4
-            and getattr(cfg.text_config, "hidden_size_per_layer_input", 0) > 0):
-        ple_embed_prefix = "model.language_model.embed_tokens_per_layer"
-        ple_embed_bpw = 4  # 2 stages, ~half the disk of 2bpw embed for noticeably better SQNR
+    # ---- Per-layer-embedding (PLE) quantization ----
+    # A [vocab × ple_width] embedding the nn.Linear walk never sees, so it stays bf16 unless
+    # quantized here explicitly. Small on gemma-4 E2B/E4B (~4.4 GB) and decisive on
+    # Qwen4Exp (95.4 GiB, 60% of its own checkpoint). Done after the main loop because the
+    # table has to stay bf16 while the calibration forward runs through it. Right-only RHT
+    # keeps rows independent so a per-row gather at inference is trivial.
+    # Skipped on profiling passes (they uniformly use 2 bpw and exit early before here).
+    ple_spec = _ple_embed_spec(arch, profile, cfg) if streaming else None
+    if ple_spec is not None:
+        ple_embed_prefix = ple_spec['prefix']
+        ple_embed_bpw = ple_spec['bpw']
         # Free hidden_states + per_layer_inputs since we only need the embed
         # weight from disk for this final step. KV cache is already on CPU.
         del hidden_states
         if per_layer_inputs is not None:
             del per_layer_inputs
+        # Release the Viterbi CUDA-graph pools built up over the layer loop. They are keyed
+        # by (T, B) shapes the PLE step will never reuse — its sequence length is the table
+        # width, not a 16x16 tile — and torch does not reclaim a graph's private pool while
+        # the graph is alive. Measured on an L40S quantizing gemma-4's PLE: 20.8 GiB of a
+        # 44 GiB card still held by those pools when the embedding step began, on top of
+        # which it then tried to allocate from_state.
+        for _cb_obj in (codebook, getattr(codebook, 'cb', None)):
+            _free = getattr(_cb_obj, 'free_viterbi_graphs', None)
+            if _free is not None:
+                _free()
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
-        ple_w = _load_tensor_from_shards(
-            weight_map, shard_paths, f"{ple_embed_prefix}.weight")
-        vocab_size_ple, embed_dim_ple = ple_w.shape
-        print(f"\nQuantizing PLE embedding {tuple(ple_w.shape)} at {ple_embed_bpw}bpw...")
+        # Lazy row reader, not a whole-tensor load: Qwen4Exp's table is 95.4 GiB across
+        # 128 shards and will not fit in the RAM of a box that can otherwise quantize the
+        # model. gemma-4's single tensor goes through the same interface.
+        vocab_size_ple, embed_dim_ple, ple_read = _ple_row_reader(
+            weight_map, shard_paths, ple_spec)
+        print(f"\nQuantizing PLE embedding ({vocab_size_ple:,}, {embed_dim_ple}) "
+              f"at {ple_embed_bpw}bpw via {ple_spec['codebook']}, "
+              f"{'block-diagonal' if ple_spec['block_diagonal'] else 'full-Hadamard'} RHT "
+              f"({vocab_size_ple * embed_dim_ple * 2 / 2**30:.1f} GiB bf16) ...")
         # Rows are independent (apply_left=False) so we chunk by rows to bound
         # GPU memory: a chunk of 16k rows × 16k embed × fp32 = ~1 GB. Each
         # chunk's LDLQ calibrates its own Wscale + inv_resid_scale; we save
@@ -2518,29 +2720,76 @@ def quantize(
         chunk_rows = 16384
         ple_qidxs_chunks = []
         ple_qidxs2_chunks = []
+        ple_packed_chunks = []          # trellis path
+        ple_blocks_n = None
         H_id = torch.eye(embed_dim_ple, dtype=torch.float32, device=device)
         ple_sv = None  # SV is RHT-seeded identically for every chunk
         ple_su = None
         ple_wscale_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
         ple_inv_rs_per_row = torch.empty(vocab_size_ple, dtype=torch.float32)
         ple_sqnr_chunks = []
-        # E8RHTEmbedding decodes the PLE per-row via the shell E8 lookup (no e8p
-        # tensor-core or trellis decode path), so quantize it with a shell codebook
-        # under --codebook e8p AND trellis — the e8p path stores 'Qidxs_e8p' (the
-        # shell-key assembly below KeyErrors) and the trellis path asserts on the
-        # padded full-Hadamard RHT its no-padding layout forbids. Shell/relaxed
-        # runs reuse the global codebook unchanged (it is already shell-decodable).
-        ple_codebook = (E8ShellCodebook(device=device)
-                        if (getattr(codebook, 'is_e8p', False)
-                            or type(codebook).__name__ == "TrellisCodebook")
-                        else codebook)
+        # Which codebook decodes a gathered row, per the profile descriptor.
+        #
+        # 'shell': E8RHTEmbedding decodes per-row via the shell E8 lookup, so quantize with
+        # a shell codebook even under --codebook e8p or trellis — the e8p path stores
+        # 'Qidxs_e8p' (the shell-key assembly below KeyErrors) and the trellis path asserts
+        # on the padded full-Hadamard RHT its no-padding layout forbids. Shell/relaxed runs
+        # reuse the global codebook unchanged (it is already shell-decodable).
+        #
+        # 'trellis': only reachable with block_diagonal=True, which is what removes that
+        # padding and lets the trellis layout apply to a 160-wide row.
+        if ple_spec['codebook'] == 'trellis':
+            assert ple_spec['block_diagonal'], (
+                "trellis PLE requires block-diagonal RHT: the padded full-Hadamard layout "
+                "is exactly what the trellis path asserts against")
+            # Imported here, not at module scope: the main trellis import above sits inside
+            # the --codebook trellis branch, and a shell/e8p run with a trellis PLE would
+            # otherwise NameError at the end of a multi-hour quantize.
+            from .trellis import TrellisCodebook
+            ple_codebook = TrellisCodebook(
+                variant=os.environ.get('GLQ_TRELLIS_VARIANT', '3inst'),
+                K=ple_embed_bpw, device=device)
+        else:
+            ple_codebook = (E8ShellCodebook(device=device)
+                            if (getattr(codebook, 'is_e8p', False)
+                                or type(codebook).__name__ == "TrellisCodebook")
+                            else codebook)
+        _ple_t0 = time.perf_counter()
         for r0 in range(0, vocab_size_ple, chunk_rows):
             r1 = min(r0 + chunk_rows, vocab_size_ple)
-            chunk = ple_w[r0:r1].to(device)
+            chunk = ple_read(r0, r1).to(device=device, dtype=torch.float32)
+            if ple_spec['codebook'] == 'trellis':
+                # Row-wise: each row is its own tail-biting sequence, so a gathered row
+                # decodes without touching its neighbours. Scale is genuinely per row here
+                # (the shell path below calibrates per chunk and stores it per row).
+                arts_chunk, hat_chunk = _quantize_ple_chunk_trellis(
+                    chunk, bpw=ple_embed_bpw, device=device, codebook=ple_codebook)
+                ple_packed_chunks.append(arts_chunk['trellis_packed'])
+                ple_wscale_per_row[r0:r1] = arts_chunk['Wscale'].float()
+                if ple_sv is None:
+                    ple_sv = arts_chunk['SV']
+                    ple_blocks_n = arts_chunk['_blocks_n']
+                err = (chunk - hat_chunk.to(chunk.dtype)).pow(2).sum()
+                ple_sqnr_chunks.append(float(
+                    10 * torch.log10(chunk.pow(2).sum() / err.clamp_min(1e-30))))
+                # Progress, because this step can run for many minutes and used to print
+                # nothing until it finished. Viterbi is O(T) sequential per call and the
+                # chunk cap shrinks B as the table widens, so cost grows roughly with
+                # width^2: gemma-4's 8960-wide PLE is ~1150x the sequential work of a
+                # 160-wide one. Silence there is indistinguishable from a hang.
+                _done, _total = len(ple_sqnr_chunks), -(-vocab_size_ple // chunk_rows)
+                _el = time.perf_counter() - _ple_t0
+                print(f"    PLE chunk {_done}/{_total}  SQNR {ple_sqnr_chunks[-1]:.2f} dB  "
+                      f"{_el:.0f}s elapsed  ETA {_el / _done * (_total - _done):.0f}s",
+                      flush=True)
+                del chunk, hat_chunk, arts_chunk
+                if use_gpu:
+                    torch.cuda.empty_cache()
+                continue
             _, arts_chunk, met_chunk = quantize_layer_e8_shell_rht(
                 chunk, H_id, ple_codebook,
                 bpw=ple_embed_bpw, tune_iters=0,
-                apply_left=False, block_diagonal=False)
+                apply_left=False, block_diagonal=ple_spec['block_diagonal'])
             ple_qidxs_chunks.append(arts_chunk['Qidxs'].cpu())
             if 'Qidxs2' in arts_chunk:
                 ple_qidxs2_chunks.append(arts_chunk['Qidxs2'].cpu())
@@ -2556,21 +2805,37 @@ def quantize(
             del chunk
             if use_gpu:
                 torch.cuda.empty_cache()
-        ple_arts = {
-            'SV': ple_sv,
-            'SU': ple_su,
-            'Wscale': ple_wscale_per_row,           # [vocab] not scalar
-            'Qidxs': torch.cat(ple_qidxs_chunks, dim=0),
-        }
-        if ple_qidxs2_chunks:
-            ple_arts['Qidxs2'] = torch.cat(ple_qidxs2_chunks, dim=0)
-            ple_arts['inv_resid_scale'] = ple_inv_rs_per_row  # [vocab]
+        if ple_spec['codebook'] == 'trellis':
+            ple_arts = {
+                'SV': ple_sv,
+                # fp16: fp32 over 320M rows would add 1.19 GiB for no measured gain.
+                'Wscale': ple_wscale_per_row.to(torch.float16),
+                'trellis_packed': torch.cat(ple_packed_chunks, dim=0),
+                # The decoder rebuilds the codebook from the tlut deterministically — no
+                # kmeans at load. 3INST is lookup-free and carries none, hence the guard.
+                **({'tlut': ple_codebook.cb.tlut.cpu()}
+                   if getattr(ple_codebook.cb, 'tlut', None) is not None else {}),
+                # Block sizes the inverse RHT needs. A real tensor, not a runtime handle:
+                # the save loop writes every artifact value straight into the state dict, and
+                # the loader must not have to re-derive the decomposition of a non-pow2 width.
+                'rht_blocks': torch.tensor(ple_blocks_n, dtype=torch.int32),
+            }
+        else:
+            ple_arts = {
+                'SV': ple_sv,
+                'SU': ple_su,
+                'Wscale': ple_wscale_per_row,           # [vocab] not scalar
+                'Qidxs': torch.cat(ple_qidxs_chunks, dim=0),
+            }
+            if ple_qidxs2_chunks:
+                ple_arts['Qidxs2'] = torch.cat(ple_qidxs2_chunks, dim=0)
+                ple_arts['inv_resid_scale'] = ple_inv_rs_per_row  # [vocab]
         avg_chunk_sqnr = sum(ple_sqnr_chunks) / len(ple_sqnr_chunks)
         print(f"  PLE embed avg SQNR={avg_chunk_sqnr:.2f} dB "
               f"({len(ple_qidxs_chunks)} chunks, per-row Wscale)")
         all_artifacts[ple_embed_prefix] = ple_arts
         all_sqnr.append(avg_chunk_sqnr)
-        del ple_w, H_id, ple_qidxs_chunks, ple_qidxs2_chunks, ple_codebook
+        del H_id, ple_qidxs_chunks, ple_qidxs2_chunks, ple_packed_chunks, ple_codebook
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
@@ -2713,13 +2978,17 @@ def quantize(
     #   - any layer the allocator hadn't profiled yet (defensive).
     # Default the bpw for those to ``ple_embed_bpw=4`` for the embedding
     # and to the global ``bpw`` for everything else.
-    PLE_PREFIX = "model.language_model.embed_tokens_per_layer"
+    # The PLE entry, whatever this architecture calls it and whatever bpw its descriptor
+    # asked for. Hardcoding gemma-4's name and 4 here would leave Qwen4Exp's table out of the
+    # map, and a quantized layer absent from it loads as bf16 and KeyErrors on its indices.
+    _ple_sp = _ple_embed_spec(arch, profile, cfg)
+    PLE_PREFIX = _ple_sp['prefix'] if _ple_sp else None
     layer_bpw_out: dict[str, int] = {}
     for p in all_artifacts.keys():
         if bpw_map is not None and p in bpw_map:
             layer_bpw_out[p] = int(bpw_map[p])
-        elif p == PLE_PREFIX:
-            layer_bpw_out[p] = 4  # matches ple_embed_bpw above
+        elif PLE_PREFIX is not None and p == PLE_PREFIX:
+            layer_bpw_out[p] = int(_ple_sp['bpw'])
         else:
             layer_bpw_out[p] = int(bpw)
     # Record the RHT layout so the runtime sizes the weight buffers correctly.
@@ -2746,6 +3015,12 @@ def quantize(
         # would silently scramble under a kernel-layout decoder — the loader guards on this.
         config_dict["quantization_config"]["trellis_layout"] = (
             "kernel" if getattr(codebook, "has_kernel", True) else "natural")
+    if _ple_sp is not None and _ple_sp['codebook'] != 'shell':
+        # The serving side registers embedding buffers before the checkpoint loads, so it
+        # cannot read the codebook off the tensor keys. Emitted only when it differs from
+        # shell, so existing gemma-4 checkpoints keep an unchanged config.json.
+        config_dict["quantization_config"]["ple_codebook"] = _ple_sp['codebook']
+        config_dict["quantization_config"]["ple_bpw"] = int(_ple_sp['bpw'])
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
     with open(os.path.join(output_dir, "config.json"), "w") as f:

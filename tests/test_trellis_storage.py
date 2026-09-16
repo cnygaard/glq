@@ -252,3 +252,194 @@ def test_sqnr_strictly_improves_with_rate():
     # mean the extra bits are not reaching the Viterbi.
     assert sqnr[3] - sqnr[2] > 3.0, sqnr
     assert sqnr[4] - sqnr[3] > 3.0, sqnr
+
+
+# ---------------------------------------------------------------------------
+# 4. unpack_trellis is a sliding window, not a sequential recursion
+# ---------------------------------------------------------------------------
+#
+# The published form carries state across T//V steps:
+#
+#     trellis[:, i] = ((trellis[:, i-1] << K*V) & (2**L - 1)) + bits[L+(i-1)*K*V : L+i*K*V]
+#
+# which reads as a dependency chain and was implemented as a Python loop — T//V tiny kernels
+# per call. But `<< K*V` masked to L bits is a shift register: it drops the top K*V bits and
+# admits K*V new ones, so by induction trellis[:, i] is simply the L-wide window of the
+# (tail-biting) bitstream at offset i*K*V. Every step is therefore independent.
+#
+# That matters because embedding decode puts this on the per-token path: measured on an
+# RTX PRO 6000, the loop cost ~8.1 ms at ANY batch size (launch-bound), against 0.11 ms
+# windowed — 74x at B=8.
+#
+# _reference_unpack below is the original loop, kept as the oracle so the fast path is
+# pinned against the definition rather than against itself.
+
+
+def _reference_unpack(cb, packed, T):
+    """The sequential form, verbatim, as the correctness oracle."""
+    packed = packed.view(torch.uint16).to(torch.int32)
+    uint_mask = (2 ** torch.arange(16, dtype=torch.int32)).flip(dims=(-1,))[None, None]
+    bf = (packed.unsqueeze(-1) & uint_mask) > 0
+    pad_amt = math.ceil(T * cb.K / 16) * 16 - T * cb.K
+    bf = bf.reshape(-1, (T * cb.K + pad_amt))[:, :T * cb.K]
+    bf = torch.concat([bf, bf[:, :cb.L - cb.K * cb.V]], dim=-1)
+    L_mask = (2 ** torch.arange(cb.L, dtype=torch.int32)).flip(dims=(-1,))[None]
+    K_mask = (2 ** torch.arange(cb.K * cb.V, dtype=torch.int32)).flip(dims=(-1,))[None]
+    out = torch.zeros(bf.shape[0], T // cb.V, dtype=torch.int32)
+    out[:, 0] = (bf[:, :cb.L].int() * L_mask).sum(dim=-1)
+    for i in range(1, T // cb.V):
+        out[:, i] = ((out[:, i - 1] << (cb.K * cb.V)) & ((1 << cb.L) - 1)) + \
+            (bf[:, cb.L + (i - 1) * cb.K * cb.V:cb.L + i * cb.K * cb.V].int()
+             * K_mask).sum(dim=-1)
+    return out
+
+
+def _rand_packed(cb, T, rows=5, seed=3):
+    g = torch.Generator().manual_seed(seed)
+    cols = math.ceil(T * cb.K / 16)
+    return torch.randint(-32768, 32767, (rows, cols), generator=g,
+                         dtype=torch.int16)
+
+
+@pytest.mark.parametrize("K", KS)
+@pytest.mark.parametrize("maker,name", [(_hyb_cb, "hyb"), (_3inst_cb, "3inst")])
+@pytest.mark.parametrize("T", [256, 160])
+def test_unpack_matches_the_sequential_definition(K, maker, name, T):
+    """Both V=2 (hyb) and V=1 (3inst), and both the 16x16 tile length and the 160-wide
+    embedding row length."""
+    cb = maker(K=K).cb if hasattr(maker(K=K), "cb") else maker(K=K)
+    if T % cb.V:
+        pytest.skip(f"T={T} not divisible by V={cb.V}")
+    packed = _rand_packed(cb, T)
+    assert torch.equal(cb.unpack_trellis(packed, T).to(torch.int32),
+                       _reference_unpack(cb, packed, T)), name
+
+
+@pytest.mark.parametrize("K", KS)
+def test_unpack_roundtrips_real_encoder_state_at_row_length(K):
+    """T=160 is the PLE row length: each embedding row is its own tail-biting sequence,
+    which is what makes a row-subset gather decodable without touching its neighbours."""
+    cb = _3inst_cb(K=K).cb
+    torch.manual_seed(1)
+    _, state = cb.quantize(torch.randn(8, 160) * 0.02)
+    packed = cb.pack_trellis(state)
+    assert torch.equal(cb.unpack_trellis(packed, 160).to(torch.int32),
+                       state.to(torch.int32))
+
+
+def test_unpack_work_does_not_grow_with_sequence_length():
+    """The mechanism, asserted without a stopwatch.
+
+    A per-step loop issues work proportional to T//V; a windowed implementation issues the
+    same fixed set of ops whatever T is. Counting dispatched aten calls distinguishes the
+    two deterministically, so this cannot pass via a fallback that is merely fast today.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _Count(TorchDispatchMode):
+        def __init__(self):
+            self.n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    cb = _3inst_cb(K=3).cb
+
+    def count(T):
+        packed = _rand_packed(cb, T)
+        c = _Count()
+        with c:
+            cb.unpack_trellis(packed, T)
+        return c.n
+
+    small, big = count(256), count(2560)      # 10x the sequence length
+    assert big == small, (
+        f"op count grew {small} -> {big} with T: still per-step, not windowed")
+
+
+# ---------------------------------------------------------------------------
+# 5. chunk sizing must account for the sequence length
+# ---------------------------------------------------------------------------
+#
+# viterbi allocates
+#     from_state = empty(T//V, B, 2**(L - K*V))
+# which scales with T, but _chunk_b picked B from L2 and the *cost* tensor alone
+# (per_row = 2*4*2**L) and never saw T. Fine for a 256-element weight tile; for an
+# 8960-wide embedding row it asks for 8960*144*4096*4 = 21.1 GB in one allocation and
+# OOMs a 46 GB card. Measured exactly that on an L40S quantizing gemma-4's PLE.
+#
+# The cap must be DETERMINISTIC — derived from T and fixed constants, never from free
+# memory. A B that varied with machine state would make checkpoints vary with it too,
+# and byte-identical encoding is a hard requirement.
+
+
+def _cb_for_chunk(K=4):
+    """3INST, because that is the variant that OOM'd and the shipped default.
+
+    The variant matters here: HYB has V=2, so from_state's last axis is 2**(L-K*V) = 2**8,
+    sixteen times smaller than 3INST's 2**12 at V=1. The cap correctly does not bind for HYB
+    (see the companion test) — testing this on HYB would assert nothing.
+    """
+    return _3inst_cb(K=K).cb
+
+
+def test_short_sequences_keep_the_previous_chunk_size():
+    """The shipped weight path encodes 16x16 tiles (T=256). If the new cap bound there it
+    would change B, and B changes are exactly what a byte-identical checkpoint cannot
+    survive."""
+    cb = _cb_for_chunk()
+    assert cb._chunk_b("cpu", T=256) == cb._chunk_b("cpu")
+
+
+def test_a_long_sequence_gets_a_smaller_chunk():
+    """8960 is gemma-4's PLE width (num_layers * ple_dim)."""
+    cb = _cb_for_chunk()
+    assert cb._chunk_b("cpu", T=8960) < cb._chunk_b("cpu", T=256)
+
+
+def test_the_long_sequence_allocation_stays_bounded():
+    """The property that matters, stated as bytes rather than as a chunk count."""
+    cb = _cb_for_chunk()
+    for T in (2560, 8960, 32768):
+        B = cb._chunk_b("cpu", T=T)
+        nbytes = (T // cb.V) * B * 2 ** (cb.L - cb.K * cb.V) * 4
+        assert nbytes <= 4 * 2 ** 30, f"T={T}: from_state would be {nbytes / 2**30:.1f} GiB"
+
+
+def test_chunk_size_is_deterministic():
+    """Two calls must agree, and must not consult free memory: a checkpoint whose bytes
+    depend on what else was running is not reproducible."""
+    cb = _cb_for_chunk()
+    assert cb._chunk_b("cpu", T=8960) == cb._chunk_b("cpu", T=8960)
+    assert cb._chunk_b("cpu", T=8960) >= 1
+
+
+def test_the_env_override_still_wins():
+    """GLQ_TRELLIS_CHUNK_B is the escape hatch for a box where the heuristic is wrong."""
+    import os
+    cb = _cb_for_chunk()
+    os.environ["GLQ_TRELLIS_CHUNK_B"] = "7"
+    try:
+        assert cb._chunk_b("cpu", T=8960) == 7
+    finally:
+        del os.environ["GLQ_TRELLIS_CHUNK_B"]
+
+
+def test_hyb_is_not_capped_at_the_same_width():
+    """V=2 quarters the state axis twice over, so HYB at 8960 stays inside the budget and
+    keeps its full chunk. The cap is a response to an allocation size, not to T alone."""
+    cb = _hyb_cb(K=4).cb
+    assert cb.V == 2
+    assert cb._chunk_b("cpu", T=8960) == cb._chunk_b("cpu")
+
+
+def test_the_cap_never_moves_weight_tile_chunking(monkeypatch):
+    """B straddles the CUDA-graph threshold — graphed at or below _GLQ_TRELLIS_CUDAGRAPH_MAX_B,
+    eager above. So a cap that lowered weight-path B could move the shipped encode onto a
+    different code path even though B itself is output-invariant. Simulate a large-VRAM
+    device and assert T=256 is untouched."""
+    cb = _3inst_cb(K=4).cb
+    monkeypatch.setattr(type(cb), "_state_budget", lambda self, dev: 11 << 30)
+    assert cb._chunk_b("cpu", T=256) == cb._chunk_b("cpu")
+    assert cb._chunk_b("cpu", T=8960) < cb._chunk_b("cpu"), "should still bind when wide"
