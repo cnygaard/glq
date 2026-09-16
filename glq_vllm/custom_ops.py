@@ -60,7 +60,7 @@ def _register_embedding_dequant(dispatch_key):
     from glq.quantized_linear import _dequant_embedding_rows_trellis_fn
     _glq_lib.define(
         "embedding_dequant_trellis(Tensor input_ids, Tensor trellis_packed, Tensor sv, "
-        "Tensor wscale, Tensor lut, Tensor blocks_n, int embedding_dim, "
+        "Tensor wscale, Tensor lut, int[] blocks_n, int embedding_dim, "
         "int L, int K, int V, float embed_scale, ScalarType? out_dtype) -> Tensor")
     _glq_lib.impl("embedding_dequant_trellis",
                   _dequant_embedding_rows_trellis_fn, dispatch_key)

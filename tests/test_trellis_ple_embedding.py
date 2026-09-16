@@ -298,3 +298,51 @@ def test_the_decode_matches_its_fake_kernels_shape_and_stride():
     fake = ids.new_empty((*ids.shape, WIDTH), dtype=real.dtype)
     assert real.shape == fake.shape, (real.shape, fake.shape)
     assert real.stride() == fake.stride(), (real.stride(), fake.stride())
+
+
+def test_the_decode_takes_block_sizes_as_ints_not_a_tensor():
+    """Block sizes are static metadata, and reading them from a tensor forces a host sync.
+
+    `blocks_n.tolist()` inside the op is a device-to-host copy, which CUDA-graph capture
+    forbids outright:
+
+        RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture
+                      unless the CPU tensor is pinned
+
+    vLLM captures the embedding lookup, so the op has to be free of host syncs. Taking a
+    list of ints keeps the sizes in the schema, where they belong, and removes the copy.
+    """
+    import inspect
+    from glq.quantized_linear import _dequant_embedding_rows_trellis_fn as fn
+    sig = inspect.signature(fn)
+    assert "blocks_n" in sig.parameters
+    W = _table(rows=16)
+    arts, hat = _quantize_ple_chunk_trellis(W, bpw=3, device="cpu")
+    # a plain list must work — no tensor, nothing to sync
+    out = fn(torch.arange(16), arts["trellis_packed"], arts["SV"], arts["Wscale"],
+             arts["_codebook"].cb.lut, [int(b) for b in arts["_blocks_n"]],
+             WIDTH, int(arts["_codebook"].cb.L), int(arts["_codebook"].cb.K),
+             int(arts["_codebook"].cb.V), 1.0, None)
+    assert torch.allclose(out.float(), hat.float(), atol=1e-3)
+
+
+def test_the_decode_performs_no_host_sync():
+    """Guard the property directly: nothing in the decode may move data off-device.
+
+    Asserted by counting `.tolist()`/`.item()`/`.cpu()` reachable in the function source —
+    crude, but it fails loudly if someone reintroduces a sync, which otherwise only shows
+    up as a CUDA-graph capture error on a GPU box nobody runs tests on.
+    """
+    import ast
+    import inspect
+    from glq import quantized_linear as ql
+
+    tree = ast.parse(inspect.getsource(ql._dequant_embedding_rows_trellis_fn).lstrip())
+    fn = tree.body[0]
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)):
+        fn.body = fn.body[1:]          # drop the docstring: it *mentions* .tolist() by design
+    calls = {n.func.attr for n in ast.walk(ast.Module(body=fn.body, type_ignores=[]))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    offenders = calls & {"tolist", "item", "cpu", "numpy"}
+    assert not offenders, f"{sorted(offenders)} in the decode force a host sync"

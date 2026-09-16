@@ -1437,8 +1437,8 @@ def _dequant_embedding_rows_trellis(
     cb = getattr(codebook, "cb", codebook)
     return _dequant_embedding_rows_trellis_fn(
         input_ids, trellis_packed, sv, wscale, cb.lut,
-        torch.as_tensor([int(b) for b in blocks_n], dtype=torch.int32),
-        embedding_dim, int(cb.L), int(cb.K), int(cb.V), embed_scale, out_dtype)
+        [int(b) for b in blocks_n], embedding_dim,
+        int(cb.L), int(cb.K), int(cb.V), embed_scale, out_dtype)
 
 
 def _dequant_embedding_rows_trellis_fn(
@@ -1447,7 +1447,7 @@ def _dequant_embedding_rows_trellis_fn(
     sv: torch.Tensor,
     wscale: torch.Tensor,
     lut: torch.Tensor,
-    blocks_n: torch.Tensor,
+    blocks_n: list[int],
     embedding_dim: int,
     L: int,
     K: int,
@@ -1462,7 +1462,9 @@ def _dequant_embedding_rows_trellis_fn(
     ``block_diagonal_fht`` is a kernel dynamo cannot trace, which is what made the GLQ
     embedding the last path breaking vLLM's torch.compile; one opaque node fixes that.
 
-    ``lut`` is the codebook's (V, 2**L) table; L/K/V are its rate parameters.
+    ``lut`` is the codebook's (V, 2**L) table; L/K/V are its rate parameters. ``blocks_n``
+    is a plain list of ints, deliberately: as a tensor it would need ``.tolist()`` here,
+    which is a device-to-host copy and CUDA-graph capture rejects it outright.
     """
     dev = trellis_packed.device
     flat_ids = input_ids.reshape(-1).to(dev)
@@ -1476,7 +1478,7 @@ def _dequant_embedding_rows_trellis_fn(
     deq = deq.transpose(0, 1).reshape(embedding_dim, B).T.float()
 
     deq = deq * wscale.index_select(0, flat_ids).unsqueeze(-1).float()
-    deq = block_diagonal_fht(deq, [int(b) for b in blocks_n.tolist()]) * sv.float()
+    deq = block_diagonal_fht(deq, blocks_n) * sv.float()
     if embed_scale != 1.0:
         deq = deq * embed_scale
 
@@ -1591,10 +1593,19 @@ class TrellisRHTEmbedding(nn.Module):
             state_dict, prefix, local_metadata,
             strict, missing_keys, unexpected_keys, error_msgs)
 
+    def _blocks(self) -> list[int]:
+        """RHT block sizes as ints, cached. Reading the buffer every forward would be a
+        host sync on GPU, which CUDA-graph capture forbids."""
+        cached = getattr(self, "_blocks_cache", None)
+        if cached is None or sum(cached) != self.embedding_dim:
+            cached = [int(b) for b in self.rht_blocks.tolist()]
+            self._blocks_cache = cached
+        return cached
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return _dequant_embedding_rows_trellis(
             input_ids, self.trellis_packed, self.SV, self.Wscale,
-            self._ensure_codebook(), [int(b) for b in self.rht_blocks.tolist()],
+            self._ensure_codebook(), self._blocks(),
             embedding_dim=self.embedding_dim, embed_scale=self.embed_scale,
             out_dtype=getattr(self, "_compute_dtype", self.SV.dtype))
 
