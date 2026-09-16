@@ -189,6 +189,10 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
                                  tlut=tlut)
             layer.glq_trellis_lut = cb.cb.lut.to(dev)
             layer.glq_trellis_LKV = (int(cb.cb.L), int(cb.cb.K), int(cb.cb.V))
+            # Materialize the block sizes ONCE, here. Reading them from the buffer inside
+            # the op is a device-to-host copy, and vLLM captures this lookup in a CUDA
+            # graph, where that raises "Cannot copy between CPU and CUDA tensors".
+            layer.glq_blocks_n = [int(b) for b in layer.rht_blocks.tolist()]
             return
         dev = layer.Qidxs.device
         cb1, cb2 = _get_codebook_pair(self.bpw, dev)
@@ -219,7 +223,7 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             L, K, V = layer.glq_trellis_LKV
             return torch.ops.glq.embedding_dequant_trellis(
                 input_ids, layer.trellis_packed, layer.SV, layer.Wscale,
-                layer.glq_trellis_lut, layer.rht_blocks,
+                layer.glq_trellis_lut, layer.glq_blocks_n,
                 layer.glq_embedding_dim, L, K, V, 1.0, layer.glq_out_dtype)
         # Cached at load time; defensive lazy-fill for a direct (non-vLLM) call.
         cb1 = getattr(layer, "glq_cb1", None)

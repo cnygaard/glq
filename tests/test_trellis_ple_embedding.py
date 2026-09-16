@@ -262,3 +262,87 @@ def test_the_rate_is_read_from_the_buffer_at_every_rate(bpw):
     mod = TrellisRHTEmbedding(16, WIDTH, bpw=3)
     mod.trellis_packed = arts["trellis_packed"]
     assert mod.K == bpw
+
+
+def test_the_decode_returns_a_contiguous_tensor():
+    """The op's real output must match what its fake/meta kernel promises.
+
+    The fake returns `input_ids.new_empty((*shape, dim))` — contiguous. The real decode
+    builds its result via `.reshape(dim, B).T`, which is stride (1, dim), and `.to(dtype)`
+    preserves memory format by default, so the transposed layout reached the return.
+    torch.compile compares the two and refuses:
+
+        assert_size_stride(buf26, (s72, 10752), (10752, 1),
+                           'torch.ops.glq.embedding_dequant_trellis.default')
+        AssertionError: expected ... stride 1==10752 at dim=0
+
+    Eager execution never checks this, which is why an `enforce_eager=True` serve test
+    passed while vLLM's compiled path could not start at all.
+    """
+    W = _table(rows=64)
+    arts, _ = _quantize_ple_chunk_trellis(W, bpw=3, device="cpu")
+    out = _dequant_embedding_rows_trellis(
+        torch.arange(64), arts["trellis_packed"], arts["SV"], arts["Wscale"],
+        arts["_codebook"], arts["_blocks_n"], WIDTH)
+    assert out.is_contiguous(), f"non-contiguous output, strides {out.stride()}"
+
+
+def test_the_decode_matches_its_fake_kernels_shape_and_stride():
+    """Pin the contract directly against the fake, since that is what torch.compile uses."""
+    W = _table(rows=32)
+    arts, _ = _quantize_ple_chunk_trellis(W, bpw=3, device="cpu")
+    ids = torch.randint(0, 32, (5,))
+    real = _dequant_embedding_rows_trellis(
+        ids, arts["trellis_packed"], arts["SV"], arts["Wscale"],
+        arts["_codebook"], arts["_blocks_n"], WIDTH)
+    fake = ids.new_empty((*ids.shape, WIDTH), dtype=real.dtype)
+    assert real.shape == fake.shape, (real.shape, fake.shape)
+    assert real.stride() == fake.stride(), (real.stride(), fake.stride())
+
+
+def test_the_decode_takes_block_sizes_as_ints_not_a_tensor():
+    """Block sizes are static metadata, and reading them from a tensor forces a host sync.
+
+    `blocks_n.tolist()` inside the op is a device-to-host copy, which CUDA-graph capture
+    forbids outright:
+
+        RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture
+                      unless the CPU tensor is pinned
+
+    vLLM captures the embedding lookup, so the op has to be free of host syncs. Taking a
+    list of ints keeps the sizes in the schema, where they belong, and removes the copy.
+    """
+    import inspect
+    from glq.quantized_linear import _dequant_embedding_rows_trellis_fn as fn
+    sig = inspect.signature(fn)
+    assert "blocks_n" in sig.parameters
+    W = _table(rows=16)
+    arts, hat = _quantize_ple_chunk_trellis(W, bpw=3, device="cpu")
+    # a plain list must work — no tensor, nothing to sync
+    out = fn(torch.arange(16), arts["trellis_packed"], arts["SV"], arts["Wscale"],
+             arts["_codebook"].cb.lut, [int(b) for b in arts["_blocks_n"]],
+             WIDTH, int(arts["_codebook"].cb.L), int(arts["_codebook"].cb.K),
+             int(arts["_codebook"].cb.V), 1.0, None)
+    assert torch.allclose(out.float(), hat.float(), atol=1e-3)
+
+
+def test_the_decode_performs_no_host_sync():
+    """Guard the property directly: nothing in the decode may move data off-device.
+
+    Asserted by counting `.tolist()`/`.item()`/`.cpu()` reachable in the function source —
+    crude, but it fails loudly if someone reintroduces a sync, which otherwise only shows
+    up as a CUDA-graph capture error on a GPU box nobody runs tests on.
+    """
+    import ast
+    import inspect
+    from glq import quantized_linear as ql
+
+    tree = ast.parse(inspect.getsource(ql._dequant_embedding_rows_trellis_fn).lstrip())
+    fn = tree.body[0]
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)):
+        fn.body = fn.body[1:]          # drop the docstring: it *mentions* .tolist() by design
+    calls = {n.func.attr for n in ast.walk(ast.Module(body=fn.body, type_ignores=[]))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    offenders = calls & {"tolist", "item", "cpu", "numpy"}
+    assert not offenders, f"{sorted(offenders)} in the decode force a host sync"
