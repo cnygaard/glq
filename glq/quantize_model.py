@@ -589,16 +589,24 @@ def _ple_embed_spec(arch, profile=None, cfg=None):
     which is what lets Qwen4Exp use trellis here.
     """
     spec = (profile or {}).get('ple_embed')
+    declared = spec is not None
     if spec is None and "Gemma4" in arch and "ForConditionalGeneration" in arch:
         spec = _GEMMA4_PLE
     if spec is None:
         return None
-    # A PLE table only exists when the text config declares a per-layer width. gemma4_unified
-    # shares gemma-4's module layout but is dense (hidden_size_per_layer_input == 0), and
+    # The hidden_size_per_layer_input check applies ONLY to the gemma-4 fallback, where it
+    # excludes gemma4_unified: that model shares gemma-4's module layout but is dense, and
     # quantizing a table it does not have would fail deep inside the save path.
-    text_cfg = getattr(cfg, 'text_config', None) if cfg is not None else None
-    if not getattr(text_cfg, 'hidden_size_per_layer_input', 0):
-        return None
+    #
+    # It must NOT gate an explicitly declared descriptor. The attribute is gemma-4's; other
+    # architectures have a PLE by a different mechanism and never set it — Qwen4Exp's is an
+    # n-gram embedding, and its config has no such field. Requiring it there returned None,
+    # so the PLE step was skipped without a word: an 11-hour run reported success and wrote a
+    # 169 GiB checkpoint with the table still bf16, instead of 72 GiB.
+    if not declared:
+        text_cfg = getattr(cfg, 'text_config', None) if cfg is not None else None
+        if not getattr(text_cfg, 'hidden_size_per_layer_input', 0):
+            return None
     spec = dict(spec)
 
     # Opt-in override. Two uses: exercising the trellis serving path on a small model in
