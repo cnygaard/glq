@@ -50,14 +50,30 @@ def test_never_matches_the_cuda_wheel():
 
 
 def test_fetch_failure_falls_back_to_the_pinned_wheel():
-    def boom(url):
+    """Asserted against the constant, not a literal version. The property under test is
+    "falls back to the pinned wheel"; hardcoding the number coupled these tests to a value
+    they do not care about, so a routine fallback bump broke them."""
+    def _api_unreachable(url):
         raise OSError("rate limited")
-    url = W.latest_cpu_wheel_url("x86_64", fetch=boom)
-    assert "v0.28.0" in url and "+cpu" in url and "x86_64" in url
+    url = W.latest_cpu_wheel_url("x86_64", fetch=_api_unreachable)
+    assert url == W.FALLBACK_X86
+    assert "+cpu" in url and "x86_64" in url
 
 
 def test_garbage_response_falls_back():
-    assert "v0.28.0" in W.latest_cpu_wheel_url("x86_64", fetch=lambda url: {"weird": 1})
+    assert W.latest_cpu_wheel_url("x86_64", fetch=lambda url: {"weird": 1}) == W.FALLBACK_X86
+
+
+def test_the_pinned_fallback_can_serve_the_current_transformers_pin():
+    """The fallback only fires when the GitHub API is unreachable, but it must still be a
+    vLLM that works with the pinned transformers. vLLM 0.29 is where gemma-4 builds from
+    per-layer configs, which is what let the <5.15 transformers ceiling be lifted -- a
+    fallback older than that would quietly recreate the problem it protected against."""
+    import re
+    for url in (W.FALLBACK_X86, W.FALLBACK_AARCH64):
+        m = re.search(r"/v(\d+)\.(\d+)\.(\d+)/", url)
+        assert m, url
+        assert tuple(map(int, m.groups())) >= (0, 29, 0), f"fallback predates vLLM 0.29: {url}"
 
 
 def test_percent_encoded_plus_is_normalized():
