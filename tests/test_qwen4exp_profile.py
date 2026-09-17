@@ -276,3 +276,65 @@ def test_a_profile_without_the_flag_is_unaffected():
                                   cfg=_Cfg(mrope=False))
     assert kw["position_ids"].dim() == 2
     assert rot.seen[0] == 1
+
+
+# ---- sparse-attention layers need a causal mask -----------------------------------------
+
+def test_sparse_attention_archs_get_a_causal_mask():
+    """Qwen4Exp's sparse-attention layers dereference attention_mask unconditionally.
+
+    `Qwen4ExpIndexer.forward` does
+
+        visible_token_indices = attention_mask if attention_mask.dtype == torch.bool \\
+                                else attention_mask == 0
+
+    with the comment "the mask is never None here". Calling the layer directly with None
+    raises `AttributeError: 'NoneType' object has no attribute 'dtype'` — observed live at
+    layer 3 of 47, the first qwen_sparse_attention block (0-2 are linear_attention, which
+    has no indexer, so the run got 43 minutes in before failing).
+    """
+    profile = qm._MODEL_PROFILES["Qwen4ExpForConditionalGeneration"]
+    kw = qm._build_forward_kwargs(profile, torch.zeros(1, 8, 4), _Rotary(),
+                                  layer_idx=0, cfg=_Cfg(mrope=True))
+    m = kw.get("attention_mask")
+    assert m is not None, "sparse-attention layers cannot run without a mask"
+    assert m.dim() == 4, f"indexer indexes [batch, 0, query]; got {m.dim()}-D"
+    assert m.shape[0] == 1 and m.shape[1] == 1, m.shape
+
+
+def test_the_mask_is_causal_not_all_visible():
+    """An all-True mask would let the indexer select FUTURE tokens.
+
+    That does not raise — it silently changes which tokens attend, so every downstream
+    Hessian is computed against activations the model would never produce at inference. The
+    quantize would finish and report success with quietly wrong calibration.
+    """
+    profile = qm._MODEL_PROFILES["Qwen4ExpForConditionalGeneration"]
+    kw = qm._build_forward_kwargs(profile, torch.zeros(1, 8, 4), _Rotary(),
+                                  layer_idx=0, cfg=_Cfg(mrope=True))
+    m = kw["attention_mask"]
+    vis = m if m.dtype == torch.bool else (m == 0)
+    vis = vis[0, 0]
+    assert bool(vis[0, 0]), "a token must see itself"
+    assert not bool(vis[0, -1]), "token 0 must NOT see the last token — mask is not causal"
+    assert bool(vis[-1, 0]), "the last token must see token 0"
+
+
+def test_archs_without_the_capability_get_no_mask():
+    """Every other architecture builds its own mask internally; an unexpected kwarg would
+    either be swallowed silently or raise."""
+    kw = qm._build_forward_kwargs({}, torch.zeros(1, 8, 4), _Rotary(),
+                                  layer_idx=0, cfg=_Cfg(mrope=True))
+    assert "attention_mask" not in kw
+
+
+def test_the_mask_helper_never_returns_none():
+    """create_causal_mask returns None whenever it judges the mask skippable — measured
+    against the real Qwen4Exp config, it does so even with allow_is_causal_skip=False. The
+    indexer indexes the mask directly, so None is exactly the crash this fix exists to
+    prevent. Pin that the helper always yields a usable tensor."""
+    import glq.quantize_model as q
+    for cfg in (_Cfg(mrope=True), None):
+        m = q._causal_mask_for(torch.zeros(1, 8, 4), cfg, torch.arange(8)[None])
+        assert m is not None, "helper returned None — the indexer would crash"
+        assert m.dim() == 4 and m.shape[-1] == 8, m.shape
