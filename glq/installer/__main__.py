@@ -43,23 +43,27 @@ class Runner:
         return subprocess.call([str(c) for c in cmd], **kw)
 
 
-#: Both ends of this range exist because of gemma-4, and vLLM declares only
-#: `transformers>=5.5.3`, so without it pip resolves the newest and every gemma-4 checkpoint
-#: dies before a weight is loaded.
+#: Pinned exactly, because vLLM declares only `transformers>=5.5.3` and leaving the choice
+#: to pip's resolver has broken serving twice — once by resolving too new, once by being
+#: capped too old.
 #:
-#:   floor   5.13.1 — earlier transformers has no gemma-4 at all.
-#:   ceiling <5.15  — 5.15.0 moved gemma-4 to a per-layer config and made the global
-#:                    `config.head_dim` raise AmbiguousGlobalPerLayerAttributeError, which
-#:                    vLLM 0.27.1 reads while building its ModelConfig. Bisected on an L4:
-#:                    5.15.0 fails, 5.14.1 / 5.13.1 / 5.12.1 / 5.11.0 / 5.10.4 all give
-#:                    head_size=512 and load.
+#: The previous `>=5.13.1,<5.15` ceiling existed for vLLM 0.27.1, which read the global
+#: `config.head_dim` while building its ModelConfig and hit
+#: AmbiguousGlobalPerLayerAttributeError once 5.15.0 moved gemma-4 to a per-layer config.
+#: Its comment named its own expiry: lift it when vLLM builds gemma-4 from per-layer
+#: configs. vLLM 0.29 does, and the installer pins no vLLM version at all — both the CUDA
+#: and CPU paths resolve the newest — so the ceiling had stopped protecting anyone.
 #:
-#: Not a GLQ bug — stock bf16 google/gemma-4-E2B-it fails the same way with no GLQ in the
-#: process — and not fixable from the config: forcing the documented
-#: `allow_global_per_layer_attribute_access` yields head_size=256 for a model whose layers
-#: are 256 *and* 512, and the weight loader dies on a size assert. Lift the ceiling when
-#: vLLM builds gemma-4 from per-layer configs.
-GEMMA4_TRANSFORMERS = "transformers>=5.13.1,<5.15"
+#: It had started doing harm instead: `qwen4_exp` (Qwen3.8-Flash-Next) landed in 5.16.0, so
+#: under the old ceiling install.sh produced an environment that could not load the model at
+#: all, failing with "Transformers does not recognize this architecture".
+#:
+#: 5.17.0 is the version actually measured, on vLLM 0.29.0 / RTX PRO 6000: gemma-4
+#: E2B/12B/26B-GLQ, Qwen3.5 and SmolLM3-GLQ all serve (benchmarks/_gemma4_transformers_gate.py
+#: re-runs it), and gemma-4 E2B, Qwen3.5 and Qwen4Exp all quantize. An exact pin rather than
+#: a floor: "resolve the newest" is the documented failure mode above, so this needs bumping
+#: deliberately, with the gate re-run, rather than drifting on its own.
+GEMMA4_TRANSFORMERS = "transformers==5.17.0"
 
 # Template constants live in glq.tooling — the single source both this installer and
 # glq-code read, so the family knowledge cannot drift again.

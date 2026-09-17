@@ -38,17 +38,30 @@ def _pip_commands(components):
     return " ".join(" ".join(c) for c in seen)
 
 
-def test_serving_pins_transformers_below_the_gemma4_break():
-    """Without this, a fresh install resolves the newest transformers and every gemma-4
-    checkpoint dies before a single weight is loaded."""
+def test_serving_pins_transformers_exactly():
+    """Left to pip's resolver, serving has broken twice — once from resolving too new, once
+    from a ceiling that outlived its cause. An exact pin is the version actually measured."""
     flat = _pip_commands(("core", "vllm"))
     assert "transformers" in flat, f"transformers is left to pip's resolver:\n{flat}"
-    assert "<5.15" in flat, f"no ceiling on transformers:\n{flat}"
+    assert "==5.17.0" in flat, f"transformers is not pinned exactly:\n{flat}"
 
 
-def test_serving_keeps_the_floor_gemma4_needs():
-    """5.13.1 is where transformers gained gemma-4. Below it the models do not exist."""
-    assert ">=5.13.1" in _pip_commands(("core", "vllm"))
+def test_the_pin_can_load_qwen4_exp():
+    """`qwen4_exp` (Qwen3.8-Flash-Next) landed in transformers 5.16.0. Under the old
+    `<5.15` ceiling install.sh produced an environment that could not load the model at all
+    -- "Transformers does not recognize this architecture" -- so the pin must stay >=5.16."""
+    import re
+    flat = _pip_commands(("core", "vllm"))
+    m = re.search(r"transformers==(\d+)\.(\d+)", flat)
+    assert m, f"no exact transformers pin found:\n{flat}"
+    assert (int(m.group(1)), int(m.group(2))) >= (5, 16), f"{m.group(0)} predates qwen4_exp"
+
+
+def test_the_pin_keeps_the_floor_gemma4_needs():
+    """5.13.1 is where transformers gained gemma-4; anything pinned must be at or above it."""
+    import re
+    m = re.search(r"transformers==(\d+)\.(\d+)\.(\d+)", _pip_commands(("core", "vllm")))
+    assert m and tuple(map(int, m.groups())) >= (5, 13, 1)
 
 
 def test_the_pin_travels_with_vllm_not_with_the_chat_ui():
@@ -127,9 +140,9 @@ def test_cpu_install_never_names_bare_vllm(monkeypatch):
 
 
 def test_cpu_install_keeps_the_transformers_pin(monkeypatch):
-    """The gemma-4 pin is model-bound, not device-bound — it applies equally on CPU."""
+    """The transformers pin is model-bound, not device-bound — it applies equally on CPU."""
     flat = _pip_commands_cpu(("core", "vllm"), monkeypatch)
-    assert ">=5.13.1" in flat and "<5.15" in flat
+    assert "transformers==5.17.0" in flat, flat
 
 
 def test_default_device_argv_is_unchanged():

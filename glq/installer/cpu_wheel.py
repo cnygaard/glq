@@ -22,10 +22,10 @@ _ASSET_SUFFIX = "+cpu-cp38-abi3-manylinux_2_34_{arch}.whl"
 
 #: Known-good pins — the exact wheels validated end to end (SmolLM3 + gemma-4-E4B served
 #: on the CPU backend). Bump when a newer release is validated.
-FALLBACK_X86 = ("https://github.com/vllm-project/vllm/releases/download/v0.28.0/"
-                "vllm-0.28.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl")
-FALLBACK_AARCH64 = ("https://github.com/vllm-project/vllm/releases/download/v0.28.0/"
-                    "vllm-0.28.0+cpu-cp38-abi3-manylinux_2_34_aarch64.whl")
+FALLBACK_X86 = ("https://github.com/vllm-project/vllm/releases/download/v0.29.0/"
+                "vllm-0.29.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl")
+FALLBACK_AARCH64 = ("https://github.com/vllm-project/vllm/releases/download/v0.29.0/"
+                    "vllm-0.29.0+cpu-cp38-abi3-manylinux_2_34_aarch64.whl")
 
 #: The torch index the +cpu wheel's dependencies resolve against.
 PYTORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
