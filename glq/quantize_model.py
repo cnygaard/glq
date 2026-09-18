@@ -16,6 +16,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -1530,6 +1531,39 @@ def _quantize_ple_chunk_trellis(chunk, bpw, device, codebook=None, rht=None):
     return arts, rht.inverse_transform_weights(hat_t.float() * per_row)
 
 
+#: A per-expert artifact key: ``....experts.<e>.gate_proj`` and friends. The original these
+#: replace is the STACKED ``....experts.gate_up_proj`` / ``.down_proj``, which shares no
+#: prefix with them.
+_EXPERT_PROJ_RE = re.compile(
+    r"^(?P<base>.+\.experts)\.\d+\.(?:gate_proj|up_proj|down_proj)$")
+
+
+def _superseded_original_keys(all_artifacts, weight_map, ple_spec):
+    """Checkpoint keys whose content is now carried by a quantized artifact under a
+    DIFFERENT key, so ``param_prefix in quantized_prefixes`` cannot see the relationship.
+
+    Two layouts need this, and getting it wrong is silent — the save simply writes both
+    copies. Measured on a real Qwen3.8-Flash-Next run: 396.9 GiB instead of ~72, larger than
+    the 335 GiB bf16 source, from 229.7 GiB of stacked experts plus 96.0 GiB of PLE shards
+    written beside a correct 67.3 GiB of payload.
+
+    Derived from the artifacts rather than recorded while quantizing. The previous
+    stacked-expert drop set was filled inside the unstacking loop, so a ``--resume`` run that
+    skips quantization left it empty and wrote every original.
+    """
+    drop: set[str] = set()
+    for key in all_artifacts:
+        m = _EXPERT_PROJ_RE.match(key)
+        if m:
+            base = m.group("base")
+            drop.add(f"{base}.gate_up_proj")
+            drop.add(f"{base}.down_proj")
+    if ple_spec and ple_spec.get("shards") and ple_spec.get("prefix") in all_artifacts:
+        shard_root = f"{ple_spec['prefix']}.shard_"
+        drop.update(k for k in (weight_map or {}) if k.startswith(shard_root))
+    return drop
+
+
 def _ple_row_reader(weight_map, shard_paths, spec):
     """``(n_rows, width, read(r0, r1))`` for a PLE table, without holding it in RAM.
 
@@ -2929,6 +2963,12 @@ def quantize(
     from safetensors import safe_open
 
     quantized_prefixes = set(all_artifacts.keys())
+    superseded_keys = _superseded_original_keys(
+        all_artifacts, weight_map if streaming else {},
+        _ple_embed_spec(arch, profile, cfg))
+    # The set recorded while unstacking experts is kept as a belt-and-braces union: it is
+    # authoritative for anything the derivation cannot see, and empty on a resumed run.
+    superseded_keys |= dropped_stacked_keys
     state_dict = {}
 
     # Add quantized layer artifacts
@@ -2939,10 +2979,11 @@ def quantize(
     if streaming:
         # Stream non-quantized parameters from source safetensors
         for key in weight_map:
-            # Gemma-4 MoE: the original stacked expert tensors were replaced by
-            # per-expert GLQ artifacts (different key prefix), so the generic
-            # quantized_prefixes check below won't catch them — drop explicitly.
-            if key in dropped_stacked_keys:
+            # Originals whose replacement lives under a different key: stacked MoE
+            # experts and a sharded PLE table. Derived from the artifacts, so a --resume
+            # run (which never enters the unstacking loop that used to record them) drops
+            # them too. See _superseded_original_keys.
+            if key in superseded_keys:
                 continue
             param_prefix = key.rsplit(".", 1)[0] if "." in key else ""
             if param_prefix in quantized_prefixes:
@@ -2989,6 +3030,32 @@ def quantize(
         print(f"  promoted to text-only (stripped language_model. wrapper, "
               f"dropped {len(state_dict) - len(remapped)} vision/projector tensors)")
         state_dict = remapped
+
+    # A quantized checkpoint that is not smaller than its source is not a checkpoint, it is
+    # a bug wearing one's markers. The Qwen4Exp run that prompted this guard wrote 396.9 GiB
+    # against a 335 GiB bf16 source and reported success: quant_method, bpw, ple_bpw and
+    # ple_codebook were all correct, every shard was present, and the only wrong thing was
+    # the size -- which was the only thing nothing asserted. Cheap, and it fires before the
+    # hours are spent uploading.
+    _written = sum(t.numel() * t.element_size() for t in state_dict.values())
+    _source = 0
+    if streaming:
+        for _sp in set(shard_paths.values()):
+            try:
+                _source += os.path.getsize(_sp)
+            except OSError:
+                _source = 0
+                break
+    if _source and _written >= _source:
+        raise RuntimeError(
+            f"refusing to write a checkpoint no smaller than its source: "
+            f"{_written / 2**30:.1f} GiB written vs {_source / 2**30:.1f} GiB of source "
+            f"weights. Quantized payload is present but originals were not dropped — the "
+            f"usual cause is a tensor whose replacement lives under a different key "
+            f"(stacked MoE experts, a sharded PLE table); see _superseded_original_keys.")
+    print(f"  writing {_written / 2**30:.2f} GiB"
+          + (f" (source {_source / 2**30:.1f} GiB, "
+             f"{_source / max(_written, 1):.2f}x smaller)" if _source else ""))
 
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
