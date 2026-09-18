@@ -1,7 +1,7 @@
 """Generate a GLQ HuggingFace model card.
 
 Injects GLQ-specific sections (install, vLLM/Transformers usage, pi-code/opencode
-coding-agent configs, E8 KV cache, benchmarks) into the *original* base-model card:
+coding-agent configs, benchmarks) into the *original* base-model card:
 the base README's YAML frontmatter (license, language, pipeline_tag, tags) is
 inherited, its body is appended verbatim under a collapsible section, and a
 derivative-work notice + license are added. The result respects the base model's

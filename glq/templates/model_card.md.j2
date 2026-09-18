@@ -6,7 +6,7 @@
 **GLQ ({{ "%.1f"|format(avg_bpw) }} bits/weight)** quantization of [`{{ base_model }}`](https://huggingface.co/{{ base_model }}) using an **E8-lattice codebook + randomized Hadamard transform (RHT) + LDLQ**. Weights stay compressed in memory and are dequantized on the fly by fused CUDA kernels.
 {% endif %}
 
-> **Where GLQ shines:** the size-vs-accuracy win is strongest at **2–4 bits/weight**. {% if avg_bpw > 4.05 %}At {{ "%.1f"|format(avg_bpw) }} bpw the weight savings are modest — the bigger win at this precision is pairing it with the **E8 KV cache** (≈4× smaller KV cache → much longer context / more concurrency in the same VRAM).{% else %}For even more headroom, combine it with the **E8 KV cache** (≈4× smaller KV cache → longer context in the same VRAM).{% endif +%}
+> **Where GLQ shines:** the size-vs-accuracy win is strongest at **2–4 bits/weight**. {% if avg_bpw > 4.05 %}At {{ "%.1f"|format(avg_bpw) }} bpw the footprint saving is smaller, so this rung is for keeping quality close to bf16 while still fitting a card that the full-precision model would not.{% else %}This checkpoint sits in that range.{% endif +%}
 
 - **Base model:** [`{{ base_model }}`](https://huggingface.co/{{ base_model }})
 {% if is_trellis %}
@@ -112,18 +112,6 @@ vllm serve {{ repo_id }} --port 8000
 {{ opencode_config }}
 ```
 
-## Smaller KV cache (E8) — long context in the same VRAM
-
-GLQ also ships an **E8-quantized KV cache** (~4× smaller than fp16, ~bit-identical at 4-bit). Enable it at serve time:
-
-```bash
-GLQ_KV_QUANT=e8_relaxed:2 \
-GLQ_KV_E8_SIDECAR=1 GLQ_KV_E8_SIDECAR_READ=1 GLQ_KV_E8_COMPRESSED_ALLOC=1 \
-GLQ_KV_E8_FUSED_GATHER=1 GLQ_KV_E8_FUSED_WRITE=1 \
-vllm serve {{ repo_id }}
-```
-
-`e8_relaxed:2` ≈ 4-bit KV, `:1` ≈ 2-bit, `:3` ≈ 6-bit. This is the part of GLQ that keeps paying off **above** 4-bit weights.
 {% if benchmarks %}
 
 ## Benchmarks
