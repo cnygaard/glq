@@ -318,8 +318,25 @@ _MODEL_PROFILES = {
             'block_diagonal': True,
             'shards': 128,
         },
+        # `.input_mix_weight_down` / `_up` [320, 10240] are the hyper-connection mixers —
+        # they decide how the residual streams combine, the role a router plays. Two
+        # independent reasons they stay bf16:
+        #   quality:     worst-reconstructing group in the 3 bpw run, mean SQNR 15.33 dB
+        #                against a 15.91 dB model mean and a 12.82 dB worst matrix
+        #                (routed experts 15.90, shared expert 16.74). 0.35% of params,
+        #                so quantizing them buys 0.95 GiB of 77.5 for the largest
+        #                per-matrix error in the file.
+        #   servability: vLLM builds both with `quant_config=None` — down is merged with
+        #                `.block_inject_weight` into one MergedColumnParallelLinear, up is
+        #                a ReplicatedLinear — so `get_quant_method` is never called and a
+        #                quantized one fails weight loading outright. Upstream FP8
+        #                checkpoints leave them bf16 too. `.block_inject_weight`, the
+        #                third shard of that merged linear, was already skipped; these
+        #                complete the set, which has to be all-or-nothing because one
+        #                parameter cannot mix GLQ and bf16 shards.
         'skip_linears': ('.in_proj_b', '.in_proj_a', '.shared_expert_gate',
-                         '.block_inject_weight', '.indexer.'),
+                         '.block_inject_weight', '.indexer.',
+                         '.input_mix_weight_down', '.input_mix_weight_up'),
     },
     'SarvamMoEForCausalLM': {
         # sarvam-30b (model_type `sarvam_moe`, trust_remote_code): a dense-text
@@ -676,9 +693,55 @@ def _collect_linears(layer, profile):
             linears[name] = mod
     skip = tuple(profile.get('skip_linears') or ())
     if skip:
-        for name in [n for n in linears if n.endswith(skip)]:
+        for name in [n for n in linears if _skip_match(n, skip)]:
             del linears[name]
     return linears
+
+
+def _skip_match(name, skip):
+    """True when ``name`` is excluded by one of the ``skip_linears`` entries.
+
+    Two forms, because profiles already use both:
+
+    ``'.o_proj'``      suffix — the sublayer itself.
+    ``'.indexer.'``    namespace — everything beneath it.
+
+    The namespace form needs its own rule: no module name ends in a dot, so a plain
+    ``endswith`` matched it never. Qwen4Exp's profile has declared ``'.indexer.'`` skipped
+    since the arch was added, and its 12 ``index_qk_proj`` matrices were quantized anyway
+    — a documented exclusion that silently did nothing.
+    """
+    for s in skip:
+        if s.endswith('.'):
+            if s in name or name.startswith(s[1:] if s.startswith('.') else s):
+                return True
+        elif name.endswith(s):
+            return True
+    return False
+
+
+def _drop_skipped_artifacts(mapping, profile):
+    """Return ``mapping`` without entries the profile's ``skip_linears`` excludes.
+
+    ``--resume`` replays a bank instead of re-quantizing, and does so with a bare
+    ``all_artifacts.update(arts_map)`` — ``_collect_linears``, the only reader of
+    ``skip_linears``, runs on the branch resume skips. So a bank produced *before* a
+    matrix joined the skip list keeps supplying it, and the re-saved checkpoint stays
+    quantized exactly where the profile now says it must not be.
+
+    Qwen4Exp's hyper-connection mixers were banked by an 11-hour run and only afterwards
+    found to be both unservable (vLLM builds them with ``quant_config=None``) and the
+    worst-reconstructing group in the file. The profile is the authority; the bank is a
+    cache.
+
+    Returns a new dict — ``load_layer`` hands back three parallel maps (artifacts,
+    metrics, losses) and they must be filtered by the same rule, so mutating in place
+    would let layer_metrics.json describe matrices the checkpoint no longer quantizes.
+    """
+    skip = tuple(profile.get('skip_linears') or ())
+    if not skip:
+        return mapping
+    return {k: v for k, v in mapping.items() if not _skip_match(k, skip)}
 
 
 def _require_streaming_for_wrapper(arch, profile, streaming):
@@ -1624,6 +1687,52 @@ def _download_snapshot(model_id):
     return snapshot_download(model_id)
 
 
+def _restore_source_layer_types(config_dict, model_name):
+    """Write back the ``layer_types`` the source repo declared, before we serialize.
+
+    ``config.json`` is written from ``save_cfg.to_dict()`` — the config as *transformers
+    loaded it*, not as the source repo declared it. Usually identical; for Qwen4Exp it is
+    not. transformers 5.17's ``Qwen4ExpTextConfig`` rewrites ``"full_attention"`` to
+    ``"qwen_sparse_attention"`` on load whenever ``indexer_n_heads`` is set, and that name
+    is internal to transformers: vLLM's Qwen4Exp accepts only ``"linear_attention"`` and
+    ``"full_attention"`` and otherwise raises ``ValueError: Invalid layer_type`` during
+    layer construction — before a single weight is read.
+
+    So a checkpoint saved from the loaded config cannot be served at all, quantized or
+    not; a bf16 copy saved the same way fails the same way. Measured on
+    Qwen3.8-Flash-Next, whose source declares 36 ``linear_attention`` + 12
+    ``full_attention``.
+
+    Best-effort by design: this runs at the end of a multi-hour quantize, so an
+    unreadable or absent source config leaves the dict alone rather than losing the run.
+    """
+    import json
+    import os
+    try:
+        if os.path.isdir(model_name):
+            path = os.path.join(model_name, "config.json")
+        else:
+            # ONE file, not ``_download_snapshot``: that fetches the whole repo, which
+            # for Qwen3.8-Flash-Next is 335 GiB pulled to read a 5 MB config.
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(model_name, "config.json")
+        with open(path) as f:
+            raw = json.load(f)
+    except Exception:  # noqa: BLE001 — never fail a finished run over a config nicety
+        return
+    source = raw.get("layer_types") or (raw.get("text_config") or {}).get("layer_types")
+    if not source:
+        return
+    for holder in (config_dict, config_dict.get("text_config")):
+        if not isinstance(holder, dict):
+            continue
+        current = holder.get("layer_types")
+        # Only override a list of the same length: a different length describes a
+        # different model, and copying it would mis-declare which layers hold KV.
+        if current and len(current) == len(source) and list(current) != list(source):
+            holder["layer_types"] = list(source)
+
+
 def quantize(
     model_name: str,
     output_dir: str,
@@ -2222,6 +2331,12 @@ def quantize(
         if resume_store is not None and layer_idx in _done:
             from .resume import dequantize_artifacts
             arts_map, metrics_map, losses_map = resume_store.load_layer(layer_idx)
+            # The bank may predate a change to the profile's skip list, and resume never
+            # reaches _collect_linears. Drop what the profile now excludes, so a resumed
+            # run and a fresh one produce the same set of quantized matrices.
+            arts_map = _drop_skipped_artifacts(arts_map, profile)
+            metrics_map = _drop_skipped_artifacts(metrics_map, profile)
+            losses_map = _drop_skipped_artifacts(losses_map, profile)
             all_artifacts.update(arts_map)
             all_layer_metrics.update(metrics_map)
             all_proxy_losses.update(losses_map)
@@ -3078,6 +3193,9 @@ def quantize(
         is_wrapped = False
     config_dict = save_cfg.to_dict()
     config_dict["use_cache"] = True  # Restore KV cache for inference
+    # to_dict() serializes the config as transformers LOADED it, which is not always what
+    # the source declared — and a renamed layer_type makes the checkpoint unservable.
+    _restore_source_layer_types(config_dict, model_name)
     if is_wrapped:
         from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
         causal_cls = MODEL_FOR_CAUSAL_LM_MAPPING.get(type(save_cfg), None)

@@ -163,6 +163,28 @@ class GLQvLLMConfig(QuantizationConfig):
             forms.add("model.language_model." + prefix[len("language_model.model."):])
         return any(f in self.layer_bpw for f in forms)
 
+    def embedding_quant_method(self, prefix: str):
+        """The GLQ method for a quantized embedding table at ``prefix``, or None when
+        this checkpoint leaves that table unquantized.
+
+        Split out of ``get_quant_method`` because one architecture's table never
+        reaches it: vLLM builds Qwen4Exp's n-gram embedding with an explicitly passed
+        ``quant_method`` from its own FP8-only helper, so ``glq_vllm._qwen4exp_ple``
+        has to ask for the method by prefix alone, with no layer to dispatch on. Both
+        callers must agree, hence one implementation rather than two.
+        """
+        bpw = self._lookup_bpw(prefix)
+        if bpw is None:
+            return None
+        # ple_codebook marks a table coded differently from the run's codebook
+        # (absent == shell, so existing checkpoints are unaffected). It has to come
+        # from config.json: create_weights runs before any tensor key is visible.
+        ple_cb = getattr(self, "ple_codebook", None) or "shell"
+        ple_bpw = getattr(self, "ple_bpw", None) or bpw
+        return GLQEmbeddingMethod(
+            self, bpw=(ple_bpw if ple_cb == "trellis" else bpw),
+            codebook=ple_cb, variant=self.variant)
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):
             bpw = self._lookup_bpw(prefix)
@@ -187,17 +209,8 @@ class GLQvLLMConfig(QuantizationConfig):
         # time. Embeddings absent from the map (main embed_tokens, lm_head)
         # fall through to UnquantizedEmbeddingMethod.
         if isinstance(layer, VocabParallelEmbedding):
-            bpw = self._lookup_bpw(prefix)
-            if bpw is None:
-                return UnquantizedEmbeddingMethod()
-            # ple_codebook marks a table coded differently from the run's codebook
-            # (absent == shell, so existing checkpoints are unaffected). It has to come
-            # from config.json: create_weights runs before any tensor key is visible.
-            ple_cb = getattr(self, "ple_codebook", None) or "shell"
-            ple_bpw = getattr(self, "ple_bpw", None) or bpw
-            return GLQEmbeddingMethod(
-                self, bpw=(ple_bpw if ple_cb == "trellis" else bpw),
-                codebook=ple_cb, variant=self.variant)
+            return (self.embedding_quant_method(prefix)
+                    or UnquantizedEmbeddingMethod())
 
         # FusedMoE layers — lazy import to avoid circular deps. vLLM 0.25 split the
         # 0.23 `FusedMoE` nn.Module into a factory *function* (returns a MoERunner)
