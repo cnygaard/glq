@@ -300,10 +300,15 @@ than silently rounded — and the fused kernel needs layer dims with
 Above 4 bpw the layer becomes a two-stage stacked RVQ (a K=4 code plus a
 K=bpw−4 residual), which costs roughly 2× the decode of a single stage;
 5–8 bpw checkpoints need **glq ≥ 0.8.0** and `GLQ_TRELLIS_VARIANT=3inst`.
-Models with per-layer embeddings (Gemma-4 E2B/E4B) are handled
-automatically — the PLE table quantizes via the shell codebook (requires
-glq ≥ 0.7.2). `--streaming` is **required** for the Gemma-4 and
-Qwen3.5/Qwen3.8 families, not just recommended.
+Models with per-layer embeddings are handled automatically, with the codebook
+chosen per architecture. Gemma-4 E2B/E4B route the PLE table to the shell
+codebook (glq ≥ 0.7.2). Qwen3.8-Flash-Next (`qwen4_exp`) routes it to trellis
+with a block-diagonal RHT (glq ≥ 0.8.20): its n-gram table is 95.4 GiB, most of
+the checkpoint, and its rows are 160 wide — not a power of two — so the shell
+path's full Hadamard would pad every one of them. `GLQ_PLE_CODEBOOK` and
+`GLQ_PLE_BPW` override the codebook and the rate for a single run.
+`--streaming` is **required** for the Gemma-4 and Qwen3.5/Qwen3.8 families, not
+just recommended.
 
 **Mixture-of-Experts** (Gemma-4 26B-A4B and similar) needs **glq ≥ 0.8.1**,
 which added the fused grouped trellis MoE decode. It serves under a full
