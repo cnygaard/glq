@@ -33,6 +33,11 @@ def register():
         # non-capturable MoE fallback (cudaErrorStreamCaptureUnsupported).
         from . import _cudagraph_cap
         _cudagraph_cap.install()
+        # Qwen4Exp builds its per-layer-embedding table with an explicitly passed
+        # quant_method from an FP8-only helper, so GLQ's config is never consulted for
+        # it and the 24 GiB table would be built dense in bf16 (95.37 GiB → OOM).
+        from . import _qwen4exp_ple
+        _qwen4exp_ple.install()
     except ImportError:
         pass
 
