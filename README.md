@@ -223,7 +223,7 @@ plus one downloads-earned extra at the end. Everything is on the
 | [`SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-135M | 4.0 | Apache 2.0 | 0.1 GiB | smallest checkpoint; CI smoke tests |
 | [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic (top-15 by downloads; not in start-here) |
 
-**44 public checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has
+**37 public checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has
 trellis builds of the whole Gemma-4 family (E2B/E4B/12B/26B/31B at 4 bpw), SmolLM3-3B and
 SmolLM2-360M trellis ladders at 3–6 bpw, and the Gemma-4 12B/31B/E4B family across
 **3–8 bpw** (incl. `e8p` variants). Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
