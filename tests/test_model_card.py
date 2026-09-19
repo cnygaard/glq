@@ -99,7 +99,6 @@ def test_build_card_uniform(tmp_path):
     assert 'quantization="glq"' in body
     assert "## Use with Transformers" in body
     assert "AutoModelForCausalLM" in body          # not multimodal
-    assert "GLQ_KV_QUANT=e8_relaxed:2" in body     # E8 KV recipe
     assert "xv0y5ncu/Test-GLQ-4bpw" in body        # repo id threaded into examples
     assert "GLQ on GitHub" in body                 # footer
     # written to disk
@@ -168,11 +167,45 @@ def test_build_card_shell_unchanged_default(tmp_path):
 
 
 def test_build_card_sweet_spot_callout(tmp_path):
-    # >4 bpw -> steer toward E8 KV cache
+    # >4 bpw -> says what the rung IS for, now that it can no longer point at the E8 KV
+    # cache (which does not start on vLLM >= 0.27).
     out_hi = _write_quant_dir(tmp_path / "hi", bpw=8)
     card_hi = build_card(out_hi, "x/y", write=False)
-    assert "E8 KV cache" in card_hi
+    assert "8.0 bpw" in card_hi
+    assert "close to bf16" in card_hi
     # 2-4 bpw -> sweet spot
     out_lo = _write_quant_dir(tmp_path / "lo", bpw=3)
     card_lo = build_card(out_lo, "x/y", write=False)
     assert "2–4" in card_lo or "2-4" in card_lo
+
+
+# ---- E8 KV cache: removed from the card --------------------------------------------
+
+def test_no_card_advertises_the_e8_kv_cache(tmp_path):
+    """The E8 KV cache does not start on vLLM >= 0.27.
+
+    Every stage still announces itself and then EngineCore exits on
+    ``kv_cache_stride_order``. It was removed from the README on 2026-08-16 for exactly
+    that reason, but the card template kept a whole section plus a pitch in the opening
+    blockquote — so every generated card shipped serve flags that produce a dead engine,
+    on repos users reach before they reach the README.
+
+    Both bpw branches are checked: the >4.05 branch made the KV cache the *only*
+    justification it offered for a high-bpw checkpoint.
+    """
+    for bpw in (3, 5):
+        out = _write_quant_dir(tmp_path / f"b{bpw}", bpw=bpw)
+        card = build_card(out, "x/y", write=False)
+        for probe in ("E8 KV cache", "GLQ_KV_QUANT", "e8_relaxed:2",
+                      "GLQ_KV_E8_SIDECAR", "Smaller KV cache"):
+            assert probe not in card, f"{probe!r} still advertised at {bpw} bpw"
+
+
+def test_the_high_bpw_branch_still_says_something_useful(tmp_path):
+    """Deleting the KV-cache clause must not leave ">4 bpw: savings are modest" dangling
+    with no follow-up — that reads as a reason not to use the checkpoint at all."""
+    out = _write_quant_dir(tmp_path, bpw=6)
+    card = build_card(out, "x/y", write=False)
+    assert "2–4 bits/weight" in card
+    head = card[: card.find("## Install")]
+    assert "modest" not in head or len(head.split("modest")[1].split("\n")[0]) > 40
