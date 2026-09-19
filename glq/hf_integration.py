@@ -648,6 +648,19 @@ class GLQQuantizer(HfQuantizer):
         # and carries no tlut; HYB's is meaningless without knowing which it is) and the
         # compute dtype — but not the shell codebook above.
         emb_variant = getattr(self.quantization_config, "variant", "hyb")
+        # Stitch each expert's gate/up halves into its fused [2I, H] projection BEFORE
+        # codebooks are attached. The checkpoint stores the halves separately (the quantizer
+        # split them after quantizing jointly), but the decode applies a row-direction
+        # Hadamard over blocks_m derived from out_features -- so a 704-row half decodes
+        # under [512,128,64] where the codes live in the 2I-row basis [1024,256,128], and
+        # the weights come out wrong with a completely clean load report.
+        from .fused_experts import _GatedExpertPair
+        n_fusedgu = sum(1 for m in model.modules()
+                        if isinstance(m, _GatedExpertPair) and m.fuse_gate_up())
+        if n_fusedgu:
+            import logging
+            logging.getLogger(__name__).debug(
+                "GLQ: fused gate/up for %d experts", n_fusedgu)
         for module in model.modules():
             if isinstance(module, TrellisRHTEmbedding):
                 module.variant = emb_variant

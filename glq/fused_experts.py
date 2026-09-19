@@ -362,7 +362,29 @@ def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True) -
 
 
 class _GatedExpertPair(nn.Module):
-    """One gated MoE expert: ``down(act(gate(x)) * up(x))``."""
+    """One gated MoE expert: ``down(act(gate) * up)`` with gate/up FUSED.
+
+    gate and up are ONE ``[2I, H]`` linear, not two ``[I, H]`` ones, because the decode
+    applies a row-direction block-diagonal Hadamard over ``blocks_m`` (see
+    ``quantized_linear.py``: ``y = block_diagonal_fht(y_rht, self.blocks_m) * self.SU``).
+    ``blocks_m`` is derived from ``out_features``, and the quantizer quantized the fused
+    ``[2I, H]`` matrix, so the stored codes live in a 2I-row RHT basis --
+    ``_block_decompose(1408) = [1024, 256, 128]``. Decoding a 704-row half instead applies
+    ``[512, 128, 64]``: everything loads, and the weights come out wrong. Measured on
+    gemma-4-26B-A4B, max weight error 0.264 against a weight std of 0.026, and the model
+    emitted pure garbage with a completely clean load report.
+
+    vLLM does the same thing for the same reason -- ``fused_moe_method.py`` allocates
+    ``w13_SU`` at ``2 * intermediate_size`` and decodes gate+up together.
+
+    The checkpoint still stores the halves separately (``experts.{e}.gate_proj.*``), since
+    the quantizer split the artifacts after quantizing them jointly, so a load pre-hook
+    stitches them back together.
+    """
+
+    #: Artifacts split ROW-wise by the quantizer (``_is_row_art``) — re-concatenated here.
+    _ROW_ARTS = ("trellis_packed", "trellis_packed2", "SU", "Qidxs", "Qidxs2",
+                 "Qidxs3", "Qidxs_e8p", "inv_resid_scale", "inv_resid_scale2")
 
     def __init__(self, hidden_dim: int, intermediate_dim: int,
                  block_diagonal: bool = True, codebook_type: str = "e8_shell"):
@@ -370,15 +392,79 @@ class _GatedExpertPair(nn.Module):
         # codebook_type is threaded through deliberately: `_ExpertPair` drops it and always
         # builds e8_shell buffers, so a trellis checkpoint would fail on shapes inside HF's
         # loader with nothing naming GLQ.
+        self.gate_up_proj = E8RHTLinear(hidden_dim, 2 * intermediate_dim, bias=False,
+                                        block_diagonal=block_diagonal,
+                                        codebook_type=codebook_type)
+        self.down_proj = E8RHTLinear(intermediate_dim, hidden_dim, bias=False,
+                                     block_diagonal=block_diagonal,
+                                     codebook_type=codebook_type)
+        # Landing pads for the checkpoint's separate halves. transformers 5.x loads through
+        # `convert_and_load_state_dict_in_model`, which assigns by key and never calls
+        # `_load_from_state_dict` or its pre-hooks -- which is why the NemotronH path uses a
+        # class-level `_checkpoint_conversion_mapping` rather than a hook. A regex cannot
+        # merge two keys into one, so the halves land here and `fuse_gate_up()` stitches
+        # them afterwards, from `_process_model_after_weight_loading`.
         self.gate_proj = E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
                                      block_diagonal=block_diagonal,
                                      codebook_type=codebook_type)
         self.up_proj = E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
                                    block_diagonal=block_diagonal,
                                    codebook_type=codebook_type)
-        self.down_proj = E8RHTLinear(intermediate_dim, hidden_dim, bias=False,
-                                     block_diagonal=block_diagonal,
-                                     codebook_type=codebook_type)
+        self._fused = False
+
+    def fuse_gate_up(self) -> bool:
+        """Concatenate the loaded gate/up halves into the fused projection, then drop them.
+
+        Row artifacts concatenate gate-first (the native forward chunks the output, so gate
+        is rows ``0:I`` -- the order ``_split_gate_up_arts(arts, inter, inter)`` wrote).
+        Everything else is a shared artifact the splitter cloned to both halves, so gate's
+        copy wins. Idempotent.
+        """
+        if self._fused:
+            return False
+        g, u, f = self.gate_proj, self.up_proj, self.gate_up_proj
+        if g is None or getattr(g, "trellis_packed", None) is None:
+            return False
+        for name, gv in list(g.named_buffers(recurse=False)):
+            uv = getattr(u, name, None)
+            if gv is None or gv.numel() == 0 or uv is None:
+                continue
+            merged = (torch.cat([gv, uv], dim=0)
+                      if name in self._ROW_ARTS and gv.dim() > 0 else gv)
+            setattr(f, name, merged.clone())
+        # Re-derive the row-block decomposition for the now-2I-row matrix; this is the
+        # whole point of fusing (blocks_m for 2I != two blocks_m for I).
+        if hasattr(f, "_refresh_block_meta"):
+            f._refresh_block_meta()
+        self.gate_proj = None
+        self.up_proj = None
+        self._fused = True
+        return True
+
+    @staticmethod
+    def _merge_gate_up(module, state_dict, prefix, local_metadata, strict,
+                       missing_keys, unexpected_keys, error_msgs):
+        """Rewrite ``gate_proj.X`` + ``up_proj.X`` into ``gate_up_proj.X`` before loading.
+
+        Row artifacts concatenate (gate first: the native forward chunks the output, so
+        gate is rows ``0:I`` -- the same order ``_split_gate_up_arts(arts, inter, inter)``
+        wrote them in). Everything else is a shared artifact the splitter cloned to both
+        halves, so gate's copy is taken and up's discarded.
+        """
+        g_pre, u_pre = prefix + "gate_proj.", prefix + "up_proj."
+        names = {k[len(g_pre):] for k in state_dict if k.startswith(g_pre)}
+        for name in names:
+            gk, uk = g_pre + name, u_pre + name
+            if uk not in state_dict:
+                continue
+            gv, uv = state_dict.pop(gk), state_dict.pop(uk)
+            if name in _GatedExpertPair._ROW_ARTS and gv.dim() > 0:
+                state_dict[prefix + "gate_up_proj." + name] = torch.cat([gv, uv], dim=0)
+            else:
+                state_dict[prefix + "gate_up_proj." + name] = gv
+        # Any gate-only leftovers (no up counterpart) still need re-pointing.
+        for k in [k for k in list(state_dict) if k.startswith(g_pre)]:
+            state_dict[prefix + "gate_up_proj." + k[len(g_pre):]] = state_dict.pop(k)
 
 
 class GLQStackedGatedExperts(nn.Module):
@@ -437,8 +523,10 @@ class GLQStackedGatedExperts(nn.Module):
                 continue
             current_state = hidden_states[token_idx]
             pair = self[expert_idx]
-            h = self.act_fn(pair.gate_proj(current_state)) * pair.up_proj(current_state)
-            h = pair.down_proj(h)
+            # One fused projection, then chunk — mirrors the native
+            # `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` and keeps the 2I-row RHT basis.
+            gate, up = pair.gate_up_proj(current_state).chunk(2, dim=-1)
+            h = pair.down_proj(self.act_fn(gate) * up)
             h = h * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(
                 0, token_idx, h.to(final_hidden_states.dtype))

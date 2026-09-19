@@ -129,14 +129,15 @@ def test_dimensions_come_from_the_parameter_not_config_names():
 
 # ---- checkpoint key layout -----------------------------------------------------------
 
-def test_per_expert_children_match_checkpoint_keys():
-    """The quantizer writes ``...experts.{e}.gate_proj.*`` (glq/quantize_model.py:2478).
-    Children must sit under integer-string keys so HF's loader finds them with no rename."""
+def test_per_expert_children_sit_under_integer_keys():
+    """Children must sit under integer-string keys so HF's loader reaches them with no
+    rename. gate/up are fused, so the modules are gate_up_proj and down_proj — the
+    checkpoint's separate halves are stitched by the load pre-hook."""
     m = _Wrapper()
     _replace_stacked_gated_experts(m)
     names = dict(m.named_modules())
     for e in range(E):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("gate_up_proj", "down_proj"):
             assert f"mlp.experts.{e}.{proj}" in names, f"missing experts.{e}.{proj}"
 
 
@@ -147,18 +148,17 @@ def test_the_codebook_type_reaches_every_expert_linear():
     m = _Wrapper()
     _replace_stacked_gated_experts(m, codebook_type="trellis")
     for e in range(E):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("gate_up_proj", "down_proj"):
             lin = getattr(m.mlp.experts[e], proj)
             assert getattr(lin, "_is_trellis", False), f"experts.{e}.{proj} is not trellis"
 
 
-def test_expert_linear_shapes_match_the_split():
-    """gate/up are [I, H] each (the 2I fused projection halved); down is [H, I]."""
+def test_expert_linear_shapes():
+    """gate_up is the fused [2I, H]; down is [H, I]."""
     m = _Wrapper()
     _replace_stacked_gated_experts(m)
     ex = m.mlp.experts
-    assert (ex[0].gate_proj.in_features, ex[0].gate_proj.out_features) == (H, I)
-    assert (ex[0].up_proj.in_features, ex[0].up_proj.out_features) == (H, I)
+    assert (ex[0].gate_up_proj.in_features, ex[0].gate_up_proj.out_features) == (H, 2 * I)
     assert (ex[0].down_proj.in_features, ex[0].down_proj.out_features) == (I, H)
 
 
@@ -168,11 +168,10 @@ def _swap_in_dense(container, native):
     """Replace the GLQ linears with plain nn.Linear carrying the native weights, so the
     routing and gating math can be compared without a real quantized payload."""
     for e in range(container.num_experts):
-        gate_w, up_w = native.gate_up_proj[e].chunk(2, dim=0)
-        g = nn.Linear(H, I, bias=False); g.weight.data = gate_w.clone()
-        u = nn.Linear(H, I, bias=False); u.weight.data = up_w.clone()
+        gu = nn.Linear(H, 2 * I, bias=False)
+        gu.weight.data = native.gate_up_proj[e].clone()
         d = nn.Linear(I, H, bias=False); d.weight.data = native.down_proj[e].clone()
-        container[e].gate_proj, container[e].up_proj, container[e].down_proj = g, u, d
+        container[e].gate_up_proj, container[e].down_proj = gu, d
 
 
 def test_forward_matches_the_native_gated_implementation():
@@ -210,3 +209,92 @@ def test_forward_handles_an_unrouted_expert():
     with torch.no_grad():
         got = m.mlp.experts(x, idx, w)
     assert torch.allclose(got, ref, atol=1e-5)
+
+
+# ---- the fused gate_up requirement ---------------------------------------------------
+#
+# The decode applies a ROW-direction block-diagonal Hadamard (quantized_linear.py:74):
+#
+#     y = block_diagonal_fht(y_rht, self.blocks_m) * self.SU
+#
+# blocks_m comes from out_features. The quantizer quantizes the FUSED [2I, H] matrix, so
+# the codes live in a 2I-row RHT basis: _block_decompose(1408) = [1024, 256, 128]. Decoding
+# a 704-row half applies [512, 128, 64] instead -- a different transform, so the weights
+# come out wrong while everything still loads. Measured on gemma-4-26B-A4B: max weight
+# error 0.264 against a weight std of 0.026, and the model emitted pure garbage.
+#
+# vLLM avoids this by concatenating gate+up into one w13 buffer (fused_moe_method.py
+# allocates w13_SU at 2 * intermediate_size) and decoding them together. The container has
+# to do the same: hold ONE fused [2I, H] linear and chunk its output, exactly as the native
+# forward does with `linear(x, gate_up_proj[e]).chunk(2, -1)`.
+
+def test_the_pair_holds_one_fused_gate_up_projection():
+    m = _Wrapper()
+    _replace_stacked_gated_experts(m)
+    pair = m.mlp.experts[0]
+    assert hasattr(pair, "gate_up_proj"), "gate and up must share one fused linear"
+    assert pair.gate_up_proj.out_features == 2 * I
+    assert pair.gate_up_proj.in_features == H
+    # gate_proj/up_proj exist only as landing pads for the checkpoint's separate halves
+    # (transformers assigns by key and never calls load hooks); fuse_gate_up() drops them.
+    assert pair.gate_proj.out_features == I and pair.up_proj.out_features == I
+
+
+def test_checkpoint_halves_are_merged_into_the_fused_buffers():
+    """The checkpoint stores per-expert ``gate_proj.*`` / ``up_proj.*`` because the
+    quantizer split the fused artifacts. Loading must put them back together, row-wise,
+    or the row-Hadamard basis is wrong."""
+    # Built directly (not via the replacement) so the buffers are real rather than meta:
+    # E8RHTLinear resizes its 0-size trellis buffers during a normal load, and the meta
+    # skeleton takes HF's assign path instead.
+    experts = GLQStackedGatedExperts(1, H, I, nn.SiLU(), codebook_type="trellis")
+
+    gate_packed = torch.arange(4 * 8, dtype=torch.int16).reshape(4, 8)
+    up_packed = (gate_packed + 100).to(torch.int16)
+    sd = {
+        "0.gate_proj.trellis_packed": gate_packed,
+        "0.up_proj.trellis_packed": up_packed,
+        "0.gate_proj.SU": torch.arange(I, dtype=torch.float16),
+        "0.up_proj.SU": torch.arange(I, dtype=torch.float16) + 1000,
+        "0.gate_proj.SV": torch.ones(H, dtype=torch.float16),
+        "0.up_proj.SV": torch.ones(H, dtype=torch.float16),
+        "0.gate_proj.Wscale": torch.tensor(0.5),
+        "0.up_proj.Wscale": torch.tensor(0.5),
+        "0.down_proj.SU": torch.ones(H, dtype=torch.float16),
+        "0.down_proj.SV": torch.ones(I, dtype=torch.float16),
+        "0.down_proj.Wscale": torch.tensor(0.25),
+        "0.down_proj.trellis_packed": torch.zeros(4, 8, dtype=torch.int16),
+    }
+    experts.load_state_dict(sd, strict=False)
+    assert experts[0].fuse_gate_up() is True
+    assert experts[0].gate_proj is None, "halves should be dropped after fusing"
+    fused = experts[0].gate_up_proj
+    assert torch.equal(fused.trellis_packed,
+                       torch.cat([gate_packed, up_packed], dim=0)), "packed not row-merged"
+    assert torch.equal(fused.SU, torch.cat([sd["0.gate_proj.SU"],
+                                            sd["0.up_proj.SU"]], dim=0)), "SU not merged"
+    # SV and Wscale are shared artifacts: both halves carry identical copies.
+    assert torch.equal(fused.SV, sd["0.gate_proj.SV"])
+    assert float(fused.Wscale) == 0.5
+
+
+def test_forward_chunks_the_fused_projection():
+    """Output parity again, now through the fused linear."""
+    torch.manual_seed(2)
+    m = _Wrapper()
+    native = m.mlp.experts
+    x = torch.randn(4, H)
+    idx = torch.randint(0, E, (4, 2))
+    w = torch.rand(4, 2)
+    with torch.no_grad():
+        ref = native(x, idx, w)
+    _replace_stacked_gated_experts(m)
+    for e in range(E):
+        gu = nn.Linear(H, 2 * I, bias=False)
+        gu.weight.data = native.gate_up_proj[e].clone()
+        d = nn.Linear(I, H, bias=False)
+        d.weight.data = native.down_proj[e].clone()
+        m.mlp.experts[e].gate_up_proj, m.mlp.experts[e].down_proj = gu, d
+    with torch.no_grad():
+        got = m.mlp.experts(x, idx, w)
+    assert torch.allclose(got, ref, atol=1e-5), (got - ref).abs().max()
