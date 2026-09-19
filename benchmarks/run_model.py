@@ -212,6 +212,8 @@ def run_vllm(args, failures):
               max_num_seqs=max(batches))
     if args.quant == "glq":
         kw["quantization"] = "glq"
+    if args.cpu_offload_gb:
+        kw["cpu_offload_gb"] = args.cpu_offload_gb
     if args.eager:
         kw["enforce_eager"] = True
     else:
@@ -269,18 +271,43 @@ def run_vllm(args, failures):
               f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{note}", flush=True)
 
 
+def resolve_hf_class(cfg, transformers_mod=None):
+    """The model class to load with, from ``config.architectures[0]``.
+
+    ``AutoModelForCausalLM`` maps the *config class*, not the architecture string. On a
+    multimodal wrapper that returns the TEXT-ONLY variant: Qwen4Exp resolves to
+    ``Qwen4ExpForCausalLM`` (modules ``model.layers.*``) while the checkpoint is
+    ``Qwen4ExpForConditionalGeneration`` (``model.language_model.layers.*``), so every key
+    mismatches and the load reports the whole GLQ payload as UNEXPECTED instead of failing.
+
+    Falls back to ``AutoModelForCausalLM`` when the architecture is absent or not exported.
+    """
+    if transformers_mod is None:
+        import transformers as transformers_mod
+    archs = getattr(cfg, "architectures", None) or []
+    if archs:
+        cls = getattr(transformers_mod, archs[0], None)
+        if cls is not None:
+            return cls
+    return transformers_mod.AutoModelForCausalLM
+
+
 def run_hf(args, failures):
     import torch
     # MUST precede from_pretrained. Without it transformers silently ignores
     # quantization_config, builds a DENSE model that generates plausible text and reports
     # bf16 memory — a bench that already shipped one wrong set of numbers.
     import glq.hf_integration  # noqa: F401
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
+
+    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    model_cls = resolve_hf_class(cfg)
+    print(f"HF class {model_cls.__name__} (from architectures)", flush=True)
 
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=getattr(torch, args.dtype), device_map="cuda",
+    model = model_cls.from_pretrained(
+        args.model, dtype=getattr(torch, args.dtype), device_map=args.device_map,
         trust_remote_code=True)
     model.eval()
     load_s = time.perf_counter() - t0
@@ -332,7 +359,7 @@ def run_hf(args, failures):
     print(f"PEAK_ALLOC_GIB {torch.cuda.max_memory_allocated() / 2 ** 30:.2f}", flush=True)
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", required=True, help="local checkpoint dir or HF repo id")
     ap.add_argument("--runtime", default="vllm", choices=["vllm", "hf"])
@@ -343,6 +370,13 @@ def main():
     ap.add_argument("--maxtok", type=int, default=96, help="tokens for the coherence sample")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
+    ap.add_argument("--device-map", dest="device_map", default="cuda",
+                    help="HF device_map: 'cuda' (default) or 'cpu' for a CPU-only run")
+    ap.add_argument("--cpu-offload-gb", dest="cpu_offload_gb", type=float, default=0.0,
+                    help="GiB of WEIGHTS to keep in host (CPU) RAM and stream over PCIe "
+                         "each forward pass. Not free VRAM: it trades bandwidth for "
+                         "capacity, so it suits prefill-bound work (perplexity) far "
+                         "better than decode. 0 = off.")
     ap.add_argument("--dtype", default="bfloat16",
                     help="float16 is required by some GLQ kernels; bf16-native models "
                          "(Mistral/Ministral) NaN in fp16 on activation outliers")
@@ -357,7 +391,11 @@ def main():
     ap.add_argument("--expect", default=None,
                     help="assert the coherence sample contains this substring")
     ap.add_argument("--label", default="")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     failures = []
     (run_hf if args.runtime == "hf" else run_vllm)(args, failures)

@@ -340,3 +340,147 @@ def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True) -
         new_mod.requires_grad_(False)
         model.set_submodule(name, new_mod)
     return len(targets)
+
+
+# ======================================================================================
+# Stacked GATED experts (Qwen4Exp, Gemma-4) — the CPU/HF path
+# ======================================================================================
+#
+# NemotronH's MoE above is non-gated, so `_ExpertPair` has only up/down. Qwen4Exp and
+# Gemma-4 are gated and store the projection fused:
+#
+#     gate_up_proj  (E, 2I, H)        down_proj  (E, H, I)
+#
+# with the native forward chunking it -- `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` --
+# so **gate is rows 0:I and up is rows I:2I**. That is the same order the quantizer writes
+# per-expert keys in (`_split_gate_up_arts(arts, inter, inter)`, quantize_model.py:2617),
+# which is what lets the saved `experts.{e}.gate_proj.*` load with no remapping.
+#
+# There is no fused-kernel path here on purpose: `_try_fused_forward` above returns None
+# for non-CUDA input anyway, and this exists to make CPU inference possible for
+# architectures vLLM refuses (its Qwen4Exp is "CUDA and ROCm only").
+
+
+class _GatedExpertPair(nn.Module):
+    """One gated MoE expert: ``down(act(gate(x)) * up(x))``."""
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int,
+                 block_diagonal: bool = True, codebook_type: str = "e8_shell"):
+        super().__init__()
+        # codebook_type is threaded through deliberately: `_ExpertPair` drops it and always
+        # builds e8_shell buffers, so a trellis checkpoint would fail on shapes inside HF's
+        # loader with nothing naming GLQ.
+        self.gate_proj = E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
+                                     block_diagonal=block_diagonal,
+                                     codebook_type=codebook_type)
+        self.up_proj = E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
+                                   block_diagonal=block_diagonal,
+                                   codebook_type=codebook_type)
+        self.down_proj = E8RHTLinear(intermediate_dim, hidden_dim, bias=False,
+                                     block_diagonal=block_diagonal,
+                                     codebook_type=codebook_type)
+
+
+class GLQStackedGatedExperts(nn.Module):
+    """Per-expert GLQ stand-in for a stacked **gated** expert container.
+
+    Mirrors the native ``forward(hidden_states, top_k_index, top_k_weights)`` — the same
+    signature NemotronH uses — so the surrounding router and MoE block are untouched.
+
+    Children live in ``self._modules[str(i)]`` rather than an ``nn.ModuleList`` for the
+    reason given on :class:`E8RHTFusedExperts`: ModuleList's ``__setattr__`` auto-numbers
+    every submodule attribute, which would collide with the expert indices (``act_fn``
+    would become expert ``0``).
+    """
+
+    def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int,
+                 act_fn, block_diagonal: bool = True,
+                 codebook_type: str = "e8_shell"):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.hidden_dim = int(hidden_dim)
+        self.intermediate_dim = int(intermediate_dim)
+        self.act_fn = act_fn
+        for i in range(self.num_experts):
+            self._modules[str(i)] = _GatedExpertPair(
+                self.hidden_dim, self.intermediate_dim,
+                block_diagonal=block_diagonal, codebook_type=codebook_type)
+
+    def __getitem__(self, idx: int) -> _GatedExpertPair:
+        return self._modules[str(idx)]  # type: ignore[return-value]
+
+    def __iter__(self):
+        for i in range(self.num_experts):
+            yield self._modules[str(i)]
+
+    def __len__(self) -> int:
+        return self.num_experts
+
+    def forward(self, hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = nn.functional.one_hot(
+                top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(
+                expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = int(expert_idx[0])
+            # The native loop carries this guard: routers may emit num_experts as a
+            # "dropped token" sentinel, which is not a valid index.
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            if token_idx.numel() == 0:
+                continue
+            current_state = hidden_states[token_idx]
+            pair = self[expert_idx]
+            h = self.act_fn(pair.gate_proj(current_state)) * pair.up_proj(current_state)
+            h = pair.down_proj(h)
+            h = h * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(
+                0, token_idx, h.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
+def _is_stacked_gated_experts(mod: nn.Module) -> bool:
+    """Structural test: a 3-D ``gate_up_proj`` Parameter.
+
+    Same rule as ``_collect_stacked_experts`` (glq/quantize_model.py:667), so quantize and
+    load agree on what a stacked expert container is, and both cover Qwen4ExpTextExperts
+    and Gemma4TextExperts without importing either. The 3-D check matters: an ordinary
+    SwiGLU MLP also has a fused ``gate_up_proj``, but 2-D.
+    """
+    gup = getattr(mod, "gate_up_proj", None)
+    return isinstance(gup, nn.Parameter) and gup.dim() == 3
+
+
+def _replace_stacked_gated_experts(model: nn.Module, block_diagonal: bool = True,
+                                   codebook_type: str = "e8_shell") -> int:
+    """Swap every stacked gated expert container for :class:`GLQStackedGatedExperts`.
+
+    Returns the number of substitutions. Without this the ``nn.Linear`` walk sees none of
+    the expert weights -- on Qwen3.8-Flash-Next that is 67% of the model -- and
+    transformers builds them dense in bf16.
+    """
+    targets = [(name, mod) for name, mod in model.named_modules()
+               if _is_stacked_gated_experts(mod)]
+    for name, mod in targets:
+        n_exp, two_inter, hidden = mod.gate_up_proj.shape
+        act_fn = getattr(mod, "act_fn", None)
+        if act_fn is None:
+            import torch.nn.functional as F
+            act_fn = F.silu
+        # Build on meta: a 512-expert, 48-layer model is 73,728 E8RHTLinears, and HF
+        # materializes them from the checkpoint immediately afterwards. Matches what
+        # replace_with_glq_embedding already does.
+        with torch.device("meta"):
+            new_mod = GLQStackedGatedExperts(
+                n_exp, hidden, two_inter // 2, act_fn,
+                block_diagonal=block_diagonal, codebook_type=codebook_type)
+        new_mod.requires_grad_(False)
+        model.set_submodule(name, new_mod)
+    return len(targets)

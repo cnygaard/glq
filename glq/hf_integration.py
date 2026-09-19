@@ -495,11 +495,20 @@ class GLQQuantizer(HfQuantizer):
         # NemotronHExperts). Swap them for E8RHTFusedExperts before walking
         # nn.Linear so each per-expert E8RHTLinear gets installed and the
         # saved per-expert state-dict keys load straight in.
-        from .fused_experts import _replace_nemotron_h_experts
+        from .fused_experts import (
+            _replace_nemotron_h_experts,
+            _replace_stacked_gated_experts,
+        )
         from .state_dict_stacker import install_nemotron_h_state_dict_renames
         n_fused = _replace_nemotron_h_experts(model, block_diagonal=block_diag)
         if n_fused:
             install_nemotron_h_state_dict_renames(model)
+        # Gated stacked experts (Qwen4Exp, Gemma-4): the same problem NemotronH has, but
+        # gate/up fused into one 3-D Parameter. Without this the nn.Linear walk misses
+        # them entirely — 67% of Qwen3.8-Flash-Next — and they load dense in bf16. No
+        # state-dict rename is needed: these checkpoints already use native key names.
+        n_gated = _replace_stacked_gated_experts(
+            model, block_diagonal=block_diag, codebook_type=cb_type)
         replaced = replace_with_glq_linear(
             model, block_diagonal=block_diag, quantized_layers=quantized_layers,
             codebook_type=cb_type)
@@ -510,10 +519,11 @@ class GLQQuantizer(HfQuantizer):
             model, quantized_layers=quantized_layers,
             trellis_layers=(_collect_trellis_embedding_names(pretrained_path)
                             if pretrained_path else None))
-        if not replaced and not n_fused:
+        if not replaced and not n_fused and not n_gated:
             import logging
             logging.getLogger(__name__).warning(
-                "GLQ: no nn.Linear or NemotronHExperts modules found to replace")
+                "GLQ: no nn.Linear, NemotronHExperts or stacked gated expert modules "
+                "found to replace — the model will load DENSE in its original dtype")
         # DO NOT add Qidxs2 etc. to _keys_to_ignore_on_load_missing — HF's
         # _move_missing_keys_from_meta_to_cpu uses the missing_keys list to
         # reinitialize meta-device buffers, and "ignored" keys still get
