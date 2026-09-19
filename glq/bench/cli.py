@@ -51,6 +51,7 @@ def _cmd_run(args) -> int:
     recs = runner.run(
         model=args.model, tasks=tasks, quant=args.quant, runtime=args.runtime,
         n=args.n, budget=args.budget, avg_k=args.avg_k, gpu_mem_util=args.gpu_mem_util,
+        max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len, kv_cache_dtype=args.kv_cache_dtype,
         hf_token=None, task_config=task_config,
     )
@@ -157,6 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--avg-k", dest="avg_k", type=int, default=1,
                    help="samples per problem for avg@k scoring (aime); default 1 = pass@1")
     r.add_argument("--gpu-mem-util", dest="gpu_mem_util", type=float, default=0.9)
+    r.add_argument("--max-num-seqs", dest="max_num_seqs", type=int, default=64,
+                   help="engine concurrency. On hybrid-GDN models every decode slot "
+                        "reserves a Mamba cache block up front, so this is the knob that "
+                        "relieves 'max_num_seqs exceeds available Mamba cache blocks' "
+                        "when gpu-mem-util has no room left. Lower also shrinks the "
+                        "per-step logits buffer, which matters on large vocabularies.")
     r.add_argument("--max-model-len", dest="max_model_len", type=int, default=None)
     # An engine argument, not an env var: selecting a KV dtype any other way
     # runs bf16 and reports it as a KV-quantization result.
