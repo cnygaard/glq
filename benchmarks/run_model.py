@@ -179,19 +179,46 @@ class _LogTee:
 
 # ---------------------------------------------------------------------------------- runners
 
-def _two_point(generate_fn, batch, decode):
-    """Decode throughput with prefill removed.
+def summarize(samples):
+    """(median, min, max). Median because one scheduling hiccup should not move the
+    headline number, min/max because a figure with no spread cannot be judged."""
+    xs = sorted(samples)
+    n = len(xs)
+    med = xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+    return med, xs[0], xs[-1]
+
+
+def _two_point(generate_fn, batch, decode, repeats: int = 1, warmup: int = 16):
+    """Decode throughput with prefill removed, repeated so it can report a spread.
 
     Time the same batch for 1 token and for N; the difference cancels prefill and scheduler
     setup, leaving (N-1) pure decode steps. A single timed generate folds prefill into the
     decode number and flatters short runs.
+
+    The subtraction has a cost: a difference of two noisy samples carries BOTH variances, so
+    with a small ``decode`` the endpoint noise can rival the signal. Relative error falls
+    roughly as 1/decode, which is why 64 is a far better default than 8, and ``repeats``
+    exists so the result comes with a range instead of being a bare point estimate.
+
+    ``warmup`` is deliberately not tiny. On CPU a multi-GiB checkpoint arrives by lazy
+    page-fault through mmap, and a 4-token warmup cannot fault in the working set -- the
+    timed run then pays first-touch cost, which is a bias rather than noise.
     """
-    t1, _ = generate_fn(batch, 1)
-    tn, ntok = generate_fn(batch, decode)
-    span = tn - t1
-    if span <= 0:                      # too fast/noisy to separate — fall back, say so
-        return batch * decode / tn, t1 * 1000.0, ntok, True
-    return batch * (decode - 1) / span, t1 * 1000.0, ntok, False
+    if warmup:
+        generate_fn(batch, warmup)
+    rates, ttfts, ntok, degraded = [], [], 0, False
+    for _ in range(max(1, repeats)):
+        t1, _ = generate_fn(batch, 1)
+        tn, ntok = generate_fn(batch, decode)
+        span = tn - t1
+        if span <= 0:                  # too fast/noisy to separate — fall back, say so
+            rates.append(batch * decode / tn)
+            degraded = True
+        else:
+            rates.append(batch * (decode - 1) / span)
+        ttfts.append(t1 * 1000.0)
+    tps, lo, hi = summarize(rates)
+    return tps, summarize(ttfts)[0], ntok, degraded, (lo, hi)
 
 
 def run_vllm(args, failures):
@@ -264,11 +291,14 @@ def run_vllm(args, failures):
 
     gen(max(batches), 8)                       # warm the captured shapes before timing
     for b in batches:
-        tps, ttft_ms, ntok, degraded = _two_point(gen, b, args.decode)
+        tps, ttft_ms, ntok, degraded, spread = _two_point(
+            gen, b, args.decode, repeats=args.repeats, warmup=args.warmup)
         note = " (prefill NOT isolated: decode too fast to separate)" if degraded else ""
+        rng = (f" tokps_range={spread[0]:.1f}-{spread[1]:.1f} n_repeats={args.repeats}"
+               if args.repeats > 1 else "")
         print(f"RESULT label={args.label} model={args.model} batch={b} "
               f"total_decode_tokps={tps:.1f} per_seq_tokps={tps / b:.1f} "
-              f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{note}", flush=True)
+              f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{rng}{note}", flush=True)
 
 
 def is_cuda_device(device_map) -> bool:
@@ -447,12 +477,14 @@ def run_hf(args, failures):
         return dt, int(o.shape[0] * (o.shape[1] - batched["input_ids"].shape[1]))
 
     for b in parse_batches(args.batches):
-        gen(b, 4)                              # warm
-        tps, ttft_ms, ntok, degraded = _two_point(gen, b, args.decode)
+        tps, ttft_ms, ntok, degraded, spread = _two_point(
+            gen, b, args.decode, repeats=args.repeats, warmup=args.warmup)
         note = " (prefill NOT isolated)" if degraded else ""
+        rng = (f" tokps_range={spread[0]:.1f}-{spread[1]:.1f} n_repeats={args.repeats}"
+               if args.repeats > 1 else "")
         print(f"RESULT label={args.label} model={args.model} runtime=hf batch={b} "
               f"total_decode_tokps={tps:.1f} per_seq_tokps={tps / b:.1f} "
-              f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{note}", flush=True)
+              f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{rng}{note}", flush=True)
     if on_cuda:
         print(f"PEAK_ALLOC_GIB {torch.cuda.max_memory_allocated() / 2 ** 30:.2f}", flush=True)
     else:
@@ -466,7 +498,14 @@ def build_parser():
     ap.add_argument("--quant", default="glq", choices=["glq", "none"],
                     help="'none' for a bf16 baseline arm")
     ap.add_argument("--batches", default="1,32", help="comma list, e.g. 1,8,32")
-    ap.add_argument("--decode", type=int, default=256, help="decode steps per timed run")
+    ap.add_argument("--decode", type=int, default=256, help="decode steps per timed run. "
+                    "Relative error falls ~1/decode, so small values are noisy")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="timed pairs per batch size; >1 reports a median and a range. "
+                         "Without it the result is a point estimate with no error bar")
+    ap.add_argument("--warmup", type=int, default=16,
+                    help="warmup tokens before timing. On CPU a big checkpoint arrives by "
+                         "lazy page-fault, so too short a warmup biases the first timing")
     ap.add_argument("--maxtok", type=int, default=96, help="tokens for the coherence sample")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
