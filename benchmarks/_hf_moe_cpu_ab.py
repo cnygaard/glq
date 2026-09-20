@@ -76,6 +76,11 @@ def main():
         return out, time.perf_counter() - t
 
     loop_before, t_loop = logits("0")
+    # The FIRST fused forward also re-homes every expert into its stacked buffer, which
+    # touches all 42 GiB of expert weights -- most of which the loop never faulted in,
+    # since only top_k of num_experts are read per token. Timing that call would report
+    # the one-time build as if it were the steady state.
+    _, t_build = logits("1")
     fused, t_fused = logits("1")
     loop_after, _ = logits("0")
 
@@ -103,12 +108,24 @@ def main():
     top5f = set(fused.topk(5).indices.tolist())
     top5l = set(loop_before.topk(5).indices.tolist())
     print(f"top5 overlap: {len(top5f & top5l)}/5")
-    if cos < 0.9999:
-        print("  cosine below 0.9999 -- treat as a failure, not rounding")
-        ok = False
 
-    print(f"single-forward wall: loop={t_loop:.2f}s fused={t_fused:.2f}s "
-          f"({t_loop / t_fused:.2f}x)   # one forward, not a throughput number")
+    # The threshold is dtype-dependent and the reason is documented, not guessed: the loop
+    # rounds each expert's gate_up output to the activation dtype before the gated multiply
+    # while the op stays fp32, so under bf16 (eps ~7.8e-3) the two paths genuinely differ.
+    # float32 is therefore the CONTROL: same code, same weights, only the dtype moves. If
+    # the divergence does not collapse there, it is not rounding.
+    floor = {"float32": 0.99999, "float64": 0.99999}.get(args.dtype, 0.999)
+    if cos < floor:
+        print(f"  cosine below the {args.dtype} floor {floor} -- not rounding")
+        ok = False
+    elif args.dtype != "float32":
+        print(f"  within the {args.dtype} floor {floor}; run --dtype float32 for the "
+              f"control that says whether this is rounding or a bug")
+
+    print(f"one-time re-home: {t_build - t_fused:.1f}s added to the first forward "
+          f"(touches every expert; the loop only ever faults in the routed ones)")
+    print(f"steady-state single forward: loop={t_loop:.2f}s fused={t_fused:.2f}s "
+          f"({t_loop / t_fused:.2f}x)   # ONE prefill forward, not a decode throughput number")
 
     if args.tokens:
         for flag in ("0", "1"):
