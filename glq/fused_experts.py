@@ -32,11 +32,16 @@ key remapping.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
 
 from .quantized_linear import E8RHTLinear
+
+#: One-shot guard for the fused-CPU-MoE fallback warning: a 48-layer model would otherwise
+#: emit the same line once per layer per forward.
+_WARNED_HF_MOE_CPU_FALLBACK = False
 
 
 def _is_relu2(act_fn) -> bool:
@@ -45,6 +50,40 @@ def _is_relu2(act_fn) -> bool:
     activation_type=5 (relu2_no_mul) path."""
     name = type(act_fn).__name__.lower()
     return "relu2" in name or "relusquared" in name
+
+
+#: Names that mean exactly the activation the fused op implements. Matched EXACTLY, never
+#: as substrings: ``nn.Tanh`` contains "tanh" and would otherwise read as gelu-tanh.
+_SILU_NAMES = frozenset({"silu", "swish", "siluactivation"})
+_GELU_TANH_NAMES = frozenset({"pytorchgelutanh", "gelutanh", "gelupytorchtanh"})
+
+
+def _gated_activation_id(act_fn) -> int | None:
+    """The fused MoE op's activation id — 0 silu, 1 gelu-tanh, 2 relu² — or None.
+
+    None means "take the Python loop". Refusing is the safe direction and the only correct
+    one: the op selects a branch on this integer and a wrong id does not fault, it returns
+    finite plausible numbers from the wrong nonlinearity.
+
+    ``nn.GELU`` is resolved by its ``approximate`` attribute rather than its name, because
+    the op calls ``at::gelu(gate, "tanh")`` and the erf default is a different function.
+    Activations that are *mathematically* the tanh approximation under another name
+    (transformers' ``NewGELUActivation``) are deliberately not listed: an unrecognised
+    activation costs speed, a mis-recognised one costs correctness.
+    """
+    if act_fn is None:
+        return None
+    if _is_relu2(act_fn):
+        return 2
+    import torch.nn as _nn
+    if isinstance(act_fn, _nn.GELU):
+        return 1 if getattr(act_fn, "approximate", "none") == "tanh" else None
+    name = (getattr(act_fn, "__name__", None) or type(act_fn).__name__).lower()
+    if name in _SILU_NAMES:
+        return 0
+    if name in _GELU_TANH_NAMES:
+        return 1
+    return None
 
 
 class _ExpertPair(nn.Module):
@@ -512,9 +551,212 @@ class GLQStackedGatedExperts(nn.Module):
     def __len__(self) -> int:
         return self.num_experts
 
+    # ------------------------------------------------------------------ fused CPU MoE path
+
+    def _glq_moe_cpu_weight_facts(self) -> dict:
+        """The weight-derived half of the gate, resolved once and cached.
+
+        Scanning 512 experts costs ~1k tensor reads and ~1k `torch.equal`s over the SV
+        vectors. That is nothing at load and ruinous per forward, which is exactly where a
+        REFUSED container would pay it: `_stacked_is_live()` short-circuits the accepted
+        case, so only the refusal would be recomputed 48 times a token.
+
+        Deliberately excludes the env switches — those are cheap to read and must stay live
+        so a caller can toggle `GLQ_HF_MOE_CPU_FUSED` between forwards (which is how the
+        A/B driver compares both paths against one set of loaded weights).
+        """
+        cached = getattr(self, "_moe_cpu_facts", None)
+        if cached is not None:
+            return cached
+        e0 = self[0] if self.num_experts else None
+        f = getattr(e0, "gate_up_proj", None) if e0 is not None else None
+        d = getattr(e0, "down_proj", None) if e0 is not None else None
+        if f is None or d is None or f.trellis_packed.numel() == 0:
+            return {"loaded": False}           # not cached: it becomes true after loading
+
+        # Read the whole container, not expert 0: a single divergent expert is exactly the
+        # case that decodes to plausible garbage rather than failing.
+        pairs = [(self[e].gate_up_proj, self[e].down_proj) for e in range(self.num_experts)]
+        shape_ok = True
+        for lin in (f, d):
+            shape_ok = shape_ok and lin.m_pad % 32 == 0 and lin.n_pad % 64 == 0
+            shape_ok = shape_ok and lin.m_pad <= 16384 and lin.n_pad <= 16384
+            # The kernel's R ladder ends in a bare `else` that runs R=4, so an out-of-range
+            # rate decodes a neighbour's bits rather than raising.
+            r = lin.trellis_packed.shape[-1] // 16 if lin.trellis_packed.dim() == 2 else 0
+            shape_ok = shape_ok and 2 <= r <= 4
+
+        facts = {
+            "loaded": True,
+            "has_s2": any(lin.trellis_packed2.numel() > 0 for p in pairs for lin in p),
+            "is_3inst": all(lin.tlut.numel() == 0 for p in pairs for lin in p),
+            "sv_shared": all(torch.equal(g.SV, f.SV) and torch.equal(dn.SV, d.SV)
+                             for g, dn in pairs),
+            "shape_ok": shape_ok,
+            # trellis never pads, so anything else means this is not a trellis layout.
+            "unpadded": (f.n_pad == f.in_features and f.m_pad == f.out_features
+                         and d.n_pad == d.in_features and d.m_pad == d.out_features),
+            "activation": _gated_activation_id(self.act_fn),
+        }
+        self._moe_cpu_facts = facts
+        return facts
+
+    def _glq_moe_cpu_refusal(self) -> str | None:
+        """Why the fused CPU MoE op cannot serve this container, or None if it can.
+
+        Delegates to :func:`glq.moe_cpu_gate.moe_cpu_fused_refusal`, the same decision
+        vLLM-CPU makes, so the two paths refuse the same layers for the same reasons.
+        """
+        import os
+
+        from .moe_cpu_gate import moe_cpu_fused_refusal
+
+        if self.num_experts == 0:
+            return "no experts"
+        facts = self._glq_moe_cpu_weight_facts()
+        if not facts["loaded"]:
+            return "expert weights are not loaded yet"
+
+        from . import inference_kernel_cpu as _ikc
+        ext = _ikc._glq_cpu if _ikc._try_load_cpu_ext() else None
+        act = facts["activation"]
+        return moe_cpu_fused_refusal(
+            fused_shape_ok=facts["shape_ok"],
+            has_stage2=facts["has_s2"],
+            is_3inst=facts["is_3inst"],
+            unpadded=facts["unpadded"],
+            sv_shared=facts["sv_shared"],
+            activation_type=act if act is not None else -1,
+            ext_has_entry=(ext is not None
+                           and hasattr(ext, "glq_fused_moe_trellis_3inst_cpu")),
+            force_fallback=os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") != "0",
+            cpu_fused_enabled=os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0")
+
+    def _stacked_is_live(self) -> bool:
+        """Do the stacked buffers still own the per-expert weights?
+
+        The stacked tensors are plain attributes, not registered buffers -- a buffer would
+        land in ``state_dict()`` and duplicate the whole expert set on re-save. The cost is
+        that ``.to(device)`` moves the per-expert views and leaves these behind, so identity
+        has to be checked rather than assumed. Pointer equality on expert 0 is enough: the
+        build re-points every expert or none.
+        """
+        if getattr(self, "_w13_packed", None) is None:
+            return False
+        e0 = self[0]
+        return (e0.gate_up_proj is not None
+                and self._w13_packed[0].data_ptr() == e0.gate_up_proj.trellis_packed.data_ptr()
+                and self._w2_packed[0].data_ptr() == e0.down_proj.trellis_packed.data_ptr())
+
+    def _build_stacked_cpu(self) -> str | None:
+        """Re-home the per-expert weights into contiguous ``(E, ...)`` buffers. Idempotent.
+
+        Returns None on success, or the refusal reason.
+
+        The op wants ``(E, tiles, 16R)``; GLQ stores one buffer per expert. The CUDA
+        container (:meth:`E8RHTFusedExperts._try_build_stacked`) answers that with
+        ``torch.stack``, which COPIES -- on Qwen3.8-Flash-Next that is a second 42 GiB.
+        So allocate the destination, copy each expert in, and then point the expert's
+        linear at ``stacked[e]``, dropping the standalone allocation as we go. Steady-state
+        memory is unchanged; the transient is one layer (~900 MiB at 512 experts).
+
+        Pointing at a slice rather than freeing it outright is deliberate: ``stacked[e]`` of
+        a contiguous ``(E, ...)`` tensor is itself contiguous, so the per-expert dense path
+        still works on it unchanged -- which keeps the Python loop available both as the
+        fallback and as the A/B oracle this path is validated against.
+        """
+        if self._stacked_is_live():
+            return None
+        why = self._glq_moe_cpu_refusal()
+        if why is not None:
+            return why
+
+        E = self.num_experts
+        e0 = self[0]
+        f0, d0 = e0.gate_up_proj, e0.down_proj
+
+        def _rehome(attr: str):
+            ref = getattr(self[0], attr).trellis_packed
+            dst = torch.empty((E, *ref.shape), dtype=ref.dtype)
+            for e in range(E):
+                lin = getattr(self[e], attr)
+                dst[e].copy_(lin.trellis_packed)
+                lin.trellis_packed = dst[e]     # the standalone buffer is freed here
+            return dst
+
+        self._w13_packed = _rehome("gate_up_proj")
+        self._w2_packed = _rehome("down_proj")
+        # SU and Wscale are per-expert by the op's contract. They are small (a 512-expert
+        # layer is ~1.3 MiB of SU), so stacking them is a copy rather than a re-home.
+        self._w13_SU = torch.stack([self[e].gate_up_proj.SU for e in range(E)]).contiguous()
+        self._w2_SU = torch.stack([self[e].down_proj.SU for e in range(E)]).contiguous()
+        self._w13_Wscale = torch.stack(
+            [self[e].gate_up_proj.Wscale.reshape(()) for e in range(E)]).float()
+        self._w2_Wscale = torch.stack(
+            [self[e].down_proj.Wscale.reshape(()) for e in range(E)]).float()
+        # SV and the block metas are shared across experts -- one RHT basis per layer, which
+        # `_glq_moe_cpu_refusal` has just verified against the loaded weights rather than
+        # trusting the fixed seed.
+        self._w13_SV, self._w2_SV = f0.SV.contiguous(), d0.SV.contiguous()
+        self._bn13, self._bm13 = f0._blocks_n_meta_cpu, f0._blocks_m_meta_cpu
+        self._bn2, self._bm2 = d0._blocks_n_meta_cpu, d0._blocks_m_meta_cpu
+        self._activation_id = _gated_activation_id(self.act_fn)
+        return None
+
+    def _try_fused_cpu(self, hidden_states: torch.Tensor,
+                       top_k_index: torch.Tensor,
+                       top_k_weights: torch.Tensor):
+        """One extension call for the whole MoE block, or None to take the Python loop.
+
+        Off by default while the win is being measured -- see ``GLQ_HF_MOE_CPU_FUSED``.
+        """
+        import os
+
+        if os.environ.get("GLQ_HF_MOE_CPU_FUSED", "0") == "0":
+            return None
+        if hidden_states.is_cuda or hidden_states.dim() != 2:
+            return None
+        why = self._build_stacked_cpu()
+        if why is not None:
+            self._warn_moe_cpu_fallback(why)
+            return None
+
+        from . import inference_kernel_cpu as _ikc
+        out = _ikc._glq_cpu.glq_fused_moe_trellis_3inst_cpu(
+            hidden_states, top_k_index, top_k_weights,
+            self._w13_packed, self._w13_SU, self._w13_SV, self._w13_Wscale,
+            self._w2_packed, self._w2_SU, self._w2_SV, self._w2_Wscale,
+            self.hidden_dim, self.intermediate_dim, 2 * self.intermediate_dim,
+            self._bn13, self._bm13, self._bn2, self._bm2,
+            self._activation_id)
+        return out.to(hidden_states.dtype)
+
+    def _warn_moe_cpu_fallback(self, why: str) -> None:
+        """One-shot: a 48-layer model would otherwise emit this 48 times."""
+        global _WARNED_HF_MOE_CPU_FALLBACK
+        if _WARNED_HF_MOE_CPU_FALLBACK or why is None:
+            return
+        _WARNED_HF_MOE_CPU_FALLBACK = True
+        warnings.warn(
+            f"GLQ_HF_MOE_CPU_FUSED is set but this MoE is using the per-expert loop: "
+            f"{why}. Correct, but slower than the fused CPU op.", RuntimeWarning)
+
     def forward(self, hidden_states: torch.Tensor,
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor) -> torch.Tensor:
+        fused = self._try_fused_cpu(hidden_states, top_k_index, top_k_weights)
+        if fused is not None:
+            return fused
+        return self._loop_forward(hidden_states, top_k_index, top_k_weights)
+
+    def _loop_forward(self, hidden_states: torch.Tensor,
+                      top_k_index: torch.Tensor,
+                      top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Per-expert Python loop: correct on any shape, and the oracle the fused CPU path
+        is validated against. Note it rounds the fused projection's output to the
+        activation dtype before the gated multiply, where the fused op stays fp32 -- so the
+        two agree to a tolerance, not bit-exactly, and under bf16 the op is the more
+        accurate of the pair."""
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
             expert_mask = nn.functional.one_hot(
