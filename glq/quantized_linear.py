@@ -187,7 +187,8 @@ class E8RHTLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
-                 block_diagonal: bool = False, codebook_type: str = "e8_shell"):
+                 block_diagonal: bool = False, codebook_type: str = "e8_shell",
+                 packed_shape=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -231,7 +232,7 @@ class E8RHTLinear(nn.Module):
             self._init_e8p_buffers(bias)
             return
         if self._is_trellis:
-            self._init_trellis_buffers(bias)
+            self._init_trellis_buffers(bias, packed_shape=packed_shape)
             return
 
         # Quantized weight storage
@@ -343,7 +344,7 @@ class E8RHTLinear(nn.Module):
         self._blocks_n_meta_gpu = None
         self._blocks_m_meta_gpu = None
 
-    def _init_trellis_buffers(self, bias):
+    def _init_trellis_buffers(self, bias, packed_shape=None):
         """Register compressed QTIP-trellis buffers (glq/trellis.py storage format).
 
         ``trellis_packed`` is the kernel-layout packed int16 codes; ``tlut`` the fitted
@@ -351,7 +352,16 @@ class E8RHTLinear(nn.Module):
         resized to the checkpoint shape on load (K/bpw is checkpoint-authoritative). The
         decoded weight is materialized+cached lazily in _forward_trellis (pure-torch S0
         reference; the S1 CUDA kernel fuses decode into the matvec)."""
-        self.register_buffer('trellis_packed', torch.zeros(0, dtype=torch.int16))
+        # ``packed_shape`` is a PLACEMENT HINT read off the checkpoint header, not an
+        # authority: `_load_from_state_dict` still resizes to whatever the checkpoint holds.
+        # Without it this stays 0-size, and a trellis layer then weighs nothing to
+        # accelerate's `infer_auto_device_map` -- which runs AFTER GLQ swaps its modules in
+        # (modeling_utils.py: preprocess_model then _get_device_map). On Qwen3.8-Flash-Next
+        # that hid ~43 GiB of decoder weights and device_map="auto" tried to put everything
+        # on the GPU.
+        self.register_buffer(
+            'trellis_packed',
+            torch.zeros(tuple(packed_shape) if packed_shape else 0, dtype=torch.int16))
         # Stacked-RVQ residual stage (5-8 bpw only). Registered EAGERLY at 0-size even for
         # 2-4 bpw: from_pretrained's meta-assign path only populates buffers that already
         # exist, so lazy registration in _load_from_state_dict silently drops them. 0-size
@@ -1549,6 +1559,20 @@ class TrellisRHTEmbedding(nn.Module):
         self.codebook = None
 
     @property
+    def weight(self):
+        """Proxy so code reading ``weight.device`` works.
+
+        Qwen4Exp's PLE picks its execution device with
+        ``self.ngram_embedding.weight.device``; a quantized table has no ``weight``, so
+        without this the forward raises after the whole model has loaded. Mirrors the
+        identical proxy on :class:`E8RHTLinear` (added for Mamba).
+
+        Returns a zero-element tensor — these tables reach 24 GiB, so it must allocate
+        nothing and must NOT be mistaken for the dense weight.
+        """
+        return torch.empty(0, dtype=torch.float16, device=self.Wscale.device)
+
+    @property
     def K(self) -> int:
         """Bits per weight, read from the packed width every time rather than cached.
 
@@ -1669,6 +1693,21 @@ class E8RHTEmbedding(nn.Module):
         self.codebook2 = None
         self._n_stages = 1
         self._rsqrt_n = self.n_pad ** -0.5
+
+
+    @property
+    def weight(self):
+        """Proxy so code reading ``weight.device`` works.
+
+        Qwen4Exp's PLE picks its execution device with
+        ``self.ngram_embedding.weight.device``; a quantized table has no ``weight``, so
+        without this the forward raises after the whole model has loaded. Mirrors the
+        identical proxy on :class:`E8RHTLinear` (added for Mamba).
+
+        Returns a zero-element tensor — these tables reach 24 GiB, so it must allocate
+        nothing and must NOT be mistaken for the dense weight.
+        """
+        return torch.empty(0, dtype=torch.float16, device=self.Wscale.device)
 
     def set_codebook(self, codebook, codebook2=None):
         """Attach the shared E8ShellCodebook(s). Mirrors E8RHTLinear API."""

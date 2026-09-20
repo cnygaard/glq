@@ -387,17 +387,26 @@ class _GatedExpertPair(nn.Module):
                  "Qidxs3", "Qidxs_e8p", "inv_resid_scale", "inv_resid_scale2")
 
     def __init__(self, hidden_dim: int, intermediate_dim: int,
-                 block_diagonal: bool = True, codebook_type: str = "e8_shell"):
+                 block_diagonal: bool = True, codebook_type: str = "e8_shell",
+                 packed: dict | None = None):
         super().__init__()
+        # Placement hints off the checkpoint header. Only the FUSED projection is sized:
+        # the gate_proj/up_proj landing pads are transient (fuse_gate_up drops them after
+        # load), so sizing all three would make accelerate count this expert twice.
+        packed = packed or {}
+        _gu = packed.get("gate_up_proj")
+        _dn = packed.get("down_proj")
         # codebook_type is threaded through deliberately: `_ExpertPair` drops it and always
         # builds e8_shell buffers, so a trellis checkpoint would fail on shapes inside HF's
         # loader with nothing naming GLQ.
         self.gate_up_proj = E8RHTLinear(hidden_dim, 2 * intermediate_dim, bias=False,
                                         block_diagonal=block_diagonal,
-                                        codebook_type=codebook_type)
+                                        codebook_type=codebook_type,
+                                        packed_shape=_gu)
         self.down_proj = E8RHTLinear(intermediate_dim, hidden_dim, bias=False,
                                      block_diagonal=block_diagonal,
-                                     codebook_type=codebook_type)
+                                     codebook_type=codebook_type,
+                                     packed_shape=_dn)
         # Landing pads for the checkpoint's separate halves. transformers 5.x loads through
         # `convert_and_load_state_dict_in_model`, which assigns by key and never calls
         # `_load_from_state_dict` or its pre-hooks -- which is why the NemotronH path uses a
@@ -481,7 +490,7 @@ class GLQStackedGatedExperts(nn.Module):
 
     def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int,
                  act_fn, block_diagonal: bool = True,
-                 codebook_type: str = "e8_shell"):
+                 codebook_type: str = "e8_shell", packed: dict | None = None):
         super().__init__()
         self.num_experts = int(num_experts)
         self.hidden_dim = int(hidden_dim)
@@ -490,7 +499,8 @@ class GLQStackedGatedExperts(nn.Module):
         for i in range(self.num_experts):
             self._modules[str(i)] = _GatedExpertPair(
                 self.hidden_dim, self.intermediate_dim,
-                block_diagonal=block_diagonal, codebook_type=codebook_type)
+                block_diagonal=block_diagonal, codebook_type=codebook_type,
+                packed=(packed or {}).get(i))
 
     def __getitem__(self, idx: int) -> _GatedExpertPair:
         return self._modules[str(idx)]  # type: ignore[return-value]
@@ -546,8 +556,32 @@ def _is_stacked_gated_experts(mod: nn.Module) -> bool:
     return isinstance(gup, nn.Parameter) and gup.dim() == 3
 
 
+def _fused_packed_shapes(prefix: str, n_exp: int, shapes: dict | None):
+    """``{expert_idx: {"gate_up_proj": shape, "down_proj": shape}}`` from checkpoint shapes.
+
+    The checkpoint stores gate and up separately because the quantizer split them, so the
+    fused buffer's size is the two halves stacked: same columns, twice the rows.
+    """
+    if not shapes:
+        return {}
+    out = {}
+    for e in range(n_exp):
+        base = f"{prefix}.{e}." if prefix else f"{e}."
+        g = (shapes.get(base + "gate_proj") or {}).get("trellis_packed")
+        d = (shapes.get(base + "down_proj") or {}).get("trellis_packed")
+        ent = {}
+        if g and len(g) == 2:
+            ent["gate_up_proj"] = (g[0] * 2, g[1])
+        if d and len(d) == 2:
+            ent["down_proj"] = tuple(d)
+        if ent:
+            out[e] = ent
+    return out
+
+
 def _replace_stacked_gated_experts(model: nn.Module, block_diagonal: bool = True,
-                                   codebook_type: str = "e8_shell") -> int:
+                                   codebook_type: str = "e8_shell",
+                                   shapes: dict | None = None) -> int:
     """Swap every stacked gated expert container for :class:`GLQStackedGatedExperts`.
 
     Returns the number of substitutions. Without this the ``nn.Linear`` walk sees none of
@@ -565,10 +599,12 @@ def _replace_stacked_gated_experts(model: nn.Module, block_diagonal: bool = True
         # Build on meta: a 512-expert, 48-layer model is 73,728 E8RHTLinears, and HF
         # materializes them from the checkpoint immediately afterwards. Matches what
         # replace_with_glq_embedding already does.
+        packed = _fused_packed_shapes(name, n_exp, shapes)
         with torch.device("meta"):
             new_mod = GLQStackedGatedExperts(
                 n_exp, hidden, two_inter // 2, act_fn,
-                block_diagonal=block_diagonal, codebook_type=codebook_type)
+                block_diagonal=block_diagonal, codebook_type=codebook_type,
+                packed=packed)
         new_mod.requires_grad_(False)
         model.set_submodule(name, new_mod)
     return len(targets)

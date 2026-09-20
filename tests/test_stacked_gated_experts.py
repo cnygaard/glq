@@ -298,3 +298,29 @@ def test_forward_chunks_the_fused_projection():
     with torch.no_grad():
         got = m.mlp.experts(x, idx, w)
     assert torch.allclose(got, ref, atol=1e-5), (got - ref).abs().max()
+
+
+# ---- the embedding weight proxy ------------------------------------------------------
+
+def test_quantized_embeddings_expose_a_weight_device_proxy():
+    """Qwen4Exp's PLE picks an execution device off the embedding:
+
+        execution_device = self.ngram_embedding.weight.device if ... != "meta" else None
+
+    `TrellisRHTEmbedding` stores `trellis_packed`/`SV`/`Wscale` and no `weight`, so this
+    raised ``AttributeError: 'TrellisRHTEmbedding' object has no attribute 'weight'`` after
+    a 190 s load of the full 77.5 GiB model. gemma-4's PLE never probes it, which is why
+    E4B passed and only Qwen Next hit it.
+
+    `E8RHTLinear` already carries exactly this proxy (for Mamba); the embeddings just never
+    got one. It must allocate nothing — these tables are 24 GiB.
+    """
+    pytest.importorskip("glq.quantized_linear")
+    from glq.quantized_linear import E8RHTEmbedding, TrellisRHTEmbedding
+
+    for cls in (TrellisRHTEmbedding, E8RHTEmbedding):
+        emb = cls(num_embeddings=64, embedding_dim=32)
+        w = emb.weight
+        assert w.numel() == 0, f"{cls.__name__}.weight must not allocate"
+        assert w.dtype.is_floating_point, f"{cls.__name__}.weight should look float-ish"
+        assert w.device.type == emb.Wscale.device.type
