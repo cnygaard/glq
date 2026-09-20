@@ -157,6 +157,74 @@ def _peek_qidxs_keys(pretrained_path):
     return keys, sample_shape
 
 
+#: Buffer suffixes that carry GLQ payload. Used to decide which tensors describe a
+#: quantized module's footprint.
+_GLQ_BUFFER_SUFFIXES = (
+    "trellis_packed", "trellis_packed2", "Qidxs", "Qidxs2", "Qidxs3", "Qidxs_e8p",
+    "SU", "SV", "Wscale", "inv_resid_scale", "inv_resid_scale2", "rht_blocks", "tlut",
+)
+
+
+def _collect_quantized_shapes(pretrained_path):
+    """``{module_name: {buffer_name: shape}}`` for every GLQ buffer in the checkpoint.
+
+    Read so the replaced modules can be registered at their TRUE size. transformers infers
+    the device map from the model as it stands after ``preprocess_model``
+    (``modeling_utils.py``), so a skeleton with 0-size buffers makes a 77 GiB checkpoint
+    look empty and ``device_map="auto"`` puts everything on the GPU.
+
+    Shapes come from the safetensors **headers** — ``get_slice(...).get_shape()`` reads no
+    tensor data — rather than being re-derived from bpw. That avoids duplicating
+    ``pack_layer``'s ``[(m//16)*(n//16), ceil(256*K/16)]`` (glq/trellis.py) and stays correct
+    for whatever layout or rate a checkpoint actually carries.
+
+    Returns ``None`` when the checkpoint cannot be peeked, so callers keep their previous
+    behaviour.
+    """
+    if not pretrained_path:
+        return None
+    from safetensors import safe_open
+    from transformers.utils.hub import cached_file
+
+    def _shapes_from(path):
+        out = {}
+        with safe_open(path, framework="pt") as st:
+            for k in st.keys():
+                for sfx in _GLQ_BUFFER_SUFFIXES:
+                    if k.endswith("." + sfx):
+                        out.setdefault(k[: -len(sfx) - 1], {})[sfx] = list(
+                            st.get_slice(k).get_shape())
+                        break
+        return out
+
+    shapes = {}
+    try:
+        idx_path = cached_file(pretrained_path, "model.safetensors.index.json",
+                               _raise_exceptions_for_missing_entries=False)
+    except Exception:
+        idx_path = None
+    try:
+        if idx_path is not None:
+            import json
+            with open(idx_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            for fname in sorted(set(weight_map.values())):
+                shard = cached_file(pretrained_path, fname,
+                                    _raise_exceptions_for_missing_entries=False)
+                if shard is not None:
+                    for mod, bufs in _shapes_from(shard).items():
+                        shapes.setdefault(mod, {}).update(bufs)
+        else:
+            single = cached_file(pretrained_path, "model.safetensors",
+                                 _raise_exceptions_for_missing_entries=False)
+            if single is None:
+                return None
+            shapes = _shapes_from(single)
+    except Exception:
+        return None
+    return shapes or None
+
+
 def _detect_block_diagonal(pretrained_path):
     """Peek at checkpoint to detect block-diagonal quantization."""
     _, sample_shape = _peek_qidxs_keys(pretrained_path)
@@ -208,7 +276,8 @@ def _collect_trellis_embedding_names(pretrained_path):
     return {k[:-len(".trellis_packed")] for k in keys if k.endswith(".trellis_packed")}
 
 
-def replace_with_glq_embedding(model, quantized_layers=None, trellis_layers=None):
+def replace_with_glq_embedding(model, quantized_layers=None, trellis_layers=None,
+                               shapes=None):
     """Replace nn.Embedding modules with a GLQ embedding when the checkpoint has payload.
 
     ``trellis_layers`` names the subset whose payload is trellis-coded; those become
@@ -252,11 +321,21 @@ def replace_with_glq_embedding(model, quantized_layers=None, trellis_layers=None
             embed_scale = float(raw_scale)
         is_trellis = bool(trellis_layers) and name in trellis_layers
         cls = TrellisRHTEmbedding if is_trellis else E8RHTEmbedding
+        kw = {}
+        if is_trellis:
+            # Recover the table's RATE from the packed width rather than taking the
+            # constructor default of 3: cols == ceil(embedding_dim*bpw/16). A 4 bpw table
+            # built at 3 under-reports by 25%, which is how a 23.84 GiB PLE fit inside a
+            # 20 GiB budget and then overran the card at load.
+            cols = ((shapes or {}).get(name, {}) or {}).get("trellis_packed", [None, None])[-1]
+            if cols:
+                kw["bpw"] = max(1, round(cols * 16 / module.embedding_dim))
         with torch.device("meta"):
             new_module = cls(
                 num_embeddings=module.num_embeddings,
                 embedding_dim=module.embedding_dim,
                 embed_scale=embed_scale,
+                **kw,
             )
         new_module.requires_grad_(False)
         model.set_submodule(name, new_module)
@@ -265,7 +344,7 @@ def replace_with_glq_embedding(model, quantized_layers=None, trellis_layers=None
 
 
 def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None,
-                            codebook_type="e8_shell"):
+                            codebook_type="e8_shell", shapes=None):
     """Replace nn.Linear modules with E8RHTLinear on meta device.
 
     When ``quantized_layers`` is provided, only ``nn.Linear`` modules whose
@@ -286,6 +365,9 @@ def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None,
         if quantized_layers is not None and name not in quantized_layers:
             continue
 
+        # True packed shape off the checkpoint header, so the meta skeleton weighs what
+        # the model will actually weigh and device_map="auto" can place it.
+        packed = ((shapes or {}).get(name, {}) or {}).get("trellis_packed")
         with torch.device("meta"):
             new_module = E8RHTLinear(
                 module.in_features,
@@ -293,6 +375,7 @@ def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None,
                 bias=module.bias is not None,
                 block_diagonal=block_diagonal,
                 codebook_type=codebook_type,
+                packed_shape=packed,
             )
         new_module.requires_grad_(False)
         model.set_submodule(name, new_module)
@@ -490,6 +573,10 @@ class GLQQuantizer(HfQuantizer):
         quantized_layers = (
             _collect_quantized_layer_names(pretrained_path) if pretrained_path else None
         )
+        # Header-only peek of every GLQ buffer's true shape, so the modules below are
+        # registered at the size they will actually occupy. Device-map inference runs
+        # after this replacement, and budgets against whatever it finds.
+        glq_shapes = _collect_quantized_shapes(pretrained_path) if pretrained_path else None
         # NemotronH on the native HF integration packs experts into stacked
         # tensors (see transformers/models/nemotron_h/modeling_nemotron_h.py
         # NemotronHExperts). Swap them for E8RHTFusedExperts before walking
@@ -508,17 +595,18 @@ class GLQQuantizer(HfQuantizer):
         # them entirely — 67% of Qwen3.8-Flash-Next — and they load dense in bf16. No
         # state-dict rename is needed: these checkpoints already use native key names.
         n_gated = _replace_stacked_gated_experts(
-            model, block_diagonal=block_diag, codebook_type=cb_type)
+            model, block_diagonal=block_diag, codebook_type=cb_type, shapes=glq_shapes)
         replaced = replace_with_glq_linear(
             model, block_diagonal=block_diag, quantized_layers=quantized_layers,
-            codebook_type=cb_type)
+            codebook_type=cb_type, shapes=glq_shapes)
         # Gemma-4 PLE embedding (and any other quantized nn.Embedding) gets
         # swapped to E8RHTEmbedding when the saved checkpoint has its GLQ
         # payload. No-op for older single-modal checkpoints.
         replace_with_glq_embedding(
             model, quantized_layers=quantized_layers,
             trellis_layers=(_collect_trellis_embedding_names(pretrained_path)
-                            if pretrained_path else None))
+                            if pretrained_path else None),
+            shapes=glq_shapes)
         if not replaced and not n_fused and not n_gated:
             import logging
             logging.getLogger(__name__).warning(

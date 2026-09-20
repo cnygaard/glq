@@ -271,6 +271,81 @@ def run_vllm(args, failures):
               f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{note}", flush=True)
 
 
+def is_cuda_device(device_map) -> bool:
+    """True when ``device_map`` names a CUDA device. 'auto' counts as not-CUDA here: the
+    CPU branches below are the safe default, and 'auto' on a GPU box still works because
+    the model lands wherever HF puts it."""
+    return str(device_map).startswith("cuda")
+
+
+def hf_footprint_gib(device_map, cuda_mod=None):
+    """Weight footprint after an HF load.
+
+    On CUDA that is ``memory_allocated()``. On CPU there is no such counter, and calling
+    the CUDA ones does not merely return 0 — ``reset_peak_memory_stats`` raises
+    ``RuntimeError: invalid argument to reset_peak_memory_stats`` — so fall back to peak
+    process RSS. RSS includes the interpreter and torch itself (~1 GiB), so it slightly
+    OVERSTATES the weights; it is a footprint bound, not a weights-only figure.
+    """
+    if is_cuda_device(device_map):
+        if cuda_mod is None:
+            import torch
+            cuda_mod = torch.cuda
+        return cuda_mod.memory_allocated() / 2 ** 30
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
+
+
+def wants_offload_buffers(device_map, opt_in: bool = False) -> bool:
+    """Whether to pass ``offload_buffers=True``. **Opt-in only.**
+
+    GLQ registers its quantized weights as buffers, not parameters, and that makes both
+    accelerate settings bad:
+
+    * ``False`` (accelerate's default) keeps the buffers of CPU-assigned modules on the
+      execution device, so the whole offloaded portion follows the model onto the GPU --
+      38.3 GiB on Qwen Next, which fills the card whatever ``max_memory`` says.
+    * ``True`` streams those buffers CPU->GPU every forward, which is the weight-streaming
+      cost module placement was supposed to avoid. Measured on Qwen Next: **0.2 tok/s**
+      against **1.5 tok/s** for plain ``--device-map cpu``.
+
+    So it is not defaulted on: turning an OOM into a silent 7.5x slowdown is worse than
+    the OOM. Fixing this properly means storing GLQ weights as
+    ``nn.Parameter(requires_grad=False)`` so accelerate leaves CPU-assigned modules on CPU.
+    """
+    if not opt_in:
+        return False
+    return not isinstance(device_map, str) or device_map in ("auto", "balanced",
+                                                             "balanced_low_0", "sequential")
+
+
+def parse_device_map(spec):
+    """A device_map string, or a parsed dict when given JSON.
+
+    ``auto`` places whole MODULES and cannot split one, so a single oversized module can
+    still land badly. transformers accepts a module-name-keyed dict, which is the escape
+    hatch for pinning it by hand.
+    """
+    if isinstance(spec, str) and spec.strip().startswith("{"):
+        import json as _json
+        return _json.loads(spec)
+    return spec
+
+
+def parse_max_memory(spec):
+    """Parse a ``--max-memory`` JSON spec into accelerate's ``max_memory`` dict.
+
+    Device keys are ints for GPUs and the string "cpu", which is what
+    ``infer_auto_device_map`` expects; JSON can only give string keys, so digits are
+    converted back.
+    """
+    if not spec:
+        return None
+    import json as _json
+    raw = _json.loads(spec)
+    return {(int(k) if str(k).isdigit() else k): v for k, v in raw.items()}
+
+
 def resolve_hf_class(cfg, transformers_mod=None):
     """The model class to load with, from ``config.architectures[0]``.
 
@@ -304,18 +379,38 @@ def run_hf(args, failures):
     model_cls = resolve_hf_class(cfg)
     print(f"HF class {model_cls.__name__} (from architectures)", flush=True)
 
-    torch.cuda.reset_peak_memory_stats()
+    on_cuda = is_cuda_device(args.device_map)   # dict/auto -> False, so inputs go to cpu
+                                                #    and accelerate's hooks relocate them
+    if on_cuda:
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
+    _mm = parse_max_memory(getattr(args, "max_memory", None))
+    _dm = parse_device_map(args.device_map)
+    _extra = {"max_memory": _mm} if _mm else {}
+    if wants_offload_buffers(_dm, getattr(args, "offload_buffers", False)):
+        _extra["offload_buffers"] = True
     model = model_cls.from_pretrained(
-        args.model, dtype=getattr(torch, args.dtype), device_map=args.device_map,
-        trust_remote_code=True)
+        args.model, dtype=getattr(torch, args.dtype),
+        device_map=_dm, trust_remote_code=True, **_extra)
     model.eval()
     load_s = time.perf_counter() - t0
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     # HF loads in-process, so unlike the vLLM path the CUDA counter is the right instrument.
-    weights_gib = torch.cuda.memory_allocated() / 2 ** 30
-    print(f"FOOTPRINT load_s={load_s:.1f} weights_gib={weights_gib:.2f} runtime=hf", flush=True)
+    # Report where things actually landed. A hybrid run that silently put everything on
+    # one device looks identical to a working split from the outside.
+    dmap = getattr(model, "hf_device_map", None)
+    if dmap:
+        import collections as _c
+        tally = _c.Counter(str(v) for v in dmap.values())
+        print(f"DEVICE_MAP {dict(tally)} modules={len(dmap)}", flush=True)
+        for _mod, _dev in list(dmap.items())[:4]:
+            print(f"  {_dev}  {_mod}", flush=True)
+
+    weights_gib = hf_footprint_gib(args.device_map)
+    print(f"FOOTPRINT load_s={load_s:.1f} weights_gib={weights_gib:.2f} runtime=hf "
+          f"device={args.device_map}"
+          + ("" if on_cuda else " (peak RSS: includes interpreter+torch)"), flush=True)
     if args.expect_gib is not None and not footprint_ok(weights_gib, args.expect_gib):
         failures.append(f"footprint {weights_gib:.2f} GiB misses the expected "
                         f"{args.expect_gib} GiB by >15% — likely loaded dense (is "
@@ -326,7 +421,7 @@ def run_hf(args, failures):
         prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     else:
         prompt = COHERENCE_Q
-    ids = tok(prompt, return_tensors="pt").to("cuda")
+    ids = tok(prompt, return_tensors="pt").to("cuda" if on_cuda else "cpu")
     with torch.no_grad():
         gen_ids = model.generate(**ids, max_new_tokens=args.maxtok, do_sample=False)
     text = tok.decode(gen_ids[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
@@ -336,16 +431,18 @@ def run_hf(args, failures):
     if args.expect and args.expect.lower() not in text.lower():
         failures.append(f"coherence sample lacks expected substring {args.expect!r}")
 
-    enc = tok([PROMPT], return_tensors="pt").to("cuda")
+    enc = tok([PROMPT], return_tensors="pt").to("cuda" if on_cuda else "cpu")
 
     def gen(batch, n):
         batched = {k: v.repeat(batch, 1) for k, v in enc.items()}
-        torch.cuda.synchronize()
+        if on_cuda:
+            torch.cuda.synchronize()
         t = time.perf_counter()
         with torch.no_grad():
             o = model.generate(**batched, max_new_tokens=n, do_sample=False,
                                min_new_tokens=n)
-        torch.cuda.synchronize()
+        if on_cuda:
+            torch.cuda.synchronize()
         dt = time.perf_counter() - t
         return dt, int(o.shape[0] * (o.shape[1] - batched["input_ids"].shape[1]))
 
@@ -356,7 +453,10 @@ def run_hf(args, failures):
         print(f"RESULT label={args.label} model={args.model} runtime=hf batch={b} "
               f"total_decode_tokps={tps:.1f} per_seq_tokps={tps / b:.1f} "
               f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{note}", flush=True)
-    print(f"PEAK_ALLOC_GIB {torch.cuda.max_memory_allocated() / 2 ** 30:.2f}", flush=True)
+    if on_cuda:
+        print(f"PEAK_ALLOC_GIB {torch.cuda.max_memory_allocated() / 2 ** 30:.2f}", flush=True)
+    else:
+        print(f"PEAK_RSS_GIB {hf_footprint_gib('cpu'):.2f}", flush=True)
 
 
 def build_parser():
@@ -370,6 +470,16 @@ def build_parser():
     ap.add_argument("--maxtok", type=int, default=96, help="tokens for the coherence sample")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
+    ap.add_argument("--offload-buffers", dest="offload_buffers", action="store_true",
+                    help="allow accelerate to offload BUFFERS. GLQ stores weights as "
+                         "buffers, so this streams them over PCIe every forward: measured "
+                         "0.2 tok/s vs 1.5 for --device-map cpu on Qwen Next. Without it a "
+                         "multi-device map OOMs instead. Neither is good; see the docstring.")
+    ap.add_argument("--max-memory", dest="max_memory", default=None,
+                    help='accelerate max_memory budget, JSON, e.g. \'{"0": "20GiB", '
+                         '"cpu": "200GiB"}\'. Caps what device_map=auto puts on each '
+                         'device; needed when a single module is large enough to OOM the '
+                         'card on its own.')
     ap.add_argument("--device-map", dest="device_map", default="cuda",
                     help="HF device_map: 'cuda' (default) or 'cpu' for a CPU-only run")
     ap.add_argument("--cpu-offload-gb", dest="cpu_offload_gb", type=float, default=0.0,
