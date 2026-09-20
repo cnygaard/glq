@@ -783,6 +783,17 @@ class GLQQuantizer(HfQuantizer):
         # use_cache=False at generate time. Patch them in-place if present.
         _patch_nemotron_h_decode_cache(model)
 
+        # GatedDeltaNet decode on CPU: transformers runs a reference PyTorch rule that
+        # walks the K x V recurrent state five times per token. Wrap it so eligible decode
+        # steps take GLQ's fused kernel; everything else still calls what was there
+        # before. No-op unless GLQ_CPU_GDN is set. See glq/gdn_cpu.py.
+        from .gdn_cpu import install as _install_gdn_cpu
+        n_gdn = _install_gdn_cpu(model)
+        if n_gdn:
+            import logging
+            logging.getLogger(__name__).debug(
+                "GLQ: wrapped the GatedDeltaNet recurrent rule in %d module(s)", n_gdn)
+
         return model
 
     @property

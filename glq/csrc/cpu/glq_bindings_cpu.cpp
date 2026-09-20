@@ -19,6 +19,7 @@ void blockdiag_fht_rows(float* x, int64_t rows, int64_t n, const int32_t* meta,
 // glq_moe_cpu.cpp — the fused MoE entry registers itself, so the MoE orchestration
 // (grouping, per-expert indexing, gated activation, weighted reduce) stays in its own TU.
 void register_moe_bindings(pybind11::module& m);
+void register_gdn_bindings(pybind11::module& m);
 }  // namespace glq_cpu
 
 namespace {
@@ -244,6 +245,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("glq_trellis_cpu_kernel_supported", &kernel_supported,
           py::arg("m"), py::arg("k"));
     glq_cpu::register_moe_bindings(m);
+    glq_cpu::register_gdn_bindings(m);
     m.def("glq_cpu_active_isa", [] { return std::string(glq_cpu::active_name()); });
     m.def("glq_cpu_isa_available", [](const std::string& name) {
         for (int t = 0; t < glq_cpu::TIER_COUNT; ++t)
