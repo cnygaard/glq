@@ -108,6 +108,21 @@ def test_a_module_without_the_global_is_skipped(fake):
 
 # ---- delegation: every ineligible path must reach the original -----------------------
 
+def test_the_default_is_off(fake, monkeypatch):
+    """The switch ships off, so an UNSET environment must take the reference. The other
+    tests all set GLQ_CPU_GDN explicitly, so none of them would notice the default
+    flipping -- which is exactly the kind of change that ships by accident."""
+    monkeypatch.delenv("GLQ_CPU_GDN", raising=False)
+    assert not gdn_cpu._enabled()
+    mod, model = fake
+    gdn_cpu.install(model)
+    q, k, v, g, beta, st = _args()
+    mod.torch_recurrent_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=st,
+                                         output_final_state=True,
+                                         use_qk_l2norm_in_kernel=True)
+    assert len(mod.calls) == 1, "the kernel ran with the flag unset"
+
+
 @pytest.mark.parametrize("case", ["flag_off", "prefill", "no_state"])
 def test_ineligible_calls_reach_the_original(fake, monkeypatch, case):
     mod, model = fake
