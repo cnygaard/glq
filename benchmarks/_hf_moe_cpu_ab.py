@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--tokens", type=int, default=8,
                     help="greedy tokens to also compare as text")
+    ap.add_argument("--flag", default="GLQ_HF_MOE_CPU_FUSED",
+                    help="the env switch to A/B. Both GLQ CPU fast paths are read per "
+                         "forward, so either one can be toggled against one set of weights")
     args = ap.parse_args()
 
     import torch
@@ -57,24 +60,49 @@ def main():
     model.eval()
     print(f"loaded in {time.perf_counter() - t0:.1f}s", flush=True)
 
+    is_moe = args.flag == "GLQ_HF_MOE_CPU_FUSED"
     containers = [m for m in model.modules() if isinstance(m, GLQStackedGatedExperts)]
-    print(f"GLQStackedGatedExperts containers: {len(containers)}", flush=True)
-    if not containers:
-        print("AB_FAIL no stacked gated expert containers — nothing to compare")
-        return 2
-    why = containers[0]._glq_moe_cpu_refusal()
-    print(f"gate says: {why or 'eligible'}", flush=True)
+    if is_moe:
+        print(f"GLQStackedGatedExperts containers: {len(containers)}", flush=True)
+        if not containers:
+            print("AB_FAIL no stacked gated expert containers — nothing to compare")
+            return 2
+        print(f"gate says: {containers[0]._glq_moe_cpu_refusal() or 'eligible'}", flush=True)
+    else:
+        gdn = [m for m in model.modules() if "GatedDeltaNet" in type(m).__name__]
+        print(f"GatedDeltaNet modules: {len(gdn)}", flush=True)
+        if not gdn:
+            print(f"AB_FAIL no GatedDeltaNet modules — nothing for {args.flag} to do")
+            return 2
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     enc = tok([PROMPT], return_tensors="pt")
 
     def logits(flag: str):
-        os.environ["GLQ_HF_MOE_CPU_FUSED"] = flag
-        t = time.perf_counter()
-        with torch.no_grad():
-            out = model(**enc).logits[0, -1].float()
-        return out, time.perf_counter() - t
+        """Logits of ONE token, from a fresh cache.
 
+        For the GDN flag this MUST be a decode step, not a prompt forward: the shim only
+        handles `seq_len == 1`, so comparing a prefill forward compares the reference
+        against itself and reports a perfect match that means nothing. So prime the cache
+        with the prompt, then measure the NEXT token -- which is the seq_len==1 path.
+
+        The cache is rebuilt per arm on purpose. GLQ's kernel updates the recurrent state
+        in place, so a cache shared between arms would carry one arm's mutation into the
+        other; a fresh prefill each time is both correct and a check on that.
+        """
+        os.environ[args.flag] = flag
+        with torch.no_grad():
+            if is_moe:
+                t = time.perf_counter()
+                return model(**enc).logits[0, -1].float(), time.perf_counter() - t
+            pre = model(**enc, use_cache=True)
+            nxt = pre.logits[0, -1].argmax().view(1, 1)
+            t = time.perf_counter()
+            step = model(input_ids=nxt, past_key_values=pre.past_key_values,
+                         use_cache=True)
+            return step.logits[0, -1].float(), time.perf_counter() - t
+
+    logits("0")                 # discard: the first forward pays cold-start page faults
     loop_before, t_loop = logits("0")
     # The FIRST fused forward also re-homes every expert into its stacked buffer, which
     # touches all 42 GiB of expert weights -- most of which the loop never faulted in,
@@ -84,19 +112,27 @@ def main():
     fused, t_fused = logits("1")
     loop_after, _ = logits("0")
 
-    # Did the fused path actually engage? A stale gate would make every number below agree
+    # Did the fast path actually engage? Without this every number below could agree
     # perfectly and mean nothing.
-    engaged = containers[0]._stacked_is_live()
-    print(f"stacked buffers live: {engaged}", flush=True)
-
     ok = True
-
-    same = torch.equal(loop_before, loop_after)
-    print(f"re-home is value-preserving: loop_after == loop_before -> {same}")
-    if not same:
-        d = (loop_after - loop_before).abs().max().item()
-        print(f"  max abs diff {d:.3e}  <-- the re-home changed the weights")
-        ok = False
+    if is_moe:
+        engaged = containers[0]._stacked_is_live()
+        print(f"stacked buffers live: {engaged}", flush=True)
+        same = torch.equal(loop_before, loop_after)
+        print(f"re-home is value-preserving: loop_after == loop_before -> {same}")
+        if not same:
+            d = (loop_after - loop_before).abs().max().item()
+            print(f"  max abs diff {d:.3e}  <-- the re-home changed the weights")
+            ok = False
+    else:
+        # The GDN shim leaves no durable state, so engagement is proven by the numbers
+        # MOVING at all: identical logits would mean the wrapper never fired.
+        engaged = not torch.equal(fused, loop_before)
+        print(f"gdn shim changed the logits (i.e. it ran): {engaged}", flush=True)
+        same = torch.equal(loop_before, loop_after)
+        print(f"reference is unperturbed: loop_after == loop_before -> {same}")
+        if not same:
+            ok = False
 
     d = (fused - loop_before).abs()
     denom = loop_before.abs().max().item() or 1.0
@@ -122,14 +158,15 @@ def main():
         print(f"  within the {args.dtype} floor {floor}; run --dtype float32 for the "
               f"control that says whether this is rounding or a bug")
 
-    print(f"one-time re-home: {t_build - t_fused:.1f}s added to the first forward "
-          f"(touches every expert; the loop only ever faults in the routed ones)")
+    if is_moe:
+        print(f"one-time re-home: {t_build - t_fused:.1f}s added to the first forward "
+              f"(touches every expert; the loop only ever faults in the routed ones)")
     print(f"steady-state single forward: loop={t_loop:.2f}s fused={t_fused:.2f}s "
           f"({t_loop / t_fused:.2f}x)   # ONE prefill forward, not a decode throughput number")
 
     if args.tokens:
         for flag in ("0", "1"):
-            os.environ["GLQ_HF_MOE_CPU_FUSED"] = flag
+            os.environ[args.flag] = flag
             with torch.no_grad():
                 o = model.generate(**enc, max_new_tokens=args.tokens,
                                    min_new_tokens=args.tokens, do_sample=False)
