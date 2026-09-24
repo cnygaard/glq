@@ -43,6 +43,51 @@ from .quantized_linear import E8RHTLinear
 #: emit the same line once per layer per forward.
 _WARNED_HF_MOE_CPU_FALLBACK = False
 
+#: Resolved `malloc_trim`, or False once we know this libc has none. See
+#: :func:`_return_freed_heap_to_os`.
+_MALLOC_TRIM = None
+
+
+def _return_freed_heap_to_os() -> bool:
+    """Ask glibc to hand back the pages the re-home just freed. Best effort.
+
+    The re-home frees 512 per-expert buffers per layer and allocates one big destination.
+    glibc keeps the freed blocks in its arena instead of returning them, so RSS shows the
+    destination as pure growth even though the same bytes were released a moment earlier.
+
+    Measured on a one-layer repro (512 experts, 900 MiB of packed codes), delta from the
+    post-build baseline:
+
+        sources contiguous   +320.4 MiB  ->  +20.5 MiB after a trim
+        sources interleaved  +900.0 MiB  ->   +2.7 MiB after a trim
+
+    The interleaved case is the real one -- a checkpoint load scatters other allocations
+    between the experts -- and it is why Qwen3.8-Flash-Next grew ~47 GiB with the fused MoE
+    path on. Note this is NOT the dynamic mmap threshold, which was tested and ruled out:
+    the question is not whether the blocks were mmap'd but whether freed heap is trimmed.
+
+    glibc-only and deliberately silent elsewhere: musl and macOS have no `malloc_trim`, and
+    a missing one costs footprint, never correctness.
+    """
+    global _MALLOC_TRIM
+    if _MALLOC_TRIM is False:
+        return False
+    if _MALLOC_TRIM is None:
+        try:
+            import ctypes
+            import ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+            _MALLOC_TRIM = libc.malloc_trim          # AttributeError on musl
+        except Exception:                            # noqa: BLE001 - best effort by design
+            _MALLOC_TRIM = False
+            return False
+    try:
+        _MALLOC_TRIM(0)
+        return True
+    except Exception:                                # noqa: BLE001
+        _MALLOC_TRIM = False
+        return False
+
 
 def _is_relu2(act_fn) -> bool:
     """Heuristic: detect whether an activation is the relu² (squared-relu)
@@ -701,6 +746,7 @@ class GLQStackedGatedExperts(nn.Module):
         self._bn13, self._bm13 = f0._blocks_n_meta_cpu, f0._blocks_m_meta_cpu
         self._bn2, self._bm2 = d0._blocks_n_meta_cpu, d0._blocks_m_meta_cpu
         self._activation_id = _gated_activation_id(self.act_fn)
+        _return_freed_heap_to_os()
         return None
 
     def _try_fused_cpu(self, hidden_states: torch.Tensor,

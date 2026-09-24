@@ -155,6 +155,48 @@ def test_the_build_does_not_duplicate_the_weights():
     assert packed_bytes() == before
 
 
+# ---- returning the freed heap to the OS ----------------------------------------------
+
+def test_the_build_asks_the_allocator_to_return_freed_pages(monkeypatch):
+    """The mechanism, not the RSS: an RSS assertion would be flaky in CI, but a build that
+    silently stopped trimming would put the ~47 GiB back and nothing else here would fail.
+
+    Measured on a one-layer repro (512 experts, 900 MiB of codes) with other allocations
+    interleaved between the experts, as a real checkpoint load does: RSS grew by the
+    destination's FULL size (+900.0 MiB) and fell to +2.7 MiB after the trim.
+    """
+    _ext()
+    from glq import fused_experts as fe
+    calls = []
+    monkeypatch.setattr(fe, "_return_freed_heap_to_os",
+                        lambda: calls.append(1) or True)
+    c = build_container(E=3)
+    assert c._build_stacked_cpu() is None
+    assert calls, "the re-home did not ask the allocator to return the freed pages"
+
+
+def test_the_trim_helper_is_best_effort(monkeypatch):
+    """glibc-only by design. musl and macOS have no malloc_trim, and a missing one costs
+    footprint, never correctness -- so it must report False, not raise."""
+    from glq import fused_experts as fe
+    monkeypatch.setattr(fe, "_MALLOC_TRIM", None)
+    import ctypes
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: (_ for _ in ()).throw(OSError("no libc")))
+    assert fe._return_freed_heap_to_os() is False
+    assert fe._MALLOC_TRIM is False, "the failure should be cached, not retried per layer"
+    assert fe._return_freed_heap_to_os() is False
+
+
+def test_the_trim_helper_works_where_it_exists(monkeypatch):
+    import platform
+
+    from glq import fused_experts as fe
+    if platform.system() != "Linux" or platform.libc_ver()[0] != "glibc":
+        pytest.skip("no glibc malloc_trim on this platform")
+    monkeypatch.setattr(fe, "_MALLOC_TRIM", None)
+    assert fe._return_freed_heap_to_os() is True
+
+
 def test_the_build_is_idempotent():
     _ext()
     c = build_container(E=3)
