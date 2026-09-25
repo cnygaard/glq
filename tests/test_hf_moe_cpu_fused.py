@@ -155,6 +155,123 @@ def test_the_build_does_not_duplicate_the_weights():
     assert packed_bytes() == before
 
 
+# ---- fusing straight into the stacked buffers -----------------------------------------
+
+def _pad(hidden, packed_rows, su, sv, wscale):
+    """A gate/up landing pad as the loader leaves it: one `[I, H]` half of the pair."""
+    from glq.quantized_linear import E8RHTLinear
+    lin = E8RHTLinear(hidden, INTER, bias=False, block_diagonal=True,
+                      codebook_type="trellis")
+    lin.trellis_packed = packed_rows.clone()
+    lin.SU = su.clone()
+    lin.SV = sv.clone()
+    lin.Wscale = wscale.clone()
+    lin._wscale_float = None
+    return lin
+
+
+def _unfused_container(E=3, **kw):
+    """A container as the loader leaves it: gate/up pads populated, nothing fused yet.
+
+    Built by splitting an already-fused container back into halves, so the pads carry
+    exactly the bytes `fuse_gate_up` would have concatenated -- which is what makes the
+    byte-identity comparison meaningful rather than circular.
+    """
+    c = build_container(E=E, **kw)
+    for e in range(E):
+        p = c[e]
+        f = p.gate_up_proj
+        hp = f.trellis_packed.shape[0] // 2          # packed rows per half
+        hs = f.SU.shape[0] // 2                      # SU is a row artifact too
+        p.gate_proj = _pad(f.in_features, f.trellis_packed[:hp], f.SU[:hs], f.SV, f.Wscale)
+        p.up_proj = _pad(f.in_features, f.trellis_packed[hp:], f.SU[hs:], f.SV, f.Wscale)
+        f.trellis_packed = torch.zeros(0, dtype=torch.int16)
+        p._fused = False
+    return c
+
+
+def test_fusing_into_stacked_is_byte_identical_to_fusing_then_rehoming():
+    """THE gate. Both routes must land the same bytes in the stacked buffer.
+
+    `fuse_gate_up` + `_build_stacked_cpu` allocates the expert bytes twice on the way;
+    `fuse_into_stacked` copies the halves straight into slices of the destination. That is
+    only valid if gate occupies rows 0:I and up rows I:2I -- and getting it wrong is the
+    gate/up-swap failure: loads clean, decodes finite, emits garbage. Unlike the
+    fused-vs-loop numerics this CAN be bit-exact, so assert equality, not a tolerance.
+    """
+    _ext()
+    old = _unfused_container(E=4)
+    for e in range(4):
+        old[e].fuse_gate_up()
+    assert old._build_stacked_cpu() is None
+
+    new = _unfused_container(E=4)
+    assert new.fuse_into_stacked() is None
+
+    assert torch.equal(new._w13_packed, old._w13_packed), "w13 bytes differ"
+    assert torch.equal(new._w2_packed, old._w2_packed), "w2 bytes differ"
+    assert torch.equal(new._w13_SU, old._w13_SU)
+    assert torch.equal(new._w2_SU, old._w2_SU)
+    assert torch.equal(new._w13_SV, old._w13_SV)
+
+
+def test_a_swapped_gate_up_order_would_not_be_byte_identical():
+    """Proves the test above is load-bearing rather than vacuously true: if the two halves
+    were interchangeable, swapping them would still match and the gate would prove nothing.
+    """
+    _ext()
+    old = _unfused_container(E=3)
+    for e in range(3):
+        old[e].fuse_gate_up()
+    old._build_stacked_cpu()
+    half = old._w13_packed.shape[1] // 2
+    swapped = torch.cat([old._w13_packed[:, half:], old._w13_packed[:, :half]], dim=1)
+    assert not torch.equal(swapped, old._w13_packed), \
+        "the halves are identical, so the byte-identity gate cannot see an order error"
+
+
+def test_fusing_into_stacked_leaves_no_per_expert_intermediate():
+    """The point of the change: every expert's packed codes must BE a slice of the stacked
+    buffer, so the `[2I, H]` per-expert allocation never exists."""
+    _ext()
+    c = _unfused_container(E=4)
+    assert c.fuse_into_stacked() is None
+    for e in range(4):
+        assert c._w13_packed[e].data_ptr() == c[e].gate_up_proj.trellis_packed.data_ptr()
+        assert c._w2_packed[e].data_ptr() == c[e].down_proj.trellis_packed.data_ptr()
+        assert c[e].gate_proj is None and c[e].up_proj is None
+    assert c._stacked_is_live()
+
+
+def test_fusing_into_stacked_is_idempotent_and_skips_the_lazy_build():
+    _ext()
+    c = _unfused_container(E=3)
+    assert c.fuse_into_stacked() is None
+    ptr = c._w13_packed.data_ptr()
+    assert c.fuse_into_stacked() is None
+    assert c._build_stacked_cpu() is None, "the lazy build must no-op once already stacked"
+    assert c._w13_packed.data_ptr() == ptr
+
+
+def test_fusing_into_stacked_declines_when_already_fused():
+    """The loader calls this before fuse_gate_up; if the pads are gone it must hand back a
+    reason so the caller falls through, not build from a half-populated container."""
+    _ext()
+    c = build_container(E=3)          # build_container already leaves them fused
+    why = c.fuse_into_stacked()
+    assert why is not None and "fuse_gate_up" in why, why
+
+
+def test_an_unshared_sv_is_refused_by_the_direct_path_too():
+    """fuse_into_stacked runs BEFORE the pads are dropped, so it cannot call the refusal
+    gate (which reads the fused projection). The SV check has to be re-done in the shared
+    tail, or this path would happily stack experts that do not share an RHT basis."""
+    _ext()
+    c = _unfused_container(E=3, shared_sv=False)
+    why = c.fuse_into_stacked()
+    assert why is not None and "SV" in why, why
+
+
 # ---- returning the freed heap to the OS ----------------------------------------------
 
 def test_the_build_asks_the_allocator_to_return_freed_pages(monkeypatch):
