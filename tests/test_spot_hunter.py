@@ -524,6 +524,183 @@ def test_probes_are_confined_to_the_scanned_regions(monkeypatch):
     assert touched, "the walk did not probe at all"
 
 
+# ---- --list-running: "is anything of mine still up" -------------------------------------
+#
+# A different question from --cleanup-probes, which only matches the glq-spot-probe tag. The
+# case that prompted this flag was a real box left running under an OpenTofu Name, which the
+# probe sweep reported as absent because it never looked for it.
+
+def _fake_ec2(instances_by_region, terminated=None, regions=None):
+    """boto3 whose describe_instances honours the tag + state filters, like AWS does."""
+    import types as _t
+
+    class _Paginator:
+        def __init__(self, region, filters):
+            self.region, self.filters = region, filters
+
+        def paginate(self, **kw):
+            want = {f["Name"]: f["Values"] for f in self.filters}
+            out = []
+            for inst in instances_by_region.get(self.region, []):
+                if "tag:Name" in want and inst.get("_name") not in want["tag:Name"]:
+                    continue
+                if inst["State"]["Name"] not in want["instance-state-name"]:
+                    continue
+                out.append(inst)
+            return [{"Reservations": [{"Instances": out}]}] if out else [{"Reservations": []}]
+
+    class _Client:
+        def __init__(self, region):
+            self.region = region
+
+        def get_paginator(self, _name):
+            region = self.region
+
+            class _P:  # boto3 takes the filters on paginate(), not get_paginator()
+                def paginate(self, Filters=None, **kw):  # noqa: N803 - boto3's casing
+                    return _Paginator(region, Filters or []).paginate()
+            return _P()
+
+        def describe_regions(self, AllRegions=False):  # noqa: N803
+            return {"Regions": regions or []}
+
+        def terminate_instances(self, InstanceIds):  # noqa: N803
+            if terminated is not None:
+                terminated.extend(InstanceIds)
+            return {}
+
+    fake = _t.ModuleType("boto3")
+    fake.Session = lambda **kw: _t.SimpleNamespace(
+        client=lambda _svc, region_name=None, **k: _Client(region_name),
+        get_available_regions=lambda _svc: list(instances_by_region))
+    return fake
+
+
+def _inst(iid, itype="g6e.2xlarge", state="running", life="spot", name="-"):
+    return {"InstanceId": iid, "InstanceType": itype, "State": {"Name": state},
+            "InstanceLifecycle": life, "LaunchTime": SH.dt.datetime(2026, 9, 25, 19, 48,
+                                                                   tzinfo=SH.dt.timezone.utc),
+            "PublicIpAddress": "13.60.87.125",
+            "Tags": [{"Key": "Name", "Value": name}], "_name": name}
+
+
+def test_the_sweep_finds_a_box_the_probe_tag_filter_misses():
+    """THE case this flag exists for. A box stood up by OpenTofu carries its own Name, so
+    --cleanup-probes reports a clean bill of health while it is still billing."""
+    inst = _inst("i-091e3dc56e0e31b48", name="golay-leech-quant-eval")
+    sys.modules["boto3"] = _fake_ec2({"eu-north-1": [inst]})
+    try:
+        untagged = SH.sweep_instances(["eu-north-1"], {})
+        probe_only = SH.sweep_instances(["eu-north-1"], {}, tag=SH.PROBE_TAG_NAME)
+    finally:
+        del sys.modules["boto3"]
+    assert [r["id"] for r in untagged] == ["i-091e3dc56e0e31b48"]
+    assert probe_only == [], "the probe-tag sweep must NOT see a differently-tagged box"
+
+
+def test_the_sweep_reports_lifecycle_so_spot_is_distinguishable():
+    """'Are there stray SPOT instances' turns on this field; AWS omits it for on-demand."""
+    od = _inst("i-ondemand", name="build")
+    del od["InstanceLifecycle"]
+    sys.modules["boto3"] = _fake_ec2({"eu-west-1": [_inst("i-spot"), od]})
+    try:
+        rows = {r["id"]: r["life"] for r in SH.sweep_instances(["eu-west-1"], {})}
+    finally:
+        del sys.modules["boto3"]
+    assert rows == {"i-spot": "spot", "i-ondemand": "on-demand"}
+
+
+def test_the_sweep_terminates_nothing():
+    """Read-only is the contract: --list-running must be safe to run without thinking."""
+    killed = []
+    sys.modules["boto3"] = _fake_ec2({"eu-north-1": [_inst("i-1")]}, terminated=killed)
+    try:
+        SH.sweep_instances(["eu-north-1"], {})
+    finally:
+        del sys.modules["boto3"]
+    assert killed == [], "the sweep called terminate_instances"
+
+
+def test_cleanup_still_terminates_through_the_shared_sweep():
+    """The refactor must not have turned cleanup into a no-op."""
+    killed = []
+    probe = _inst("i-probe", name=SH.PROBE_TAG_NAME)
+    sys.modules["boto3"] = _fake_ec2({"eu-north-1": [probe]}, terminated=killed)
+    try:
+        assert SH.cleanup_probes(["eu-north-1"], {}) == 1
+    finally:
+        del sys.modules["boto3"]
+    assert killed == ["i-probe"]
+
+
+def test_enabled_regions_skips_the_ones_that_cannot_hold_an_instance():
+    """A not-opted-in region cannot hold an instance, so scanning it only produces
+    AuthFailure noise — the standing error that trains a reader to ignore errors."""
+    regions = [{"RegionName": "us-east-1", "OptInStatus": "opt-in-not-required"},
+               {"RegionName": "eu-south-2", "OptInStatus": "opted-in"},
+               {"RegionName": "eu-south-1", "OptInStatus": "not-opted-in"},
+               {"RegionName": "ap-south-1", "OptInStatus": "opt-in-not-required"}]
+    sys.modules["boto3"] = _fake_ec2({}, regions=regions)
+    try:
+        got = SH.enabled_regions({})
+    finally:
+        del sys.modules["boto3"]
+    assert got == ["eu-south-2", "us-east-1"], got
+    assert "eu-south-1" not in got and "ap-south-1" not in got
+
+
+def test_a_clean_bill_of_health_says_what_it_covers(capsys):
+    """"Nothing running" is only meaningful with the scope attached — the same reasoning
+    cleanup_probes' own output already follows."""
+    SH.print_running([], ["us-east-1", "eu-west-1"])
+    out = capsys.readouterr().out
+    assert "us-east-1" in out and "eu-west-1" in out and "2 region(s)" in out
+
+
+def test_list_running_defaults_to_everywhere_not_the_hunt_default(monkeypatch):
+    """--regions defaults to two cheap regions for a HUNT; for 'is anything of mine running'
+    that would print a clean bill of health with a box up in us-east-1."""
+    seen = {}
+    monkeypatch.setattr(SH, "enabled_regions", lambda kw, **k: ["us-east-1", "eu-west-1"])
+    monkeypatch.setattr(SH, "sweep_instances",
+                        lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
+    monkeypatch.setattr(SH, "print_running", lambda rows, scope: None)
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
+    monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--list-running"])
+    SH.main()
+    assert seen["scope"] == ["us-east-1", "eu-west-1"]
+    assert SH.DEFAULT_REGIONS != seen["scope"], "must not silently use the hunt default"
+
+
+def test_list_running_honours_an_explicit_region(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(SH, "enabled_regions",
+                        lambda kw, **k: pytest.fail("should not widen when told a region"))
+    monkeypatch.setattr(SH, "sweep_instances",
+                        lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
+    monkeypatch.setattr(SH, "print_running", lambda rows, scope: None)
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
+    monkeypatch.setattr(sys, "argv",
+                        ["spot_hunter.py", "--list-running", "--regions", "us-west-2"])
+    SH.main()
+    assert seen["scope"] == ["us-west-2"]
+
+
+def test_the_hunt_still_defaults_to_the_two_cheap_regions(monkeypatch):
+    """Guards the --regions default=None change: every non-list path must be unaffected."""
+    seen = {}
+    monkeypatch.setattr(SH, "latest_prices",
+                        lambda r, t, p, kw, cpu_only=False: seen.setdefault(
+                            "regions", []).append(r) or [])
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
+    monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--cpu-only"])
+    try:
+        SH.main()
+    except SystemExit:
+        pass
+    assert sorted(seen["regions"]) == sorted(SH.DEFAULT_REGIONS)
+
+
 def test_cleanup_names_the_regions_it_swept(capsys):
     """"No probe instances found" is a clean bill of health. It has to say which regions it
     is a clean bill of health FOR — a walk run with --regions us-east-1 and then killed
