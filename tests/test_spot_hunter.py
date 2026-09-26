@@ -573,6 +573,20 @@ def _fake_ec2(instances_by_region, terminated=None, regions=None):
     fake.Session = lambda **kw: _t.SimpleNamespace(
         client=lambda _svc, region_name=None, **k: _Client(region_name),
         get_available_regions=lambda _svc: list(instances_by_region))
+
+    # `_probe_client` also does `from botocore.config import Config` (spot_hunter.py:641), and
+    # stubbing boto3 alone left that reaching the real package. On a machine without botocore
+    # the ImportError was swallowed per-region by `sweep_instances` and every sweep returned
+    # [] -- which reads as "no instances found" rather than "could not look". `setdefault` so
+    # a real botocore, when installed, is still the one used.
+    import sys as _sys
+    if "botocore" not in _sys.modules:
+        bc = _t.ModuleType("botocore")
+        cfg = _t.ModuleType("botocore.config")
+        cfg.Config = lambda **kw: _t.SimpleNamespace(**kw)
+        bc.config = cfg
+        _sys.modules["botocore"] = bc
+        _sys.modules["botocore.config"] = cfg
     return fake
 
 
@@ -664,7 +678,7 @@ def test_list_running_defaults_to_everywhere_not_the_hunt_default(monkeypatch):
     monkeypatch.setattr(SH, "enabled_regions", lambda kw, **k: ["us-east-1", "eu-west-1"])
     monkeypatch.setattr(SH, "sweep_instances",
                         lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
-    monkeypatch.setattr(SH, "print_running", lambda rows, scope: None)
+    monkeypatch.setattr(SH, "print_running", lambda rows, scope, errors=(): None)
     monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
     monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--list-running"])
     SH.main()
@@ -678,7 +692,7 @@ def test_list_running_honours_an_explicit_region(monkeypatch):
                         lambda kw, **k: pytest.fail("should not widen when told a region"))
     monkeypatch.setattr(SH, "sweep_instances",
                         lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
-    monkeypatch.setattr(SH, "print_running", lambda rows, scope: None)
+    monkeypatch.setattr(SH, "print_running", lambda rows, scope, errors=(): None)
     monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
     monkeypatch.setattr(sys, "argv",
                         ["spot_hunter.py", "--list-running", "--regions", "us-west-2"])
@@ -720,3 +734,81 @@ def test_cleanup_names_the_regions_it_swept(capsys):
         del sys.modules["boto3"]
     out = capsys.readouterr().out
     assert "eu-north-1" in out and "eu-south-2" in out, out
+
+
+# --------------------------------------------------- a failed scan is not an empty one
+#
+# Discovered on the GPU box: `botocore` was absent, `_probe_client` raised ImportError,
+# `sweep_instances` caught it per-region and continued, and every sweep returned []. For a
+# tool whose entire purpose is finding instances that are still billing, "No instances in a
+# live state across 12 region(s)" when it queried none of them is the dangerous direction.
+
+def test_a_missing_dependency_raises_instead_of_reporting_nothing_running():
+    """A local import failure is not a per-region condition and cannot mean "no instances".
+
+    Retrying it across twelve regions also just prints the same error twelve times, which is
+    how a reader is trained to scroll past errors.
+    """
+    import sys as _sys
+    # _fake_ec2 installs a botocore stub (see its own note), so pop AFTER building it —
+    # otherwise this test passes on the stub and never exercises the absence it is about.
+    _sys.modules["boto3"] = _fake_ec2({"eu-north-1": [_inst("i-1")]})
+    real = {k: _sys.modules.pop(k, None) for k in ("botocore", "botocore.config")}
+
+    class Blocker:
+        def find_spec(self, name, path=None, target=None):
+            if name.split(".")[0] == "botocore":
+                raise ImportError("No module named 'botocore'")
+            return None
+
+    blocker = Blocker()
+    _sys.meta_path.insert(0, blocker)
+    try:
+        with pytest.raises(ImportError):
+            SH.sweep_instances(["eu-north-1"], {})
+    finally:
+        _sys.meta_path.remove(blocker)
+        del _sys.modules["boto3"]
+        for k, v in real.items():
+            if v is not None:
+                _sys.modules[k] = v
+
+
+def test_a_region_that_could_not_be_scanned_is_reported_not_silently_empty(capsys):
+    """An AWS-side failure stays per-region and non-fatal — other regions are still worth
+    scanning — but it must be visible in the RESULT, not only on stderr."""
+    boom = _fake_ec2({"eu-north-1": [_inst("i-1")], "eu-west-1": []})
+    original = boom.Session
+
+    def _session(**kw):
+        s = original(**kw)
+        real_client = s.client
+
+        def client(svc, region_name=None, **k):
+            if region_name == "eu-west-1":
+                raise RuntimeError("AuthFailure")
+            return real_client(svc, region_name=region_name, **k)
+        s.client = client
+        return s
+    boom.Session = _session
+    sys.modules["boto3"] = boom
+    errors: list = []
+    try:
+        rows = SH.sweep_instances(["eu-north-1", "eu-west-1"], {}, errors=errors)
+    finally:
+        del sys.modules["boto3"]
+    assert [r["id"] for r in rows] == ["i-1"], "the healthy region must still be scanned"
+    assert [r for r, _ in errors] == ["eu-west-1"]
+
+    SH.print_running(rows, ["eu-north-1", "eu-west-1"], errors=errors)
+    out = capsys.readouterr().out
+    assert "1 of 2" in out or "could not" in out.lower(), (
+        f"the table must say the scan was incomplete; got:\n{out}")
+
+
+def test_an_empty_but_complete_scan_still_reads_as_a_clean_bill(capsys):
+    """The opposite direction matters too: a genuine "nothing running" must not be muddied
+    into looking like a failure."""
+    SH.print_running([], ["eu-north-1"], errors=[])
+    out = capsys.readouterr().out
+    assert "No instances" in out and "could not" not in out.lower()
