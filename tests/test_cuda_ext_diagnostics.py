@@ -251,6 +251,29 @@ def test_a_machine_with_no_cuda_device_is_not_told_its_build_failed(monkeypatch)
 # tests fake the wheel layout in tmp_path: hermetic, no CUDA required, and they encode the
 # layout facts above rather than a machine's current state.
 
+@pytest.fixture
+def wheel_only_machine(monkeypatch):
+    """No usable system CUDA toolkit — the premise these tests fabricate but never enforced.
+
+    `torch.utils.cpp_extension.CUDA_HOME` is resolved once at torch import and points at a
+    real toolkit on any machine that has one. Two production paths then deliberately stand
+    down, because a system install outranks the pip wheels (mixing CUDA minors is how you get
+    subtle link errors):
+
+      * `_cudart_link_dir` returns None early when `$CUDA_HOME/lib64/libcudart.so` exists
+        (glq/inference_kernel.py:92) — so the shim tests got None and one of them died in
+        `os.path.join(None, ...)`.
+      * `_try_load_cuda_ext` skips setting CUDA_HOME when `$CUDA_HOME/bin/nvcc` exists
+        (glq/inference_kernel.py:288).
+
+    Both are correct behaviour, so the tests are what has to change. On a CPU-only machine
+    CUDA_HOME is None and all four passed for free, which is why this went unnoticed until
+    the suite first ran on a GPU box with CUDA 13.2 installed.
+    """
+    import torch.utils.cpp_extension as cpp
+    monkeypatch.setattr(cpp, "CUDA_HOME", None, raising=False)
+
+
 def _fake_wheel_layout(root, soname="libcudart.so.13", cu="cu13"):
     lib = root / "site-packages" / "nvidia" / cu / "lib"
     lib.mkdir(parents=True)
@@ -258,7 +281,7 @@ def _fake_wheel_layout(root, soname="libcudart.so.13", cu="cu13"):
     return root / "site-packages", lib / soname
 
 
-def test_the_shim_supplies_the_symlink_the_wheels_omit(tmp_path):
+def test_the_shim_supplies_the_symlink_the_wheels_omit(tmp_path, wheel_only_machine):
     sp, real = _fake_wheel_layout(tmp_path)
 
     link_dir = ik._cudart_link_dir([str(sp)], str(tmp_path / "cache"))
@@ -269,7 +292,7 @@ def test_the_shim_supplies_the_symlink_the_wheels_omit(tmp_path):
     assert os.path.realpath(link) == str(real)
 
 
-def test_the_shim_follows_whatever_soname_is_installed(tmp_path):
+def test_the_shim_follows_whatever_soname_is_installed(tmp_path, wheel_only_machine):
     """cu14 must work with no code change — the CUDA major is torch's to choose."""
     sp, real = _fake_wheel_layout(tmp_path, soname="libcudart.so.14", cu="cu14")
 
@@ -326,7 +349,7 @@ def test_no_shim_when_there_is_no_wheel_cudart_at_all(tmp_path):
     assert ik._cudart_link_dir([str(tmp_path)], str(tmp_path / "cache")) is None
 
 
-def test_the_shim_is_idempotent(tmp_path):
+def test_the_shim_is_idempotent(tmp_path, wheel_only_machine):
     """Called on every process start; a stale or duplicate link must not error."""
     sp, real = _fake_wheel_layout(tmp_path)
     cache = str(tmp_path / "cache")
@@ -392,7 +415,7 @@ def test_no_venv_cuda_root_when_there_is_no_nvcc(tmp_path):
     assert ik._venv_cuda_home([str(tmp_path / "site-packages")]) is None
 
 
-def test_the_build_sets_cuda_home_when_it_is_unset(monkeypatch, tmp_path):
+def test_the_build_sets_cuda_home_when_it_is_unset(monkeypatch, tmp_path, wheel_only_machine):
     """Without this the toolchain install is inert and the build dies before compiling."""
     root = tmp_path / "nvidia" / "cu13"
     (root / "bin").mkdir(parents=True)

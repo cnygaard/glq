@@ -21,14 +21,44 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from glq.installer import verify as V  # noqa: E402
 
 
-def _probes(glq=True, glq_vllm=True, plugin=True, cuda=True, kernels=(True, None)):
+def _probes(glq=True, glq_vllm=True, plugin=True, cuda=True, kernels=(True, None),
+            quantize_deps=True, pi=True, cpu_kernels=(True, "loaded (isa=avx2)"),
+            vllm_version="0.29.0"):
+    """Every probe `run_checks` accepts, so a check never reaches the real machine.
+
+    This used to supply five of nine. The rest fell through to the module-level defaults —
+    and those are bound at `def` time, so they cannot even be monkeypatched; passing them is
+    the only way. On a CPU-only dev machine the un-injected probes happened to answer the way
+    the tests assumed (no vLLM installed => "nothing to match against", a warning), so every
+    test passed. On the GPU box the real `_vllm_version` answered "0.29.0" and the real
+    `_cpu_kernels_available` answered `(True, "loaded (isa=avx512fp16)")`, and
+    `test_no_cuda_is_a_warning_not_a_failure` went red on a check it never meant to exercise.
+
+    `test_probes_covers_every_probe` keeps this honest when a tenth probe is added.
+    """
     return {
         "glq_importable": lambda: ("0.8.3" if glq else None),
         "glq_vllm_importable": lambda: glq_vllm,
         "plugin_registered": lambda: plugin,
         "cuda_available": lambda: cuda,
         "kernels_available": lambda: kernels,
+        "quantize_deps_importable": lambda: quantize_deps,
+        "pi_resolvable": lambda: pi,
+        "cpu_kernels_available": lambda: cpu_kernels,
+        "vllm_version": lambda: vllm_version,
     }
+
+
+def test_probes_covers_every_probe():
+    """A probe added to `run_checks` but not to `_probes` silently reaches the real machine,
+    which is how this suite came to pass only on hardware without a GPU."""
+    import inspect
+    params = inspect.signature(V.run_checks).parameters
+    injectable = {n for n, p in params.items()
+                  if p.kind is inspect.Parameter.KEYWORD_ONLY and n != "device"}
+    assert injectable == set(_probes()), (
+        f"_probes() is missing {injectable - set(_probes())} / "
+        f"has stale {set(_probes()) - injectable}")
 
 
 # --------------------------------------------------- the check that was missing
@@ -118,8 +148,17 @@ def test_missing_glq_itself_is_caught():
 
 def test_no_cuda_is_a_warning_not_a_failure():
     """CPU-only is a supported (slow) configuration — glq falls back to
-    dequantize-then-matmul. Failing the install over it would be wrong."""
-    checks = V.run_checks(("core", "vllm"), **_probes(cuda=False))
+    dequantize-then-matmul. Failing the install over it would be wrong.
+
+    The wheel has to match the machine being described, or this asserts something the suite
+    deliberately rejects two checks later: a CUDA vLLM with no GPU visible is a hard failure
+    (`verify.py:249`, no `warning_only`) because serving cannot start at all. So a coherent
+    CPU-only box carries a `+cpu` wheel. Previously `vllm_version` was not injected, and the
+    test passed only because the dev machine had no vLLM installed — on the box the real
+    probe answered "0.29.0" and the check fired exactly as designed.
+    """
+    checks = V.run_checks(("core", "vllm"),
+                          **_probes(cuda=False, vllm_version="0.29.0+cpu"))
     cuda = [c for c in checks if "cuda" in c.name.lower()][0]
     assert cuda.ok is False
     assert cuda.warning_only is True
@@ -151,14 +190,12 @@ def test_render_is_readable_and_marks_each_line():
 def test_quantize_component_checks_its_deps_are_importable():
     """The binary exists in every install; only the deps distinguish a working quantize
     from a traceback on `from datasets import load_dataset` twenty minutes in."""
-    checks = V.run_checks(("core", "quantize"), **_probes(),
-                          quantize_deps_importable=lambda: False)
+    checks = V.run_checks(("core", "quantize"), **_probes(quantize_deps=False))
     c = [c for c in checks if "quantize" in c.name]
     assert c and not c[0].ok
     assert "glq[quantize]" in c[0].detail
 
-    checks = V.run_checks(("core", "quantize"), **_probes(),
-                          quantize_deps_importable=lambda: True)
+    checks = V.run_checks(("core", "quantize"), **_probes(quantize_deps=True))
     c = [c for c in checks if "quantize" in c.name]
     assert c and c[0].ok
 
@@ -171,14 +208,12 @@ def test_no_quantize_component_no_quantize_check():
 def test_picode_component_checks_the_pi_binary_resolves():
     """The summary is about to print `glq-code`; if pi is not actually resolvable the
     user meets a runtime error far from the install that caused it."""
-    checks = V.run_checks(("core", "picode"), **_probes(),
-                          pi_resolvable=lambda: False)
+    checks = V.run_checks(("core", "picode"), **_probes(pi=False))
     c = [c for c in checks if "pi " in c.name or "picode" in c.name]
     assert c and not c[0].ok
     assert "picode" in c[0].detail
 
-    checks = V.run_checks(("core", "picode"), **_probes(),
-                          pi_resolvable=lambda: True)
+    checks = V.run_checks(("core", "picode"), **_probes(pi=True))
     c = [c for c in checks if "pi " in c.name or "picode" in c.name]
     assert c and c[0].ok
 
