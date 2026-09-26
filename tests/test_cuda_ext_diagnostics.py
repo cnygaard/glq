@@ -88,7 +88,8 @@ def test_a_failed_build_records_the_compiler_error(monkeypatch):
     """The whole point: after a failed build, something must still know why."""
     _make_build_fail(monkeypatch)
 
-    assert ik._try_load_cuda_ext() is False
+    with pytest.warns(RuntimeWarning, match="GLQ CUDA extension"):
+        assert ik._try_load_cuda_ext() is False
 
     available, error = ik.cuda_ext_status()
     assert available is False
@@ -104,7 +105,8 @@ def test_the_reason_survives_repeated_calls(monkeypatch):
     failing call, every consumer after the first gets a bare 'unavailable'.
     """
     _make_build_fail(monkeypatch)
-    ik._try_load_cuda_ext()
+    with pytest.warns(RuntimeWarning, match="GLQ CUDA extension"):
+        ik._try_load_cuda_ext()
 
     for _ in range(3):
         available, error = ik.cuda_ext_status()
@@ -123,8 +125,10 @@ def test_the_build_is_attempted_only_once(monkeypatch):
 
     monkeypatch.setattr(cpp, "load", _raise)
 
-    for _ in range(3):
+    with pytest.warns(RuntimeWarning, match="GLQ CUDA extension"):
         ik._try_load_cuda_ext()
+    for _ in range(2):
+        ik._try_load_cuda_ext()          # cached: no rebuild and no second warning
     assert len(calls) == 1, f"rebuilt {len(calls)} times; the failure verdict is not cached"
 
 
@@ -569,7 +573,7 @@ def test_a_cuda_home_exported_after_torch_imported_still_reaches_torch(monkeypat
 def test_requiring_a_symbol_reports_the_build_failure(monkeypatch):
     _make_build_fail(monkeypatch)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.warns(RuntimeWarning, match="GLQ CUDA extension"), pytest.raises(RuntimeError) as excinfo:
         ik.require_cuda_ext("glq_fused_linear_trellis_3inst_yrht_cuda")
 
     message = str(excinfo.value)
@@ -797,7 +801,8 @@ def test_a_prebuilt_that_cannot_load_records_why(monkeypatch):
     monkeypatch.setitem(sys_mod.modules, "glq._C", None)   # import raises
     _make_build_fail(monkeypatch)
 
-    available, error = ik.cuda_ext_status()
+    with pytest.warns(RuntimeWarning, match="GLQ CUDA extension"):
+        available, error = ik.cuda_ext_status()
 
     assert available is False
     assert "glq._C" in error, (
