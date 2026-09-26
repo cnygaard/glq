@@ -93,6 +93,30 @@ def _parse_summary(path: str) -> dict[int, dict]:
     return out
 
 
+def _serve_flags(*, quant: str | None, dtype: str | None, max_model_len: int, port: int,
+                 gpu_mem, serve_extra: str) -> str:
+    """The `vllm serve` flags for the server this sweep starts and stops itself.
+
+    ``--dtype`` matters here more than anywhere: this task produces the decode tok/s in the
+    README's picker table, and without the flag the server takes vLLM's ``auto`` — the
+    checkpoint's declared bf16 — while `glq-chat` serves the dtype `preferred_dtype` chose.
+    The published speed would then describe a configuration no user runs. Omitted rather than
+    passed as ``auto`` when unset, following the same rule as ``kv_cache_dtype``: "auto" is
+    not the same thing to every engine version.
+    """
+    from ..runtime import is_baseline_quant
+    flags = f"--max-model-len {max_model_len} --port {port}"
+    if not is_baseline_quant(quant):
+        flags += f" --quantization {quant}"
+    if dtype:
+        flags += f" --dtype {dtype}"
+    if gpu_mem is not None:
+        flags += f" --gpu-memory-utilization {float(gpu_mem)}"
+    if serve_extra:
+        flags += f" {serve_extra}"
+    return flags
+
+
 def run(ctx, config: dict):
     concurrencies = [int(c) for c in config.get("concurrencies", [1, 32])]
     num_runs = int(config.get("num_runs", 3))
@@ -121,13 +145,9 @@ def run(ctx, config: dict):
             "pip install pandas")
 
     vllm = _resolve_vllm()
-    serve_flags = f"--max-model-len {max_model_len} --port {port}"
-    if ctx.quant and ctx.quant not in ("none", "bf16"):
-        serve_flags += f" --quantization {ctx.quant}"
-    if gpu_mem is not None:
-        serve_flags += f" --gpu-memory-utilization {float(gpu_mem)}"
-    if serve_extra:
-        serve_flags += f" {serve_extra}"
+    serve_flags = _serve_flags(quant=ctx.quant, dtype=getattr(ctx, "dtype", None),
+                               max_model_len=max_model_len, port=port, gpu_mem=gpu_mem,
+                               serve_extra=serve_extra)
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = os.path.join(tmp, "bench_params.json")

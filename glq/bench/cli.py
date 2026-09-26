@@ -51,7 +51,7 @@ def _cmd_run(args) -> int:
     recs = runner.run(
         model=args.model, tasks=tasks, quant=args.quant, runtime=args.runtime,
         n=args.n, budget=args.budget, avg_k=args.avg_k, gpu_mem_util=args.gpu_mem_util,
-        max_num_seqs=args.max_num_seqs,
+        max_num_seqs=args.max_num_seqs, dtype=args.dtype,
         max_model_len=args.max_model_len, kv_cache_dtype=args.kv_cache_dtype,
         hf_token=None, task_config=task_config,
     )
@@ -165,6 +165,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "when gpu-mem-util has no room left. Lower also shrinks the "
                         "per-step logits buffer, which matters on large vocabularies.")
     r.add_argument("--max-model-len", dest="max_model_len", type=int, default=None)
+    r.add_argument("--dtype", default=None,
+                   help="engine dtype for vLLM-backed tasks (float16|bfloat16|float32). "
+                        "Default: glq.tooling.preferred_dtype for the model. "
+                        "runtime.build_llm_kwargs always accepted this; it simply was "
+                        "not reachable, so every vLLM-backed number was bf16 whether or "
+                        "not that was the right dtype for the model.")
     # An engine argument, not an env var: selecting a KV dtype any other way
     # runs bf16 and reports it as a KV-quantization result.
     r.add_argument("--kv-cache-dtype", dest="kv_cache_dtype", default=None,
