@@ -27,7 +27,7 @@ import urllib.request
 from collections import deque
 from pathlib import Path
 
-from glq import kv_compression
+from glq import kv_compression, tooling
 
 #: vLLM's own default is 0.9 of *total* VRAM, which is the right call for a dedicated
 #: inference box and the wrong one for a desktop. A GLQ checkpoint is small by construction —
@@ -484,6 +484,14 @@ class VllmSupervisor:
     # ------------------------------------------------------------------ lifecycle
 
     def argv(self) -> list[str]:
+        # --dtype is passed explicitly rather than left to vLLM's `auto`, which reads the
+        # checkpoint's declared bf16. bf16 is aligned with NEITHER kernel path (CUDA computes
+        # fp16, CPU computes fp32), so it pays conversions everywhere and was measured slowest
+        # on both: fp16 is +12.8% on an RTX PRO 6000 at IDENTICAL footprint, and +7.6% on a
+        # Xeon 8559C. `preferred_dtype` returns bf16 for the architectures where fp16 would
+        # NaN, so this is a speed win that costs neither quality nor correctness.
+        # An explicit --dtype in extra_args still wins: vLLM takes the last occurrence.
+        dtype = tooling.preferred_dtype(self.model, self.device)
         if self.device == "cpu":
             # --gpu-memory-utilization means nothing to the CPU backend, and its
             # fullgraph compile cannot trace the fused CPU decode path — --enforce-eager
@@ -491,6 +499,7 @@ class VllmSupervisor:
             # (VLLM_CPU_KVCACHE_SPACE), not a flag.
             return [self.vllm_bin, "serve", self.model,
                     "--quantization", "glq",
+                    "--dtype", dtype,
                     "--port", str(self.port),
                     "--enforce-eager",
                     "--max-model-len", str(self.max_model_len),
@@ -498,6 +507,7 @@ class VllmSupervisor:
                     *self.extra_args]
         return [self.vllm_bin, "serve", self.model,
                 "--quantization", "glq",
+                "--dtype", dtype,
                 "--port", str(self.port),
                 "--gpu-memory-utilization", str(self.gpu_memory_utilization),
                 "--max-model-len", str(self.max_model_len),
