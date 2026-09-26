@@ -986,12 +986,28 @@ def test_older_cards_are_left_alone_even_without_nvcc():
     assert flashinfer_env(compute_cap="8.9", have_nvcc=False) == {}
 
 
-def test_unknown_capability_changes_nothing():
-    """No driver, no nvidia-smi, or an unparseable answer: do not silently alter vLLM's
-    sampler on a guess."""
+def test_an_unparseable_capability_changes_nothing():
+    """Do not silently alter vLLM's sampler on a guess."""
     from glq.supervisor import flashinfer_env
-    assert flashinfer_env(compute_cap=None, have_nvcc=False) == {}
     assert flashinfer_env(compute_cap="banana", have_nvcc=False) == {}
+
+
+def test_no_driver_changes_nothing(monkeypatch):
+    """The "no nvidia-smi" case, which `compute_cap=None` CANNOT express.
+
+    `None` is the autodetect sentinel: `flashinfer_env` (glq/supervisor.py:210) reads it as
+    "go and look", so passing it tests detection rather than absence. On a machine without a
+    driver `_compute_cap()` also returns None and the old assertion passed by coincidence; on
+    the GPU box detection answers "12.0" and the same call correctly returns the override —
+    which is how this test failed there while being green everywhere it had ever run.
+
+    Patch the detector instead, which is what "no driver" actually means.
+    """
+    import glq.supervisor as S
+    monkeypatch.setattr(S, "_compute_cap", lambda: None)
+    monkeypatch.setattr(S, "_nvcc_present", lambda: False)
+    monkeypatch.setattr(S, "_ninja_present", lambda: False)
+    assert S.flashinfer_env() == {}
 
 
 def test_newer_than_blackwell_also_falls_back():
