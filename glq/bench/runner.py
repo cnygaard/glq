@@ -27,6 +27,9 @@ class RunContext:
     hf_token: str | None
     gpu_mem_util: float
     max_model_len: int | None
+    dtype: str | None = None         # resolved engine dtype; adapters that start their own
+                                     # server (kind="throughput") must pass it on, or the
+                                     # published number describes a dtype nobody serves
     handle: Any = None               # runtime.LoadedModel for quality tasks
     standalone_serving: ServingMeta | None = None   # set by hf/throughput adapters
     pbar_factory: Any = None         # per-task vLLM use_tqdm= heartbeat factory
@@ -66,6 +69,7 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
         runtime: str = "vllm", n: int | None = None, budget: int | None = None,
         avg_k: int = 1, gpu_mem_util: float = 0.9, max_model_len: int | None = None,
         max_num_seqs: int = 64,
+        dtype: str | None = None,
         kv_cache_dtype: str | None = None,
         hf_token: str | None = None,
         task_config: dict | None = None) -> list[BenchRecord]:
@@ -82,6 +86,20 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
     hw = hardware_snapshot()
     mm = model_meta(model, quant_override=quant, hf_token=hf_token)
     eff_quant = quant or mm.quant_method
+    # One source with the serving path, so a published tok/s describes what glq-chat runs.
+    # Without this the engine took build_llm_kwargs' hardcoded bf16 -- on CUDA that is the
+    # dtype GLQ's kernels do NOT compute in, so every vLLM-backed record was measured with a
+    # conversion at every quantized layer.
+    #
+    # A baseline arm stays bf16. `preferred_dtype` keys on the repo id, which says nothing
+    # about --quant none, and the fp16-gated fast paths GLQ skips are the ones an unquantized
+    # model needs (runtime.is_baseline_quant documents the case). Serving the reference in
+    # fp16 would slow only the arm GLQ is compared against -- bias with a direction, which is
+    # worse than noise. Each arm gets the dtype that is actually best for it.
+    from . import runtime as rt
+    from ..tooling import preferred_dtype
+    eff_dtype = dtype or ("bfloat16" if rt.is_baseline_quant(eff_quant)
+                          else preferred_dtype(model, "cuda"))
 
     specs = [get_task(t) for t in tasks]
     quality = [s for s in specs if s.kind == "quality"]
@@ -90,7 +108,7 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
 
     ctx = RunContext(model=model, quant=eff_quant, arch=mm.architecture,
                      hf_token=hf_token, gpu_mem_util=gpu_mem_util,
-                     max_model_len=max_model_len)
+                     max_model_len=max_model_len, dtype=eff_dtype)
     records: list[BenchRecord] = []
 
     def _record(s, idx, total, kind_serving):
@@ -114,13 +132,12 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
                                     overrides=task_config).get("budget", 16384))
                    for s in quality]
         mml = max_model_len or (max(budgets) + 4096)
-        from . import runtime as rt
         log_ts(f"loading vLLM engine for {len(quality)} quality task(s) "
                f"(max_model_len={mml})…")
         t0 = time.time()
         ctx.handle = rt.load(model, quant=eff_quant, max_model_len=mml,
                              gpu_mem_util=gpu_mem_util, arch=mm.architecture,
-                             max_num_seqs=max_num_seqs,
+                             max_num_seqs=max_num_seqs, dtype=eff_dtype,
                              kv_cache_dtype=kv_cache_dtype)
         log_ts(f"engine ready: weights {ctx.handle.serving.load_gpu_mem_gib} GiB "
                f"loaded in {_fmt(time.time() - t0)}")

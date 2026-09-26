@@ -28,7 +28,8 @@ SH = pytest.importorskip("spot_hunter",
 
 # ---- the lineups are well-formed ---------------------------------------------------------
 
-@pytest.mark.parametrize("lineup", ["DEFAULT_TYPES", "DEFAULT_CPU_TYPES"])
+@pytest.mark.parametrize("lineup", ["DEFAULT_TYPES", "DEFAULT_CPU_TYPES",
+                                    "DEFAULT_METAL_TYPES"])
 def test_every_instance_type_can_actually_match(lineup):
     """A merged or space-padded entry matches nothing and fails SILENTLY: AWS treats an
     unknown instance type as a filter that returns no rows."""
@@ -68,6 +69,136 @@ def test_the_declared_tiers_are_ones_the_kernel_actually_has():
 
 def test_unknown_families_report_a_question_mark_rather_than_guessing():
     assert SH._cpu_cols("zz9.2xlarge") == ("?", "?")
+
+
+# ---- bare metal (--metal) ----------------------------------------------------------------
+
+#: The sizes this flag exists to price. Both spellings are real and both must pass: older
+#: families are a bare `.metal`, newer ones carry the socket count.
+METAL_SIZES = ["c7i.metal-24xl", "r8a.metal-24xl", "m7i.metal-24xl",
+               "m8azn.metal-12xl", "m8a.metal-24xl", "m8azn.metal-24xl",
+               "c5.metal", "m6i.metal"]
+
+
+@pytest.mark.parametrize("itype", METAL_SIZES)
+def test_metal_sizes_are_recognised(itype):
+    """Before --metal existed the regex only knew `[0-9]*x?large`, so every metal row warned
+    'will never match' on every run — the standing noise the regex exists to prevent."""
+    assert SH._TYPE_RE.match(itype), itype
+
+
+@pytest.mark.parametrize("itype", [
+    "c7i.metal-24xlarge",   # metal sizes are `xl`, not `xlarge`
+    "c7i.metal-",           # dangling separator
+    "c7i.metalx",           # not a size
+    "c7i.24xl",             # `xl` is metal-only; a virtual size is `24xlarge`
+    "c7i.metal-24xl ",      # trailing space, the documented silent-vanish
+])
+def test_widening_the_regex_did_not_make_it_accept_junk(itype):
+    """The regex earns its place by REJECTING things. Adding the metal spellings must not
+    turn it into a rubber stamp, or the missing-comma trap comes back unnoticed."""
+    assert not SH._TYPE_RE.match(itype), itype
+
+
+def test_the_metal_lineup_holds_no_gpu_families():
+    overlap = [t for t in SH.DEFAULT_METAL_TYPES if SH._family(t) in set(SH.GPU_INFO)]
+    assert not overlap, overlap
+
+
+def test_the_metal_lineup_is_x86_only():
+    """Same reason as the CPU lineup: the wheels are manylinux_2_28_x86_64 and the SIMD
+    tiers are x86 intrinsics."""
+    arm = [t for t in SH.DEFAULT_METAL_TYPES
+           if SH._family(t).endswith("g") or SH._family(t).endswith("gd")]
+    assert not arm, f"ARM families in the metal lineup: {arm}"
+
+
+def test_every_metal_family_declares_its_simd_tier():
+    missing = sorted({SH._family(t) for t in SH.DEFAULT_METAL_TYPES} - set(SH.CPU_INFO))
+    assert not missing, f"families with no CPU_INFO entry: {missing}"
+
+
+def test_turin_is_not_claimed_to_have_fp16():
+    """AVX512_FP16 is believed Intel-only (Sapphire Rapids and newer). Understating is the
+    safe direction: the module's rule is that a wrong ISA claim sends someone to a box whose
+    decode is a tier slower than the table promised. If Turin turns out to have it,
+    `glq_cpu_active_isa()` on the box is the authority — not this table."""
+    for family in ("m8a", "r8a", "c8a", "m8azn"):
+        cpu, isa = SH.CPU_INFO[family]
+        assert "Turin" in cpu, family
+        assert isa == "avx512", f"{family} claims {isa!r}; FP16 is unverified on Zen 5"
+
+
+# ---- the silent-no-match failure, from the other end -------------------------------------
+
+def test_a_requested_type_that_never_priced_is_named():
+    """`_validate_types` catches malformed spellings; this catches well-formed WRONG ones — a
+    retired size, a typo'd socket count, or a family not offered in the scanned regions. AWS
+    treats an unknown type as a filter matching nothing, so without this it vanishes."""
+    rows = [{"instance": "c7i.metal-24xl"}]
+    missing = SH.report_unpriced(["c7i.metal-24xl", "m8a.metal-96xl"], rows)
+    assert missing == ["m8a.metal-96xl"]
+
+
+def test_nothing_is_reported_when_every_type_priced(capsys):
+    rows = [{"instance": "c5.metal"}, {"instance": "m6i.metal"}]
+    assert SH.report_unpriced(["c5.metal", "m6i.metal"], rows) == []
+    assert capsys.readouterr().err == "", "silence when there is nothing to report"
+
+
+# ---- specs are region-scoped, even though the values are not -----------------------------
+
+def _fake_specs_boto3(catalogue):
+    """boto3 whose describe_instance_types knows only `catalogue[region]`, and raises for
+    the whole call on anything else — which is exactly what AWS does."""
+    import types as _t
+
+    class _Client:
+        def __init__(self, region):
+            self.region = region
+
+        def describe_instance_types(self, InstanceTypes):  # noqa: N803 - boto3's casing
+            known = catalogue.get(self.region, set())
+            bad = [t for t in InstanceTypes if t not in known]
+            if bad:
+                raise RuntimeError(f"InvalidInstanceType: do not exist: {bad}")
+            return {"InstanceTypes": [
+                {"InstanceType": t, "VCpuInfo": {"DefaultVCpus": 96},
+                 "MemoryInfo": {"SizeInMiB": 192 * 1024}} for t in InstanceTypes]}
+
+    fake = _t.ModuleType("boto3")
+    fake.Session = lambda **kw: _t.SimpleNamespace(
+        client=lambda _svc, region_name: _Client(region_name))
+    return fake
+
+
+def test_specs_are_asked_of_each_region_about_only_its_own_types():
+    """`describe_instance_types` only knows the types OFFERED in the region it is called
+    against, and rejects the WHOLE call for the rest. This used to be one call in whichever
+    region happened to be cheapest, so a single type priced only elsewhere blanked vCPU and
+    RAM for every row. --metal hits it constantly: metal availability varies far more by
+    region than virtual does."""
+    catalogue = {"eu-north-1": {"c5.metal"}, "eu-west-1": {"m8a.metal-24xl"}}
+    sys.modules["boto3"] = _fake_specs_boto3(catalogue)
+    try:
+        specs = SH.fetch_specs(
+            {"eu-north-1": ["c5.metal"], "eu-west-1": ["m8a.metal-24xl"]}, {})
+    finally:
+        del sys.modules["boto3"]
+    assert set(specs) == {"c5.metal", "m8a.metal-24xl"}, \
+        "a type priced in one region must get its specs from THAT region"
+
+
+def test_one_region_failing_does_not_blank_the_others():
+    """Best-effort per region: a table with some specs beats one with none."""
+    catalogue = {"eu-north-1": {"c5.metal"}}          # eu-west-1 knows nothing -> raises
+    sys.modules["boto3"] = _fake_specs_boto3(catalogue)
+    try:
+        specs = SH.fetch_specs(
+            {"eu-north-1": ["c5.metal"], "eu-west-1": ["m8a.metal-24xl"]}, {})
+    finally:
+        del sys.modules["boto3"]
+    assert set(specs) == {"c5.metal"}
 
 
 # ---- row shape ---------------------------------------------------------------------------
@@ -142,6 +273,10 @@ def test_the_generated_tf_still_says_gpu_by_default():
     (["--isa", "avx512"], "only applies with --cpu-only"),
     (["--cpu-only", "--cc", "sm_89"], "filter with --isa"),
     (["--cpu-only", "--vram", "24"], "CPU instances have none"),
+    # --metal implies --cpu-only, so it must inherit the same guards rather than silently
+    # accepting GPU filters that can never match a metal CPU box.
+    (["--metal", "--cc", "sm_89"], "filter with --isa"),
+    (["--metal", "--vram", "24"], "CPU instances have none"),
 ])
 def test_mismatched_filters_are_refused_with_an_explanation(argv, expected):
     """These combinations are silently empty result sets otherwise — the reader is left
@@ -150,6 +285,63 @@ def test_mismatched_filters_are_refused_with_an_explanation(argv, expected):
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode != 0
     assert expected in proc.stderr, proc.stderr
+
+
+def _selected_lineup(argv):
+    """Which types main() would price, with the AWS calls stubbed out.
+
+    Exercises the real argument wiring rather than re-deriving it: the flag ordering is the
+    bug risk here, since --metal implies --cpu-only and would never reach its own lineup if
+    the branches were checked the other way round.
+    """
+    import types as _t
+    seen: list[list[str]] = []
+
+    def _fake_latest_prices(region, types, product, session_kwargs, cpu_only=False):
+        seen.append(list(types))
+        return []
+
+    orig = SH.latest_prices
+    SH.latest_prices = _fake_latest_prices
+    argv_orig = sys.argv
+    sys.argv = ["spot_hunter.py", "--regions", "eu-north-1", *argv]
+    fake = _t.ModuleType("boto3")
+    fake.Session = lambda **kw: _t.SimpleNamespace(client=lambda *a, **k: None)
+    sys.modules["boto3"] = fake
+    try:
+        SH.main()
+    except SystemExit:
+        pass
+    finally:
+        SH.latest_prices = orig
+        sys.argv = argv_orig
+        sys.modules.pop("boto3", None)
+    return seen[0] if seen else []
+
+
+def test_metal_selects_the_metal_lineup_not_the_cpu_one():
+    """--metal sets cpu_only, so if the lineup branches were ordered the other way it would
+    silently price the virtual CPU lineup and nobody would notice from the output."""
+    types = _selected_lineup(["--metal"])
+    assert "c7i.metal-24xl" in types
+    assert "m8azn.metal-12xl" in types
+    assert not any(t.endswith("xlarge") for t in types), \
+        f"virtual sizes leaked into the metal hunt: {[t for t in types if t.endswith('xlarge')]}"
+
+
+def test_cpu_only_is_unaffected_by_the_new_flag():
+    types = _selected_lineup(["--cpu-only"])
+    assert types == SH.DEFAULT_CPU_TYPES
+    assert not any(".metal" in t for t in types)
+
+
+def test_an_explicit_instance_type_still_overrides_metal():
+    assert _selected_lineup(["--metal", "--instance-types", "r8a.metal-24xl"]) == \
+        ["r8a.metal-24xl"]
+
+
+def test_the_default_hunt_is_still_gpu():
+    assert _selected_lineup([]) == SH.DEFAULT_TYPES
 
 
 # ---- --try-create: walking the price ladder ---------------------------------------------
@@ -330,6 +522,183 @@ def test_probes_are_confined_to_the_scanned_regions(monkeypatch):
     SH.try_create(rows, {}, max_price=2.0)
     assert set(touched) <= scanned, f"probed outside the scan: {set(touched) - scanned}"
     assert touched, "the walk did not probe at all"
+
+
+# ---- --list-running: "is anything of mine still up" -------------------------------------
+#
+# A different question from --cleanup-probes, which only matches the glq-spot-probe tag. The
+# case that prompted this flag was a real box left running under an OpenTofu Name, which the
+# probe sweep reported as absent because it never looked for it.
+
+def _fake_ec2(instances_by_region, terminated=None, regions=None):
+    """boto3 whose describe_instances honours the tag + state filters, like AWS does."""
+    import types as _t
+
+    class _Paginator:
+        def __init__(self, region, filters):
+            self.region, self.filters = region, filters
+
+        def paginate(self, **kw):
+            want = {f["Name"]: f["Values"] for f in self.filters}
+            out = []
+            for inst in instances_by_region.get(self.region, []):
+                if "tag:Name" in want and inst.get("_name") not in want["tag:Name"]:
+                    continue
+                if inst["State"]["Name"] not in want["instance-state-name"]:
+                    continue
+                out.append(inst)
+            return [{"Reservations": [{"Instances": out}]}] if out else [{"Reservations": []}]
+
+    class _Client:
+        def __init__(self, region):
+            self.region = region
+
+        def get_paginator(self, _name):
+            region = self.region
+
+            class _P:  # boto3 takes the filters on paginate(), not get_paginator()
+                def paginate(self, Filters=None, **kw):  # noqa: N803 - boto3's casing
+                    return _Paginator(region, Filters or []).paginate()
+            return _P()
+
+        def describe_regions(self, AllRegions=False):  # noqa: N803
+            return {"Regions": regions or []}
+
+        def terminate_instances(self, InstanceIds):  # noqa: N803
+            if terminated is not None:
+                terminated.extend(InstanceIds)
+            return {}
+
+    fake = _t.ModuleType("boto3")
+    fake.Session = lambda **kw: _t.SimpleNamespace(
+        client=lambda _svc, region_name=None, **k: _Client(region_name),
+        get_available_regions=lambda _svc: list(instances_by_region))
+    return fake
+
+
+def _inst(iid, itype="g6e.2xlarge", state="running", life="spot", name="-"):
+    return {"InstanceId": iid, "InstanceType": itype, "State": {"Name": state},
+            "InstanceLifecycle": life, "LaunchTime": SH.dt.datetime(2026, 9, 25, 19, 48,
+                                                                   tzinfo=SH.dt.timezone.utc),
+            "PublicIpAddress": "13.60.87.125",
+            "Tags": [{"Key": "Name", "Value": name}], "_name": name}
+
+
+def test_the_sweep_finds_a_box_the_probe_tag_filter_misses():
+    """THE case this flag exists for. A box stood up by OpenTofu carries its own Name, so
+    --cleanup-probes reports a clean bill of health while it is still billing."""
+    inst = _inst("i-091e3dc56e0e31b48", name="golay-leech-quant-eval")
+    sys.modules["boto3"] = _fake_ec2({"eu-north-1": [inst]})
+    try:
+        untagged = SH.sweep_instances(["eu-north-1"], {})
+        probe_only = SH.sweep_instances(["eu-north-1"], {}, tag=SH.PROBE_TAG_NAME)
+    finally:
+        del sys.modules["boto3"]
+    assert [r["id"] for r in untagged] == ["i-091e3dc56e0e31b48"]
+    assert probe_only == [], "the probe-tag sweep must NOT see a differently-tagged box"
+
+
+def test_the_sweep_reports_lifecycle_so_spot_is_distinguishable():
+    """'Are there stray SPOT instances' turns on this field; AWS omits it for on-demand."""
+    od = _inst("i-ondemand", name="build")
+    del od["InstanceLifecycle"]
+    sys.modules["boto3"] = _fake_ec2({"eu-west-1": [_inst("i-spot"), od]})
+    try:
+        rows = {r["id"]: r["life"] for r in SH.sweep_instances(["eu-west-1"], {})}
+    finally:
+        del sys.modules["boto3"]
+    assert rows == {"i-spot": "spot", "i-ondemand": "on-demand"}
+
+
+def test_the_sweep_terminates_nothing():
+    """Read-only is the contract: --list-running must be safe to run without thinking."""
+    killed = []
+    sys.modules["boto3"] = _fake_ec2({"eu-north-1": [_inst("i-1")]}, terminated=killed)
+    try:
+        SH.sweep_instances(["eu-north-1"], {})
+    finally:
+        del sys.modules["boto3"]
+    assert killed == [], "the sweep called terminate_instances"
+
+
+def test_cleanup_still_terminates_through_the_shared_sweep():
+    """The refactor must not have turned cleanup into a no-op."""
+    killed = []
+    probe = _inst("i-probe", name=SH.PROBE_TAG_NAME)
+    sys.modules["boto3"] = _fake_ec2({"eu-north-1": [probe]}, terminated=killed)
+    try:
+        assert SH.cleanup_probes(["eu-north-1"], {}) == 1
+    finally:
+        del sys.modules["boto3"]
+    assert killed == ["i-probe"]
+
+
+def test_enabled_regions_skips_the_ones_that_cannot_hold_an_instance():
+    """A not-opted-in region cannot hold an instance, so scanning it only produces
+    AuthFailure noise — the standing error that trains a reader to ignore errors."""
+    regions = [{"RegionName": "us-east-1", "OptInStatus": "opt-in-not-required"},
+               {"RegionName": "eu-south-2", "OptInStatus": "opted-in"},
+               {"RegionName": "eu-south-1", "OptInStatus": "not-opted-in"},
+               {"RegionName": "ap-south-1", "OptInStatus": "opt-in-not-required"}]
+    sys.modules["boto3"] = _fake_ec2({}, regions=regions)
+    try:
+        got = SH.enabled_regions({})
+    finally:
+        del sys.modules["boto3"]
+    assert got == ["eu-south-2", "us-east-1"], got
+    assert "eu-south-1" not in got and "ap-south-1" not in got
+
+
+def test_a_clean_bill_of_health_says_what_it_covers(capsys):
+    """"Nothing running" is only meaningful with the scope attached — the same reasoning
+    cleanup_probes' own output already follows."""
+    SH.print_running([], ["us-east-1", "eu-west-1"])
+    out = capsys.readouterr().out
+    assert "us-east-1" in out and "eu-west-1" in out and "2 region(s)" in out
+
+
+def test_list_running_defaults_to_everywhere_not_the_hunt_default(monkeypatch):
+    """--regions defaults to two cheap regions for a HUNT; for 'is anything of mine running'
+    that would print a clean bill of health with a box up in us-east-1."""
+    seen = {}
+    monkeypatch.setattr(SH, "enabled_regions", lambda kw, **k: ["us-east-1", "eu-west-1"])
+    monkeypatch.setattr(SH, "sweep_instances",
+                        lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
+    monkeypatch.setattr(SH, "print_running", lambda rows, scope: None)
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
+    monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--list-running"])
+    SH.main()
+    assert seen["scope"] == ["us-east-1", "eu-west-1"]
+    assert SH.DEFAULT_REGIONS != seen["scope"], "must not silently use the hunt default"
+
+
+def test_list_running_honours_an_explicit_region(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(SH, "enabled_regions",
+                        lambda kw, **k: pytest.fail("should not widen when told a region"))
+    monkeypatch.setattr(SH, "sweep_instances",
+                        lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
+    monkeypatch.setattr(SH, "print_running", lambda rows, scope: None)
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
+    monkeypatch.setattr(sys, "argv",
+                        ["spot_hunter.py", "--list-running", "--regions", "us-west-2"])
+    SH.main()
+    assert seen["scope"] == ["us-west-2"]
+
+
+def test_the_hunt_still_defaults_to_the_two_cheap_regions(monkeypatch):
+    """Guards the --regions default=None change: every non-list path must be unaffected."""
+    seen = {}
+    monkeypatch.setattr(SH, "latest_prices",
+                        lambda r, t, p, kw, cpu_only=False: seen.setdefault(
+                            "regions", []).append(r) or [])
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
+    monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--cpu-only"])
+    try:
+        SH.main()
+    except SystemExit:
+        pass
+    assert sorted(seen["regions"]) == sorted(SH.DEFAULT_REGIONS)
 
 
 def test_cleanup_names_the_regions_it_swept(capsys):

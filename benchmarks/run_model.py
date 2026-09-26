@@ -294,10 +294,10 @@ def run_vllm(args, failures):
         tps, ttft_ms, ntok, degraded, spread = _two_point(
             gen, b, args.decode, repeats=args.repeats, warmup=args.warmup)
         note = " (prefill NOT isolated: decode too fast to separate)" if degraded else ""
-        rng = (f" tokps_range={spread[0]:.1f}-{spread[1]:.1f} n_repeats={args.repeats}"
+        rng = (f" tokps_range={spread[0]:.3f}-{spread[1]:.3f} n_repeats={args.repeats}"
                if args.repeats > 1 else "")
         print(f"RESULT label={args.label} model={args.model} batch={b} "
-              f"total_decode_tokps={tps:.1f} per_seq_tokps={tps / b:.1f} "
+              f"total_decode_tokps={tps:.3f} per_seq_tokps={tps / b:.3f} "
               f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{rng}{note}", flush=True)
 
 
@@ -480,10 +480,10 @@ def run_hf(args, failures):
         tps, ttft_ms, ntok, degraded, spread = _two_point(
             gen, b, args.decode, repeats=args.repeats, warmup=args.warmup)
         note = " (prefill NOT isolated)" if degraded else ""
-        rng = (f" tokps_range={spread[0]:.1f}-{spread[1]:.1f} n_repeats={args.repeats}"
+        rng = (f" tokps_range={spread[0]:.3f}-{spread[1]:.3f} n_repeats={args.repeats}"
                if args.repeats > 1 else "")
         print(f"RESULT label={args.label} model={args.model} runtime=hf batch={b} "
-              f"total_decode_tokps={tps:.1f} per_seq_tokps={tps / b:.1f} "
+              f"total_decode_tokps={tps:.3f} per_seq_tokps={tps / b:.3f} "
               f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{rng}{note}", flush=True)
     if on_cuda:
         print(f"PEAK_ALLOC_GIB {torch.cuda.max_memory_allocated() / 2 ** 30:.2f}", flush=True)
@@ -526,9 +526,12 @@ def build_parser():
                          "each forward pass. Not free VRAM: it trades bandwidth for "
                          "capacity, so it suits prefill-bound work (perplexity) far "
                          "better than decode. 0 = off.")
-    ap.add_argument("--dtype", default="bfloat16",
-                    help="float16 is required by some GLQ kernels; bf16-native models "
-                         "(Mistral/Ministral) NaN in fp16 on activation outliers")
+    ap.add_argument("--dtype", default=None,
+                    help="default: glq.tooling.preferred_dtype(model, device) -- fp16, which "
+                         "is what GLQ's CUDA kernels already compute in (and beats bf16 on "
+                         "CPU too), except for architectures where fp16 NaNs on activation "
+                         "outliers. bf16 is aligned with neither kernel path and was measured "
+                         "slowest on both")
     ap.add_argument("--capture-sizes", default=None,
                     help="override cudagraph capture sizes (default covers --batches)")
     ap.add_argument("--eager", action="store_true", help="skip CUDA graphs (eager numbers "
@@ -545,6 +548,15 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+
+    # Resolve --dtype from the one family-aware source, so the harness and `glq-chat` cannot
+    # drift on which dtype a model is measured versus served with. Device-aware because the
+    # aligned dtype differs by path: CUDA kernels compute fp16, CPU kernels compute fp32.
+    if args.dtype is None:
+        from glq.tooling import preferred_dtype
+        device = "cuda" if is_cuda_device(args.device_map) else "cpu"
+        args.dtype = preferred_dtype(args.model, device)
+        print(f"DTYPE {args.dtype} (default for {device}; override with --dtype)", flush=True)
 
     failures = []
     (run_hf if args.runtime == "hf" else run_vllm)(args, failures)
