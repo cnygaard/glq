@@ -116,10 +116,22 @@ def ensure_gemma4_template(templates_dir=None, fetch=_fetch) -> Path:
 #: Mode 3 was the reason to doubt a denylist, so it was measured rather than argued: forcing
 #: the Triton GDN path on Qwen3.8-Flash-Next-GLQ-3bpw (both arms bf16, sm_120, vLLM 0.29.0,
 #: decode 64, repeats 3) cost -0.26% at B=1 -- 32.035 vs 31.951 tok/s with overlapping
-#: ranges, and triton marginally AHEAD at B=8. On a GLQ checkpoint decode is dominated by the
-#: trellis dequant+matvec, not the GDN recurrence, which is the same reason the CPU GDN
-#: kernel's in-situ share is ~0%. So the silent mode exists but is cheap, and that -- not its
-#: nonexistence -- is what makes a denylist acceptable here.
+#: ranges, and triton marginally AHEAD at B=8.
+#:
+#: A null that small is indistinguishable from a flag that does nothing, and vLLM's init-time
+#: "GDN decode kernel: …" line proves only that the flag was SET. So the substitution was
+#: confirmed at the op level (`benchmarks/_gdn_cuda_engagement.py`, in-process + eager so the
+#: calls are visible; a FULL cudagraph replay does not re-enter Python):
+#:
+#:   kernel=cuda    qwen_gdn_attention_core 0 calls   ..._fused_norm_packed 1536 calls
+#:   kernel=triton  qwen_gdn_attention_core 1536      ..._fused_norm_packed 0
+#:
+#: 1536 = 48 GDN layers x 32 decode tokens: a complete swap, so the flag does change what
+#: runs. The op is **0.70-0.82% of total device time**, which caps any end-to-end effect at
+#: ~0.8% and explains the null instead of merely reporting it. On a GLQ checkpoint decode is
+#: dominated by the trellis dequant+matvec, not the GDN recurrence -- the same reason the CPU
+#: GDN kernel's in-situ share is ~0%. So the silent mode exists but is cheap, and that -- not
+#: its nonexistence -- is what makes a denylist acceptable here.
 FP16_UNSAFE = (
     # Activation outliers exceed fp16's 65504 range -> hard NaN. The observed case; see
     # glq/quantized_linear.py's fp32-accum note and the GLQ fp16-overflow finding.
