@@ -130,10 +130,12 @@ def test_an_unknown_family_gets_the_device_default_not_a_refusal():
     """Deliberately a DENYLIST, unlike `tool_serve_args` which refuses unknown families.
 
     The original justification was that a wrong dtype cannot fail silently. That is false —
-    see `_DEFAULT_DTYPE`'s note on the third failure mode. It survives as a denylist because
+    see `FP16_UNSAFE`'s note on the third failure mode. It survives as a denylist because
     that silent mode was MEASURED and is small: forcing the Triton GDN decode path instead
     of the fused CUDA one cost -0.26% at B=1 on a GLQ checkpoint (32.035 vs 31.951 tok/s,
-    overlapping ranges over 3 repeats).
+    overlapping ranges over 3 repeats), and the substitution was confirmed at the op level
+    (1536 calls moving cleanly between the two custom ops) with the op measuring 0.70-0.82%
+    of device time — so ~0.8% is the ceiling on the whole effect, not just what one run saw.
     """
     assert preferred_dtype("someorg/BrandNewArch-9B-GLQ-4bpw", "cuda") == "float16"
     assert preferred_dtype("someorg/BrandNewArch-9B-GLQ-4bpw", "cpu") == "bfloat16"
