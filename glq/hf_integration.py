@@ -742,13 +742,25 @@ class GLQQuantizer(HfQuantizer):
         # Hadamard over blocks_m derived from out_features -- so a 704-row half decodes
         # under [512,128,64] where the codes live in the 2I-row basis [1024,256,128], and
         # the weights come out wrong with a completely clean load report.
-        from .fused_experts import _GatedExpertPair
+        from .fused_experts import GLQStackedGatedExperts, _GatedExpertPair
+        # When the fused CPU MoE path is wanted, fuse STRAIGHT INTO the stacked buffers the
+        # op needs. The two-step route (fuse per expert, then re-home into the stacked
+        # buffer) reaches the same state but allocates the expert bytes twice on the way,
+        # and glibc hands only ~72% of the freed half back -- measured +2.26 GiB of RSS on
+        # gemma-4-26B-A4B. Falls through to the per-expert fuse on any refusal, so an
+        # ineligible layer behaves exactly as before.
+        n_stacked = 0
+        if os.environ.get("GLQ_HF_MOE_CPU_FUSED", "0") != "0":
+            for m in model.modules():
+                if isinstance(m, GLQStackedGatedExperts) and m.fuse_into_stacked() is None:
+                    n_stacked += 1
         n_fusedgu = sum(1 for m in model.modules()
                         if isinstance(m, _GatedExpertPair) and m.fuse_gate_up())
-        if n_fusedgu:
+        if n_fusedgu or n_stacked:
             import logging
             logging.getLogger(__name__).debug(
-                "GLQ: fused gate/up for %d experts", n_fusedgu)
+                "GLQ: fused gate/up for %d experts; %d container(s) fused directly into "
+                "their stacked buffers", n_fusedgu, n_stacked)
         for module in model.modules():
             if isinstance(module, TrellisRHTEmbedding):
                 module.variant = emb_variant

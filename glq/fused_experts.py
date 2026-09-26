@@ -505,13 +505,19 @@ class _GatedExpertPair(nn.Module):
                                    codebook_type=codebook_type)
         self._fused = False
 
-    def fuse_gate_up(self) -> bool:
+    def fuse_gate_up(self, skip: tuple[str, ...] = ()) -> bool:
         """Concatenate the loaded gate/up halves into the fused projection, then drop them.
 
         Row artifacts concatenate gate-first (the native forward chunks the output, so gate
         is rows ``0:I`` -- the order ``_split_gate_up_arts(arts, inter, inter)`` wrote).
         Everything else is a shared artifact the splitter cloned to both halves, so gate's
         copy wins. Idempotent.
+
+        ``skip`` names artifacts the caller has already placed itself.
+        :meth:`GLQStackedGatedExperts.fuse_into_stacked` uses it for the packed codes: it
+        copies the halves straight into the stacked buffer, and without the skip this would
+        `cat` them into a fresh per-expert buffer first only to have it replaced and freed --
+        exactly the allocation the direct path exists to avoid.
         """
         if self._fused:
             return False
@@ -519,12 +525,21 @@ class _GatedExpertPair(nn.Module):
         if g is None or getattr(g, "trellis_packed", None) is None:
             return False
         for name, gv in list(g.named_buffers(recurse=False)):
+            if name in skip:
+                continue
             uv = getattr(u, name, None)
             if gv is None or gv.numel() == 0 or uv is None:
                 continue
-            merged = (torch.cat([gv, uv], dim=0)
-                      if name in self._ROW_ARTS and gv.dim() > 0 else gv)
-            setattr(f, name, merged.clone())
+            if name in self._ROW_ARTS and gv.dim() > 0:
+                # `cat` already returns a fresh allocation; cloning it allocated every row
+                # artifact TWICE at load and freed the first immediately -- 5.58 GiB of
+                # transient for Qwen3.8-Flash-Next's w13.
+                merged = torch.cat([gv, uv], dim=0)
+            else:
+                # Here `merged` IS the gate pad's own buffer, and the pad is dropped two
+                # lines below -- so this clone is load-bearing, not symmetry.
+                merged = gv.clone()
+            setattr(f, name, merged)
         # Re-derive the row-block decomposition for the now-2I-row matrix; this is the
         # whole point of fusing (blocks_m for 2I != two blocks_m for I).
         if hasattr(f, "_refresh_block_meta"):
@@ -717,8 +732,6 @@ class GLQStackedGatedExperts(nn.Module):
             return why
 
         E = self.num_experts
-        e0 = self[0]
-        f0, d0 = e0.gate_up_proj, e0.down_proj
 
         def _rehome(attr: str):
             ref = getattr(self[0], attr).trellis_packed
@@ -731,6 +744,23 @@ class GLQStackedGatedExperts(nn.Module):
 
         self._w13_packed = _rehome("gate_up_proj")
         self._w2_packed = _rehome("down_proj")
+        why = self._finish_stacked_metadata()
+        if why is not None:
+            return why
+        _return_freed_heap_to_os()
+        return None
+
+    def _finish_stacked_metadata(self) -> str | None:
+        """Everything the fused op needs besides the packed codes. Shared by both builders.
+
+        :meth:`_build_stacked_cpu` and :meth:`fuse_into_stacked` differ only in how the
+        packed bytes get into ``_w13_packed``/``_w2_packed``; this is the identical tail.
+        Keeping it in one place is what makes "the two paths agree" a property of the code
+        rather than of two copies staying in sync.
+        """
+        E = self.num_experts
+        e0 = self[0]
+        f0, d0 = e0.gate_up_proj, e0.down_proj
         # SU and Wscale are per-expert by the op's contract. They are small (a 512-expert
         # layer is ~1.3 MiB of SU), so stacking them is a copy rather than a re-home.
         self._w13_SU = torch.stack([self[e].gate_up_proj.SU for e in range(E)]).contiguous()
@@ -739,13 +769,74 @@ class GLQStackedGatedExperts(nn.Module):
             [self[e].gate_up_proj.Wscale.reshape(()) for e in range(E)]).float()
         self._w2_Wscale = torch.stack(
             [self[e].down_proj.Wscale.reshape(()) for e in range(E)]).float()
-        # SV and the block metas are shared across experts -- one RHT basis per layer, which
-        # `_glq_moe_cpu_refusal` has just verified against the loaded weights rather than
-        # trusting the fixed seed.
+        # SV and the block metas are shared across experts -- one RHT basis per layer. The
+        # refusal gate verifies that against the loaded weights rather than trusting the
+        # fixed seed, so re-check it here: fuse_into_stacked runs BEFORE the pads are gone
+        # and cannot call the gate, which reads the fused projection.
+        if any(not torch.equal(self[e].gate_up_proj.SV, f0.SV)
+               or not torch.equal(self[e].down_proj.SV, d0.SV) for e in range(1, E)):
+            return ("SV differs across experts: the fused CPU MoE op applies one SV to "
+                    "every expert, so this layer's experts do not share an RHT basis")
         self._w13_SV, self._w2_SV = f0.SV.contiguous(), d0.SV.contiguous()
         self._bn13, self._bm13 = f0._blocks_n_meta_cpu, f0._blocks_m_meta_cpu
         self._bn2, self._bm2 = d0._blocks_n_meta_cpu, d0._blocks_m_meta_cpu
         self._activation_id = _gated_activation_id(self.act_fn)
+        return None
+
+    def fuse_into_stacked(self) -> str | None:
+        """Fuse gate/up straight into the stacked buffers, skipping the per-expert copy.
+
+        Returns None on success, or a reason. The caller falls back to ``fuse_gate_up()``.
+
+        ``fuse_gate_up()`` + :meth:`_build_stacked_cpu` reach the same end state but allocate
+        the expert bytes twice on the way: once as a per-expert ``[2I, H]`` buffer and again
+        as the row of the stacked one, with the first freed immediately. glibc does not hand
+        those freed pages back on its own -- ``_return_freed_heap_to_os`` recovers ~72% of
+        them (measured 7.98 GiB of stacked buffers costing +2.26 GiB of RSS on
+        gemma-4-26B-A4B) -- so the remaining footprint is best removed by never allocating
+        it. Copying the two halves into slices of the destination does that.
+
+        The halves land in the same order ``fuse_gate_up`` concatenates them: gate occupies
+        rows ``0:I``, up ``I:2I``. That is the order ``_split_gate_up_arts`` wrote and what
+        ``_fused_packed_shapes`` sizes for, and it is the one thing here that must not be
+        taken on trust -- swapping them loads cleanly, decodes finitely, and emits garbage.
+        tests/test_hf_moe_cpu_fused.py gates it on byte identity against ``fuse_gate_up``.
+        """
+        if self._stacked_is_live():
+            return None
+        if self.num_experts == 0:
+            return "no experts"
+        e0 = self[0]
+        if e0.gate_proj is None or getattr(e0.gate_proj, "trellis_packed", None) is None:
+            return "gate/up already fused or not loaded; use fuse_gate_up + _build_stacked_cpu"
+        if e0.gate_proj.trellis_packed.numel() == 0:
+            return "expert weights are not loaded yet"
+
+        E = self.num_experts
+        gref = e0.gate_proj.trellis_packed
+        dref = e0.down_proj.trellis_packed
+        half = gref.shape[0]
+
+        w13 = torch.empty((E, 2 * half, gref.shape[1]), dtype=gref.dtype)
+        w2 = torch.empty((E, *dref.shape), dtype=dref.dtype)
+        for e in range(E):
+            pair = self[e]
+            g, u, d = pair.gate_proj, pair.up_proj, pair.down_proj
+            w13[e][:half].copy_(g.trellis_packed)        # gate: rows 0:I
+            w13[e][half:].copy_(u.trellis_packed)        # up:   rows I:2I
+            w2[e].copy_(d.trellis_packed)
+            # Everything that is NOT the packed codes still goes through the existing merge,
+            # so the row-vs-shared artifact rules stay in one place. `skip` keeps it from
+            # cat-ing a per-expert packed buffer we would immediately replace -- allocating
+            # and freeing that 512 times a layer is what this path exists to avoid.
+            pair.fuse_gate_up(skip=("trellis_packed",))
+            pair.gate_up_proj.trellis_packed = w13[e]
+            d.trellis_packed = w2[e]
+
+        self._w13_packed, self._w2_packed = w13, w2
+        why = self._finish_stacked_metadata()
+        if why is not None:
+            return why
         _return_freed_heap_to_os()
         return None
 
@@ -762,7 +853,11 @@ class GLQStackedGatedExperts(nn.Module):
             return None
         if hidden_states.is_cuda or hidden_states.dim() != 2:
             return None
-        why = self._build_stacked_cpu()
+        # Check eligibility on EVERY forward, not just the first. `_build_stacked_cpu`
+        # short-circuits once the buffers are live, so when `fuse_into_stacked` has already
+        # built them at load this is the only thing standing between an ineligible layer and
+        # the op. The weight-derived half is cached, so it costs a dict lookup.
+        why = self._glq_moe_cpu_refusal() or self._build_stacked_cpu()
         if why is not None:
             self._warn_moe_cpu_fallback(why)
             return None
