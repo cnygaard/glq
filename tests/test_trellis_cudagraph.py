@@ -169,12 +169,18 @@ def test_trellis_update_equiv(variant, K):
         f"{variant} K={K}: cost diverged from the gather-form reference"
 
 
-def test_update_is_two_kernels():
+def test_update_is_not_defused():
     """FALLBACK-path guard (the fused Triton step has its own suite): the compiled ACS
-    update — still the CPU / GLQ_TRELLIS_FUSED_STEP=0 path — must stay fused to exactly
-    TWO kernels: the view-min reduction (prev shift+cast+store in its epilogue) and the
-    state_err/cost-update pointwise kernel. A third kernel means inductor de-fused the
-    out_row mutation or the cast.
+    update — still the CPU / GLQ_TRELLIS_FUSED_STEP=0 path — must stay FUSED. A kernel
+    appearing on top of the view-min reduction (prev shift+cast+store in its epilogue) and
+    the state_err/cost-update pointwise kernel means inductor de-fused the out_row mutation
+    or the cast, which is the regression this guards.
+
+    Asserted as `<= 2` rather than `== 2` because the count is inductor's to choose and it
+    changes across releases: 2 through torch 2.12, and **1** on 2.13.0+cu130, which is
+    strictly better fusion and the opposite of the failure above. Pinning the literal made
+    this fail on an inductor improvement. The observed names are in the message either way,
+    so a change is still visible when something else sends you here.
 
     Needs a fresh dynamo state: the parity matrix above compiles `update` for ~18
     (variant, K, B) specializations, exceeding dynamo's per-function cache limit (8), after
@@ -197,7 +203,10 @@ def test_update_is_two_kernels():
     kernels = [e.key for e in prof.key_averages()
                if e.self_device_time_total > 0
                and "Memcpy" not in e.key and "Memset" not in e.key]
-    assert len(kernels) == 2, f"update de-fused into {len(kernels)} kernels: {kernels}"
+    assert len(kernels) <= 2, f"update de-fused into {len(kernels)} kernels: {kernels}"
+    # Name what actually ran, so an inductor change is visible in the log of a passing run
+    # rather than only discoverable by editing the test.
+    print(f"\nupdate compiled to {len(kernels)} kernel(s): {kernels}")
 
 
 def test_no_fill_kernel_in_viterbi():
