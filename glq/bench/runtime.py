@@ -38,6 +38,22 @@ def is_multimodal(arch: str | None) -> bool:
     return bool(arch and any(h in arch for h in _MULTIMODAL_HINTS))
 
 
+#: Spellings that mean "serve the model as it is", i.e. the unquantized reference arm.
+_BASELINE_QUANT = ("none", "bf16")
+
+
+def is_baseline_quant(quant: str | None) -> bool:
+    """Is this the unquantized reference arm rather than a quantized one?
+
+    Two callers, and they must agree: it decides whether ``quantization`` reaches the engine
+    at all, AND whether the arm keeps bf16 instead of taking the GLQ-preferred dtype. A
+    baseline served in fp16 can lose kernels that a *quantized* model never touches —
+    ``flashinfer_utils.py:120`` requires bf16 weights for the unquantized FlashInfer TRTLLM
+    MoE backend — so the bias would run one way only, against the arm GLQ is compared to.
+    """
+    return not quant or quant in _BASELINE_QUANT
+
+
 def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
                      max_model_len: int | None = None, gpu_mem_util: float = 0.9,
                      multimodal: bool = False, cudagraph: bool = True,
@@ -54,7 +70,7 @@ def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bflo
                     max_num_seqs=int(max_num_seqs))
     if max_model_len:
         kw["max_model_len"] = max_model_len
-    if quant and quant not in ("none", "bf16"):
+    if not is_baseline_quant(quant):
         kw["quantization"] = quant
     if multimodal:
         kw["limit_mm_per_prompt"] = dict(_TEXT_ONLY_MM)
