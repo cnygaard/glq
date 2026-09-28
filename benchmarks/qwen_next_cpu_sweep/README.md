@@ -56,10 +56,11 @@ What the counters do establish:
 * **The step is ~91% non-scaling.** A least-squares fit of `T(n) = S + P/n` over all five points
   gives **S = 252.7 ms, P = 1268.6 ms** — S is 91% of the 277.5 ms step at T=96. Model-free and
   assumption-free: 12x the threads removed only 143 ms of a 420 ms step.
-* **The kernel is not what fails to scale.** It is 70.67% of a T=1 step but only ~6-12 ms of a
-  279 ms step at T=48 — it parallelizes. The non-scaling remainder is the *non-GLQ* work
-  (oneDNN bf16 GEMMs 15.19%, libtorch 7.87%, interpreter 3.32%, libc 1.95% ≈ 236 ms at T=1,
-  closely matching S).
+* **The kernel is not what fails to scale.** It is 70.67% of a T=1 step (~996 ms of ~1.41 s) but
+  on the order of ~20 ms of a 279 ms step at T=48 — it parallelizes. The remainder is the
+  *non-GLQ* work (oneDNN bf16 GEMMs 15.19%, libtorch 7.87%, interpreter 3.32%, libc 1.95%), which
+  is ~400 ms at T=1. That is *larger* than S, so part of it parallelizes too; the exact split
+  needs a multi-thread profile and is **not yet measured**.
 * **It is core-bound, not memory-bound**: 45.3% core-bound vs 19.3% memory-bound, at ~0.9% of
   DRAM peak. More cores cannot help work that is already serial, and bandwidth was never the
   limit.

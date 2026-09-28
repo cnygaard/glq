@@ -86,6 +86,19 @@ win topdownL1 perf stat -p $PID -M TopdownL1 -- sleep 12
 win topdownL2 perf stat -p $PID -M TopdownL2 -- sleep 12
 win ipc       perf stat -p $PID -e cycles,instructions,branches,branch-misses -- sleep 12
 
+# ---- native symbol attribution runs EARLY, on purpose --------------------------------------
+# A decode window is finite and the later windows get skipped when it ends. This is the most
+# valuable one -- TMA cannot tell "efficient" from "efficiently doing useless work", because an
+# interpreter and a spinning barrier both RETIRE instructions -- so it must not be the one that
+# gets dropped. (At T=48 a 512-token decode is only ~140 s, which is shorter than the full
+# window sequence; DECODE has to be sized per thread count, and this ordering is the backstop.)
+if alive; then
+  echo "--- perf record (lbr, 30s) @ $(date -u +%T)Z"
+  perf record -p $PID --call-graph=lbr -F 999 -o "$OUT/perf.data" -- sleep 30 > "$OUT/record.txt" 2>&1
+  perf report -i "$OUT/perf.data" --stdio --no-children -F overhead,dso     > "$OUT/by_dso.txt" 2>&1
+  perf report -i "$OUT/perf.data" --stdio --no-children -F overhead,dso,sym > "$OUT/by_sym.txt" 2>&1
+fi
+
 if [ "$FULL" = "1" ]; then
   # Two independent DRAM readings. They must agree before either is quotable; at T=1 they came
   # in at 2.79 GB/s (CAS x 64 B) and 2.88 GB/s (perf's own metric).
@@ -95,16 +108,6 @@ if [ "$FULL" = "1" ]; then
   win fp_width    perf stat -p $PID \
       -e fp_arith_inst_retired.512b_packed_single,fp_arith_inst_retired.256b_packed_single,fp_arith_inst_retired.128b_packed_single,fp_arith_inst_retired.scalar_single -- sleep 12
   win tma_l3mem   perf stat -p $PID -M TmaL3mem -- sleep 12
-fi
-
-# ---- native symbol attribution: which .so, which function -------------------------------------
-# TMA alone cannot tell "efficient" from "efficiently doing useless work" -- an interpreter and a
-# spinning barrier both RETIRE instructions. It is only interpretable next to this.
-if alive; then
-  echo "--- perf record (lbr, 30s) @ $(date -u +%T)Z"
-  perf record -p $PID --call-graph=lbr -F 999 -o "$OUT/perf.data" -- sleep 30 > "$OUT/record.txt" 2>&1
-  perf report -i "$OUT/perf.data" --stdio --no-children -F overhead,dso     > "$OUT/by_dso.txt" 2>&1
-  perf report -i "$OUT/perf.data" --stdio --no-children -F overhead,dso,sym > "$OUT/by_sym.txt" 2>&1
 fi
 
 # ---- Python-frame attribution: the only view that prices the per-expert loop directly ---------

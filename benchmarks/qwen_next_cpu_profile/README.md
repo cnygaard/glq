@@ -116,8 +116,10 @@ reconstructs worst at 15.33 dB.
 ## Three conclusions that contradict the obvious reading
 
 **1. Optimizing the top of the profile would be near-useless.** The kernel is 70.67% at T=1, but
-the step falls 806 -> 277 ms from T=1 to T=96 and only the kernel is large enough to supply that
-drop — so at T=48 it is roughly 6-12 ms of a 279 ms step. The lever recorded in
+the step falls from **~1.41 s at T=1** (DRAM-derived; the Amdahl extrapolation independently gives
+1.52 s) to 277 ms at T=96, and only the kernel is large enough to supply that drop. The kernel is
+therefore ~996 ms of a T=1 step, and if it parallelizes it is on the order of **~20 ms of a 279 ms
+step at T=48**. The lever recorded in
 `glq_trellis_layout.hpp:128-132` (the staging store, ~10% of the kernel) is therefore worth
 **~0.4% end-to-end** at the thread count anyone deploys at. **A single-thread profile inverts the
 optimization ranking**; that is the transferable lesson here.
@@ -133,17 +135,75 @@ curve to "dispatch over 48 layers x 512 experts = 24,576 expert modules". Interp
 dispatch is **3.32%**. Independently, wiring the fused MoE path — which deletes exactly that
 dispatch — measured **+0%** on this model. Corrected in that file.
 
+## Result 4 — quantizing lm_head: a 1.43x win on that layer, worth 0.6% end-to-end on CPU
+
+`benchmarks/_lm_head_shape_probe.py` times the bare trellis matvec against the bf16 GEMV it
+would replace, at lm_head's actual 248320x2560 shape. The GLQ arm is a **lower bound** (no RHT
+bracket, no bf16->fp32 activation convert). Random packed data is a valid fixture and this was
+checked rather than assumed: against a real Viterbi/LDLQ-quantized layer it timed within
+**1.02x**, with zero subnormals and identical `absmax` — so no denormal-stall artifact.
+
+**At 48 threads** (`lm_head_shape_probe.txt`, `lm_head_probe.tsv`):
+
+| arm | ms | GB/s | vs bf16 |
+|---|---|---|---|
+| glq3 / **avx512fp16** | **3.69** | 64.5 | **1.43x FASTER** |
+| glq3 / avx512 | 4.58 | 52.0 | 1.15x faster |
+| **bf16 (today)** | 5.29 | **240.5** | baseline |
+| fp32 | 10.73 | 237.0 | 0.49x |
+| glq3 / avx2 | 14.19 | 16.8 | 0.37x SLOWER |
+| glq3 / scalar | 15.00 | 15.9 | 0.35x SLOWER |
+
+**At 1 thread the sign flips:** glq3/avx512fp16 157.12 ms vs bf16 117.62 ms = **0.75x, slower**.
+
+**The crossover is thread count, and the mechanism is which wall each arm hits.** At 48 threads
+bf16 reaches 240.5 GB/s = **78% of the ~307 GB/s theoretical peak**, so it is genuinely
+DRAM-bound and cannot go faster; GLQ moves 5.3x fewer bytes and is compute-bound, so it keeps
+scaling. In throughput terms GLQ goes 4.0 -> 172.3 G weights/s from 1 to 48 threads
+(**42.6x, 89% parallel efficiency**) while bf16 manages only 22x. At 1 thread bf16 is nowhere
+near the wall (10.8 GB/s) and GLQ's ~20-instructions-per-arithmetic-instruction decode loses.
+
+**Two consequences worth keeping:**
+
+1. **Traffic share is not time share.** lm_head is **32.3% of per-token bytes but only 5.29 ms
+   of a ~279 ms T=48 step — about 1.9% of time** — because one large contiguous GEMV saturates
+   DRAM cheaply, whereas the GLQ-quantized layers are compute-bound decode work. So a 1.43x win
+   on lm_head is worth **~0.57% end-to-end on CPU**. Quantizing it is a **footprint** play
+   (-0.96 GiB) and a **GPU** play (where B=1 decode is bandwidth-bound, so time share does track
+   traffic share), not a CPU speed play.
+2. **The sign depends on the ISA tier**, so this cannot be a single global default: avx2 and
+   scalar *lose* (0.35-0.37x), avx512 and avx512fp16 win. Any default would have to be gated on
+   tier and thread count, the way the dtype default is already gated on device.
+
+This also means **~87% of a T=48 step is neither the trellis kernel (~29 ms, from 172.3 G
+weights/s over this checkpoint's 5.08 G weights/token) nor lm_head (~5 ms)**. Naming that
+remainder is what the T=48 arm is for.
+
 ## What this run does NOT establish
 
 Stated plainly, because the box was reclaimed before the follow-up arms could run:
 
 * **The T=1 tok/s was never captured.** The run's `RESULT` line had not been written when results
-  were rescued, and the box is gone. The 806 ms/token above is **derived** from DRAM traffic and
-  cross-checked against the Amdahl extrapolation — it is not a measured rate.
-* **No multi-thread profile exists.** The ~253 ms non-scaling term (least-squares `S` over the
-  five sweep points, `P` = 1268.6 ms, 91% of the T=96 step) is *attributed by inference* from T=1
-  shares — `[JIT]` + libtorch + python + libc = 29.3% of an 806 ms step ≈ 236 ms, which matches
-  `S` closely. **That agreement is suggestive, not measured.** A T=48 arm would settle it.
+  were rescued, and the box is gone. The **~1.41 s/token** above is **derived** (3.935 GB / 2.79
+  GB/s) and cross-checked against the Amdahl extrapolation's 1.52 s — it is not a measured rate.
+* **No multi-thread profile exists, and the decomposition does NOT close.** The non-scaling term
+  is `S` = 252.7 ms (least-squares over the five sweep points, `P` = 1268.6 ms, 91% of the T=96
+  step). But the non-GLQ work at T=1 — `[JIT]` + libtorch + python + libc = 28.3% — is **~400 ms**
+  of a 1.41 s step, i.e. *larger* than `S`. So some of it parallelizes too (oneDNN is
+  multithreaded, so that is expected), and the split between "serial work" and "parallel-region
+  overhead" cannot be pinned down from a T=1 profile alone. **A T=48 arm is required**; treat the
+  three-way split as unresolved until then.
+* **RESOLVED — a third route now agrees.** An earlier reading of the shape probe on an
+  **avx2** machine implied a T=1 step an order of magnitude longer, which looked like a
+  contradiction. It was the ISA tier: the same probe on this box measures a **2.38x** gap between
+  avx2 (374.6 ms) and avx512fp16 (157.1 ms) at lm_head's shape, far more than the ~1.5x the
+  records suggested. At the top tier GLQ runs 4.05 G weights/s per thread, so 5.08 G
+  weights/token / 4.05 / 0.7067 (the kernel's cycle share) = **1.77 s**. Three independent
+  routes — DRAM traffic 1.41 s, Amdahl extrapolation 1.52 s, kernel throughput 1.77 s — now
+  bracket the T=1 step at **1.4-1.8 s**. The denormal hypothesis was tested and falsified
+  (random vs real packed data: 1.02x, zero subnormals). Separately, note that **local dev-machine
+  timings were not reproducible** (the same shape gave 1.20 and 4.25 G weights/s on two runs);
+  only the box numbers, whose ranges are ±0.1%, are used here.
 * **The knee mechanism is untested.** The leading hypothesis is parallel-region granularity:
   parallelism is `at::parallel_for` over `m/32` row blocks (`glq_bindings_cpu.cpp:97`, grain 1),
   and an expert `gate_up` is m=1280 = **40 blocks**, so efficiency saturates once threads approach
@@ -180,6 +240,8 @@ Stated plainly, because the box was reclaimed before the follow-up arms could ru
 | `counters_*.txt` | raw `perf stat` output per metric group, perf preamble stripped |
 | `attribution_by_dso.txt` / `_by_symbol.txt` | `perf report` cycle attribution |
 | `attribution_pyspy_frames.txt` | Python-frame counts from 6 `py-spy dump` snapshots |
+| `lm_head_shape_probe.txt` | full output of `benchmarks/_lm_head_shape_probe.py`, all four ISA tiers at 48 and 1 threads |
+| `lm_head_probe.tsv` | the crossover table above, machine-readable |
 
 `perf.data` (12.6 MB) is deliberately not committed; it is in `.local-logs/pmu_qwen_next/`.
 

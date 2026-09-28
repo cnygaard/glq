@@ -1,0 +1,57 @@
+=== lm_head shape probe, all tiers, 48 threads :: 2026-09-28T20:18:27Z
+torch 2.14.0+cu130  threads 48  glq cpu ext: loaded (isa=avx512fp16)
+GLQ arm is a LOWER BOUND: bare matvec, no RHT bracket, no bf16->fp32 convert.
+
+shape                      arm         ms (median)         min-max  weight MiB    GB/s  verdict
+-----------------------------------------------------------------------------------------------
+lm_head        Qwen-Next   glq3/scalar        15.00   15.0-  15.0       227.3    15.9  0.35x vs bf16 — SLOWER
+lm_head        Qwen-Next   glq3/avx2         14.19   12.2-  14.2       227.3    16.8  0.37x vs bf16 — SLOWER
+lm_head        Qwen-Next   glq3/avx512         4.58    4.3-   4.7       227.3    52.0  1.15x vs bf16 — FASTER
+lm_head        Qwen-Next   glq3/avx512fp16         3.69    3.5-   3.8       227.3    64.5  1.43x vs bf16 — FASTER
+lm_head        Qwen-Next   bf16               5.29    5.3-   5.5      1212.5   240.5  baseline (today)
+lm_head        Qwen-Next   fp32              10.73   10.6-  11.2      2425.0   237.0  0.49x vs bf16 — SLOWER
+
+expert gate_up             glq3/scalar         0.06    0.1-   0.1         1.2    21.5  0.77x vs bf16 — SLOWER
+expert gate_up             glq3/avx2          0.06    0.1-   0.1         1.2    20.2  0.73x vs bf16 — SLOWER
+expert gate_up             glq3/avx512         0.04    0.0-   0.1         1.2    30.5  1.09x vs bf16 — FASTER
+expert gate_up             glq3/avx512fp16         0.03    0.0-   0.0         1.2    37.9  1.36x vs bf16 — FASTER
+expert gate_up             bf16               0.04    0.0-   0.0         6.2   148.8  baseline (today)
+expert gate_up             fp32               0.02    0.0-   0.0        12.5   753.7  2.53x vs bf16 — FASTER
+
+dense 2560x2560            glq3/scalar         0.10    0.1-   0.1         2.3    24.4  0.44x vs bf16 — SLOWER
+dense 2560x2560            glq3/avx2          0.11    0.1-   0.1         2.3    22.4  0.40x vs bf16 — SLOWER
+dense 2560x2560            glq3/avx512         0.07    0.1-   0.1         2.3    36.7  0.66x vs bf16 — SLOWER
+dense 2560x2560            glq3/avx512fp16         0.05    0.0-   0.1         2.3    49.6  0.89x vs bf16 — SLOWER
+dense 2560x2560            bf16               0.04    0.0-   0.0        12.5   295.9  baseline (today)
+dense 2560x2560            fp32               0.02    0.0-   0.0        25.0  1219.7  2.06x vs bf16 — FASTER
+
+Scope: CPU only, batch 1, this ISA tier and thread count. CPU decode is core-bound
+(measured 45.3% core-bound vs 19.3% memory-bound at ~1% of DRAM peak), so a CPU
+result here does NOT predict GPU, where B=1 decode is bandwidth-bound and is where
+GLQ's recorded 1.90x-on-an-L4 comes from. Read this as the CPU half of the trade.
+=== same probe at 1 thread, to separate tier effect from thread effect ===
+torch 2.14.0+cu130  threads 1  glq cpu ext: loaded (isa=avx512fp16)
+GLQ arm is a LOWER BOUND: bare matvec, no RHT bracket, no bf16->fp32 convert.
+
+shape                      arm         ms (median)         min-max  weight MiB    GB/s  verdict
+-----------------------------------------------------------------------------------------------
+lm_head        Qwen-Next   glq3/avx2        374.61  374.6- 374.8       227.3     0.6  0.31x vs bf16 — SLOWER
+lm_head        Qwen-Next   glq3/avx512fp16       157.12  157.1- 157.2       227.3     1.5  0.75x vs bf16 — SLOWER
+lm_head        Qwen-Next   bf16             117.62  117.3- 117.9      1212.5    10.8  baseline (today)
+lm_head        Qwen-Next   fp32             175.09  175.0- 175.4      2425.0    14.5  0.67x vs bf16 — SLOWER
+
+expert gate_up             glq3/avx2          1.92    1.9-   1.9         1.2     0.6  0.22x vs bf16 — SLOWER
+expert gate_up             glq3/avx512fp16         0.78    0.8-   0.8         1.2     1.6  0.55x vs bf16 — SLOWER
+expert gate_up             bf16               0.43    0.4-   0.4         6.2    15.2  baseline (today)
+expert gate_up             fp32               0.43    0.4-   0.4        12.5    30.8  1.01x vs bf16 — parity
+
+dense 2560x2560            glq3/avx2          3.85    3.8-   3.9         2.3     0.6  0.21x vs bf16 — SLOWER
+dense 2560x2560            glq3/avx512fp16         1.57    1.6-   1.6         2.3     1.6  0.53x vs bf16 — SLOWER
+dense 2560x2560            bf16               0.82    0.8-   0.9        12.5    15.9  baseline (today)
+dense 2560x2560            fp32               0.84    0.8-   0.8        25.0    31.3  0.98x vs bf16 — parity
+
+Scope: CPU only, batch 1, this ISA tier and thread count. CPU decode is core-bound
+(measured 45.3% core-bound vs 19.3% memory-bound at ~1% of DRAM peak), so a CPU
+result here does NOT predict GPU, where B=1 decode is bandwidth-bound and is where
+GLQ's recorded 1.90x-on-an-L4 comes from. Read this as the CPU half of the trade.
+=== PROBE DONE :: 2026-09-28T20:18:54Z
