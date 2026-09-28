@@ -1,0 +1,9 @@
+
+ Performance counter stats for 'system wide':
+
+        2264928764      UNC_M_CAS_COUNT.RD               #    12.56 tma_info_system_dram_bw_use
+          90725438      UNC_M_CAS_COUNT.WR                                                    
+       12001216241      duration_time                                                         
+
+      12.001124979 seconds time elapsed
+

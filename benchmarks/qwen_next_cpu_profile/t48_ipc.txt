@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '7814':
+
+     1142899852631      cycles                                                                
+      408665033396      instructions                                                          
+       61718305693      branches                                                              
+          79085509      branch-misses                                                         
+
+      12.003643774 seconds time elapsed
+

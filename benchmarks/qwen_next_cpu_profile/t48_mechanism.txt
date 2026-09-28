@@ -1,0 +1,6 @@
+OMP_NUM_THREADS   = 48
+torch.num_threads = 48
+torch.interop     = 48
+glq cpu ext       = loaded (isa=avx512fp16)
+GLQ_CPU_GDN       = unset
+GLQ_HF_MOE_CPU_FUSED = unset

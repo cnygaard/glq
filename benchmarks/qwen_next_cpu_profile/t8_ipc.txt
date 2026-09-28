@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '28048':
+
+      194184825061      cycles                                                                
+      225904584487      instructions                                                          
+       23603244654      branches                                                              
+          46771199      branch-misses                                                         
+
+      12.002201508 seconds time elapsed
+

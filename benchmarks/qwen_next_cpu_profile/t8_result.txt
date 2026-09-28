@@ -1,0 +1,3 @@
+FOOTPRINT load_s=132.5 weights_gib=75.31 runtime=hf device=cpu (peak RSS: includes interpreter+torch)
+RESULT label=t8_base model=xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4 runtime=hf batch=1 total_decode_tokps=2.357 per_seq_tokps=2.357 ttft_ms=10565 n_tokens=900
+PEAK_RSS_GIB 96.34

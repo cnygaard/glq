@@ -1,0 +1,14 @@
+
+ Performance counter stats for process id '28048':
+
+     1771245678600      TOPDOWN.SLOTS                    #      0.3 %  tma_bad_speculation    
+                                                         #      2.9 %  tma_frontend_bound     
+      350726701164      topdown-retiring                 #     76.9 %  tma_backend_bound      
+       51977968991      topdown-fe-bound                                                      
+     1362480320874      topdown-be-bound                                                      
+       88566825094      topdown-heavy-ops                #     19.8 %  tma_retiring           
+        6061819605      topdown-bad-spec                                                      
+          94190905      INT_MISC.UOP_DROPPING                                                 
+
+      12.001823610 seconds time elapsed
+

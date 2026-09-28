@@ -65,12 +65,26 @@ What the counters do establish:
   DRAM peak. More cores cannot help work that is already serial, and bandwidth was never the
   limit.
 
-The **leading hypothesis for the knee is now parallel-region granularity, and it is untested**:
-parallelism is `at::parallel_for` over `m/32` output-row blocks (`glq_bindings_cpu.cpp:97`,
-grain 1), and an expert `gate_up` is m=1280 = **40 blocks**, so efficiency saturates once thread
-count approaches the block count. That fits a knee at 16 as smooth saturation rather than a step.
-Separating it from the alternatives needs `libgomp` share measured at T=8/16/48, which the spot
-reclaim prevented.
+**The cause is now measured: OpenMP barrier wait.** `libgomp` share against thread count, on a
+second identical box with the stack matched:
+
+| T | tok/s | **libgomp** | glq_cpu | IPC | useful cycles | **effective threads** |
+|---|---|---|---|---|---|---|
+| 1 | 0.709 (derived) | **0.03%** | 70.67% | 1.522 | 99.5% | **1.00** |
+| 8 | 2.357 | **47.37%** | 34.55% | 1.163 | 49.4% | **3.95** |
+| 48 | 3.412 | **82.89%** | 10.30% | 0.357 | 16.8% | **8.07** |
+
+61.22% of all T=48 cycles are in `gomp_barrier_wait_end` alone. Per token at T=48 (293.1 ms):
+**243 ms barrier wait**, 30 ms trellis kernel, 12 ms oneDNN, 5 ms libtorch, 1 ms Python.
+
+**Effective parallelism plateaus at ~8 threads' worth of useful work however many cores are
+added** — that is the knee, and it is also why 48 -> 96 is flat. The cause is too little work per
+parallel region: with the fused MoE path off (the default), the per-expert Python loop opens
+**1,262 `at::parallel_for` regions per token**, and an expert `gate_up` is m=1280 = only **40**
+blocks of 32 rows, so at 48 threads most threads take one block and then wait. A zero-barrier-cost
+bound puts the prize at **~6.1x (~21 tok/s)**.
+
+Full analysis and the caveats: `benchmarks/qwen_next_cpu_profile/`.
 
 The earlier claim that this "reproduces a previously recorded finding (4x the cores plus AVX-512
 buy ~12%)" still holds as an *observation* about thread scaling. Its stated **mechanism** does

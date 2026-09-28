@@ -179,21 +179,101 @@ This also means **~87% of a T=48 step is neither the trellis kernel (~29 ms, fro
 weights/s over this checkpoint's 5.08 G weights/token) nor lm_head (~5 ms)**. Naming that
 remainder is what the T=48 arm is for.
 
+## Result 5 — THE BOTTLENECK: 83% of cycles at 48 threads are OpenMP barrier wait
+
+Measured on a second, identical box (2026-09-28) with the stack matched to the T=1 arm
+(torch 2.13.0+cpu, transformers 5.17.0, glq from source, `avx512fp16`). Both arms passed the
+footprint gate (75.31 / 75.34 GiB) and exited 0.
+
+| T | tok/s | ms/tok | **libgomp** | glq_cpu | `[JIT]` | libtorch | python | IPC | retiring | DRAM GB/s | GHz | useful | **eff. threads** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.709* | 1410* | **0.03%** | 70.67% | 15.19% | 7.87% | 3.32% | 1.522 | 29.0% | 2.79 | 3.08 | 99.5% | **1.00** |
+| 8 | 2.357 | 424.3 | **47.37%** | 34.55% | 6.52% | 6.06% | 0.96% | 1.163 | 19.8% | 12.56 | 2.02 | 49.4% | **3.95** |
+| 48 | 3.412 | 293.1 | **82.89%** | 10.30% | 4.09% | 1.76% | 0.28% | 0.357 | 8.9% | 18.68 | 1.98 | 16.8% | **8.07** |
+
+\* T=1 is derived (that arm's `RESULT` was lost to a spot reclaim); T=8 and T=48 are measured.
+
+The symbols are explicitly barrier waits, not ambiguous runtime time:
+
+```
+61.22%  libgomp  gomp_barrier_wait_end          1.47%  libgomp  gomp_barrier_wait
+17.17%  libgomp  gomp_team_barrier_wait_end     1.32%  libgomp  gomp_team_barrier_wait
+10.09%  glq_cpu  zmm_matvec_impl<DecodeFp16,3>  1.07%  libgomp  gomp_team_barrier_wait_final
+```
+
+**Per-token budget at T=48 (293.1 ms measured):** barrier wait **243.0 ms**, trellis kernel
+30.2 ms, oneDNN bf16 GEMMs 12.0 ms, libtorch elementwise 5.2 ms, Python+bindings 1.1 ms.
+
+**Effective parallelism plateaus at ~8 threads' worth of useful work**, however many cores are
+added — 1.00 -> 3.95 -> 8.07. That single number explains the whole sweep curve: why the knee is
+at 16, why 48 -> 96 is flat, and why TTFT barely moved across a 12x thread range. Going 8 -> 48
+threads (6x the cores) buys 1.45x.
+
+### Why: too little work per parallel region, not slow barriers
+
+GLQ contains **no `#pragma omp`** — parallelism is `at::parallel_for` over `m/32` output-row
+blocks, grain size 1 (`glq_bindings_cpu.cpp:97`, `glq_moe_cpu.cpp:84`). With
+`GLQ_HF_MOE_CPU_FUSED` off (the default), the per-expert Python loop issues **1,262 GLQ calls per
+token** (960 expert + 302 dense), each opening its own region. An expert `gate_up` is m=1280 =
+**40 blocks**; at 48 threads ~40 threads get one block each, 8 get none, and all wait for the
+slowest. So the 83% is **threads idling for lack of work per region**, not synchronization
+primitives being slow — the fix is work-per-region, not merely barrier count.
+
+**Upper bound on the prize:** if that work kept its cycles and barrier cost went to zero, it
+would occupy 1.98 s of the 12 s window — **~6.1x, or ~21 tok/s** against the measured 3.412.
+
+**This also explains the recorded `GLQ_HF_MOE_CPU_FUSED` +0%.** That A/B ran at 8 threads, where
+`expert_parallel = (used.size() >= at::get_num_threads())` = `(10 >= 8)` is **true** and the code
+already takes the one-barrier-per-layer path (`glq_moe_cpu.cpp:197`). At 48 threads the predicate
+is false, so the fused path would still open 960 regions. **The flag is not the fix**; flattening
+(expert x row-block) into one region per layer *regardless of thread count* is.
+
+### Two secondary effects worth not missing
+
+* **AVX-512 all-core downclock: 3.08 -> ~2.0 GHz (-35%)** from T=1 to T>=8. Any per-thread
+  throughput extrapolated from a single-thread measurement is 35% optimistic before parallel
+  efficiency is even considered.
+* **DRAM never becomes the limit**: 2.79 -> 12.56 -> 18.68 GB/s, still only **6%** of the
+  ~307 GB/s peak at T=48. Both readings agree at every arm (CAS x 64 B vs perf's own metric).
+
 ## What this run does NOT establish
 
-Stated plainly, because the box was reclaimed before the follow-up arms could run:
+* **The T=1 tok/s was never captured.** That arm's `RESULT` line had not been written when results
+  were rescued and the box was reclaimed. The **~1.41 s/token** is **derived** (3.935 GB / 2.79
+  GB/s), cross-checked against the Amdahl extrapolation's 1.52 s and the kernel-throughput route's
+  1.77 s. T=8 and T=48 are measured; only the T=1 row is not.
+* **The knee mechanism is now measured, but the *fix* is not.** That barrier wait dominates is a
+  measurement; that flattening (expert x row-block) recovers it is a **hypothesis** until a patch
+  is A/B'd. The ~6.1x figure is a zero-barrier-cost upper bound, not a forecast — real regions
+  cannot have zero fork/join cost, and some of the work is genuinely serial.
+* **Only one model, one box, one batch size.** Every number is batch 1 on a 48-core Sapphire
+  Rapids at `avx512fp16`. Batch > 1 gives each region more work and should move the barrier share
+  a lot; it was not measured. Nor was T=96, where the sweep's flat top lives.
+* **`[JIT]` is attributed by inference.** It is assumed to be oneDNN's Xbyak-generated bf16 GEMM
+  kernels (lm_head being the largest), because JIT-registered code has no symbol names. Nothing
+  measured confirms which GEMM those cycles belong to.
+* **The GDN recurrence is not separately visible.** It is inside `libtorch_cpu` (1.76% at T=48)
+  along with every other elementwise op, so this profile cannot price it on its own — consistent
+  with, but not independent confirmation of, the recorded in-situ null.
+* The traffic ledger is arithmetic over `config.json`, not a measured per-tensor trace.
 
-* **The T=1 tok/s was never captured.** The run's `RESULT` line had not been written when results
-  were rescued, and the box is gone. The **~1.41 s/token** above is **derived** (3.935 GB / 2.79
-  GB/s) and cross-checked against the Amdahl extrapolation's 1.52 s — it is not a measured rate.
-* **No multi-thread profile exists, and the decomposition does NOT close.** The non-scaling term
-  is `S` = 252.7 ms (least-squares over the five sweep points, `P` = 1268.6 ms, 91% of the T=96
-  step). But the non-GLQ work at T=1 — `[JIT]` + libtorch + python + libc = 28.3% — is **~400 ms**
-  of a 1.41 s step, i.e. *larger* than `S`. So some of it parallelizes too (oneDNN is
-  multithreaded, so that is expected), and the split between "serial work" and "parallel-region
-  overhead" cannot be pinned down from a T=1 profile alone. **A T=48 arm is required**; treat the
-  three-way split as unresolved until then.
-* **RESOLVED — a third route now agrees.** An earlier reading of the shape probe on an
+## Two hypotheses this work carried and then killed
+
+Kept because both were stated confidently before being tested, and both were wrong:
+
+* **"The flat thread curve is Python dispatch over 24,576 expert modules."** Measured at
+  **3.32%** of cycles at T=1 and **0.28%** at T=48. Wrong twice over, and independently
+  contradicted by the fused-MoE path measuring +0%.
+* **"The non-scaling term is serial non-GLQ work."** The T=1 shares suggested `[JIT]` + libtorch +
+  python + libc ≈ 400 ms against a least-squares `S` of 252.7 ms, which looked like a near-match
+  at the time (under a step time that was itself wrong). The T=48 arm shows the real answer is
+  none of those: they total **18.4 ms**, and 243 ms is barrier wait. **A single-thread profile
+  cannot see the dominant cost of a multi-thread workload**, because at T=1 that cost is
+  identically zero. That is the transferable lesson from this whole exercise.
+
+## A resolved measurement puzzle
+
+* An earlier reading of the shape probe on an
   **avx2** machine implied a T=1 step an order of magnitude longer, which looked like a
   contradiction. It was the ISA tier: the same probe on this box measures a **2.38x** gap between
   avx2 (374.6 ms) and avx512fp16 (157.1 ms) at lm_head's shape, far more than the ~1.5x the
@@ -204,14 +284,10 @@ Stated plainly, because the box was reclaimed before the follow-up arms could ru
   (random vs real packed data: 1.02x, zero subnormals). Separately, note that **local dev-machine
   timings were not reproducible** (the same shape gave 1.20 and 4.25 G weights/s on two runs);
   only the box numbers, whose ranges are ±0.1%, are used here.
-* **The knee mechanism is untested.** The leading hypothesis is parallel-region granularity:
-  parallelism is `at::parallel_for` over `m/32` row blocks (`glq_bindings_cpu.cpp:97`, grain 1),
-  and an expert `gate_up` is m=1280 = **40 blocks**, so efficiency saturates once threads approach
-  the block count — which fits a knee at 16 as smooth saturation. A *separate* mechanism exists in
-  the fused path (`glq_moe_cpu.cpp:197`: `expert_parallel = used.size() >= at::get_num_threads()`,
-  which with 10 routed experts flips at T=11), but that path was **off** in the sweep, so it
-  cannot be the explanation for these numbers. Both need `libgomp` share at T=8/16/48 to separate.
-* The traffic ledger is arithmetic over `config.json`, not a measured per-tensor trace.
+
+  A fourth route — scaling T=8's measured 424.3 ms by effective-thread count and clock — gives
+  1.10 s, so the honest bracket on T=1 is **~1.1-1.8 s**. Nothing in this file depends on
+  pinning it down: T=8 and T=48 are both measured, and they carry every conclusion.
 
 ## Apparatus notes, each of which cost a real failure
 

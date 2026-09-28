@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '7814':
+
+       28339670902      fp_arith_inst_retired.512b_packed_single                                      
+        1376583065      fp_arith_inst_retired.256b_packed_single                                      
+         668147135      fp_arith_inst_retired.128b_packed_single                                      
+         645079598      fp_arith_inst_retired.scalar_single                                      
+
+      12.004131615 seconds time elapsed
+
