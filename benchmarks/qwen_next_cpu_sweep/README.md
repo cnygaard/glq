@@ -41,14 +41,39 @@ Two regimes, and reporting only one of them would mislead:
 16–96 — a 6.6% spread). Prefill is the phase that should parallelise best, and it barely moves
 even over the 8→16 step where decode gains a third.
 
-### Why: dispatch, not compute
+### Why — CORRECTED 2026-09-28 by hardware counters: it is NOT dispatch
 
-This checkpoint has **48 layers x 512 experts = 24,576 expert modules**. If per-step cost is
-dominated by Python-level dispatch over experts rather than SIMD work inside the kernels, then
-neither more cores nor wider vectors help — which is exactly what the flat TTFT and the 12.8%
-decode ceiling both show. This reproduces a previously recorded CPU finding ("4x the cores plus
-AVX-512 buy ~12%") on a **fourth machine, at the top ISA tier, with a different model**. The
-consistency is the point: it is not a property of one box.
+**This section previously claimed the cause was "Python-level dispatch over 24,576 expert
+modules". That was a hypothesis inferred from the flat curve, and it is wrong.** A T=1
+hardware-counter profile on this same box (`benchmarks/qwen_next_cpu_profile/`) measured
+interpreter plus pybind dispatch at **3.32% of cycles** — `python3.12` 2.53% + `libtorch_python`
+0.79% — against **70.67%** inside the GLQ trellis kernel. Independently, wiring the fused CPU MoE
+path, which deletes exactly that per-expert dispatch, measured **+0%** on this model. Both point
+the same way: dispatch was never the binding constraint.
+
+What the counters do establish:
+
+* **The step is ~91% non-scaling.** A least-squares fit of `T(n) = S + P/n` over all five points
+  gives **S = 252.7 ms, P = 1268.6 ms** — S is 91% of the 277.5 ms step at T=96. Model-free and
+  assumption-free: 12x the threads removed only 143 ms of a 420 ms step.
+* **The kernel is not what fails to scale.** It is 70.67% of a T=1 step but only ~6-12 ms of a
+  279 ms step at T=48 — it parallelizes. The non-scaling remainder is the *non-GLQ* work
+  (oneDNN bf16 GEMMs 15.19%, libtorch 7.87%, interpreter 3.32%, libc 1.95% ≈ 236 ms at T=1,
+  closely matching S).
+* **It is core-bound, not memory-bound**: 45.3% core-bound vs 19.3% memory-bound, at ~0.9% of
+  DRAM peak. More cores cannot help work that is already serial, and bandwidth was never the
+  limit.
+
+The **leading hypothesis for the knee is now parallel-region granularity, and it is untested**:
+parallelism is `at::parallel_for` over `m/32` output-row blocks (`glq_bindings_cpu.cpp:97`,
+grain 1), and an expert `gate_up` is m=1280 = **40 blocks**, so efficiency saturates once thread
+count approaches the block count. That fits a knee at 16 as smooth saturation rather than a step.
+Separating it from the alternatives needs `libgomp` share measured at T=8/16/48, which the spot
+reclaim prevented.
+
+The earlier claim that this "reproduces a previously recorded finding (4x the cores plus AVX-512
+buy ~12%)" still holds as an *observation* about thread scaling. Its stated **mechanism** does
+not.
 
 ### Practical consequence, which inverts the usual sizing instinct
 
@@ -110,3 +135,10 @@ Two conditions for the result to mean anything:
 |---|---|
 | `results.tsv` | the table above, machine-readable |
 | `cpu_tN.trimmed.txt` | run logs with progress bars stripped (raw logs are megabytes of `it/s` spam; these are ~7.7 KB). Each carries its `DTYPE`, `FOOTPRINT`, `RESULT` and `EXIT=0`. Named `.txt` because `.gitignore` excludes `*.log` — correctly, for transient logs; these are curated artifacts |
+
+## See also
+
+`benchmarks/qwen_next_cpu_profile/` — the T=1 hardware-counter profile on this same box that
+corrected the "Why" section above, and that found **51.6% of per-token weight traffic sits in
+layers GLQ does not quantize** (`lm_head` alone is 32.3%, larger than all routed experts in all
+48 layers combined).

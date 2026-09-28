@@ -1,0 +1,14 @@
+
+ Performance counter stats for process id '147741':
+
+      221984776242      TOPDOWN.SLOTS                    #      0.8 %  tma_bad_speculation    
+                                                         #      5.5 %  tma_frontend_bound     
+       64418707052      topdown-retiring                 #     64.7 %  tma_backend_bound      
+       12188354897      topdown-fe-bound                                                      
+      143636503795      topdown-be-bound                                                      
+       13057830379      topdown-heavy-ops                #     29.0 %  tma_retiring           
+        1741217466      topdown-bad-spec                                                      
+          20925750      INT_MISC.UOP_DROPPING                                                 
+
+      12.001577496 seconds time elapsed
+

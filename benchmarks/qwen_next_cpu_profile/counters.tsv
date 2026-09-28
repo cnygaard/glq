@@ -1,0 +1,39 @@
+metric	value	unit	scope	source
+tma_retiring	29.0	pct_slots	process, 12s	counters_topdownL1.txt
+tma_backend_bound	64.7	pct_slots	process, 12s	counters_topdownL1.txt
+tma_frontend_bound	5.5	pct_slots	process, 12s	counters_topdownL1.txt
+tma_bad_speculation	0.8	pct_slots	process, 12s	counters_topdownL1.txt
+tma_core_bound	45.3	pct_slots	process, 12s	counters_topdownL2.txt
+tma_memory_bound	19.3	pct_slots	process, 12s	counters_topdownL2.txt
+tma_light_operations	23.6	pct_slots	process, 12s	counters_topdownL2.txt
+tma_heavy_operations	5.9	pct_slots	process, 12s	counters_topdownL2.txt
+tma_fetch_latency	3.9	pct_slots	process, 12s	counters_topdownL2.txt
+tma_fetch_bandwidth	1.6	pct_slots	process, 12s	counters_topdownL2.txt
+tma_branch_mispredicts	0.4	pct_slots	process, 12s	counters_topdownL2.txt
+tma_dram_bound	10.4	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+tma_l3_bound	4.8	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+tma_l2_bound	1.8	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+tma_l1_bound	2.0	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+cycles	37005635693	count	process, 12s	counters_ipc.txt
+instructions	56316845321	count	process, 12s	counters_ipc.txt
+ipc	1.522	insn_per_cycle	derived from the two above	counters_ipc.txt
+effective_clock	3.08	GHz	derived: cycles / 12.0s	counters_ipc.txt
+branch_miss_rate	0.756	pct	13632831 / 1802112284	counters_ipc.txt
+dram_read	30615.01	MiB	system-wide, 12s	counters_dram_cas.txt
+dram_write	1296.34	MiB	system-wide, 12s	counters_dram_cas.txt
+dram_bandwidth_cas	2.79	GB_per_s	derived: (read+write)/12s	counters_dram_cas.txt
+dram_bandwidth_metric	2.88	GB_per_s	perf built-in metric, independent window	counters_dram_metric.txt
+dram_pct_of_peak	0.9	pct	vs ~307 GB/s (8ch DDR5-4800)	derived
+fp_512b_packed_single	4224842864	count	process, 12s	counters_fp_width.txt
+fp_256b_packed_single	203282287	count	process, 12s	counters_fp_width.txt
+fp_128b_packed_single	99563846	count	process, 12s	counters_fp_width.txt
+fp_scalar_single	95624879	count	process, 12s	counters_fp_width.txt
+fp_pct_512bit	91.4	pct	derived; FP events only, excludes integer SIMD	counters_fp_width.txt
+dso_glq_cpu_so	70.67	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_jit_onednn	15.19	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_libtorch_cpu	7.87	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_python_plus_bindings	3.32	pct_cycles	python3.12 2.53 + libtorch_python 0.79	attribution_by_dso.txt
+dso_libgomp	0.03	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_unresolved	0.44	pct_cycles	kptr_restrict; nothing material hidden	attribution_by_dso.txt
+load_wall	142.9	s	warm page cache	run.log FOOTPRINT
+weights_rss	75.33	GiB	process RSS incl. interpreter+torch	run.log FOOTPRINT

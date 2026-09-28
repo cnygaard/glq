@@ -1,0 +1,7 @@
+--- window topdownL1 @ 22:12:37Z
+--- window topdownL2 @ 22:12:49Z
+--- window ipc @ 22:13:01Z
+--- window dram_metric @ 22:13:13Z
+--- window dram_cas @ 22:13:25Z
+--- window fp_width @ 22:13:37Z
+--- window tma_l3mem @ 22:13:49Z

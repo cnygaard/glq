@@ -1,0 +1,13 @@
+70.67%   glq_cpu.so
+15.19%   [JIT]
+7.87%    libtorch_cpu.so
+2.53%    python3.12
+1.95%    libc.so.6
+0.79%    libtorch_python.so
+0.44%    [unknown]
+0.35%    libc10.so
+0.06%    libm.so.6
+0.06%    ld-linux-x86-64.so.2
+0.05%    libstdc++.so.6.0.33
+0.03%    libgomp.so.1
+0.01%    [vdso]

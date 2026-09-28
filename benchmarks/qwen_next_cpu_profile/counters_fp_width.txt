@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '147741':
+
+        4224842864      fp_arith_inst_retired.512b_packed_single                                      
+         203282287      fp_arith_inst_retired.256b_packed_single                                      
+          99563846      fp_arith_inst_retired.128b_packed_single                                      
+          95624879      fp_arith_inst_retired.scalar_single                                      
+
+      12.001857201 seconds time elapsed
+
