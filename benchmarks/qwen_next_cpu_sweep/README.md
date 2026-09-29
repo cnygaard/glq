@@ -26,19 +26,37 @@ despite `cpu_wheel.latest_cpu_wheel_url` reading GitHub's latest release.
 | 16 | 3.194 | 3.192–3.202 | **+34.2%** | 9,945 | 132.2 | 75.32 |
 | 32 | 3.436 | 3.427–3.437 | +7.6% | 9,930 | 132.0 | 75.35 |
 | 48 | 3.585 | 3.583–3.614 | +4.3% | 9,931 | 132.3 | 75.35 |
-| 96 | 3.603 | 3.594–3.625 | **+0.5%** | 10,015 | 787.2 (cold) | 76.71 |
+| ~~96~~ **48 (see below)** | 3.603 | 3.594–3.625 | **+0.5%** | 10,015 | 787.2 (cold) | 76.71 |
 
-Ranges are ±0.4–1.7%, so every step except 48→96 is outside noise; **48→96 is flat** and SMT
-contributes nothing.
+### ⚠️ CORRECTED 2026-09-29: the "96 thread" cell was a 48-thread run
+
+The sweep set thread count via `OMP_NUM_THREADS` only, and **torch caps its intra-op pool at the
+PHYSICAL core count.** Measured on this box (48c/2t = 96 logical):
+
+```
+OMP_NUM_THREADS unset      -> torch.get_num_threads() = 48
+OMP_NUM_THREADS=96         -> torch.get_num_threads() = 48   <- capped
+torch.set_num_threads(96)  -> torch.get_num_threads() = 96   <- the only way up
+std::thread::hardware_concurrency() : 96
+```
+
+Cells 8/16/32/48 are all ≤ 48 and were honoured. **The 96 cell was therefore a duplicate of the
+48 cell**, and its +0.5% is run-to-run noise between two identical configurations. The earlier
+claim here that "48→96 is flat and SMT contributes nothing" is **withdrawn: SMT was never
+engaged**, so this sweep says nothing about it either way.
+
+`benchmarks/run_model.py` now takes `--threads`, which calls `torch.set_num_threads()` and
+prints a `THREADS requested=… torch.get_num_threads()=…` line, so the gap cannot recur silently.
 
 Two regimes, and reporting only one of them would mislead:
 
 * **8 → 16 is a real +34.2%.** Eight threads is genuinely under-provisioned; cores do help here.
-* **16 → 96 is +12.8% for 6x the cores.** Returns collapse immediately past 16, and 16 threads
-  already captures **89%** of what 96 delivers.
+* **16 → 48 is +12.2% for 3x the cores.** Returns collapse immediately past 16, and 16 threads
+  already captures **89%** of what 48 delivers. (Previously stated as "16 → 96 for 6x the
+  cores"; the top cell was 48, so the ratio was wrong even though the conclusion holds.)
 
-**TTFT is nearly flat across the whole 12x range** (10,591 ms at 8 threads, 9,930–10,015 for
-16–96 — a 6.6% spread). Prefill is the phase that should parallelise best, and it barely moves
+**TTFT is nearly flat across the whole 6x range** (10,591 ms at 8 threads, 9,930–10,015 for
+16–48 — a 6.6% spread). Prefill is the phase that should parallelise best, and it barely moves
 even over the 8→16 step where decode gains a third.
 
 ### Why — CORRECTED 2026-09-28 by hardware counters: it is NOT dispatch
@@ -54,7 +72,7 @@ the same way: dispatch was never the binding constraint.
 What the counters do establish:
 
 * **The step is ~91% non-scaling.** A least-squares fit of `T(n) = S + P/n` over all five points
-  gives **S = 252.7 ms, P = 1268.6 ms** — S is 91% of the 277.5 ms step at T=96. Model-free and
+  gives **S = 252.7 ms, P = 1268.6 ms** — S is 91% of the 277.5 ms step at the top cell (48 threads). Model-free and
   assumption-free: 12x the threads removed only 143 ms of a 420 ms step.
 * **The kernel is not what fails to scale.** It is 70.67% of a T=1 step (~996 ms of ~1.41 s) but
   on the order of ~20 ms of a 279 ms step at T=48 — it parallelizes. The remainder is the
@@ -78,7 +96,8 @@ second identical box with the stack matched:
 **243 ms barrier wait**, 30 ms trellis kernel, 12 ms oneDNN, 5 ms libtorch, 1 ms Python.
 
 **Effective parallelism plateaus at ~8 threads' worth of useful work however many cores are
-added** — that is the knee, and it is also why 48 -> 96 is flat. The cause is too little work per
+added** — that is the knee. (The sweep's apparent 48 -> 96 flatness is not evidence for this:
+that cell was a 48-thread duplicate, see the correction above.) The cause is too little work per
 parallel region: with the fused MoE path off (the default), the per-expert Python loop opens
 **1,262 `at::parallel_for` regions per token**, and an expert `gate_up` is m=1280 = only **40**
 blocks of 32 rows, so at 48 threads most threads take one block and then wait. A zero-barrier-cost
@@ -92,7 +111,7 @@ not.
 
 ### Practical consequence, which inverts the usual sizing instinct
 
-**Size for ~16 threads, and stop.** A 16-vCPU instance gets ~89% of a 96-vCPU metal box, so
+**Size for ~16 threads, and stop.** 16 threads gets ~89% of what 48 threads deliver, so
 paying for `m7i.metal-24xl` over something 6x smaller buys almost nothing — while dropping to
 8 threads does cost a third of the throughput. The knee is narrow and it is at 16.
 

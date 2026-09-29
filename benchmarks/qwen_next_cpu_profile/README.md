@@ -288,6 +288,53 @@ but 13.9% of *wall time*, and its own barrier is 8.16 of those 9.54 points — i
 "OpenMP overhead" in every cycle-based view. It took a wall-clock profiler, correctly placed
 past three prefills, to name the Python line.
 
+## Result 7 — the three CPU fast paths together: +26.7%, and two recorded nulls updated
+
+`cpu_flag_matrix.tsv`. Batch 1, decode 128, repeats 3, **48 effective threads** (see the thread-cap
+note below). Every comparison below has disjoint ranges.
+
+| flags | tok/s | ms/token | weights GiB | gain |
+|---|---|---|---|---|
+| none | 3.586 | 278.9 | 75.3 | — |
+| fast-scatter | 4.203 | 237.9 | 75.3 | +17.2% |
+| fast-scatter + GDN | 4.339 | 230.5 | 75.3 | **+21.0%** |
+| fast-scatter + fused-MoE | 4.292 | 233.0 | **89.2** | +19.7% |
+| **all three** | **4.545** | **220.0** | **89.2** | **+26.7%** |
+
+**`GLQ_CPU_GDN` is no longer a null, and the way it fails to be one confirms its mechanism.**
+It adds **+3.2%** on top of fast-scatter but **+5.9%** on top of fast-scatter + fused-MoE — a
+*fixed* serial cost is a larger fraction of a shorter step. The recorded in-situ null (2.8 tok/s
+on and off) was measured at **8 threads on Emerald Rapids**, its worst case; that note's own
+reasoning predicted this ("the kernel helps MORE on faster hardware, not less"). Engagement is
+corroborated, not assumed: transformers' reference-fallback warning count drops 4 -> 3 in both
+GDN arms.
+
+**`GLQ_HF_MOE_CPU_FUSED` is likewise no longer +0%, but read it carefully.** It is **+19.7%**
+against the *unfixed* loop — the comparison the old record made — but only **+2.1%** against the
+fixed loop, because **fast-scatter is inert when the fused op runs** (the op replaces the Python
+loop the fix lives in). And it costs **+13.9 GiB** (75.3 -> 89.2). On its own that is a poor
+trade; it earns its place only because GDN then compounds on top of it.
+
+TTFT also improves, 9983 -> 8937 ms.
+
+### The thread cap that makes "96 threads" unmeasurable from the environment
+
+**`OMP_NUM_THREADS` cannot raise torch above the physical core count.** On this 48c/2t box:
+
+```
+OMP_NUM_THREADS unset      -> torch.get_num_threads() = 48
+OMP_NUM_THREADS=96         -> torch.get_num_threads() = 48   <- capped
+torch.set_num_threads(96)  -> torch.get_num_threads() = 96   <- the only way up
+std::thread::hardware_concurrency() : 96
+```
+
+Caught by noticing CPU utilisation topping out at 4800% (48 busy threads of 96 logical), then
+confirmed from `/proc/PID/status` (`48 Rl` of 208) and a fresh interpreter. Consequences: the
+arms above are all 48-thread runs despite their labels, and the thread sweep's "96" cell was a
+**duplicate of its 48 cell** — see the correction in `../qwen_next_cpu_sweep/README.md`.
+`run_model.py` now takes `--threads`, which calls `torch.set_num_threads()` and prints
+`THREADS requested=… torch.get_num_threads()=…` so the gap cannot recur silently.
+
 ## What this run does NOT establish
 
 * **The T=1 tok/s was never captured.** That arm's `RESULT` line had not been written when results
