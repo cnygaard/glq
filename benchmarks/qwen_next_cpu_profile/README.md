@@ -335,6 +335,38 @@ arms above are all 48-thread runs despite their labels, and the thread sweep's "
 `run_model.py` now takes `--threads`, which calls `torch.set_num_threads()` and prints
 `THREADS requested=… torch.get_num_threads()=…` so the gap cannot recur silently.
 
+## Result 8 — SMT is actively harmful: 96 threads is 1.99x SLOWER than 48
+
+The first genuine measurement of this, now that `--threads` can exceed the physical core count.
+All three fast paths on, `smt_test.tsv`:
+
+| `--threads` | `torch.get_num_threads()` | tok/s | range | ms/token | TTFT |
+|---|---|---|---|---|---|
+| **48** | 48 | **4.551** | 4.542–4.554 (±0.13%) | 219.7 | 8,986 |
+| **96** | 96 | **2.291** | 2.176–2.403 (**±4.95%**) | 436.5 | 12,262 |
+
+**Oversubscribing to the logical core count nearly halves throughput** (−49.7%), and the spread
+goes **38x wider** — slower and far noisier together, which is the oversubscription signature
+rather than measurement error. TTFT degrades 8,986 -> 12,262 ms.
+
+**Genuine 96 threads with all three optimisations (2.291) is 36% SLOWER than the *unoptimised*
+48-thread baseline (3.586).** No amount of flag tuning compensates for oversubscription.
+
+**Why the obvious argument for SMT is wrong here**, recorded because it is tempting: IPC at 48
+threads is 0.357, which looks like abundant idle issue bandwidth for a sibling to fill — SMT's
+textbook best case. But that low IPC *is the spinning* (Result 5). Doubling the pool does not
+fill idle slots with useful work; it puts **95 spinning threads instead of 47** on the same 48
+cores' issue bandwidth, competing with the one thread doing real work. The evidence that looks
+like SMT's best case is the precise reason it fails.
+
+**The earlier accidental cap was lucky.** The thread sweep's "96" cell reported 3.603 tok/s only
+because torch silently clamped it to 48. A genuine 96-thread run would have reported ~1.8 tok/s
+and read as a catastrophic regression.
+
+**Practical rule: never exceed the physical core count**, and on this workload ~16 threads
+already captures ~89% of 48 (see the sweep). The profiling literature's standard advice — "pin
+to one thread per core" — is not hygiene here, it is worth 2x.
+
 ## What this run does NOT establish
 
 * **The T=1 tok/s was never captured.** That arm's `RESULT` line had not been written when results

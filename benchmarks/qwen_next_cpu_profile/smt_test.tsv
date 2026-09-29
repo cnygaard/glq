@@ -1,0 +1,6 @@
+# Genuine SMT test: --threads calls torch.set_num_threads(), which OMP_NUM_THREADS cannot do
+# above the physical core count. All three CPU fast paths on. m7i.metal-24xl (48c/2t),
+# batch 1, decode 128, repeats 3, avx512fp16, dtype bfloat16.
+threads_requested	torch_get_num_threads	tok_s	range_lo	range_hi	ms_per_token	ttft_ms	weights_gib
+48	48	4.551	4.542	4.554	219.7	8986	89.23
+96	96	2.291	2.176	2.403	436.5	12262	89.22
