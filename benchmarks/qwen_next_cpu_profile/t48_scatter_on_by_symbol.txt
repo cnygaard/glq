@@ -1,0 +1,20 @@
+    68.80%  libgomp.so.1          [.] gomp_barrier_wait_end
+    11.85%  glq_cpu.so            [.] void glq_cpu::(anonymous namespace)::zmm_matvec_impl<glq_cpu::(anonymous namespace)::DecodeFp16, 3>(un
+     8.86%  libgomp.so.1          [.] gomp_team_barrier_wait_end
+     1.37%  libgomp.so.1          [.] gomp_barrier_wait
+     0.72%  libgomp.so.1          [.] gomp_team_barrier_wait_final
+     0.43%  libgomp.so.1          [.] gomp_thread_start
+     0.30%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::Vectoriz
+     0.24%  [JIT] tid 5181        [.] 0x0000795b9811e095
+     0.23%  libtorch_cpu.so       [.] void at::native::(anonymous namespace)::vectorized_outer_sum<float, at::native::(anonymous namespace):
+     0.15%  [JIT] tid 5181        [.] 0x0000795b9811e0ad
+     0.15%  [JIT] tid 5181        [.] 0x0000795b9811e137
+     0.15%  [JIT] tid 5181        [.] 0x0000795b9811e0db
+     0.13%  [JIT] tid 5181        [.] 0x0000795b9811e24b
+     0.13%  [JIT] tid 5181        [.] 0x0000795b9811e23a
+     0.13%  [JIT] tid 5181        [.] 0x0000795b9811e0ca
+     0.12%  [JIT] tid 5181        [.] 0x0000795b9811e21d
+     0.12%  [JIT] tid 5181        [.] 0x0000795b978de0ac
+     0.12%  [JIT] tid 5181        [.] 0x0000795b9811e109
+     0.11%  glq_cpu.so            [.] glq_cpu::fht_inplace(float*, long)
+     0.11%  [JIT] tid 5181        [.] 0x0000795b9811e126

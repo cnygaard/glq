@@ -236,6 +236,53 @@ is false, so the fused path would still open 960 regions. **The flag is not the 
 * **DRAM never becomes the limit**: 2.79 -> 12.56 -> 18.68 GB/s, still only **6%** of the
   ~307 GB/s peak at T=48. Both readings agree at every arm (CAS x 64 B vs perf's own metric).
 
+## Result 6 — the fix the measurements actually pointed at: +16.8% for two lines
+
+Wall-clock attribution (not counters — see the 48x trap above) put **13.9% of a decode step on
+one line**: `final_hidden_states.index_add_(0, token_idx, h)` in `_loop_forward`
+(`glq/fused_experts.py`). CPU `index_add_` dispatches to `scatter_add_`, which sorts indices
+(fbgemm `radix_sort_parallel`) so parallel accumulation is safe when indices collide. At
+batch-1 decode every routed expert sees exactly ONE token — so this is a 48-way parallel sort
+of a single index, run ~480x per token. A lone index cannot collide, so a direct row add is
+**bit-identical** and skips the sort. Shipped behind `GLQ_CPU_FAST_SCATTER` (default off).
+
+**Effect** (`fast_scatter_ab.tsv`; `--repeats 3`, ranges disjoint at both thread counts):
+
+| threads | off | on | gain | ms/token saved |
+|---|---|---|---|---|
+| **48** | 3.597 (3.575-3.612) | **4.202** (4.183-4.214) | **+16.8%** | 40.0 |
+| **16** | 3.192 (3.188-3.193) | **3.286** (3.284-3.292) | **+2.9%** | 9.0 |
+
+**Mechanism, asserted rather than inferred** (`t48_scatter_on_by_dso.txt`, `_by_symbol.txt`):
+
+| symbol | flag off | flag on |
+|---|---|---|
+| `fbgemm::radix_sort_parallel` | **9.54%** | **absent (0 occurrences)** |
+| `gomp_barrier_wait_end` | 61.22% | 68.80% |
+| `zmm_matvec_impl` | 10.09% | 11.85% |
+
+The sort is gone from the profile entirely. The other components rise as *shares* because the
+total shrank; the matvec is unchanged in absolute terms.
+
+**Three independent checks that this is the right mechanism, not a coincidence:**
+
+1. **Prediction vs measurement.** The profile predicted ~41 ms/token on that line; the measured
+   saving at T=48 is **40.0 ms/token** — agreement to ~2%.
+2. **The falsification test.** A parallel-region penalty *must* shrink with fewer threads. It
+   does: 3x the threads gives 4.4x the saving. Had T=16 shown the same +16.8%, this explanation
+   would have been wrong.
+3. **Cross-check at a different decode length and box.** The PMU arm at decode 1300 scored 3.949
+   with the flag on against 3.412 off — **+15.7%**, consistent with +16.8% at decode 128.
+
+**Read the two A/B rows as ratios only.** The T=48 pair ran on one box and the T=16 pair on
+another (spot reclaim in between). Each pair is internally controlled — same box, same session,
+same load — so the ratios are sound; the absolute tok/s are not comparable across rows.
+
+**Why counters alone could never have found this.** `radix_sort_parallel` is 9.54% of *cycles*
+but 13.9% of *wall time*, and its own barrier is 8.16 of those 9.54 points — it reads as
+"OpenMP overhead" in every cycle-based view. It took a wall-clock profiler, correctly placed
+past three prefills, to name the Python line.
+
 ## What this run does NOT establish
 
 * **The T=1 tok/s was never captured.** That arm's `RESULT` line had not been written when results

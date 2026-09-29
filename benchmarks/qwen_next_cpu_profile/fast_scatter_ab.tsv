@@ -1,0 +1,7 @@
+threads	flag	tok_s	range_lo	range_hi	ms_per_token	box	decode	note
+48	off	3.597	3.575	3.612	278.0	box-A	128	baseline
+48	on	4.202	4.183	4.214	238.0	box-A	128	+16.8% vs off
+16	off	3.192	3.188	3.193	313.3	box-B	128	baseline
+16	on	3.286	3.284	3.292	304.3	box-B	128	+2.9% vs off
+48	off	3.412	NA	NA	293.1	box-A	1300	PMU baseline arm
+48	on	3.949	NA	NA	253.2	box-B	1300	+15.7%, PMU mechanism arm
