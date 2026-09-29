@@ -20,9 +20,21 @@ from .embedding_method import GLQEmbeddingMethod
 #: HF-side in_proj_qkv and in_proj_z matrices, quantized separately). in_proj_ba is
 #: deliberately ABSENT: the quantizer skips b/a (16 rows — under the trellis out%32
 #: floor), so the fused ba layer must resolve to nothing and load bf16.
+#: kv_proj is Qwen4Exp's PLE key/value projection. vLLM **0.30.0** started merging it
+#: (``packed_modules_mapping: "kv_proj": ["key_proj", "value_proj"]`` plus an
+#: ``_EXTRA_WEIGHTS_MAPPER`` entry remapping ``ple.key_proj``/``ple.value_proj`` to shards
+#: 0/1 of ``ple.kv_proj``); 0.29.0 built them as two separate linears, so a per-name lookup
+#: sufficed and this entry was not needed. Without it the merged name resolves to nothing,
+#: GLQ declines the layer, vLLM builds it dense bf16 with only a ``weight`` parameter -- and
+#: then feeds it the checkpoint's SU/SV/Wscale/trellis_packed, which fails as
+#: ``'MergedColumnParallelLinear' object has no attribute 'data'`` (vLLM's loader defaults a
+#: missing parameter to the *module*, so the error names neither the weight nor the layer).
+#: No ``_SHARD_GROUPS`` entry: this is a plain 2-part merge like gate_up_proj -- two vLLM
+#: partitions, two checkpoint matrices, 1:1 -- unlike in_proj_qkvz's 4-to-2 case.
 _MERGE_MAP = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
               ".gate_up_proj": (".gate_proj", ".up_proj"),
-              ".in_proj_qkvz": (".in_proj_qkv", ".in_proj_z")}
+              ".in_proj_qkvz": (".in_proj_qkv", ".in_proj_z"),
+              ".kv_proj": (".key_proj", ".value_proj")}
 
 #: Fused layers whose vLLM partition structure differs from the checkpoint's matrix
 #: structure. Qwen3.5's in_proj_qkvz is a MergedColumnParallelLinear with FOUR output
