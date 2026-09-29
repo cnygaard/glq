@@ -244,7 +244,12 @@ one line**: `final_hidden_states.index_add_(0, token_idx, h)` in `_loop_forward`
 (fbgemm `radix_sort_parallel`) so parallel accumulation is safe when indices collide. At
 batch-1 decode every routed expert sees exactly ONE token — so this is a 48-way parallel sort
 of a single index, run ~480x per token. A lone index cannot collide, so a direct row add is
-**bit-identical** and skips the sort. Shipped behind `GLQ_CPU_FAST_SCATTER` (default off).
+**bit-identical** and skips the sort.
+
+**Ships ON by default**, unlike `GLQ_HF_MOE_CPU_FUSED` and `GLQ_CPU_GDN`, and deliberately so:
+those two trade accuracy or memory for speed and so have to be opted into, whereas this one
+produces the same bytes. `GLQ_CPU_FAST_SCATTER=0` stays as a kill switch, so a regression can
+be bisected without a rebuild.
 
 **Effect** (`fast_scatter_ab.tsv`; `--repeats 3`, ranges disjoint at both thread counts):
 

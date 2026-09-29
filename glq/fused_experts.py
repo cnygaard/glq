@@ -64,14 +64,23 @@ def _accumulate_expert_rows(dst: torch.Tensor, token_idx: torch.Tensor,
     thread count: 2.04x the 1-thread cost at 8 threads for a single index.
 
     A lone index cannot collide, so a direct row add is **bit-identical**, not merely close,
-    and skips the sort entirely. Gated by ``GLQ_CPU_FAST_SCATTER`` while the end-to-end win
-    is being measured, matching how ``GLQ_HF_MOE_CPU_FUSED`` and ``GLQ_CPU_GDN`` ship.
-    Because it is bit-identical it should become unconditional once measured, rather than
-    staying a flag.
+    and skips the sort entirely.
+
+    **On by default**, unlike ``GLQ_HF_MOE_CPU_FUSED`` and ``GLQ_CPU_GDN``, and deliberately
+    so: those two trade accuracy or memory for speed and therefore have to be opted into,
+    whereas this one produces the same bytes. Measured end to end (see
+    ``benchmarks/qwen_next_cpu_profile/``): **+16.8% at 48 threads** (3.597 -> 4.202 tok/s,
+    disjoint ranges) and +2.9% at 16 threads, with ``radix_sort_parallel`` gone from the
+    profile. ``GLQ_CPU_FAST_SCATTER=0`` remains as a kill switch, so a regression can be
+    bisected without a rebuild.
+
+    The win scales with thread count because what it removes is a parallel-region cost, so
+    on a small machine expect single digits — that dependence is what confirmed the mechanism
+    rather than a coincidental speedup.
     """
     import os
 
-    if token_idx.numel() == 1 and os.environ.get("GLQ_CPU_FAST_SCATTER", "0") != "0":
+    if token_idx.numel() == 1 and os.environ.get("GLQ_CPU_FAST_SCATTER", "1") != "0":
         # .add_ on the selected row, not `dst[i] += v`: the latter is getitem -> iadd ->
         # setitem, which writes the already-updated view back over itself.
         dst[int(token_idx)].add_(h[0].to(dst.dtype))

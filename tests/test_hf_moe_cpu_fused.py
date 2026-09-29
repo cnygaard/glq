@@ -544,19 +544,51 @@ def test_a_cuda_input_never_takes_this_path(monkeypatch):
     assert c._try_fused_cpu(x, ids.cuda(), wts.cuda()) is None
 
 
-# ---- the single-index scatter fast path -----------------------------------------------------
+# ---- the single-index scatter fast path (ON by default) --------------------------------------
 # At batch-1 decode every routed expert sees exactly ONE token, so `token_idx` holds one index.
 # CPU `index_add_` dispatches to `scatter_add_`, which sorts indices (fbgemm
 # `radix_sort_parallel`) so parallel accumulation is safe against duplicates. Measured on a
-# 48-core Sapphire Rapids box that sort is ~14% of a decode step's wall time — a 48-way parallel
-# sort of a single index, ~480x per token — and it scales NEGATIVELY with thread count (2.04x
-# the 1-thread cost at 8 threads). One index cannot collide, so a direct row add is
-# bit-identical and skips the whole machinery.
+# 48-core Sapphire Rapids box that sort is 13.9% of a decode step's wall time — a 48-way
+# parallel sort of a single index, ~480x per token — and it scales NEGATIVELY with thread count
+# (2.04x the 1-thread cost at 8 threads). One index cannot collide, so a direct row add is
+# bit-identical and skips the whole machinery. Measured +16.8% at T=48, +2.9% at T=16.
+#
+# The flag is an opt-OUT, so these tests must set it to "0" for a baseline rather than relying
+# on its absence — the mistake that would make every comparison below fast-vs-fast.
 
-def _loop_only(c, x, ids, wts, monkeypatch):
-    """Force the Python per-expert loop, which is where the scatter lives."""
+
+def _loop(c, x, ids, wts, monkeypatch, fast):
+    """Run the Python per-expert loop (where the scatter lives) with the fast path on or off.
+
+    `fast=None` means "leave the variable unset", which is how the default is tested.
+    """
     monkeypatch.delenv("GLQ_HF_MOE_CPU_FUSED", raising=False)
+    if fast is None:
+        monkeypatch.delenv("GLQ_CPU_FAST_SCATTER", raising=False)
+    else:
+        monkeypatch.setenv("GLQ_CPU_FAST_SCATTER", fast)
     return c(x, ids, wts)
+
+
+def _spy_on_index_add(monkeypatch):
+    """Returns a list that gains an entry per index_add_ call."""
+    seen = []
+    orig = torch.Tensor.index_add_
+    monkeypatch.setattr(torch.Tensor, "index_add_",
+                        lambda self, *a, **k: (seen.append(1), orig(self, *a, **k))[1])
+    return seen
+
+
+def test_the_fast_path_is_on_by_default(monkeypatch):
+    """The change is bit-identical, so callers should not have to opt in. With nothing set in
+    the environment the sort must already be skipped."""
+    _ext()
+    c = build_container(E=4)
+    x = torch.randn(1, HIDDEN)
+    ids, wts = _route(1, 4, 2, seed=3)
+    seen = _spy_on_index_add(monkeypatch)
+    _loop(c, x, ids, wts, monkeypatch, fast=None)
+    assert not seen, f"default must skip index_add_; it was called {len(seen)}x"
 
 
 def test_single_index_scatter_skips_index_add_entirely(monkeypatch):
@@ -564,34 +596,40 @@ def test_single_index_scatter_skips_index_add_entirely(monkeypatch):
     the fast path silently inert — which is exactly how a no-op optimisation ships."""
     _ext()
     c = build_container(E=4)
-    x = torch.randn(1, HIDDEN)              # ONE token -> one index per expert
+    x = torch.randn(1, HIDDEN)
     ids, wts = _route(1, 4, 2, seed=3)
 
-    ref = _loop_only(c, x, ids, wts, monkeypatch)          # today's path
+    ref = _loop(c, x, ids, wts, monkeypatch, fast="0")      # kill switch = the old path
 
-    seen = []
-    orig = torch.Tensor.index_add_
-    monkeypatch.setattr(torch.Tensor, "index_add_",
-                        lambda self, *a, **k: (seen.append(1), orig(self, *a, **k))[1])
-    monkeypatch.setenv("GLQ_CPU_FAST_SCATTER", "1")
-    got = _loop_only(c, x, ids, wts, monkeypatch)
+    seen = _spy_on_index_add(monkeypatch)
+    got = _loop(c, x, ids, wts, monkeypatch, fast="1")
 
     assert not seen, f"fast path did not engage: index_add_ still called {len(seen)}x"
     assert torch.equal(got, ref), f"not bit-identical: max|d|={(got - ref).abs().max()}"
 
 
+def test_the_kill_switch_restores_index_add(monkeypatch):
+    """`GLQ_CPU_FAST_SCATTER=0` must genuinely reach the old code, so a regression can be
+    bisected without a rebuild. Asserted on the mechanism, not just on equal output."""
+    _ext()
+    c = build_container(E=4)
+    x = torch.randn(1, HIDDEN)
+    ids, wts = _route(1, 4, 2, seed=9)
+    seen = _spy_on_index_add(monkeypatch)
+    _loop(c, x, ids, wts, monkeypatch, fast="0")
+    assert seen, "the kill switch did not restore index_add_"
+
+
 def test_the_fast_path_is_byte_identical_and_not_a_tolerance_match(monkeypatch):
-    """A single index cannot collide, so this must be EXACT, not close. Uses several routings
-    and both activations so a shape- or order-dependent slip would show."""
+    """A single index cannot collide, so this must be EXACT, not close. Several routings so a
+    shape- or order-dependent slip would show."""
     _ext()
     for E, topk, seed in ((4, 2, 1), (6, 3, 7), (3, 1, 11)):
         c = build_container(E=E)
         x = torch.randn(1, HIDDEN)
         ids, wts = _route(1, E, topk, seed=seed)
-        ref = _loop_only(c, x, ids, wts, monkeypatch)
-        monkeypatch.setenv("GLQ_CPU_FAST_SCATTER", "1")
-        got = _loop_only(c, x, ids, wts, monkeypatch)
-        monkeypatch.delenv("GLQ_CPU_FAST_SCATTER", raising=False)
+        ref = _loop(c, x, ids, wts, monkeypatch, fast="0")
+        got = _loop(c, x, ids, wts, monkeypatch, fast="1")
         assert torch.equal(got, ref), f"E={E} topk={topk}: max|d|={(got - ref).abs().max()}"
 
 
@@ -603,14 +641,10 @@ def test_multi_token_still_uses_index_add_and_is_unchanged(monkeypatch):
     x = torch.randn(6, HIDDEN)
     ids, wts = _route(6, 3, 2, seed=5)
 
-    ref = _loop_only(c, x, ids, wts, monkeypatch)
+    ref = _loop(c, x, ids, wts, monkeypatch, fast="0")
 
-    seen = []
-    orig = torch.Tensor.index_add_
-    monkeypatch.setattr(torch.Tensor, "index_add_",
-                        lambda self, *a, **k: (seen.append(1), orig(self, *a, **k))[1])
-    monkeypatch.setenv("GLQ_CPU_FAST_SCATTER", "1")
-    got = _loop_only(c, x, ids, wts, monkeypatch)
+    seen = _spy_on_index_add(monkeypatch)
+    got = _loop(c, x, ids, wts, monkeypatch, fast="1")
 
     assert seen, "multi-token routing must still go through index_add_"
     assert torch.equal(got, ref), f"max|d|={(got - ref).abs().max()}"
