@@ -115,6 +115,7 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
                 weight_loader, output_dim=None)
             layer.glq_embedding_dim = embedding_dim
             layer.glq_out_dtype = params_dtype
+            self._register_weight_placeholder(layer, params_dtype)
             return
 
         # Vocab-sharded buffers (output_dim=0)
@@ -152,6 +153,44 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
         # return that so downstream layers see the right tensor type.
         layer.glq_out_dtype = params_dtype
 
+        self._register_weight_placeholder(layer, params_dtype)
+
+    @staticmethod
+    def _register_weight_placeholder(layer: nn.Module,
+                                     params_dtype: torch.dtype) -> None:
+        """A 0-element ``weight``, purely to survive a vLLM >= 0.30.0 LOG line.
+
+        ``Qwen4ExpNGramEmbedding.__init__`` (``vllm/models/qwen4_exp/nvidia/
+        ngram_embedding.py:719``) does this unconditionally, regardless of quant method::
+
+            weight = self.ngram_embedding.weight
+            logger.info("Initialized PLE embedding %s: ... weight_dtype=%s, "
+                        "weight_device=%s, pinned=%s", ..., weight.dtype,
+                        weight.device, weight.is_pinned())
+
+        vLLM's own methods happen to ``register_parameter("weight", ...)`` inside
+        ``create_weights``; GLQ registers ``trellis_packed``/``Qidxs``/``SU``/``SV``/
+        ``Wscale`` and no dense table, so an **info log** takes the engine down with
+        ``'Qwen4ExpPLEDeviceEmbedding' object has no attribute 'weight'``. That is a vLLM
+        bug -- it breaks any quant method whose storage is not named ``weight`` -- and is
+        worth reporting upstream; this keeps GLQ loadable meanwhile.
+
+        Deliberately a **0-element** tensor, and a plain attribute rather than a parameter
+        or buffer: the weight loader iterates ``named_parameters``/``named_buffers``, so
+        this stays invisible to loading, and if a future vLLM ever *uses* it for real the
+        empty shape fails loudly instead of silently returning wrong rows.
+        ``dtype``/``device``/``is_pinned`` -- everything the log touches -- work on it.
+
+        Called from **both** branches of ``create_weights``. The first version of this was
+        only in the shell tail, and the trellis branch returns before reaching it, so it
+        was a no-op on exactly the checkpoints that need it.
+        """
+        if hasattr(layer, "weight"):
+            return
+        # Report the device GLQ's own buffers are on, so the log line is not misleading.
+        dev = next((p.device for p in layer.parameters()), None)
+        layer.weight = torch.empty(0, dtype=params_dtype, device=dev)
+
     def apply(self, layer: nn.Module, x: torch.Tensor,
               bias: torch.Tensor | None = None) -> torch.Tensor:
         """Required by ``QuantizeMethodBase``. Embeddings never invoke
@@ -164,6 +203,37 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             "GLQEmbeddingMethod.apply called — only embedding lookup is "
             "supported. If you're trying to quantize the LM head, that's "
             "not currently implemented; use the unquantized path.")
+
+    #: vLLM >= 0.30.0's ``Qwen4ExpPLEEmbeddingMethod`` carries this; its PLE loader reads it
+    #: to decide whether post-load processing must run on the device. GLQ's tables are
+    #: already in their runtime layout after ``process_weights_after_loading``, so False
+    #: matches what vLLM's own FP8 and unquantized PLE methods declare. Harmless on 0.29.0.
+    requires_device_loading: bool = False
+
+    def dequantize(self, layer: nn.Module, embeddings: torch.Tensor,
+                   output_dtype: torch.dtype) -> torch.Tensor:
+        """Required by vLLM >= 0.30.0, which SPLIT the PLE lookup into two calls.
+
+        0.29.0 had one step: ``embedding()`` returned activation-dtype rows. 0.30.0 calls
+        ``embedding()`` for raw rows and then ``Qwen4ExpPLEEmbedding.dequantize`` ->
+        ``embedding_method.dequantize`` to convert them (``ngram_embedding.py``, and
+        ``ple_layer.py``'s ``_dequantize_embeddings``).
+
+        GLQ's ``embedding()`` already decodes all the way to ``params_dtype``, so there is
+        nothing left to convert and this is a pass-through — the same thing vLLM's own
+        ``Qwen4ExpPLEUnquantizedEmbeddingMethod.dequantize`` does. The cast is kept only for
+        the case where the model's activation dtype differs from the table's ``params_dtype``;
+        it is a no-op when they agree.
+
+        Deliberately NOT a subclass of ``Qwen4ExpPLEEmbeddingMethod``: that class does not
+        exist on 0.29.0, and vLLM reaches this by duck typing
+        (``self.embedding_method.dequantize(...)``), so inheriting would buy nothing and
+        would pin GLQ to one vLLM version.
+        """
+        del layer
+        if embeddings.dtype == output_dtype:
+            return embeddings
+        return embeddings.to(output_dtype)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Cache the codebook + stage count on the layer at LOAD time.
