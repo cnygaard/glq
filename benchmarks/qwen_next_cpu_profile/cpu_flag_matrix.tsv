@@ -1,0 +1,10 @@
+# Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4, m7i.metal-24xl (Xeon 8488C), avx512fp16,
+# HF runtime, batch 1, decode 128, repeats 3, dtype bfloat16.
+# NOTE: labelled t96_* but all ran at 48 EFFECTIVE threads -- OMP_NUM_THREADS=96 is capped by
+# torch at the 48 physical cores. Arms are comparable to each other, not to a 96-thread run.
+label	fast_scatter	moe_fused	gdn	tok_s	range_lo	range_hi	weights_gib	peak_rss_gib	ttft_ms	gain_vs_base	gdn_fallback_lines
+t96_base	0	0	0	3.586	3.568	3.591	75.3	86.14	9983	baseline	4
+t96_scatter	1	0	0	4.203	4.199	4.209	75.3	86.22	9814	+17.2%	4
+t96_scat_gdn	1	0	1	4.339	4.316	4.356	75.3	86.40	9773	+21.0%	3
+t96_moefused	1	1	0	4.292	4.282	4.297	89.22	101.35	8985	+19.7%	4
+t96_all	1	1	1	4.545	4.519	4.557	89.23	101.25	8937	+26.7%	3

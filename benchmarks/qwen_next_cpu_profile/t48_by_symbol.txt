@@ -1,0 +1,25 @@
+    61.22%  libgomp.so.1          [.] gomp_barrier_wait_end
+    17.17%  libgomp.so.1          [.] gomp_team_barrier_wait_end
+    10.09%  glq_cpu.so            [.] void glq_cpu::(anonymous namespace)::zmm_matvec_impl<glq_cpu::(anonymous namespace)::DecodeFp16, 3>(un
+     1.47%  libgomp.so.1          [.] gomp_barrier_wait
+     1.32%  libgomp.so.1          [.] gomp_team_barrier_wait
+     1.07%  libgomp.so.1          [.] gomp_team_barrier_wait_final
+     0.51%  libgomp.so.1          [.] gomp_thread_start
+     0.25%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::Vectoriz
+     0.19%  [JIT] tid 7814        [.] 0x0000749078498095
+     0.19%  libtorch_cpu.so       [.] void at::native::(anonymous namespace)::vectorized_outer_sum<float, at::native::(anonymous namespace):
+     0.19%  libtorch_cpu.so       [.] std::pair<long*, long*> fbgemm::radix_sort_parallel<long, long>(long*, long*, long*, long*, long, long
+     0.13%  [JIT] tid 7814        [.] 0x0000749078498137
+     0.13%  [JIT] tid 7814        [.] 0x00007490784980ad
+     0.12%  [JIT] tid 7814        [.] 0x00007490784980db
+     0.11%  [JIT] tid 7814        [.] 0x000074907849824b
+     0.11%  [JIT] tid 7814        [.] 0x000074907849823a
+     0.11%  [JIT] tid 7814        [.] 0x00007490784980ca
+     0.10%  [JIT] tid 7814        [.] 0x000074907849821d
+     0.10%  [JIT] tid 7814        [.] 0x0000749078498109
+     0.10%  glq_cpu.so            [.] glq_cpu::fht_inplace(float*, long)
+     0.10%  [JIT] tid 7814        [.] 0x0000749078498126
+     0.10%  [JIT] tid 7814        [.] 0x000074907849809c
+     0.10%  glq_cpu.so            [.] void at::internal::invoke_parallel<at::parallel_for<(anonymous namespace)::matvec_trellis_3inst_cpu(at
+     0.09%  [JIT] tid 7814        [.] 0x000074906265e0ac
+     0.09%  [JIT] tid 7814        [.] 0x000074906265e09d

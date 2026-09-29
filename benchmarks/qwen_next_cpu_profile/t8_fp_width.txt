@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '28048':
+
+       19265368082      fp_arith_inst_retired.512b_packed_single                                      
+         931072783      fp_arith_inst_retired.256b_packed_single                                      
+         454124560      fp_arith_inst_retired.128b_packed_single                                      
+         436716372      fp_arith_inst_retired.scalar_single                                      
+
+      12.002203487 seconds time elapsed
+

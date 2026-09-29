@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '147741':
+
+       37005635693      cycles                                                                
+       56316845321      instructions                                                          
+        1802112284      branches                                                              
+          13632831      branch-misses                                                         
+
+      12.001977856 seconds time elapsed
+

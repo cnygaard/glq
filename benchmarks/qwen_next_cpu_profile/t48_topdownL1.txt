@@ -1,0 +1,14 @@
+
+ Performance counter stats for process id '7814':
+
+     5889252942888      TOPDOWN.SLOTS                    #      0.2 %  tma_bad_speculation    
+                                                         #      0.8 %  tma_frontend_bound     
+      521989032141      topdown-retiring                 #     90.1 %  tma_backend_bound      
+       49115741672      topdown-fe-bound                                                      
+     5302329930179      topdown-be-bound                                                      
+      206260541555      topdown-heavy-ops                #      8.9 %  tma_retiring           
+        9952079012      topdown-bad-spec                                                      
+         201853306      INT_MISC.UOP_DROPPING                                                 
+
+      12.003410440 seconds time elapsed
+

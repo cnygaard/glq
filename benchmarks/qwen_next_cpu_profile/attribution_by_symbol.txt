@@ -1,0 +1,40 @@
+    69.82%  glq_cpu.so            [.] void glq_cpu::(anonymous namespace)::zmm_matvec_impl<glq_cpu::(anonymous namespace)::DecodeFp16, 3>(unsigned short const*, float const*, float*, long, long, float
+     1.73%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::VectorizedLoop2d<at::native::(anonymous namespace)::mul_kernel(at::T
+     0.73%  python3.12            [.] _PyEval_EvalFrameDefault
+     0.69%  glq_cpu.so            [.] glq_cpu::fht_inplace(float*, long)
+     0.68%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::VectorizedLoop2d<at::native::(anonymous namespace)::add_kernel(at::T
+     0.56%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::VectorizedLoop2d<at::native::AVX2::direct_copy_kernel(at::TensorIter
+     0.49%  [JIT] tid 147741      [.] 0x00007640ffea909d
+     0.47%  libtorch_cpu.so       [.] void at::native::(anonymous namespace)::vectorized_outer_sum<float, at::native::(anonymous namespace)::OuterSumCastLoadPolicy<at::vec::AVX2::Vectorized<float>, at
+     0.43%  [JIT] tid 147741      [.] 0x00007641011f1095
+     0.42%  libc.so.6             [.] 0x00000000000ac174
+     0.37%  [JIT] tid 147741      [.] 0x00007641011f10ca
+     0.36%  [JIT] tid 147741      [.] 0x00007641011f108f
+     0.35%  [JIT] tid 147741      [.] 0x00007640ffea90ac
+     0.34%  [JIT] tid 147741      [.] 0x00007641011f1137
+     0.33%  [JIT] tid 147741      [.] 0x00007641011f10db
+     0.31%  [JIT] tid 147741      [.] 0x00007641011f120c
+     0.31%  [JIT] tid 147741      [.] 0x00007640ffea9095
+     0.29%  [JIT] tid 147741      [.] 0x00007641011f121d
+     0.29%  [JIT] tid 147741      [.] 0x00007641011f123a
+     0.29%  [JIT] tid 147741      [.] 0x00007641011f1126
+     0.28%  [JIT] tid 147741      [.] 0x00007641011f1109
+     0.27%  [JIT] tid 147741      [.] 0x00007640fff2908f
+     0.27%  [JIT] tid 147741      [.] 0x00007641011f124b
+     0.27%  [JIT] tid 147741      [.] 0x00007641011f109c
+     0.27%  [JIT] tid 147741      [.] 0x00007640ffea90c7
+     0.26%  [JIT] tid 147741      [.] 0x00007641011f10ad
+     0.25%  [JIT] tid 147741      [.] 0x00007640ffea90d5
+     0.25%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::VectorizedLoop2d<at::native::AVX2::direct_copy_kernel(at::TensorIter
+     0.24%  [JIT] tid 147741      [.] 0x00007640ffea924a
+     0.23%  [JIT] tid 147741      [.] 0x00007641011f1279
+     0.22%  [JIT] tid 147741      [.] 0x00007641011f10f8
+     0.22%  [JIT] tid 147741      [.] 0x00007640ffea9117
+     0.22%  [JIT] tid 147741      [.] 0x00007640ffea90fd
+     0.21%  [JIT] tid 147741      [.] 0x00007640ffee908d
+     0.21%  [JIT] tid 147741      [.] 0x00007640ffea90ef
+     0.18%  [JIT] tid 147741      [.] 0x00007640ffea921f
+     0.17%  [JIT] tid 147741      [.] 0x00007640ffea91f7
+     0.16%  [JIT] tid 147741      [.] 0x00007640fff2910c
+     0.16%  [JIT] tid 147741      [.] 0x00007640fff2913a
+     0.16%  libc.so.6             [.] malloc

@@ -975,6 +975,43 @@ def test_lookup_bpw_prefix_forms():
     assert cfg._lookup_bpw("model.per_layer_model_projection") is None
 
 
+@requires_vllm
+def test_lookup_bpw_resolves_the_ple_kv_proj_merge():
+    """vLLM 0.30.0 merges Qwen4Exp's PLE key/value projections into ``kv_proj``.
+
+    0.29.0 built ``ple.key_proj`` and ``ple.value_proj`` as two separate linears, so a
+    per-name lookup sufficed. 0.30.0 added ``"kv_proj": ["key_proj", "value_proj"]`` to
+    ``packed_modules_mapping`` plus an ``_EXTRA_WEIGHTS_MAPPER`` entry remapping both to
+    shards 0/1 of ``ple.kv_proj`` -- so GLQ is now asked about the MERGED name.
+
+    Without the ``_MERGE_MAP`` entry this returned None, GLQ declined the layer, vLLM built
+    it dense bf16 with only a ``weight`` parameter, and then fed it the checkpoint's
+    SU/SV/Wscale/trellis_packed. The symptom was ``'MergedColumnParallelLinear' object has
+    no attribute 'data'`` -- naming neither the weight nor the layer, because vLLM's loader
+    defaults a missing parameter to the *module* itself.
+    """
+    from glq_vllm.config import GLQvLLMConfig
+    kw = dict(bpw=3, codebook="trellis", variant="3inst", trellis_layout="kernel")
+    cfg = GLQvLLMConfig.from_config(dict(kw, layer_bpw={
+        "model.language_model.layers.1.ple.key_proj": 3,
+        "model.language_model.layers.1.ple.value_proj": 3,
+    }))
+
+    # The prefix vLLM 0.30.0 actually passes for the merged layer.
+    assert cfg._lookup_bpw("language_model.model.layers.1.ple.kv_proj") == 3
+    assert cfg._lookup_bpw("model.language_model.layers.1.ple.kv_proj") == 3
+    # The unmerged names must keep resolving, so 0.29.0 does not regress.
+    assert cfg._lookup_bpw("language_model.model.layers.1.ple.key_proj") == 3
+    assert cfg._lookup_bpw("language_model.model.layers.1.ple.value_proj") == 3
+
+    # Negative control: a kv_proj whose parts are NOT in the whitelist must still decline.
+    # Without this, the fix could over-claim and register GLQ buffers for a bf16 table --
+    # the mirror image of the bug, and just as silent.
+    bare = GLQvLLMConfig.from_config(dict(kw, layer_bpw={
+        "model.language_model.layers.0.mlp.down_proj": 3}))
+    assert bare._lookup_bpw("language_model.model.layers.1.ple.kv_proj") is None
+
+
 # ── Test 3: Dequant correctness (CPU, no vLLM server) ──────────────────
 
 @pytest.mark.skipif(

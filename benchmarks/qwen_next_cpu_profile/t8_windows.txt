@@ -1,0 +1,8 @@
+--- window topdownL1 @ 20:45:35Z
+--- window topdownL2 @ 20:45:47Z
+--- window ipc @ 20:45:59Z
+--- window dram_metric @ 20:46:47Z
+--- window dram_cas @ 20:46:59Z
+--- window fp_width @ 20:47:11Z
+--- window tma_l3mem @ 20:47:24Z
+RUN_EXIT=0

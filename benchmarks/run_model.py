@@ -495,6 +495,14 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", required=True, help="local checkpoint dir or HF repo id")
     ap.add_argument("--runtime", default="vllm", choices=["vllm", "hf"])
+    ap.add_argument("--threads", type=int, default=None,
+                    help="CPU intra-op threads. Needed because OMP_NUM_THREADS CANNOT raise "
+                         "torch above the PHYSICAL core count: on a 48c/96t box "
+                         "OMP_NUM_THREADS=96 still gives torch.get_num_threads()==48, so SMT "
+                         "is unreachable from the environment alone. Only "
+                         "torch.set_num_threads() goes higher. Values at or below the physical "
+                         "count are honoured by OMP_NUM_THREADS too, so this flag matters only "
+                         "when oversubscribing")
     ap.add_argument("--quant", default="glq", choices=["glq", "none"],
                     help="'none' for a bf16 baseline arm")
     ap.add_argument("--batches", default="1,32", help="comma list, e.g. 1,8,32")
@@ -548,6 +556,18 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+
+    # Thread count BEFORE any model work, and printed as a mechanism assertion rather than
+    # assumed: a thread sweep driven only by OMP_NUM_THREADS silently tops out at the physical
+    # core count, which made a "96 thread" cell a duplicate of the 48-thread one.
+    if args.threads is not None:
+        import torch
+        torch.set_num_threads(args.threads)
+    if args.device_map == "cpu" or not is_cuda_device(args.device_map):
+        import torch
+        print(f"THREADS requested={args.threads or os.environ.get('OMP_NUM_THREADS', 'unset')} "
+              f"torch.get_num_threads()={torch.get_num_threads()} "
+              f"interop={torch.get_num_interop_threads()}", flush=True)
 
     # Resolve --dtype from the one family-aware source, so the harness and `glq-chat` cannot
     # drift on which dtype a model is measured versus served with. Device-aware because the

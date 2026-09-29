@@ -1,0 +1,71 @@
+### OMP_NUM_THREADS=32  token=set  20:59:22Z
+DTYPE bfloat16 (default for cpu; override with --dtype)
+HF class Qwen4ExpForConditionalGeneration (from architectures)
+[transformers] [1mQwen4ExpForConditionalGeneration LOAD REPORT[0m from: xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4
+Key                                                                                      | Status  | 
+-----------------------------------------------------------------------------------------+---------+-
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.up_proj.trellis_packed2       | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.trellis_packed   | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.down_proj.trellis_packed2     | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.Wscale           | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_proj.trellis_packed2     | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_proj.tlut                | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.up_proj.inv_resid_scale2      | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.inv_resid_scale2 | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.down_proj.inv_resid_scale2    | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.SU               | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.up_proj.tlut                  | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.SV               | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.down_proj.tlut                | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.tlut             | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_up_proj.trellis_packed2  | MISSING | 
+model.language_model.layers.{0...47}.mlp.experts.{0...511}.gate_proj.inv_resid_scale2    | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.gate_proj.inv_resid_scale2        | MISSING | 
+model.language_model.layers.1.ple.value_proj.trellis_packed2                             | MISSING | 
+model.language_model.layers.{3...47}.self_attn.q_proj.inv_resid_scale2                   | MISSING | 
+model.language_model.layers.{3...47}.self_attn.o_proj.inv_resid_scale2                   | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.out_proj.tlut                           | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.up_proj.tlut                      | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.down_proj.tlut                    | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.down_proj.trellis_packed2         | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.down_proj.inv_resid_scale2        | MISSING | 
+model.language_model.layers.{3...47}.self_attn.k_proj.tlut                               | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.gate_proj.tlut                    | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.gate_proj.trellis_packed2         | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.out_proj.inv_resid_scale2               | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.up_proj.inv_resid_scale2          | MISSING | 
+model.language_model.layers.{3...47}.self_attn.k_proj.trellis_packed2                    | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.in_proj_qkv.inv_resid_scale2            | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.in_proj_qkv.trellis_packed2             | MISSING | 
+model.language_model.layers.{0...47}.mlp.shared_expert.up_proj.trellis_packed2           | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.in_proj_qkv.tlut                        | MISSING | 
+model.language_model.layers.{3...47}.self_attn.o_proj.trellis_packed2                    | MISSING | 
+model.language_model.layers.{3...47}.self_attn.v_proj.tlut                               | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.in_proj_z.trellis_packed2               | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.out_proj.trellis_packed2                | MISSING | 
+model.language_model.layers.{3...47}.self_attn.v_proj.trellis_packed2                    | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.in_proj_z.inv_resid_scale2              | MISSING | 
+model.language_model.layers.{0...46}.linear_attn.in_proj_z.tlut                          | MISSING | 
+model.language_model.layers.1.ple.value_proj.tlut                                        | MISSING | 
+model.language_model.layers.{3...47}.self_attn.q_proj.trellis_packed2                    | MISSING | 
+model.language_model.layers.{3...47}.self_attn.q_proj.tlut                               | MISSING | 
+model.language_model.layers.{3...47}.self_attn.k_proj.inv_resid_scale2                   | MISSING | 
+model.language_model.layers.{3...47}.self_attn.o_proj.tlut                               | MISSING | 
+model.language_model.layers.{3...47}.self_attn.v_proj.inv_resid_scale2                   | MISSING | 
+model.language_model.layers.1.ple.key_proj.trellis_packed2                               | MISSING | 
+model.language_model.layers.1.ple.key_proj.inv_resid_scale2                              | MISSING | 
+model.language_model.layers.1.ple.key_proj.tlut                                          | MISSING | 
+model.language_model.layers.1.ple.value_proj.inv_resid_scale2                            | MISSING | 
+Notes:
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+FOOTPRINT load_s=132.0 weights_gib=75.35 runtime=hf device=cpu (peak RSS: includes interpreter+torch)
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+[transformers] `causal_conv1d_update` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `fused_recurrent_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+SAMPLE 'We need to answer user: "Name three primary colors and give one short fact about each." Simple. Need final concise. Ensure maybe primary colors depend on additive/subtractive. Could say red, yellow, blue (traditional) or red, green, blue (light). User likely expects three primary colors. Give one short fact each. Need maybe mention context? Could say In traditional art: red, yellow, blue. Facts: r'
+RESULT label=cpu_t32 model=xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4 runtime=hf batch=1 total_decode_tokps=3.436 per_seq_tokps=3.436 ttft_ms=9930 n_tokens=32 tokps_range=3.427-3.437 n_repeats=3
+PEAK_RSS_GIB 83.93
+RUN_OK
+EXIT=0 T=32

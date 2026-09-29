@@ -1,0 +1,58 @@
+metric	value	unit	scope	source
+tma_retiring	29.0	pct_slots	process, 12s	counters_topdownL1.txt
+tma_backend_bound	64.7	pct_slots	process, 12s	counters_topdownL1.txt
+tma_frontend_bound	5.5	pct_slots	process, 12s	counters_topdownL1.txt
+tma_bad_speculation	0.8	pct_slots	process, 12s	counters_topdownL1.txt
+tma_core_bound	45.3	pct_slots	process, 12s	counters_topdownL2.txt
+tma_memory_bound	19.3	pct_slots	process, 12s	counters_topdownL2.txt
+tma_light_operations	23.6	pct_slots	process, 12s	counters_topdownL2.txt
+tma_heavy_operations	5.9	pct_slots	process, 12s	counters_topdownL2.txt
+tma_fetch_latency	3.9	pct_slots	process, 12s	counters_topdownL2.txt
+tma_fetch_bandwidth	1.6	pct_slots	process, 12s	counters_topdownL2.txt
+tma_branch_mispredicts	0.4	pct_slots	process, 12s	counters_topdownL2.txt
+tma_dram_bound	10.4	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+tma_l3_bound	4.8	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+tma_l2_bound	1.8	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+tma_l1_bound	2.0	pct_slots	process, 12s, MULTIPLEXED ~25pct	counters_tma_l3mem.txt
+cycles	37005635693	count	process, 12s	counters_ipc.txt
+instructions	56316845321	count	process, 12s	counters_ipc.txt
+ipc	1.522	insn_per_cycle	derived from the two above	counters_ipc.txt
+effective_clock	3.08	GHz	derived: cycles / 12.0s	counters_ipc.txt
+branch_miss_rate	0.756	pct	13632831 / 1802112284	counters_ipc.txt
+dram_read	30615.01	MiB	system-wide, 12s	counters_dram_cas.txt
+dram_write	1296.34	MiB	system-wide, 12s	counters_dram_cas.txt
+dram_bandwidth_cas	2.79	GB_per_s	derived: (read+write)/12s	counters_dram_cas.txt
+dram_bandwidth_metric	2.88	GB_per_s	perf built-in metric, independent window	counters_dram_metric.txt
+dram_pct_of_peak	0.9	pct	vs ~307 GB/s (8ch DDR5-4800)	derived
+fp_512b_packed_single	4224842864	count	process, 12s	counters_fp_width.txt
+fp_256b_packed_single	203282287	count	process, 12s	counters_fp_width.txt
+fp_128b_packed_single	99563846	count	process, 12s	counters_fp_width.txt
+fp_scalar_single	95624879	count	process, 12s	counters_fp_width.txt
+fp_pct_512bit	91.4	pct	derived; FP events only, excludes integer SIMD	counters_fp_width.txt
+dso_glq_cpu_so	70.67	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_jit_onednn	15.19	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_libtorch_cpu	7.87	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_python_plus_bindings	3.32	pct_cycles	python3.12 2.53 + libtorch_python 0.79	attribution_by_dso.txt
+dso_libgomp	0.03	pct_cycles	perf record lbr, 30s	attribution_by_dso.txt
+dso_unresolved	0.44	pct_cycles	kptr_restrict; nothing material hidden	attribution_by_dso.txt
+load_wall	142.9	s	warm page cache	run.log FOOTPRINT
+weights_rss	75.33	GiB	process RSS incl. interpreter+torch	run.log FOOTPRINT
+#	---- multi-thread arms, second identical box 2026-09-28, stack matched to the T=1 arm ----
+t8_decode_tokps	2.357	tok_per_s	measured, decode 900, batch 1	t8_result.txt
+t8_dso_libgomp	47.37	pct_cycles	perf record lbr	t8_by_dso.txt
+t8_dso_glq_cpu	34.55	pct_cycles	perf record lbr	t8_by_dso.txt
+t8_ipc	1.163	insn_per_cycle	225904584487/194184825061	t8_ipc.txt
+t8_tma_retiring	19.8	pct_slots	process	t8_topdownL1.txt
+t8_dram_bandwidth	12.56	GB_per_s	perf metric, system-wide	t8_dram_metric.txt
+t48_decode_tokps	3.412	tok_per_s	measured, decode 1300, batch 1	t48_result.txt
+t48_dso_libgomp	82.89	pct_cycles	gomp_barrier_wait_end 61.22 + team_barrier_wait_end 17.17 + 4.4 others	t48_by_dso.txt
+t48_dso_glq_cpu	10.30	pct_cycles	zmm_matvec_impl<DecodeFp16,3>	t48_by_dso.txt
+t48_dso_jit_onednn	4.09	pct_cycles	perf record lbr	t48_by_dso.txt
+t48_dso_libtorch_cpu	1.76	pct_cycles	perf record lbr	t48_by_dso.txt
+t48_dso_python_plus_bindings	0.36	pct_cycles	perf record lbr	t48_by_dso.txt
+t48_ipc	0.357	insn_per_cycle	408665033396/1142899852631	t48_ipc.txt
+t48_tma_retiring	8.9	pct_slots	process	t48_topdownL1.txt
+t48_tma_core_bound	65.8	pct_slots	process	t48_topdownL2.txt
+t48_dram_bandwidth	18.68	GB_per_s	CAS 18.68 and perf metric 18.67 agree	t48_dram_cas.txt
+t48_effective_clock	1.98	GHz	1142899852631/48/12s; AVX-512 all-core downclock from 3.08	t48_ipc.txt
+effective_threads_t1_t8_t48	1.00,3.95,8.07	count	threads x useful-cycle fraction	derived

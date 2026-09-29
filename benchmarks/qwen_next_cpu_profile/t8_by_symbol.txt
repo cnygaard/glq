@@ -1,0 +1,25 @@
+    42.75%  libgomp.so.1          [.] gomp_barrier_wait_end
+    28.16%  glq_cpu.so            [.] void glq_cpu::(anonymous namespace)::zmm_matvec_impl<glq_cpu::(anonymous namespace)::DecodeFp16, 3>(un
+     4.39%  glq_cpu.so            [.] void glq_cpu::(anonymous namespace)::zmm_decompress_impl<glq_cpu::(anonymous namespace)::DecodeFp16, 3
+     4.14%  libgomp.so.1          [.] gomp_team_barrier_wait_end
+     2.26%  libtorch_cpu.so       [.] sgemm_t_n23_b0
+     1.47%  glq_cpu.so            [.] void glq_cpu::(anonymous namespace)::zmm_matmul_impl<glq_cpu::(anonymous namespace)::DecodeFp16, 3>(un
+     0.83%  libtorch_cpu.so       [.] fbgemm::Float16ToFloat_avx512(unsigned short const*, float*, unsigned long)
+     0.55%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::Vectoriz
+     0.44%  [unknown]             [k] 0xffffffffae08d383
+     0.38%  glq_cpu.so            [.] glq_cpu::fht_inplace(float*, long)
+     0.30%  python3.12            [.] _PyEval_EvalFrameDefault
+     0.25%  [unknown]             [k] 0xffffffffae07784e
+     0.19%  [JIT] tid 28048       [.] 0x000076fc5c49908f
+     0.17%  [JIT] tid 28048       [.] 0x000076fc5c899095
+     0.16%  [unknown]             [k] 0xffffffffad133149
+     0.15%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::Vectoriz
+     0.15%  [JIT] tid 28048       [.] 0x000076fc5c2da0ac
+     0.14%  [JIT] tid 28048       [.] 0x000076fc5c2da09d
+     0.14%  [unknown]             [k] 0xffffffffacd5f454
+     0.14%  libtorch_cpu.so       [.] void c10::function_ref<void (char**, long const*, long, long)>::callback_fn<at::native::AVX2::Vectoriz
+     0.14%  libgomp.so.1          [.] gomp_thread_start
+     0.14%  [JIT] tid 28048       [.] 0x000076fc5c899137
+     0.13%  [JIT] tid 28048       [.] 0x000076fc5c8990ca
+     0.13%  [JIT] tid 28048       [.] 0x000076fc5c89923a
+     0.13%  [JIT] tid 28048       [.] 0x000076fc5c8990db
