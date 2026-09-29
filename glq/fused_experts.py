@@ -48,6 +48,37 @@ _WARNED_HF_MOE_CPU_FALLBACK = False
 _MALLOC_TRIM = None
 
 
+def _accumulate_expert_rows(dst: torch.Tensor, token_idx: torch.Tensor,
+                            h: torch.Tensor) -> None:
+    """Accumulate one expert's output rows into ``dst`` at ``token_idx``.
+
+    ``dst.index_add_`` is the general form, but on CPU it dispatches to ``scatter_add_``,
+    which **sorts the indices** (fbgemm ``radix_sort_parallel``) so that parallel
+    accumulation is safe when indices collide. At batch-1 decode every routed expert sees
+    exactly ONE token, so this is a 48-way parallel sort of a single index — and the loop
+    runs it once per routed expert, ~480x per token on a 48-layer/top-10 model.
+
+    Measured cost on a 48-core Sapphire Rapids box: ``radix_sort_parallel`` is 9.54% of all
+    decode cycles (8.16 of those points its own team barrier) and **13.9% of a decode step's
+    wall time** — more than the trellis matvec itself. It also scales *negatively* with
+    thread count: 2.04x the 1-thread cost at 8 threads for a single index.
+
+    A lone index cannot collide, so a direct row add is **bit-identical**, not merely close,
+    and skips the sort entirely. Gated by ``GLQ_CPU_FAST_SCATTER`` while the end-to-end win
+    is being measured, matching how ``GLQ_HF_MOE_CPU_FUSED`` and ``GLQ_CPU_GDN`` ship.
+    Because it is bit-identical it should become unconditional once measured, rather than
+    staying a flag.
+    """
+    import os
+
+    if token_idx.numel() == 1 and os.environ.get("GLQ_CPU_FAST_SCATTER", "0") != "0":
+        # .add_ on the selected row, not `dst[i] += v`: the latter is getitem -> iadd ->
+        # setitem, which writes the already-updated view back over itself.
+        dst[int(token_idx)].add_(h[0].to(dst.dtype))
+        return
+    dst.index_add_(0, token_idx, h.to(dst.dtype))
+
+
 def _return_freed_heap_to_os() -> bool:
     """Ask glibc to hand back the pages the re-home just freed. Best effort.
 
@@ -395,8 +426,7 @@ class E8RHTFusedExperts(nn.Module):
             # Apply this expert's routing weight per token.
             h = h * top_k_weights[token_idx, top_k_pos, None]
 
-            final_hidden_states.index_add_(
-                0, token_idx, h.to(final_hidden_states.dtype))
+            _accumulate_expert_rows(final_hidden_states, token_idx, h)
 
         return final_hidden_states.to(hidden_states.dtype)
 
@@ -921,8 +951,7 @@ class GLQStackedGatedExperts(nn.Module):
             gate, up = pair.gate_up_proj(current_state).chunk(2, dim=-1)
             h = pair.down_proj(self.act_fn(gate) * up)
             h = h * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(
-                0, token_idx, h.to(final_hidden_states.dtype))
+            _accumulate_expert_rows(final_hidden_states, token_idx, h)
 
         return final_hidden_states
 
