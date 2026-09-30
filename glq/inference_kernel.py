@@ -316,7 +316,9 @@ def _try_load_cuda_ext():
         _glq_cuda = _load_ext(
             'glq_cuda',
             sources=sources,
-            extra_cuda_cflags=['-O3', '--use_fast_math'],
+            # Kept identical to setup.py's wheel flags on purpose — see the note there for
+            # why 3189 (`module` as an identifier in torch's own headers) is suppressed.
+            extra_cuda_cflags=['-O3', '--use_fast_math', '--diag-suppress=3189'],
             extra_ldflags=_ldflags,
             verbose=False,
         )

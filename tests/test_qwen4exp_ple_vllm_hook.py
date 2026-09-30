@@ -101,14 +101,27 @@ def _glq_config(**kw):
     return GLQvLLMConfig(**base)
 
 
+#: The pinned-host embedding class, on builds that have one. ``install()`` patches this
+#: module attribute too, so the fixture below has to restore it or the shim leaks into every
+#: later test. Resolved, not hardcoded, for the same reason as the dispatch point.
+_NE_MOD = None if LEGACY else _ne
+HAS_PINNED = _NE_MOD is not None and hasattr(_NE_MOD, "Qwen4ExpPLEPinnedHostEmbedding")
+requires_pinned = pytest.mark.skipif(
+    not HAS_PINNED, reason="this vLLM build has no Qwen4ExpPLEPinnedHostEmbedding")
+
+
 @pytest.fixture(autouse=True)
 def _installed():
     """Install once per test and restore, so a failure cannot leak the patch into the
     rest of the suite (it mutates a third-party package)."""
     original = _save()
+    pinned = (getattr(_NE_MOD, "Qwen4ExpPLEPinnedHostEmbedding", None)
+              if HAS_PINNED else None)
     _qwen4exp_ple.install()
     yield
     _restore(original)
+    if HAS_PINNED:
+        _NE_MOD.Qwen4ExpPLEPinnedHostEmbedding = pinned
 
 
 def test_the_suite_is_pinned_to_a_known_dispatch_point():
@@ -234,3 +247,99 @@ def test_an_unknown_vllm_layout_warns_instead_of_silently_doing_nothing(monkeypa
     monkeypatch.setattr(_qwen4exp_ple, "_install_modern", lambda: False)
     with pytest.warns(RuntimeWarning, match="neither PLE quant-method dispatch point"):
         _qwen4exp_ple.install()
+
+
+# ---- PLE CPU offload (VLLM_PLE_CPU_OFFLOAD, vLLM >= 0.30.0) --------------------------
+#
+# vLLM defaults this ON. GLQ used to refuse it outright; a trellis table at ETP=1 is now
+# served from pinned host memory, which takes 23.842 GiB of `trellis_packed` off the card
+# (measured from the Qwen3.8-Flash-Next checkpoint header: [320_001_536, 40] int16).
+#
+# These assert the *dispatch*, not "it loaded": a silent fall-through to the resident table
+# also produces correct tokens, and only the footprint distinguishes it — which is why the
+# end-to-end gate is `--expect-gib`, not the sample text.
+
+def _offloading(monkeypatch, etp=1):
+    """Pretend Engram CPU offload is on, without needing an ambient vLLM config."""
+    monkeypatch.setattr(_qwen4exp_ple, "_cpu_offload_requested", lambda: True)
+    monkeypatch.setattr(_qwen4exp_ple, "_etp_world_size", lambda: etp)
+
+
+def test_offload_with_a_trellis_ple_is_no_longer_refused(monkeypatch):
+    """The regression guard for this feature: this call raised NotImplementedError before
+    the offload path existed, which is what made VLLM_PLE_CPU_OFFLOAD=0 mandatory."""
+    _offloading(monkeypatch)
+    assert isinstance(_call(_glq_config(), VLLM_PREFIX), GLQEmbeddingMethod)
+
+
+def test_offload_with_a_shell_ple_is_refused_naming_the_setting(monkeypatch):
+    """Shell PLE stores Qidxs/Qidxs2/inv_resid_scale at power-of-two row width and has no
+    offload path. Refuse with the remedy in the message rather than decoding nonsense."""
+    _offloading(monkeypatch)
+    with pytest.raises(NotImplementedError, match="VLLM_PLE_CPU_OFFLOAD=0"):
+        _call(_glq_config(ple_codebook="shell"), VLLM_PREFIX)
+
+
+def test_offload_above_etp_1_is_refused_because_glq_does_not_mask_the_vocab(monkeypatch):
+    """vLLM's dense pinned kernel masks out-of-range rows with
+    org_vocab_start_index/org_vocab_end_index; GLQ's row decode does not, so a sharded
+    table would decode foreign rows *silently*. That must fail, not approximate."""
+    _offloading(monkeypatch, etp=2)
+    with pytest.raises(NotImplementedError, match="ETP=2"):
+        _call(_glq_config(), VLLM_PREFIX)
+
+
+def test_not_offloading_leaves_every_config_alone(monkeypatch):
+    """The refusal must key on the setting, not on the codebook: a shell PLE is perfectly
+    serviceable when it is staying resident."""
+    monkeypatch.setattr(_qwen4exp_ple, "_cpu_offload_requested", lambda: False)
+    assert isinstance(_call(_glq_config(ple_codebook="shell"), VLLM_PREFIX),
+                      GLQEmbeddingMethod)
+
+
+@requires_pinned
+def test_the_pinned_host_class_is_patched_and_keeps_the_original():
+    """Same identifiability contract as the quant-method wrapper: the shim is labelled and
+    the original is retrievable, so a later release's rename is detectable rather than
+    silently turning this into a no-op."""
+    shim = _NE_MOD.Qwen4ExpPLEPinnedHostEmbedding
+    assert getattr(shim, "_glq_shim", False)
+    assert getattr(shim, "_glq_original", None) is not None
+
+
+@requires_pinned
+def test_the_shim_routes_only_glq_methods_to_glqs_class(monkeypatch):
+    """The dispatch itself, with a fake base so no GPU, UVA or distributed state is needed.
+    A non-GLQ method must reach vLLM's own class untouched — offload for FP8 and unquantized
+    PLE tables has nothing to do with GLQ and must not regress."""
+    built = []
+
+    class FakeBase:
+        def __init__(self, *a, **kw):
+            built.append(type(self).__name__)
+
+    monkeypatch.setattr(_NE_MOD, "Qwen4ExpPLEPinnedHostEmbedding", FakeBase)
+    _qwen4exp_ple._install_pinned_host()
+    shim = _NE_MOD.Qwen4ExpPLEPinnedHostEmbedding
+    assert shim is not FakeBase
+
+    glq_method = _call(_glq_config(), VLLM_PREFIX)
+    assert isinstance(glq_method, GLQEmbeddingMethod)
+    shim(1, 2, embedding_method=glq_method)
+    assert built[-1] == "GLQQwen4ExpPLEPinnedHostEmbedding"
+
+    shim(1, 2, embedding_method=object())        # not GLQ's
+    assert built[-1] == "FakeBase"
+
+
+@requires_pinned
+def test_glqs_pinned_class_overrides_only_the_lookup_seam():
+    """`__init__` is deliberately inherited: it builds _uva_weight/_prefetch_stream/
+    _prefetch_buffer, and reimplementing it would hardcode vLLM internals a release can
+    change. Only `_lookup` — the one place the dense Triton gather lives — is replaced."""
+    base = _NE_MOD.Qwen4ExpPLEPinnedHostEmbedding
+    base = getattr(base, "_glq_original", base)
+    cls = _qwen4exp_ple._glq_pinned_host_cls(base)
+    assert issubclass(cls, base)
+    assert cls._lookup is not base._lookup
+    assert "__init__" not in cls.__dict__

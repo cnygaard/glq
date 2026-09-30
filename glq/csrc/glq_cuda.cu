@@ -403,8 +403,16 @@ glq_matvec_splitk_scratch_kernel(
         if (qidxs2 != nullptr) qidxs2 += e * qidxs_estride;
         if (qidxs3 != nullptr) qidxs3 += e * qidxs_estride;
         wscale = wscale_dev[e];
-        if (inv_rs_dev != nullptr) inv_resid_scale = inv_rs_dev[e];
-        if (inv_rs2_dev != nullptr) inv_resid_scale2 = inv_rs2_dev[e];
+        // Gated on the stage count as well as the pointer. Every read of these lives under
+        // `if constexpr (NUM_STAGES >= 2/3)` below, so for a 1-stage instantiation the store
+        // is dead — which is what nvcc #550-D ("set but never used") reports. Behaviour is
+        // unchanged for every stage that actually reads the value.
+        if constexpr (NUM_STAGES >= 2) {
+            if (inv_rs_dev != nullptr) inv_resid_scale = inv_rs_dev[e];
+        }
+        if constexpr (NUM_STAGES >= 3) {
+            if (inv_rs2_dev != nullptr) inv_resid_scale2 = inv_rs2_dev[e];
+        }
     }
 
     if (NUM_STAGES >= 2 && cb2_size > 0 && cb2_size <= 256) {
@@ -1551,8 +1559,7 @@ torch::Tensor glq_dequant_matmul_cuda(
         num_sms = prop.multiProcessorCount;
     }
 
-    const int WARPS = 8;
-    dim3 block(32, WARPS);
+    const int WARPS = 8;   // the launches below build their own block dims from this
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     bool has_stage2 = (qidxs2.numel() > 0 && inv_resid_scale != 0.0f);

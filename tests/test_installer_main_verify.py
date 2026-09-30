@@ -185,7 +185,7 @@ def test_the_self_check_runs_in_a_subprocess_not_in_process(offline, monkeypatch
 
     def fake_run(cmd, **kw):
         seen.append([str(c) for c in cmd])
-        return subprocess.CompletedProcess(cmd, 0, stdout="Self-check:\n  [ok  ] glq\n",
+        return subprocess.CompletedProcess(cmd, 0, stdout="Self-check:\n  [ ok ] glq\n",
                                            stderr="")
     monkeypatch.setattr(M.subprocess, "run", fake_run)
 
