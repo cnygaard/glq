@@ -29,6 +29,29 @@ def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def _alloc_storage(layer: nn.Module, rows: int, cols: int,
+                   dtype: torch.dtype) -> torch.Tensor:
+    """Ask the LAYER for row storage, so an offload-capable layer can hand back pinned memory.
+
+    vLLM's own PLE methods do exactly this -- both ``Qwen4ExpPLEUnquantizedEmbeddingMethod``
+    and ``...Fp8EmbeddingMethod`` call ``layer.allocate_embedding_weight(...)`` from inside
+    ``create_weights`` (``vllm/models/qwen4_exp/nvidia/ngram_embedding.py``). The device layer
+    answers with an ordinary ``torch.empty`` and the pinned-host layer answers with
+    page-locked CPU memory, so one code path serves both and GLQ never decides placement.
+
+    Why this matters rather than being cosmetic: vLLM constructs the model under an ambient
+    CUDA device context, so a plain ``torch.empty`` here lands on the **GPU**. That is what we
+    want for the resident path and exactly what we must avoid for the offloaded one -- the
+    pinned allocator passes ``device="cpu", pin_memory=True`` explicitly and so overrides the
+    ambient context. Falls back to ``torch.empty`` for any layer without the hook (Gemma-4's
+    PLE, and every unit test that passes a bare ``nn.Module``).
+    """
+    alloc = getattr(layer, "allocate_embedding_weight", None)
+    if alloc is None:
+        return torch.empty(rows, cols, dtype=dtype)
+    return alloc(rows, cols, dtype)
+
+
 def _make_param(tensor: torch.Tensor, weight_loader, output_dim: int | None = None,
                 ) -> nn.Parameter:
     """Build an nn.Parameter with vLLM's weight_loader + sharding attrs.
@@ -100,9 +123,12 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             # embedding_dim wide, not n_pad. ceil(width*K/16) int16 per row -- 60 B at
             # width 160, K=3, against shell's 64 B for the same row padded to 256.
             from glq.quantized_linear import _pow2_blocks
+            # Routed through the layer (see ``_alloc_storage``) so a pinned-host PLE layer can
+            # place this 23.8 GiB table in page-locked CPU memory. FULL-SIZE on purpose: the
+            # loader ``copy_``s into it in place, which is what keeps a UVA view over it valid.
             layer.trellis_packed = _make_param(
-                torch.empty(vocab_per_rank,
-                            math.ceil(embedding_dim * self.bpw / 16), dtype=torch.int16),
+                _alloc_storage(layer, vocab_per_rank,
+                               math.ceil(embedding_dim * self.bpw / 16), torch.int16),
                 weight_loader, output_dim=0)
             layer.Wscale = _make_param(
                 torch.ones(vocab_per_rank, dtype=torch.float16),
@@ -187,6 +213,18 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
         """
         if hasattr(layer, "weight"):
             return
+        if getattr(layer, "supports_prefetch", False):
+            # The pinned-host PLE layer does more than log: its ``__init__`` runs
+            # ``get_accelerator_view_from_cpu_tensor(self.weight)`` and then takes
+            # ``_uva_weight.device`` for the prefetch stream and buffer. A 0-element,
+            # non-pinned tensor cannot produce a valid UVA view, so give it the smallest
+            # thing that can -- one page-locked element, allocated through the layer so it
+            # is pinned by the same code that pins the table. GLQ's ``_lookup`` override
+            # never reads ``_uva_weight``; this exists only so vLLM's own ``__init__``
+            # composes. Still 1 element, so any attempt to use it as a real table fails on
+            # the very next index rather than returning plausible rows.
+            layer.weight = _alloc_storage(layer, 1, 1, params_dtype).reshape(-1)
+            return
         # Report the device GLQ's own buffers are on, so the log line is not misleading.
         dev = next((p.device for p in layer.parameters()), None)
         layer.weight = torch.empty(0, dtype=params_dtype, device=dev)
@@ -235,6 +273,36 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             return embeddings
         return embeddings.to(output_dtype)
 
+    @staticmethod
+    def _prepare_uva_packed(layer: nn.Module) -> torch.device:
+        """Build the GPU-addressable view of a host-resident table; return the COMPUTE device.
+
+        Called at load time, which is the only correct moment: the view wraps the storage
+        ``trellis_packed`` already owns, and the weight loader has by then ``copy_``d the
+        checkpoint into that storage in place. Building it in ``__init__`` would work only
+        while nothing reallocates the parameter -- a fragile invariant to rely on.
+
+        Returns the device the *decode* must run on, which is deliberately NOT
+        ``trellis_packed.device``: with CPU offload the packed rows live on the host while the
+        lut, SV, Wscale and the arithmetic all stay on the GPU. Reading the device off the
+        packed tensor (as this used to) would quietly move the whole decode to the CPU.
+        """
+        packed = layer.trellis_packed
+        layer.glq_uva_packed = None
+        if packed.device.type == "cpu" and packed.is_pinned():
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+            layer.glq_uva_packed = get_accelerator_view_from_cpu_tensor(packed)
+            # Announce the mechanism, not just the outcome: a table that quietly stayed
+            # resident still generates correct tokens, so this line (and the footprint) is
+            # what distinguishes "offloaded" from "the patch was a no-op".
+            print(f"GLQPLE offload=ON pinned={packed.is_pinned()} "
+                  f"host_rows={tuple(packed.shape)} bytes={packed.numel() * 2 / 2**30:.3f}GiB "
+                  f"uva_device={layer.glq_uva_packed.device}", flush=True)
+            return layer.glq_uva_packed.device
+        print(f"GLQPLE offload=OFF resident_device={packed.device} "
+              f"bytes={packed.numel() * 2 / 2**30:.3f}GiB", flush=True)
+        return packed.device
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Cache the codebook + stage count on the layer at LOAD time.
 
@@ -253,7 +321,7 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             # per-forward path must stay free of construction and host syncs so vLLM can
             # trace and graph-capture it.
             from glq.trellis import TrellisCodebook
-            dev = layer.trellis_packed.device
+            dev = self._prepare_uva_packed(layer)
             tlut = getattr(layer, "tlut", None)
             cb = TrellisCodebook(variant=self.variant, K=self.bpw, device=dev,
                                  tlut=tlut)
@@ -291,8 +359,15 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
             if getattr(layer, "glq_trellis_lut", None) is None:
                 self.process_weights_after_loading(layer)
             L, K, V = layer.glq_trellis_LKV
+            # With CPU offload, hand the op the UVA view rather than the host parameter: the
+            # op takes its device from this tensor and gathers with ``index_select``, so a
+            # CUDA view means the rows cross PCIe while the decode stays on the GPU. Passing
+            # the host tensor instead would run the entire decode on the CPU.
+            packed = getattr(layer, "glq_uva_packed", None)
+            if packed is None:
+                packed = layer.trellis_packed
             return torch.ops.glq.embedding_dequant_trellis(
-                input_ids, layer.trellis_packed, layer.SV, layer.Wscale,
+                input_ids, packed, layer.SV, layer.Wscale,
                 layer.glq_trellis_lut, layer.glq_blocks_n,
                 layer.glq_embedding_dim, L, K, V, 1.0, layer.glq_out_dtype)
         # Cached at load time; defensive lazy-fill for a direct (non-vLLM) call.

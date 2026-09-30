@@ -310,7 +310,9 @@ codebook (glq ≥ 0.7.2). Qwen3.8-Flash-Next (`qwen4_exp`) routes it to trellis
 with a block-diagonal RHT (glq ≥ 0.8.20): its n-gram table is 95.4 GiB, most of
 the checkpoint, and its rows are 160 wide — not a power of two — so the shell
 path's full Hadamard would pad every one of them. `GLQ_PLE_CODEBOOK` and
-`GLQ_PLE_BPW` override the codebook and the rate for a single run.
+`GLQ_PLE_BPW` override the codebook and the rate for a single run. On vLLM ≥ 0.30.0
+that table can also be served from pinned host memory — see
+[PLE table in host memory](#ple-table-in-host-memory-qwen4exp-vllm--0300).
 `--streaming` is **required** for the Gemma-4 and Qwen3.5/Qwen3.8 families, not
 just recommended.
 
@@ -726,6 +728,47 @@ Cost: ~10-20 MB VRAM per captured shape on 3B / E4B models (vLLM
 prints the total at "Graph capturing finished in N s, took X GiB").
 On 24-31B models budget ~100-200 MB per shape. Capture time is
 ~1 s per shape, one-time at LLM init.
+
+### PLE table in host memory (Qwen4Exp, vLLM ≥ 0.30.0)
+
+Qwen3.8-Flash-Next's n-gram PLE table is the bulk of the checkpoint. vLLM ≥ 0.30.0
+can hold it in pinned host memory and read rows over UVA, controlled by
+`VLLM_PLE_CPU_OFFLOAD` (**vLLM defaults it ON**). GLQ ≥ 0.8.23 supports that for a
+**trellis-coded** table: the packed rows stay on the host and the gather, decode and
+inverse RHT run on the GPU, so nothing but the row bytes crosses PCIe — 80 B per row
+at 4 bpw against 320 B for a dense bf16 row.
+
+Measured on one RTX PRO 6000 Blackwell (sm_120), vLLM 0.30.0, torch 2.13.0,
+`Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4`, `--gpu-mem 0.95`, one run per arm:
+
+| | offload ON | offload OFF |
+|---|---|---|
+| Weights on GPU | **50.38 GiB** | 74.14 GiB |
+| GPU KV cache | **151,552 tokens** (74.0× conc.) | 30,347 tokens (14.8×) |
+| Decode B=1 | 31.595 tok/s | 31.602 tok/s |
+| Decode B=8 | 232.4 tok/s aggregate | 230.5 tok/s aggregate |
+
+The table itself is `[320001536, 40]` int16 = **23.842 GiB**, and that is what moves:
+−23.76 GiB resident, **5.0× the KV cache**, decode unchanged within noise on this run.
+FlashInfer's autotuner saved 0 configs in *both* arms, so the comparison is not
+confounded by kernel selection.
+
+Requirements and limits:
+
+- Needs **~24 GiB of free host RAM** to pin. Pinned pages cannot be swapped, so a
+  machine without the headroom will fail to allocate rather than degrade gracefully.
+- **Trellis PLE only.** A shell-coded table is refused with a message naming the
+  setting; its rows are padded to a power of two and have no offload path yet.
+- **Single shard (ETP=1).** vLLM's dense pinned lookup masks out-of-range vocab rows
+  inside its own kernel; GLQ's row decode does not, so a sharded table is refused
+  rather than silently decoding foreign rows.
+- At `--gpu-mem 0.95` the larger KV pool can leave too little free VRAM for
+  FlashInfer's autotune workspace, which logs one `OOM on device 0` **warning** during
+  startup and continues. It cost nothing measurable here; lower `--gpu-mem` if you
+  want the headroom back — with weights at 50 GiB there is plenty of KV either way.
+
+To keep the table resident, set `VLLM_PLE_CPU_OFFLOAD=0` or pass
+`--engram-config '{"cpu_offload": false}'`.
 
 ### Bit widths
 

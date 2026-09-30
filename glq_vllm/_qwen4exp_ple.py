@@ -67,33 +67,146 @@ def _install_legacy(ple_layer) -> bool:
     return True
 
 
-def _refuse_if_engram_cpu_offload() -> None:
-    """Fail with a message that names the cause, before vLLM fails with one that doesn't.
+def _cpu_offload_requested() -> bool:
+    """Is Engram CPU offload on? Read the same source vLLM reads, not the env var.
 
-    vLLM >= 0.30.0 defaults ``VLLM_PLE_CPU_OFFLOAD=1`` (``envs.py``), which makes
-    ``Qwen4ExpNGramEmbedding`` pick ``Qwen4ExpPLEPinnedHostEmbedding`` -- a table held in
-    pinned CPU memory and read through a UVA view that ``__init__`` builds from a single
-    dense ``self.weight``. GLQ registers ``Qidxs``/``SU``/``SV``/``Wscale`` and no such
-    tensor, so that path dies with::
-
-        AttributeError: 'Qwen4ExpPLEPinnedHostEmbedding' object has no attribute 'weight'
-
-    which names neither GLQ nor the setting responsible. Read the *same* source vLLM reads
-    (``get_current_vllm_config().engram_config``) rather than the env var, so this cannot
-    disagree with the decision it is predicting.
+    ``get_current_vllm_config().engram_config`` is what ``Qwen4ExpNGramEmbedding.__init__``
+    consults to choose the embedding class, so reading it here cannot disagree with the
+    decision being predicted. Absent ambient config (unit tests) means "not offloading".
     """
     try:
         from vllm.config import get_current_vllm_config
         engram = get_current_vllm_config().engram_config
-    except Exception:            # no ambient config yet (unit tests) -- nothing to check
+    except Exception:
+        return False
+    return engram is not None and bool(getattr(engram, "cpu_offload", False))
+
+
+def _etp_world_size() -> int:
+    """ETP shard count, or 1 when there is no distributed state (unit tests)."""
+    try:
+        from vllm.distributed import get_etp_group
+        return int(get_etp_group().world_size)
+    except Exception:
+        return 1
+
+
+def _refuse_unsupported_cpu_offload(method) -> None:
+    """Refuse the offload combinations GLQ still cannot serve, naming the cause and the fix.
+
+    A *trellis*-coded table at ETP=1 IS supported -- see ``_glq_pinned_host_cls``, which keeps
+    ``trellis_packed`` (23.8 GiB on Qwen3.8-Flash-Next) in pinned host memory and gathers its
+    rows over UVA. What remains unsupported is refused here rather than left to fail somewhere
+    that names neither GLQ nor the setting.
+    """
+    if not _cpu_offload_requested():
         return
-    if engram is not None and getattr(engram, "cpu_offload", False):
+
+    codebook = getattr(method, "codebook", None)
+    if codebook != "trellis":
         raise NotImplementedError(
-            "GLQ cannot serve the Qwen4Exp PLE table with Engram CPU offload enabled: "
-            "vLLM's pinned-host embedding builds a UVA view from one dense `weight`, and "
-            "GLQ's table is quantized into Qidxs/SU/SV/Wscale. Set VLLM_PLE_CPU_OFFLOAD=0, "
-            "or pass --engram-config '{\"cpu_offload\": false}'. Note vLLM >= 0.30.0 "
-            "defaults this ON, so it must be turned off explicitly.")
+            "GLQ supports Engram CPU offload only for a *trellis*-coded Qwen4Exp PLE table; "
+            f"this checkpoint's PLE is {codebook!r}. The shell layout stores "
+            "Qidxs/Qidxs2/inv_resid_scale at power-of-two row width and has no offload path "
+            "yet. Set VLLM_PLE_CPU_OFFLOAD=0, or pass "
+            "--engram-config '{\"cpu_offload\": false}'.")
+
+    etp = _etp_world_size()
+    if etp > 1:
+        raise NotImplementedError(
+            f"GLQ's Qwen4Exp PLE CPU offload is single-shard only, but ETP={etp}. vLLM's dense "
+            "pinned lookup masks out-of-range vocab rows inside its own Triton kernel "
+            "(org_vocab_start_index/org_vocab_end_index); GLQ's row decode does not, so a "
+            "sharded table would decode foreign rows instead of failing. Set "
+            "VLLM_PLE_CPU_OFFLOAD=0, or serve with ETP=1.")
+
+
+def _glq_pinned_host_cls(base):
+    """Build GLQ's pinned-host PLE layer as a subclass of vLLM's, overriding one method.
+
+    vLLM's ``Qwen4ExpPLEPinnedHostEmbedding._lookup`` gathers **dense** rows with a Triton
+    kernel over ``self._uva_weight`` and never consults ``embedding_method``, which is why a
+    quantized table cannot ride the stock path. Everything *around* the lookup -- the prefetch
+    side stream, the ETP reduce, ``forward`` -- operates on decoded activation-dtype rows and
+    so needs no change, hence exactly one override.
+
+    ``__init__`` is deliberately NOT overridden. It builds ``_uva_weight``,
+    ``_prefetch_stream`` and ``_prefetch_buffer`` from ``self.weight``, and GLQ satisfies that
+    with a one-element pinned placeholder (``GLQEmbeddingMethod._register_weight_placeholder``)
+    whose dtype is the activation dtype and whose UVA view is on the GPU -- precisely what
+    those three need. Reimplementing ``__init__`` would hardcode vLLM internals that a release
+    can change; this way the only vLLM behaviour GLQ depends on is the ``_lookup`` seam.
+
+    Defined lazily inside a function because the base class only exists on vLLM >= 0.30.0.
+    """
+
+    class GLQQwen4ExpPLEPinnedHostEmbedding(base):    # type: ignore[misc, valid-type]
+        """A GLQ-quantized PLE table in pinned host memory, gathered over UVA."""
+
+        _glq_offloaded = True
+
+        def _lookup(self, input_ids, output=None):
+            """Gather packed rows across PCIe and decode them on the GPU.
+
+            ``embedding_method.embedding`` already performs gather + trellis decode + inverse
+            RHT and returns ``[*input_ids.shape, embedding_dim]`` in the activation dtype --
+            the exact shape and dtype ``_prefetch_buffer`` expects -- and it picks up the UVA
+            view via ``layer.glq_uva_packed``. So this is the resident decode path, unchanged,
+            pointed at host-resident rows.
+            """
+            rows = self.embedding_method.embedding(self, input_ids)
+            if output is None:
+                return rows
+            output.copy_(rows)
+            return output
+
+    return GLQQwen4ExpPLEPinnedHostEmbedding
+
+
+def _install_pinned_host() -> bool:
+    """Route GLQ-quantized PLE tables to GLQ's pinned-host layer when offload is on.
+
+    The class is chosen inside ``Qwen4ExpNGramEmbedding.__init__`` from a module global
+    (``Qwen4ExpPLEPinnedHostEmbedding if engram_config.cpu_offload else ...Device...``).
+    Because that name is resolved at call time, replacing the module attribute is enough --
+    the same seam ``_install_modern`` uses, with the same exposure: a rename makes this a
+    no-op, so ``install()`` warns when the attribute is absent and the test resolves the
+    symbol instead of hardcoding it.
+
+    The shim dispatches on the passed ``embedding_method``, so FP8 and unquantized PLE tables
+    keep vLLM's own class byte-for-byte.
+    """
+    try:
+        from vllm.models.qwen4_exp.nvidia import ngram_embedding
+    except ImportError:
+        return False
+    current = getattr(ngram_embedding, "Qwen4ExpPLEPinnedHostEmbedding", None)
+    if current is None:
+        return False
+    if getattr(current, "_glq_shim", False):
+        return True
+
+    original = current
+    cache: dict[str, type] = {}
+
+    def _shim(*args, **kwargs):
+        method = kwargs.get("embedding_method")
+        if method is None:
+            # Positional form: `embedding_method` is keyword-only at vLLM's call site, but do
+            # not assume a future release keeps it that way.
+            method = next((a for a in args if hasattr(a, "embedding")), None)
+        from .embedding_method import GLQEmbeddingMethod
+        if isinstance(method, GLQEmbeddingMethod):
+            cls = cache.get("cls")
+            if cls is None:
+                cls = cache["cls"] = _glq_pinned_host_cls(original)
+            return cls(*args, **kwargs)
+        return original(*args, **kwargs)
+
+    _shim._glq_shim = True
+    _shim._glq_original = original
+    ngram_embedding.Qwen4ExpPLEPinnedHostEmbedding = _shim
+    return True
 
 
 def _install_modern() -> bool:
@@ -123,7 +236,7 @@ def _install_modern() -> bool:
             # Only when GLQ actually claims the table: an FP8 or unquantized PLE is free to
             # use the pinned-host path, and refusing there would break configurations that
             # have nothing to do with us.
-            _refuse_if_engram_cpu_offload()
+            _refuse_unsupported_cpu_offload(method)
             return method
         from .config import GLQvLLMConfig
         if isinstance(quant_config, GLQvLLMConfig):
@@ -157,6 +270,10 @@ def install() -> None:
         from vllm.models.qwen4_exp.nvidia import ple_layer
     except ImportError:
         return
+
+    # Independent of the quant-method seam: only >= 0.30.0 has a pinned-host class, and a
+    # build without one simply has nothing to offload, so a False here is not an error.
+    _install_pinned_host()
 
     if _install_legacy(ple_layer) or _install_modern():
         return
