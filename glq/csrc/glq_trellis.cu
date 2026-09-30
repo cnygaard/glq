@@ -88,8 +88,7 @@ uint32_t tr_grid_x() {
 constexpr uint32_t TR_WARPS       = TR_BLOCK_SIZE / TR_WARP_SIZE;   // 32
 constexpr uint32_t TR_MMA_M       = 16;
 constexpr uint32_t TR_MMA_K       = 16;
-constexpr uint32_t TR_L           = 16;   // shift-register width
-constexpr uint32_t TR_S           = 9;    // tlut index bits  → 512 entries
+constexpr uint32_t TR_S           = 9;    // tlut index bits  → 512 entries (L = 16 bits wide)
 constexpr uint32_t TR_V           = 1;    // log2(vq dim)     → 2 weights / step
 constexpr uint32_t TR_FULL_MASK   = 0xFFFFFFFFU;
 // tlut (512 half2) replicated once per lane → conflict-free smem lookup. 1<<(S+5+V+1) bytes.
@@ -269,19 +268,22 @@ __device__ inline void tr_decode_regw(uint32_t reg_c, uint32_t reg_c2, uint32_t 
             const uint32_t s1 = (uint32_t)(ext >> (WIDTH - R * (2 * j + 1))) & 0xFFFFu;
             reg_w.f16x2[j] = __halves2half2(tr_decode_3inst_half(s0), tr_decode_3inst_half(s1));
         }
-        return;
-    }
+    } else {
+        // `else` rather than an early `return` from the branch above: with a `return` the HYB
+        // loop is still *parsed* for a 3INST instantiation, and nvcc reports every one of them
+        // as #128-D "loop is not reachable". Discarding it with the branch is the same codegen.
 #pragma unroll
-    for (uint32_t j = 0; j < 4; j += 1) {
-        uint32_t idx;
-        if constexpr (R == 2)      idx = reg_c >> (4 * (4 - j));
-        else if constexpr (R == 3) idx = (j < 3) ? (reg_c >> (6 * (2 - j) + 4)) : reg_c2;
-        else                       idx = (j < 3) ? (reg_c >> (8 * (2 - j)))     : reg_c2;
+        for (uint32_t j = 0; j < 4; j += 1) {
+            uint32_t idx;
+            if constexpr (R == 2)      idx = reg_c >> (4 * (4 - j));
+            else if constexpr (R == 3) idx = (j < 3) ? (reg_c >> (6 * (2 - j) + 4)) : reg_c2;
+            else                       idx = (j < 3) ? (reg_c >> (8 * (2 - j)))     : reg_c2;
 
-        idx = idx * (idx + 1);                                   // the bitshift trellis map
-        uint32_t masked_idx = (idx & 0x7FC0u) | (laneId << 1);   // bits 6..14 → tlut index
-        reg_w.f16x2[j] = smem_codebook[masked_idx >> 1];
-        reg_w.u32[j] ^= (0x00008000u & idx);                     // sign-flip component 0
+            idx = idx * (idx + 1);                                   // the bitshift trellis map
+            uint32_t masked_idx = (idx & 0x7FC0u) | (laneId << 1);   // bits 6..14 → tlut index
+            reg_w.f16x2[j] = smem_codebook[masked_idx >> 1];
+            reg_w.u32[j] ^= (0x00008000u & idx);                     // sign-flip component 0
+        }
     }
 }
 

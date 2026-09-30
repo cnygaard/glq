@@ -105,7 +105,14 @@ if MODE != "0":
                 sources=SOURCES,
                 # Matches the JIT path's flags exactly; a wheel that behaves differently from
                 # the fallback it replaces would be a subtle source of "works on my machine".
-                extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "--use_fast_math"]},
+                # --diag-suppress=3189: torch/python.h and any_module_holder.h use `module` as
+                # an identifier, which nvcc reports once per translation unit per instantiation
+                # — 126 of the 194 warnings in a cp312 wheel build, none of them ours and none
+                # actionable here. Suppressed so our own diagnostics are readable. GLQ itself
+                # never uses `module` as an identifier, so nothing of ours is hidden.
+                extra_compile_args={"cxx": ["-O3"],
+                                    "nvcc": ["-O3", "--use_fast_math",
+                                             "--diag-suppress=3189"]},
             )
         ]
         # `use_ninja` inherits MAX_JOBS, which CI sets to the runner's core count.
