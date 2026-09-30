@@ -263,6 +263,8 @@ def all_ok(checks) -> bool:
 def render(checks) -> str:
     lines = ["", "Self-check:"]
     for c in checks:
-        mark = "ok  " if c.ok else ("warn" if c.warning_only else "FAIL")
-        lines.append(f"  [{mark}] {c.name}: {c.detail}")
+        # Centered in a 4-wide field so the short label sits between the brackets rather than
+        # hugging the left with trailing blanks: [ ok ] / [warn] / [FAIL] all line up.
+        mark = "ok" if c.ok else ("warn" if c.warning_only else "FAIL")
+        lines.append(f"  [{mark:^4}] {c.name}: {c.detail}")
     return "\n".join(lines)

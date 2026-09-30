@@ -65,7 +65,7 @@ def test_probes_covers_every_probe():
 #
 # Measured in an ubuntu:24.04 container (2026-08-15): `glq-setup --verify` reported
 #
-#     [ok  ] cuda available: GPU visible to torch
+#     [ ok ] cuda available: GPU visible to torch
 #
 # and the very next command died in a forward pass, because the CUDA extension had never
 # built. `torch.cuda.is_available()` answers "is there a GPU", which is not the question —
