@@ -66,8 +66,12 @@ backend automatically.
   token, 18.6 GiB resident (13.9 GiB weights + a 4 GiB KV pool) — against **2.7 tok/s**
   for the dense `gemma-4-E4B` on the same box, because an MoE reads only its top-k
   experts per token. `glq-chat` also gives the kernels the core vLLM holds back
-  (`VLLM_CPU_NUM_OF_RESERVED_CPU=0`), measured at **3.4 tok/s**; decode is
-  memory-bound, so more threads than physical cores add nothing. Usable for short
+  (`VLLM_CPU_NUM_OF_RESERVED_CPU=0`), measured at **3.4 tok/s**. **Never set more threads
+  than physical cores**: measured on a 48-core Sapphire Rapids, 96 threads is **1.99x
+  slower** than 48 — slower even than an unoptimised 48-thread baseline. Trellis decode is
+  compute-bound rather than bandwidth-bound (45.3% core-bound against 19.3% memory-bound,
+  at 4.6% of DRAM peak; Qwen3.8-Flash-Next 3bpw under HF, batch 1), so threads beyond the
+  physical cores add only barrier contention. Usable for short
   answers and background work, not fast chat. Model recommendations size against
   system RAM, and `glq-chat` sizes the KV pool from the checkpoint **and from the RAM
   that is actually free** — on CPU the weights, the pool, the runtime and the page cache
