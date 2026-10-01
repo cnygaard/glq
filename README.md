@@ -243,6 +243,75 @@ is stored as real bits, so the checkpoint holds more bits per weight than its no
 the footprint is correspondingly larger than 4 bpw implies. The `-block-diagonal-` repos above
 are true-to-label re-quants.</sub>
 
+### Serving from host memory — weight offload (vLLM ≥ 0.30.0)
+
+vLLM can keep part of the weights in pinned host RAM and let the GPU read them over PCIe,
+which trades decode speed for VRAM. GLQ works with this unchanged, and benefits from it
+*more* than denser 4-bit formats do: every cost in this regime is proportional to the bytes
+moved, and GLQ moves fewer.
+
+**This is most useful for MoE models**, where only the routed experts are read per token.
+Offloading just the experts is what makes the trade cheap.
+
+```bash
+vllm serve xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw \
+    --quantization glq \
+    --offload-backend uva \
+    --cpu-offload-gb 12 \
+    --cpu-offload-params experts \
+    --max-model-len 4096 \
+    --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'
+```
+
+`--cpu-offload-gb` is the host-memory budget in GiB; `--cpu-offload-params` restricts offload
+to parameters whose name contains that segment. Pass **one value** — `experts,mlp` is read as
+a single literal string, not a list. The `--limit-mm-per-prompt` line is needed only because
+this checkpoint carries a vision tower; without it a text-only serve fails at startup.
+
+Measured on one **L4 (24 GB, sm_89, PCIe 4 ×16)**, vLLM 0.30.0, torch 2.13.0, glq 0.8.23,
+`gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw`, B=1, 64 decode steps, one run per row:
+
+| configuration | weights on GPU | KV cache | TTFT | decode |
+|---|--:|--:|--:|--:|
+| resident (no offload) | 13.32 GiB | 22,706 tok | 53 ms | **35.70 tok/s** |
+| `--cpu-offload-gb 4` | 9.28 GiB | 41,861 tok | 208 ms | 17.65 tok/s |
+| `--cpu-offload-gb 8` | 5.25 GiB | 60,738 tok | 351 ms | 11.47 tok/s |
+| `--cpu-offload-gb 12` | 2.27 GiB | 74,838 tok | 471 ms | 9.11 tok/s |
+| **`12` + `--cpu-offload-params experts`** | **2.57 GiB** | 73,641 tok | 417 ms | **11.74 tok/s** |
+
+Restricting the offload to experts is the difference between 9.11 and 11.74 tok/s at the same
+footprint. Note the KV cache *grows* as weights leave the card — offload buys context as well
+as headroom.
+
+**VRAM capacity buys context, not speed.** The same expert-offload configuration, with vLLM
+capped to a fraction of the card:
+
+| VRAM available | weights | KV cache | decode |
+|---|--:|--:|--:|
+| 22.5 GiB | 2.57 GiB | 73,641 tok | 11.739 tok/s |
+| 8.1 GiB | 2.57 GiB | 20,824 tok | 11.751 tok/s |
+| **6.1 GiB** | 2.57 GiB | 11,406 tok | **11.750 tok/s** |
+
+Flat to within 0.1% across a 3.7× range: once offloaded, decode is bounded by the PCIe link
+rather than by the GPU. **A 26B-parameter MoE serves in ~6 GiB of VRAM at 11.75 tok/s with
+11,406 tokens of context.**
+
+Limits and caveats, all measured or explicitly untested:
+
+- **Use `--offload-backend uva`.** The `prefetch` backend bulk-copies whole layer groups, so it
+  transfers unrouted experts and loses the sparsity: at a *smaller* offload volume it ran
+  2.4× slower. It also currently fails with GLQ (`CPU storage for …trellis_packed is not
+  pinned!`).
+- **These numbers are MoE.** Dense models have no routing sparsity — every weight is read every
+  token — so expect the unfiltered column's behaviour, not the expert column's. Untested here.
+- **The L4 is a favourable card for this**: ~300 GB/s VRAM against ~25 GB/s PCIe 4 is a ~12:1
+  deficit, where a 3090 is ~37:1. Cards on **×8 or ×4 links** will be proportionally slower —
+  lane width is untested.
+- The 6.1 GiB row is a *simulated* cap on a ×16 card. It shows capacity is not the binding
+  constraint; it is not a measurement of a real 6 GB GPU.
+- **Quality under offload is unmeasured.** Output was checked for coherence, not accuracy.
+- n=1 per row, B=1 only.
+
 ### Quantize your own model
 
 ```bash
