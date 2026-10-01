@@ -239,8 +239,31 @@ def run_vllm(args, failures):
               max_num_seqs=max(batches))
     if args.quant == "glq":
         kw["quantization"] = "glq"
+    # Weight offload. vLLM has TWO backends and `cpu_offload_gb` alone selects only one of
+    # them (`create_offloader`: auto -> prefetch if offload_group_size > 0, else uva if
+    # cpu_offload_gb > 0). They behave differently enough that a sweep has to name the backend:
+    #   uva      — params move to pinned host memory and `p.data` becomes a CUDA *view* of it,
+    #              so the GPU reads over PCIe on demand. Cost is per byte actually accessed,
+    #              which is why it is nearly free for a sparse lookup (the 0.8.23 PLE table)
+    #              and bandwidth-bound for dense weights read in full every token.
+    #   prefetch — params live in pinned host storage and a GPU buffer is swapped in around
+    #              forward, with events so the H2D copies join CUDA-graph captures; groups
+    #              layers and prefetches ahead, so transfer can hide behind compute.
+    # `*_params` is a parameter-NAME filter, which is how "offload only the experts" is
+    # expressed (vLLM's own example: "experts.w2_weight" matches "mlp.experts.w2_weight").
     if args.cpu_offload_gb:
         kw["cpu_offload_gb"] = args.cpu_offload_gb
+    if args.offload_backend:
+        kw["offload_backend"] = args.offload_backend
+    if args.offload_params:
+        names = {s for s in args.offload_params.split(",") if s}
+        # Route the filter to whichever backend is in play; they read different fields.
+        kw["cpu_offload_params"] = names
+        kw["offload_params"] = names
+    if args.offload_group_size:
+        kw["offload_group_size"] = args.offload_group_size
+        kw["offload_num_in_group"] = args.offload_num_in_group
+        kw["offload_prefetch_step"] = args.offload_prefetch_step
     if args.eager:
         kw["enforce_eager"] = True
     else:
@@ -529,6 +552,19 @@ def build_parser():
                          'card on its own.')
     ap.add_argument("--device-map", dest="device_map", default="cuda",
                     help="HF device_map: 'cuda' (default) or 'cpu' for a CPU-only run")
+    ap.add_argument("--offload-backend", dest="offload_backend", default=None,
+                    choices=["auto", "uva", "prefetch"],
+                    help="which vLLM weight-offload backend to use; 'auto' picks prefetch "
+                         "when --offload-group-size is set, else uva when --cpu-offload-gb is")
+    ap.add_argument("--offload-params", dest="offload_params", default=None,
+                    help="comma-separated parameter-name segments to offload INSTEAD of "
+                         "everything, e.g. 'experts' to keep only expert weights off the card")
+    ap.add_argument("--offload-group-size", dest="offload_group_size", type=int, default=0,
+                    help="prefetch backend: group every N layers (>0 selects prefetch)")
+    ap.add_argument("--offload-num-in-group", dest="offload_num_in_group", type=int, default=1,
+                    help="prefetch backend: offload the last M layers of each group")
+    ap.add_argument("--offload-prefetch-step", dest="offload_prefetch_step", type=int, default=1,
+                    help="prefetch backend: how many groups ahead to start the H2D copy")
     ap.add_argument("--cpu-offload-gb", dest="cpu_offload_gb", type=float, default=0.0,
                     help="GiB of WEIGHTS to keep in host (CPU) RAM and stream over PCIe "
                          "each forward pass. Not free VRAM: it trades bandwidth for "
