@@ -145,7 +145,8 @@ def _opencode_config(repo_id: str) -> str:
 
 
 def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
-               benchmarks=None, hf_token: str | None = None,
+               benchmarks=None, offload=None, offload_hw=None,
+               hf_token: str | None = None,
                write: bool = True) -> str:
     """Render the GLQ model card for a quantized output dir and (optionally) write
     it to ``out_dir/README.md``. Returns the rendered markdown."""
@@ -174,6 +175,15 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
         lo = hi = int(round(avg_bpw))
     is_mixed = lo != hi
 
+    # Weight offload is only worth documenting where it is cheap, which means MoE: only the
+    # routed experts are read per token, so the offloaded ones cost nothing until selected.
+    # A dense model reads every weight every token and offload is bandwidth-bound instead, so
+    # the section stays out of those cards rather than inviting a bad configuration.
+    qc = cfg.get("quantization_config") or {}
+    is_moe = any("experts" in k for k in layer_bpw)
+    has_ple = bool(qcfg.get("ple_codebook") or qc.get("ple_codebook")) \
+        or any(".ple." in k or "ngram_embedding" in k for k in layer_bpw)
+
     arch = (cfg.get("architectures") or [""])[0]
     multimodal = ("ConditionalGeneration" in arch
                   or "vision_config" in cfg or "audio_config" in cfg)
@@ -199,6 +209,15 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
         "seqlen": qcfg.get("seqlen", 2048),
         "trust_remote_code": trust_remote_code,
         "multimodal": multimodal,
+        "is_moe": is_moe,
+        "has_ple": has_ple,
+        # Optional measured offload rows: [{"budget","resident","kv","tokps"}]. Numbers are
+        # card-specific (they depend on the card's PCIe link), so the template carries the
+        # instructions and the caller supplies any measurements.
+        "offload": offload or [],
+        # Name the machine: an offload number is meaningless without the PCIe link
+        # it was measured over.
+        "offload_hw": offload_hw,
         "auto_cls": "AutoModelForImageTextToText" if multimodal else "AutoModelForCausalLM",
         "benchmarks": benchmarks,
         "codebook": codebook,
