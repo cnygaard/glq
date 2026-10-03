@@ -4,15 +4,18 @@ pi (and any tool-using client) needs the server started with `--enable-auto-tool
 and a parser that matches the model's tool markup. Which parser — and for gemma-4, which
 *template*, since its bundled chat template is plain chat and the tool template lives in
 vLLM's repo examples — used to be duplicated between the installer's printed commands and
-the bench harness, and drifted once already: hermes was printed for every model, which
-matches SmolLM3/Qwen-style ``<tool_call>`` markup and silently mangles gemma-4's into
-tool calls that never parse. That is the worst failure mode, because it reads as a bad
-model rather than a bad flag.
+the bench harness, and drifted twice. First, hermes was printed for every model, which
+silently mangled gemma-4's markup into tool calls that never parse. Then hermes stayed on
+Qwen on the belief that Qwen emits "hermes-style ``<tool_call>``" markup — false for every
+Qwen this project publishes, whose templates emit ``<function=``/``<parameter=`` XML (see
+the ``qwen`` branch below for the per-checkpoint evidence). Both are the worst failure mode,
+because they read as a bad model rather than a bad flag.
 
 Stdlib only: the installer's core profile has no huggingface_hub and no requests.
 """
 from __future__ import annotations
 
+import json
 import os
 import urllib.request
 from pathlib import Path
@@ -45,19 +48,45 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
                 # RL-trained model thinks anyway — measured live in a pi session:
                 # <|thought|> markers and tool-call syntax leaking into prose, and a
                 # "thoughtthoughtthought" repetition loop in the reasoning field. The
-                # README's validated recipe always carried it. Compact JSON (no spaces)
-                # keeps the printed shell command copy-pasteable without quoting.
+                # README's validated recipe always carried it.
+                #
+                # Compact JSON (no spaces) was previously justified here as keeping the
+                # printed shell command "copy-pasteable without quoting". That is wrong, and
+                # measured so by running the printed command through bash: compactness
+                # prevents word-splitting, but the shell still strips the double quotes
+                # (vLLM then received `{enable_thinking:true}`, not JSON) and `{a,b}` is
+                # brace expansion. Shell quoting is applied where commands are PRINTED
+                # (`installer.__main__._shell_arg`); these args stay raw because they are
+                # handed to subprocess as a list, with no shell in between.
                 "--default-chat-template-kwargs", '{"enable_thinking":true}']
     if "qwen" in name:
-        # hermes matches Qwen's <tool_call> markup, but Qwen3.x are THINKING models:
-        # without --reasoning-parser qwen3 the <think> block stays in `content` and
-        # leaks into the agent's prose — the same failure class as gemma-4's
-        # enable_thinking leak (#85), and in a pi session it reads as rambling or
-        # repetition. Parser name per vLLM's official Qwen3.5 recipe
-        # (vllm-project/recipes Qwen/Qwen3.5.md). --language-model-only skips the
-        # multimodal wrapper's bf16 vision tower, which text-only agent/chat serving
-        # never uses — pure VRAM back on 24 GB cards.
-        return ["--enable-auto-tool-choice", "--tool-call-parser", "hermes",
+        # `qwen3_xml`, NOT hermes. hermes was carried here for a long time on the belief
+        # that Qwen emits "hermes-style <tool_call> markup", and that is false for every
+        # Qwen this project publishes — wrong in the silent direction, which is the exact
+        # failure this module exists to prevent. hermes reads JSON inside <tool_call>; all
+        # five published Qwen checkpoints emit XML tags. From their own chat templates:
+        #
+        #   Qwen3.5-0.8B / Qwen3.5-2B / Qwen3.8-27B (3 and 4 bpw) / Qwen3.8-Flash-Next
+        #       <function= x5     "arguments" x0
+        #   SmolLM3 (for contrast)  <function= x0     "arguments" x2   -> hermes is right
+        #
+        # Flash-Next's template both instructs the format ("If you choose to call a function
+        # ONLY reply in the following format ... <tool_call>\n<function=example_function_name>
+        # \n<parameter=...") and renders past calls in it, and vLLM's own matcher expects
+        # "\n\n<tool_call>" — the same bytes the template emits.
+        #
+        # `qwen3_xml` and `qwen3_coder` are ALIASES in vLLM: `tool_parsers/__init__.py` maps
+        # both to `Qwen3EngineToolParser`, which wraps the single `Qwen3Parser` whose
+        # docstring is that `<tool_call>/<function=/<parameter=` grammar. `qwen3_xml` is the
+        # name in Qwen's own serving recipe for Qwen3.8-27B, so that is the one carried here.
+        #
+        # Qwen3.x are THINKING models: without --reasoning-parser qwen3 the <think> block
+        # stays in `content` and leaks into the agent's prose — the same failure class as
+        # gemma-4's enable_thinking leak (#85), reading as rambling or repetition in a pi
+        # session. --language-model-only skips the multimodal wrapper's bf16 vision tower,
+        # which text-only agent/chat serving never uses — pure VRAM back on 24 GB cards, and
+        # why the vendor recipe's `--mm-encoder-tp-mode` has nothing to act on here.
+        return ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_xml",
                 "--reasoning-parser", "qwen3",
                 "--language-model-only"]
     if "smollm3" in name:
@@ -66,6 +95,76 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
         # to end — don't drift it as a side effect of Qwen changes.
         return ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
     return None
+
+
+#: What each family's model card asks for, keyed by the same repo-id substrings
+#: `tool_serve_args` dispatches on. Only parameters that are NOT already vLLM's default
+#: appear: `min_p=0.0`, `presence_penalty=0.0` and `repetition_penalty=1.0` are on Qwen's
+#: card but are also `_DEFAULT_SAMPLING_PARAMS` in vLLM's OpenAI path, so listing them would
+#: change nothing while implying it did. `top_p`'s OpenAI default IS 1.0, so 0.95 is a real
+#: setting; gemma-4's 1.0/0.95/64 are the values `glq-chat` was already shipping.
+_FAMILY_SAMPLING = {
+    "gemma-4": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
+    # Qwen3.x thinking-mode card: 1.0 / 0.95 / 20. The 20 is the whole reason this table
+    # exists — a 64 borrowed from gemma-4 is a different sampler.
+    "qwen": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    # SmolLM3's card asks for 0.6 and specifies NO top_k, so none is emitted. Leaving the
+    # key out is not the same as sending 0: it keeps whatever the checkpoint's own
+    # generation_config.json says, which is the thing we have no reason to overrule.
+    "smollm3": {"temperature": 0.6, "top_p": 0.95},
+}
+
+#: Neutral values for a family we have no card for — usable on a slider, opinionated about
+#: nothing. 0 is how vLLM spells "top_k off".
+_NEUTRAL_SAMPLING = {"temperature": 1.0, "top_p": 1.0, "top_k": 0}
+
+
+def _family_sampling(model_id: str):
+    name = (model_id or "").lower()
+    for family, params in _FAMILY_SAMPLING.items():
+        if family in name:
+            return params
+    return None
+
+
+def sampling_serve_args(model_id: str) -> list[str] | None:
+    """vLLM serve args pinning this family's recommended sampling, or None if unknown.
+
+    **Why this has to be server-side.** `top_k` is not in the OpenAI schema, so an
+    OpenAI-dialect client cannot send it — pi does not, and the installer's pi config
+    (`configure.pi_models_json`) has no field for it either. So the one parameter most likely
+    to be wrong is the one only the server can set.
+
+    **What it does and does not override.** `--override-generation-config` feeds
+    `default_sampling_params`, and vLLM resolves each field "user -> server default ->
+    OpenAI default" (`entrypoints/openai/chat_completion/protocol.py:to_sampling_params`,
+    verified on 0.30.0). Every field here is `None` on an incoming request unless the client
+    set it, so: `top_k` always takes effect, `top_p` takes effect for a client that omits it,
+    and `temperature` is inert against any client that sends its own — which pi does. That is
+    worth stating plainly rather than implying the server has the last word.
+
+    None for an unknown family, which is the opposite of `tool_serve_args`'s refusal and for
+    a reason: a wrong tool parser fails silently at the worst layer, whereas no sampling
+    override just means the checkpoint's own `generation_config.json` is used. That is a
+    better answer than a guess, not a worse one.
+    """
+    params = _family_sampling(model_id)
+    if params is None:
+        return None
+    # Compact separators: the installer prints these as copy-pasteable shell commands, and a
+    # space inside an unquoted JSON argument splits it into two.
+    return ["--override-generation-config",
+            json.dumps(params, separators=(",", ":"), sort_keys=True)]
+
+
+def recommended_sampling(model_id: str) -> dict:
+    """Slider defaults for `glq-chat`, from the same table, always fully populated.
+
+    The UI cannot render None on a slider, so a family with no `top_k` (SmolLM3) gets 0 —
+    which is how vLLM spells "off" — and an unknown model gets neutral values rather than
+    one family's numbers.
+    """
+    return {**_NEUTRAL_SAMPLING, **(_family_sampling(model_id) or {})}
 
 
 def _fetch(url: str) -> bytes:

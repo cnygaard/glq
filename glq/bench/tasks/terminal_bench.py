@@ -33,6 +33,8 @@ import time
 import urllib.error
 import urllib.request
 
+from glq.tooling import tool_serve_args
+
 from ..record import BenchmarkResult, ServingMeta, ThroughputResult
 
 _DATASET = "terminal-bench/terminal-bench-2"
@@ -109,16 +111,30 @@ def serve_command(model: str, quant: str | None, config: dict, port: int,
            "--max-model-len", str(int(config.get("max_model_len", 32768)))]
     # Tool calling is not optional here: an agent that cannot call tools cannot touch the
     # terminal, and vLLM rejects pi's `tool_choice: "auto"` with a 400 unless both flags are
-    # set. The parser is per model family — `hermes` reads the <tool_call>{...}</tool_call>
-    # markup SmolLM3 and Qwen-style templates emit.
-    parser = config.get("tool_call_parser", "hermes")
+    # set. The parser is per model family, and the family table in glq.tooling is the one
+    # source for it — this used to default to a hardcoded `hermes`, which reads
+    # <tool_call>{...}</tool_call> and therefore mis-parses every published Qwen (their
+    # templates emit <function=.../<parameter=... XML instead). That failure is silent: the
+    # rollout completes and scores 0.0, which reads as a bad model.
+    family = tool_serve_args(model) or []
+    if "tool_call_parser" in config:
+        parser = config["tool_call_parser"]
+        reasoning = config.get("reasoning_parser")
+    elif family:
+        parser = family[family.index("--tool-call-parser") + 1]
+        reasoning = (family[family.index("--reasoning-parser") + 1]
+                     if "--reasoning-parser" in family else config.get("reasoning_parser"))
+    else:
+        # Unknown family: hermes is what this did before, and tool flags with a possibly
+        # wrong parser still beat no tool flags, which 400s on the agent's first turn.
+        parser, reasoning = "hermes", config.get("reasoning_parser")
     if parser:
         cmd += ["--enable-auto-tool-choice", "--tool-call-parser", parser]
-    # Off by default because a mismatched reasoning parser mangles output. Worth setting for
-    # a thinking model: without it the <think> block arrives inside `content`, where the
-    # tool-call parser has to look past it.
-    if config.get("reasoning_parser"):
-        cmd += ["--reasoning-parser", config["reasoning_parser"]]
+    # Off unless the family asks for it or the config does, because a mismatched reasoning
+    # parser mangles output. Needed for a thinking model: without it the <think> block
+    # arrives inside `content`, where the tool-call parser has to look past it.
+    if reasoning:
+        cmd += ["--reasoning-parser", reasoning]
     if quant and quant not in ("none", "bf16"):
         cmd += ["--quantization", quant]
     return cmd

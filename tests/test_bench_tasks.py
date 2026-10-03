@@ -333,3 +333,37 @@ def test_serving_command_is_unchanged_without_glq_env(monkeypatch):
             monkeypatch.delenv(k, raising=False)
     kw = runtime.build_llm_kwargs("org/M", quant="none")
     assert runtime.serving_command("org/M", kw).startswith("vllm serve org/M")
+
+
+def test_terminal_bench_picks_the_parser_from_the_model_family():
+    """The default was a hardcoded `hermes`, which silently mis-parses every Qwen we publish
+    (their templates emit `<function=`/`<parameter=` XML, not JSON inside `<tool_call>`).
+    A TB-2 rollout with a wrong parser does not error — it produces a plausible-looking
+    reward of 0.0 — so the default has to come from the same family table glq-code uses."""
+    from glq.bench.tasks import terminal_bench as tb
+    qwen = tb.serve_command("xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw", "glq", {},
+                            port=8000, served_id="m")
+    assert qwen[qwen.index("--tool-call-parser") + 1] == "qwen3_xml"
+    assert qwen[qwen.index("--reasoning-parser") + 1] == "qwen3"
+
+    smol = tb.serve_command("xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel", "glq", {},
+                            port=8000, served_id="m")
+    assert smol[smol.index("--tool-call-parser") + 1] == "hermes"
+    assert "--reasoning-parser" not in smol       # the validated SmolLM3 pairing
+
+
+def test_an_explicit_parser_still_overrides_the_family():
+    """The config key is how a new family gets served before the table knows about it."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.serve_command("xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw", "glq",
+                           {"tool_call_parser": "pythonic"}, port=8000, served_id="m")
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "pythonic"
+
+
+def test_an_unknown_family_still_gets_tool_calling():
+    """Falling back to hermes is how this behaved before and is better than serving an agent
+    with no tool flags at all, which fails at the first turn with a 400."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.serve_command("org/something-new", "glq", {}, port=8000, served_id="m")
+    assert "--enable-auto-tool-choice" in cmd
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "hermes"
