@@ -68,7 +68,8 @@ GEMMA4_TRANSFORMERS = "transformers==5.17.0"
 # Template constants live in glq.tooling — the single source both this installer and
 # glq-code read, so the family knowledge cannot drift again.
 from glq.tooling import (GEMMA4_TOOL_TEMPLATE,  # noqa: E402
-                         GEMMA4_TOOL_TEMPLATE_URL, tool_serve_args)
+                         GEMMA4_TOOL_TEMPLATE_URL, sampling_serve_args,
+                         tool_serve_args)
 
 
 def _install_python_extras(run: Runner, venv: Path, components, device: str = "cuda") -> None:
@@ -105,6 +106,18 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         # the extra's missing deps (pyproject stays the single source of truth for them).
         print("\n== installing: glq[quantize]")
         run([pip, "install", "glq[quantize]"])
+    if "bench" in components:
+        # `glq-bench`'s quality tasks need `datasets` to fetch MMLU-Pro / AIME, and
+        # `decode_sweep` needs `pandas` — which vLLM's sweep tool imports only at the very
+        # END, when writing summary.csv, so a missing pandas discards the whole measurement
+        # after it has already run. Without this branch there was no supported way to
+        # provision a benchmarking box: the `bench` extra existed in pyproject but nothing
+        # installed it, so `glq-bench run --tasks aime_2026` ended in a bare
+        # ModuleNotFoundError, and the workaround was to over-install `quantize` for its
+        # incidental `datasets` (dragging in boto3/sentencepiece nobody benchmarking needs).
+        # Same NO --upgrade reasoning as above: the spec names glq itself.
+        print("\n== installing: glq[bench]")
+        run([pip, "install", "glq[bench]"])
 
 
 def _self_check(venv: Path, components, device: str | None,
@@ -232,6 +245,99 @@ def _start_chat(venv) -> None:
               f"Everything is installed — run it yourself when you are ready.")
 
 
+#: Width the summary wraps commands to — the same 74 columns as its own rule, so anything
+#: that fits the rule fits the commands.
+_COMMAND_WIDTH = 74
+_COMMAND_INDENT = "     "
+
+
+def _shell_arg(arg: str) -> str:
+    """One argv entry as it must appear in a command someone will paste into a shell.
+
+    JSON arguments do not survive a paste unquoted, which was measured by running the printed
+    gemma-4 command through bash against a stub binary:
+
+      * `{"temperature":1.0,"top_k":64,"top_p":0.95}` is **brace expansion** — bash turned it
+        into three separate arguments;
+      * the double quotes are removed, so `{"enable_thinking":true}` arrived as
+        `{enable_thinking:true}`, which is not JSON. That one predates the sampling flags.
+
+    Compact JSON was believed to make these safe. It prevents word-splitting only; quote
+    removal and brace expansion are unaffected.
+
+    This lives at the PRINTING layer on purpose. `glq-code` hands the same args to
+    `subprocess` as a list, where no shell is involved — quoting them there would deliver
+    literal quote characters to vLLM.
+    """
+    return shlex.quote(arg)
+
+
+def _wrap_command(cmd: str) -> list[str]:
+    """A printed command as one or more lines, continued with a trailing backslash.
+
+    The gemma-4 serve line is 401 characters — a tool parser, a reasoning parser, a template
+    path and two JSON blobs — which at 80 columns wraps mid-flag four times, and mid-flag is
+    exactly where a copy-paste goes wrong. Breaks go BETWEEN tokens and never between a flag
+    and its value, so each line reads as a complete thought.
+
+    Not every printed command can be re-flowed, and the summary holds one of each kind, so
+    anything that is not a plain single-line token sequence is returned untouched. Each guard
+    below prevents a *corrupted* command, not merely an ugly one:
+
+      * **an embedded newline** — already hand-wrapped with its own continuations and indent
+        (the `curl` example), so re-flowing it would fight that formatting;
+      * **a `#` comment** — `glq-code # --model <repo-id> for another checkpoint`. A break
+        after the `#` puts the continuation backslash inside the comment, which comments the
+        backslash out and turns the remainder into a second command;
+      * **a quoted argument spanning whitespace** (`--limit-mm-per-prompt '{"image": 0}'`),
+        found by comparing `shlex`'s token count with a naive split: splitting on whitespace
+        cuts such an argument into pieces that rejoin identically but cannot be broken across
+        lines. A quote CHARACTER alone is not the hazard — `{"enable_thinking":true}` is JSON
+        inside one unquoted token, and that is the longest argument here.
+
+    A single flag-and-value group can still exceed the width (gemma-4's `--chat-template` plus
+    an absolute path is 81 characters). Breaking that would separate the flag from its value,
+    which is the one thing this must not do, so it is left over-long.
+    """
+    tokens = cmd.split()
+    body_width = _COMMAND_WIDTH - len(_COMMAND_INDENT)
+    if len(cmd) + len(_COMMAND_INDENT) <= _COMMAND_WIDTH:
+        return [f"{_COMMAND_INDENT}{cmd}"]
+    if "\n" in cmd or "#" in cmd:
+        return [f"{_COMMAND_INDENT}{cmd}"]
+    try:
+        if len(shlex.split(cmd)) != len(tokens):
+            return [f"{_COMMAND_INDENT}{cmd}"]
+    except ValueError:                       # unbalanced quotes: not ours to re-flow
+        return [f"{_COMMAND_INDENT}{cmd}"]
+
+    # Group each flag with the value that follows it, so a break cannot separate them. The
+    # leading tokens before the first flag are one group too: `vllm serve <model>` is the
+    # command being run, and splitting `serve` from what it serves reads as a typo.
+    groups: list[str] = []
+    for token in tokens:
+        head = not groups or not any(g.startswith("--") for g in groups)
+        if groups and not token.startswith("--") and (head or groups[-1].startswith("--")):
+            groups[-1] = f"{groups[-1]} {token}"
+        else:
+            groups.append(token)
+
+    lines: list[str] = []
+    current = ""
+    for group in groups:
+        candidate = f"{current} {group}" if current else group
+        # +2 for the " \" this line will carry if another follows it.
+        if current and len(candidate) + 2 > body_width:
+            lines.append(current)
+            current = group
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return [f"{_COMMAND_INDENT}{ln}" + (" \\" if i < len(lines) - 1 else "")
+            for i, ln in enumerate(lines)]
+
+
 def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0,
                fp8_kv: bool = False, device: str = "cuda") -> str:
     """The whole user manual for someone who arrived via `curl … | bash`.
@@ -247,7 +353,8 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
         nonlocal n
         n += 1
         out.append(f"{n}. {title}")
-        out.extend(f"     {c}" for c in cmds)
+        for c in cmds:
+            out.extend(_wrap_command(c))
         out.append("")
 
     out += ["", "=" * 74, "GLQ is installed.", ""]
@@ -261,9 +368,10 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     # `400 "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser`.
     # Only added when picode was installed — they change server behaviour, so someone who
     # just wants to chat should not silently get them. The parser follows the model's
-    # FAMILY: hermes matches SmolLM3/Qwen-style <tool_call> markup and silently mangles
-    # gemma-4's, which needs its own parser plus the external template the picode
-    # component downloads (gemma-4's bundled chat template is plain chat).
+    # FAMILY, from glq.tooling: hermes for SmolLM3's JSON-in-<tool_call> markup, qwen3_xml
+    # for Qwen's <function=/<parameter= XML, and gemma-4 needs its own parser plus the
+    # external template the picode component downloads (its bundled template is plain chat).
+    # A parser from the wrong family produces tool calls that never parse, silently.
     is_gemma4 = "gemma-4" in model.lower()
     tools = ""
     if "picode" in components:
@@ -271,7 +379,12 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
         # advisory, and printing SOMETHING beats printing nothing — glq-code, which
         # actually starts servers, refuses unknown families instead.
         args = tool_serve_args(model, templates_dir=GLQ_HOME / "templates") or             ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
-        tools = " " + " ".join(args)
+        # The model card's sampling too, so this command starts the server glq-code would
+        # have started. `top_k` is the one parameter a tool-using client cannot supply — it
+        # is not an OpenAI field — so omitting it here changes what the model samples with
+        # while everything still appears to work.
+        args = args + (sampling_serve_args(model) or [])
+        tools = " " + " ".join(_shell_arg(a) for a in args)
     # A serving-time choice, so it belongs on the command the user copies — vLLM's own
     # flags, which is why they can simply be appended.
     kv_flags = kv_env.shell_suffix(fp8_kv)
@@ -313,10 +426,12 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
                    "gemma-4's tool\n    template, downloaded by the installer — the "
                    "model's own template is plain chat)\n")
     elif tools:
+        # Names the parser that was actually chosen. The note used to say `hermes`
+        # unconditionally, which is wrong for a Qwen model — it is served with qwen3_xml —
+        # and a note that contradicts the command above it is worse than no note.
         out.insert(len(out) - 1,
-                   "   (the tool-choice flags are what pi needs; `hermes` matches "
-                   "SmolLM3-style\n    <tool_call> markup — other model families need a "
-                   "different parser)\n")
+                   "   (the tool-choice flags are what pi needs; the parser matches this "
+                   "model's\n    tool markup — another family needs a different one)\n")
 
     step("Check it is up (from another terminal):",
          f"curl -s http://127.0.0.1:{port}/v1/models")
@@ -374,7 +489,8 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="glq-setup", description="Set up GLQ serving, a chat UI and picode.")
-    p.add_argument("--components", help="comma-separated: core,vllm,picode,chat,quantize")
+    p.add_argument("--components",
+                   help="comma-separated: core,vllm,picode,chat,quantize,bench")
     p.add_argument("--model", help="HF repo id to serve (default: chosen interactively)")
     p.add_argument("--chat", choices=("gradio", "openwebui", "none"), default="gradio")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -500,8 +616,9 @@ def main(argv=None) -> int:
         _install_open_webui(run)
 
     base_url = f"http://127.0.0.1:{args.port}/v1"
-    # Per-command defaults: glq-code prefers a fitting Qwen (native hermes tool calling,
-    # AIME at bf16 parity), glq-chat a fitting gemma-4 (fastest MoE decode). Fit-gated by
+    # Per-command defaults: glq-code prefers a fitting Qwen (tool markup its own template
+    # already emits, AIME at bf16 parity), glq-chat a fitting gemma-4 (fastest MoE
+    # decode). Fit-gated by
     # the same VRAM budget as the menu; the user's generic pick is the floor.
     if device == "cpu":
         from .recommend import CPU_WEIGHT_FRACTION

@@ -291,3 +291,141 @@ def test_non_gemma_models_keep_the_hermes_parser():
     t = _text()          # the default model is SmolLM3
     assert "--tool-call-parser hermes" in t
     assert "gemma4" not in t
+
+
+def test_the_printed_command_pins_the_same_sampling_glq_code_does():
+    """The by-hand command is advisory, but a user who copies it should get the server
+    glq-code would have started. `top_k` is the parameter that cannot come from the client
+    — pi has no field for it — so leaving it out of the printed command is the one drift
+    that silently changes what the model samples with."""
+    t = _text(model="xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4")
+    assert "--override-generation-config" in t
+    assert '"top_k":20' in t
+
+
+def test_sampling_is_not_pinned_for_a_plain_chat_install():
+    """glq-chat sends all three values itself from its sliders, so the server override buys
+    nothing there and would only make the printed command longer."""
+    t = _text(components=("core", "vllm", "chat"))
+    assert "--override-generation-config" not in t
+
+
+# ------------------------------------------------- wrapping the long serve commands
+
+# The gemma-4 serve line was 401 characters on one line — the tool parser, the reasoning
+# parser, a template path and a JSON kwargs blob. The 200-char guard above never saw it
+# because these tests serve SmolLM3, whose line is the shortest of the families. At 80
+# columns that wraps mid-flag four times, which is also where a copy-paste goes wrong.
+
+def _serve_line(model, components=ALL):
+    """The serve command as printed, including any continuation lines."""
+    lines = _text(model=model, components=components).splitlines()
+    start = next(i for i, ln in enumerate(lines) if "vllm serve" in ln)
+    block = [lines[start]]
+    while block[-1].rstrip().endswith("\\"):
+        block.append(lines[start + len(block)])
+    return block
+
+
+GEMMA = "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw"
+
+
+def test_no_printed_command_runs_off_the_terminal():
+    """74 columns is the width of the summary's own rule, so a command that fits it fits
+    everything else the installer prints.
+
+    Two groups are unsplittable and may exceed it: the command head (`vllm serve <model>`,
+    85 chars for a long repo id) and a single flag with a long value (gemma-4's
+    `--chat-template` plus an absolute path). Breaking either separates a thing from what it
+    applies to, so the assertion is that an over-long line holds at most ONE flag — more than
+    that means the packer gave up where it had a legal break."""
+    for model in (MODEL, GEMMA):
+        for line in _serve_line(model):
+            if len(line) <= 78:
+                continue
+            flags = [t for t in line.split() if t.startswith("--")]
+            assert len(flags) <= 1, f"{len(line)} chars, {len(flags)} flags:\n{line}"
+
+
+def test_a_wrapped_command_is_still_one_command():
+    """Continuations have to be shell continuations, not display-only line breaks: this is
+    a command whose entire purpose is to be copy-pasted."""
+    block = _serve_line(GEMMA)
+    assert len(block) > 1, "the gemma-4 command did not need wrapping — did it shrink?"
+    for line in block[:-1]:
+        assert line.rstrip().endswith("\\"), f"line break with no continuation:\n{line}"
+    rejoined = " ".join(ln.rstrip().rstrip("\\").strip() for ln in block)
+    assert rejoined.startswith(f"{VENV}/bin/vllm serve {GEMMA}")
+    assert "--tool-call-parser gemma4" in rejoined
+    assert "--override-generation-config" in rejoined
+
+
+def test_a_flag_is_never_split_from_its_value():
+    """`--port \\` / `8000` is a valid shell command and an unreadable instruction.
+
+    A valueless flag (`--enable-auto-tool-choice`) may legitimately end a line, so the
+    check is that no line STARTS with a value — i.e. a non-flag token following a break,
+    which is what a separated value would look like."""
+    block = _serve_line(GEMMA)
+    for line in block[1:]:
+        first = line.split()[0]
+        assert first.startswith("--"), f"continuation starts on a bare value:\n{line}"
+
+
+def test_a_short_command_is_left_on_one_line():
+    """Wrapping something that fits adds a backslash to read past for no reason."""
+    block = [ln for ln in _text().splitlines() if "glq-chat" in ln]
+    assert block and not any(ln.rstrip().endswith("\\") for ln in block), block
+
+
+# ------------------------------------------------- the printed command must survive a paste
+
+# Discovered by running the printed gemma-4 command through bash with a stub binary: the JSON
+# arguments arrived mangled. `{"temperature":1.0,"top_k":64,"top_p":0.95}` is bash BRACE
+# EXPANSION — it became three separate arguments — and the double quotes were stripped, so
+# `--default-chat-template-kwargs {"enable_thinking":true}` reached the program as
+# `{enable_thinking:true}`, which is not JSON. That second one predates the sampling work.
+#
+# tooling.py used to justify compact JSON as keeping the command "copy-pasteable without
+# quoting". Compactness prevents word-splitting and nothing else; quote-stripping and brace
+# expansion both still apply.
+
+def test_json_arguments_survive_the_shell():
+    """shlex models POSIX quote removal, so a round trip through it is what the program
+    would actually receive."""
+    import json
+    import shlex
+    block = _serve_line(GEMMA)
+    cmd = " ".join(ln.rstrip().rstrip("\\").strip() for ln in block)
+    argv = shlex.split(cmd)
+    for flag in ("--override-generation-config", "--default-chat-template-kwargs"):
+        value = argv[argv.index(flag) + 1]
+        assert json.loads(value), f"{flag} did not survive quote removal: {value!r}"
+
+
+def test_no_printed_argument_can_be_brace_expanded():
+    """`{a,b}` expands in bash whether or not it is JSON, and shlex cannot see that — so
+    the brace hazard is asserted on the printed text directly: a `{` must be inside quotes."""
+    for model in (MODEL, GEMMA):
+        for line in _serve_line(model):
+            for token in line.rstrip().rstrip("\\").split():
+                if "{" in token:
+                    assert token.startswith(("'", '"')), f"unquoted brace:\n{token}"
+
+
+def test_plain_flags_are_not_gratuitously_quoted():
+    """Quoting everything would work and would make the command unreadable."""
+    block = _serve_line(GEMMA)
+    joined = " ".join(block)
+    assert "--quantization glq" in joined
+    assert "'--quantization'" not in joined
+
+
+def test_the_args_handed_to_a_subprocess_stay_unquoted():
+    """The same helper feeds `glq-code`, which passes a LIST to subprocess — no shell is
+    involved there, so a shell-quoted value would reach vLLM with literal quote characters
+    in it. The quoting belongs to the printing layer only."""
+    from glq.tooling import sampling_serve_args, tool_serve_args
+    for args in (sampling_serve_args(GEMMA), tool_serve_args(GEMMA)):
+        for token in args:
+            assert not token.startswith(("'", '"')), token
