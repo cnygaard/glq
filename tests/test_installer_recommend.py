@@ -314,3 +314,58 @@ def test_per_command_picks_under_cpu_gating_prefer_the_gemma_moe_for_chat():
                                 weight_fraction=R.CPU_WEIGHT_FRACTION,
                                 require_trellis=True)
     assert picks["chat_model"] == "xv0y5ncu/gemma-4-26B-A4B-moe-4bpw"
+
+
+# ---- host offload: ranking from the RESIDENT footprint ---------------------------------
+#
+# A checkpoint that declares host-offloadable bytes does not have to hold them in VRAM.
+# Gating on file size judged Qwen3.8-Flash-Next unservable on EVERY card -- 72.2 GiB of
+# safetensors against a 96 GB card's 71.2 GiB budget -- while it demonstrably serves at
+# 49.53 GiB with the n-gram table offloaded and 12.15 GiB with the experts too.
+
+GIB = 2 ** 30
+
+
+def _declared(size_gib, ple_gib=0.0, expert_gib=0.0, rid="org/declared"):
+    return Checkpoint(rid, int(size_gib * GIB), True, True,
+                        ple_offload_bytes=int(ple_gib * GIB),
+                        expert_offload_bytes=int(expert_gib * GIB))
+
+
+def test_declared_offload_makes_an_oversize_checkpoint_fit():
+    """The case that fails without this: 72.2 GiB of weights on a 95 GiB card, where the
+    budget is 71.2 GiB. With 23.84 GiB of PLE and 36.18 GiB of experts declared, the card
+    only has to hold 12.2 GiB."""
+    c = _declared(72.2, 23.842, 36.18)
+    assert R.rank([c], int(95 * GIB))[0].fits is True
+
+
+def test_an_undeclared_checkpoint_ranks_exactly_as_before():
+    """Absent fields mean 'assume resident'. A checkpoint that predates them must not be
+    promised onto a card that cannot hold it -- the allowance is opt-in by declaration."""
+    assert R.rank([Checkpoint("org/old", int(72.2 * GIB), True, True)],
+                  int(95 * GIB))[0].fits is False
+
+
+def test_fits_and_recommended_use_the_same_measure():
+    """Deriving the label and the recommendation from different measures is how the menu
+    shows [fits] on something it will not recommend, or the reverse."""
+    c = _declared(72.2, 23.842, 36.18)
+    r = R.rank([c], int(95 * GIB))[0]
+    assert r.fits is True and r.recommended is True
+
+
+def test_offload_credit_is_capped_by_pinnable_host_ram():
+    """Pinned pages cannot be swapped, so RAM bounds how much may leave the card. Without
+    this cap a 23 GiB card with 32 GiB of RAM is offered a checkpoint whose floor fits, and
+    the supervisor then declines to offload and serves 48 GiB of weights into 23 GiB."""
+    c = _declared(72.2, 23.842, 36.18)
+    assert R.rank([c], int(23 * GIB), ram_bytes=int(128 * GIB))[0].fits is True
+    assert R.rank([c], int(23 * GIB), ram_bytes=int(32 * GIB))[0].fits is False
+
+
+def test_a_zero_size_repo_is_still_never_offered():
+    """size_bytes == 0 means the tree API gave us nothing; the offload path must not turn
+    that into 'fits anywhere'."""
+    c = Checkpoint("org/broken", 0, True, True, ple_offload_bytes=int(20 * GIB))
+    assert R.rank([c], int(95 * GIB))[0].fits is False

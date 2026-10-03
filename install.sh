@@ -66,7 +66,9 @@ usage() {
     cat <<'USAGE'
 GLQ installer
 
-  --components LIST   core,vllm,picode,chat,quantize   (default: core,vllm,chat)
+  --components LIST   core,vllm,picode,chat,quantize,bench
+                      (default: core,vllm,chat; 'bench' adds glq-bench's deps:
+                      datasets for the quality tasks, pandas for decode_sweep)
   --model REPO_ID     checkpoint to serve     (default: chosen interactively)
   --chat WHICH        gradio | openwebui | none
   --glq-version VER   pin glq (default: latest release)

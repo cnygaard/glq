@@ -71,6 +71,7 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
         max_num_seqs: int = 64,
         dtype: str | None = None,
         kv_cache_dtype: str | None = None,
+        kv_transfer_config: dict | None = None,
         hf_token: str | None = None,
         task_config: dict | None = None) -> list[BenchRecord]:
     """Run ``tasks`` on ``model`` and return one ``BenchRecord`` per task."""
@@ -138,7 +139,8 @@ def run(*, model: str, tasks: list[str], quant: str | None = None,
         ctx.handle = rt.load(model, quant=eff_quant, max_model_len=mml,
                              gpu_mem_util=gpu_mem_util, arch=mm.architecture,
                              max_num_seqs=max_num_seqs, dtype=eff_dtype,
-                             kv_cache_dtype=kv_cache_dtype)
+                             kv_cache_dtype=kv_cache_dtype,
+                             kv_transfer_config=kv_transfer_config)
         log_ts(f"engine ready: weights {ctx.handle.serving.load_gpu_mem_gib} GiB "
                f"loaded in {_fmt(time.time() - t0)}")
         for i, s in enumerate(quality, 1):

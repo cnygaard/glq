@@ -90,6 +90,34 @@ def test_quantize_extra_is_not_installed_by_default():
     assert "glq[quantize]" not in _pip_commands(("core", "vllm", "chat"))
 
 
+def test_bench_component_installs_the_extra_without_upgrading_glq():
+    """`glq-bench`'s quality tasks import `datasets` and `decode_sweep` needs `pandas`, so a
+    benchmarking box needs the `bench` extra. Before this component existed the extra was
+    declared in pyproject but nothing installed it, so `glq-bench run --tasks aime_2026`
+    ended in a bare ModuleNotFoundError on an install.sh-provisioned box. Same no-upgrade
+    rule as quantize: the spec names glq itself, so `--upgrade` would clobber a
+    --glq-source dev install with the PyPI release."""
+    seen = []
+    M._install_python_extras(lambda cmd, **kw: seen.append([str(c) for c in cmd]),
+                             Path("/home/u/.glq/venv"), ("core", "bench"))
+    bench = [c for c in seen if any("glq[bench]" in a for a in c)]
+    assert bench, f"no glq[bench] install in: {seen}"
+    assert "--upgrade" not in bench[0], bench[0]
+
+
+def test_bench_extra_is_not_installed_by_default():
+    """A serving box should stay light: datasets/pandas/matplotlib are a benchmarking cost."""
+    assert "glq[bench]" not in _pip_commands(("core", "vllm", "chat"))
+
+
+def test_bench_and_quantize_are_independent():
+    """Before the bench component, the workaround was to install `quantize` for its
+    incidental `datasets`, dragging in boto3/sentencepiece nobody benchmarking needs.
+    Each component must pull only its own extra."""
+    assert "glq[quantize]" not in _pip_commands(("core", "bench"))
+    assert "glq[bench]" not in _pip_commands(("core", "quantize"))
+
+
 def test_picode_component_fetches_the_gemma4_tool_template():
     """gemma-4's tool template is not in the model checkpoint and not in the vLLM wheel —
     it lives in vLLM's repo examples. Measured on the box: the printed serve command

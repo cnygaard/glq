@@ -75,6 +75,10 @@ class ServingMeta:
     llm_kwargs: dict[str, Any] | None = None  # exact LLM(**kwargs) used
     dtype: str | None = None
     kv_cache_dtype: str | None = None
+    #: `--kv-transfer-config` as a dict (CPU/disk KV offload, disaggregated prefill).
+    #: Kept as a dict, not a KVTransferConfig: this record is serialised with
+    #: `json.dumps(..., default=str)`, so a dataclass here would persist as its repr.
+    kv_transfer_config: dict | None = None
     gpu_memory_utilization: float | None = None
     max_model_len: int | None = None
     load_gpu_mem_gib: float | None = None     # weights+ctx resident right after load

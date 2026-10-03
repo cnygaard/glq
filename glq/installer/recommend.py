@@ -29,8 +29,9 @@ WEIGHT_FRACTION = 0.75
 CPU_WEIGHT_FRACTION = 0.5
 
 #: Per-command model-family preference, matched as a substring of the repo id. Measured
-#: rationale (2026-08, RTX PRO 6000 evals): Qwen3.8's tool calling is native hermes markup
-#: — no external template, no thought-markup leakage — and its GLQ-4bpw AIME ties bf16,
+#: rationale (2026-08, RTX PRO 6000 evals): Qwen3.8's tool calling needs no external chat
+#: template — its own emits the markup, and the reasoning parser keeps thought markup out
+#: of prose — and its GLQ-4bpw AIME ties bf16,
 #: which is what a coding agent needs; gemma-4's 26B-A4B MoE has the fastest interactive
 #: decode, which is what a chat session feels. Preference is fit-gated: it never forces a
 #: checkpoint the card cannot hold.
@@ -50,10 +51,45 @@ def usable_weight_bytes(vram_bytes: int, weight_fraction: float = WEIGHT_FRACTIO
     return int(vram_bytes * weight_fraction)
 
 
+#: Share of host RAM that pinned offloaded weights may occupy. Must agree with
+#: `supervisor._PINNED_RAM_FRACTION`: if this gate credits offload the supervisor will then
+#: refuse to perform, the menu offers a checkpoint that cannot serve.
+PINNED_RAM_FRACTION = 0.5
+
+
+def _resident_floor(c, ram_bytes: int | None = None) -> int:
+    """VRAM a checkpoint must actually hold, allowing for declared host offload.
+
+    Reads the property when present and falls back to ``size_bytes``, so this works with the
+    bare ``Checkpoint(repo_id, size)`` built by ``--model`` on the command line and with any
+    stub a test passes in — neither carries the offload fields.
+
+    ``ram_bytes`` caps the credit at what can actually be PINNED. Without it this gate and
+    `supervisor.plan_expert_offload_gib` can disagree: a 23 GiB card with 32 GiB of RAM would
+    be offered a checkpoint whose floor fits, and then the supervisor would decline to offload
+    (pinned pages cannot swap) and serve 48 GiB of weights into 23 GiB of VRAM.
+    """
+    floor = getattr(c, "resident_floor_bytes", None)
+    if not (isinstance(floor, int) and floor > 0):
+        return int(c.size_bytes)
+    if ram_bytes:
+        # Only the OFFLOADED bytes need pinning. `nontext_bytes` (MTP head, vision tower) are
+        # never loaded by a text-only serve, so they consume no host memory and must not be
+        # charged against the pinnable budget — doing so would withdraw a credit a box with
+        # modest RAM is entitled to, on account of weights nothing reads.
+        nontext = int(getattr(c, "nontext_bytes", 0) or 0)
+        offloadable = int(c.size_bytes) - int(floor) - nontext
+        pinnable = int(float(ram_bytes) * PINNED_RAM_FRACTION)
+        if offloadable > pinnable:
+            return int(c.size_bytes) - nontext - max(0, pinnable)
+    return int(floor)
+
+
 def rank(checkpoints, vram_bytes: int | None,
          prefer_family: str | None = None,
          weight_fraction: float = WEIGHT_FRACTION,
-         require_trellis: bool = False) -> list[Ranked]:
+         require_trellis: bool = False,
+         ram_bytes: int | None = None) -> list[Ranked]:
     """Largest-first, each marked fits/doesn't, with at most one recommended.
 
     With `vram_bytes=None` (no nvidia-smi, CPU-only box, container without the device) every
@@ -72,7 +108,15 @@ def rank(checkpoints, vram_bytes: int | None,
     budget = usable_weight_bytes(vram_bytes, weight_fraction)
     # size_bytes == 0 means the tree API gave us nothing usable; never treat that as
     # "fits anywhere", or a broken repo sorts to the top of the recommendation.
-    fitting = [c for c in ordered if 0 < c.size_bytes <= budget]
+    #
+    # The gate is the RESIDENT floor, not the file size: a checkpoint that declares
+    # host-offloadable bytes (a PLE table, MoE experts) does not have to hold them in VRAM.
+    # Gating on size_bytes judged Qwen3.8-Flash-Next unservable on EVERY card -- 72.2 GiB of
+    # safetensors against a 96 GB card's 71.2 GiB budget -- while it demonstrably serves at
+    # 49.53 GiB with the n-gram table offloaded and 12.15 GiB with the experts too. Undeclared
+    # offload bytes are 0, so every existing checkpoint is gated exactly as before.
+    fitting = [c for c in ordered
+               if 0 < c.size_bytes and _resident_floor(c, ram_bytes) <= budget]
     if require_trellis:
         # The CPU backend serves trellis — dense or MoE, the latter since the fused CPU
         # expert kernel landed. e8p/shell still refuse at load (their expert and dequant
@@ -94,7 +138,11 @@ def rank(checkpoints, vram_bytes: int | None,
     best = (trellis_fitting or fitting or [None])[0]
     best = best.repo_id if best is not None else None
 
-    return [Ranked(c, 0 < c.size_bytes <= budget, c.repo_id == best) for c in ordered]
+    # `fits` uses the same resident floor as the recommendation gate above. Deriving the two
+    # from different measures is how the menu ends up showing a [fits] label on a checkpoint it
+    # will not recommend, or the reverse.
+    return [Ranked(c, 0 < c.size_bytes and _resident_floor(c, ram_bytes) <= budget,
+                   c.repo_id == best) for c in ordered]
 
 
 def per_command_picks(checkpoints, vram_bytes: int | None, fallback: str,

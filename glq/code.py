@@ -23,18 +23,33 @@ import sys
 from pathlib import Path
 
 from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
-                      _server_port, _vram_bytes, default_model,
-                      positive_seconds, sizing_weights_bytes)
+                      _server_port, _vram_bytes, checkpoint_offload_bytes,
+                      default_model, positive_seconds, sizing_weights_bytes)
 from glq.installer.configure import write_pi_models
 from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
-from glq.tooling import ensure_gemma4_template, tool_serve_args
+from glq.tooling import (ensure_gemma4_template, sampling_serve_args,
+                         tool_serve_args)
 
-#: A coding agent carries file contents, diffs and multi-turn tool results — glq-chat's
-#: 8192 is a conversation, not a working set. Still far below gemma-4's declared 262144,
-#: for the same reason chat caps it: nobody's KV pool should pay for a window the session
-#: will not use. Raise it with --max-model-len.
+#: The window a coding session falls back to when the card cannot be sized — a CPU box, or
+#: a `--model` whose config we could not read. A coding agent carries file contents, diffs
+#: and multi-turn tool results, so glq-chat's 8192 is a conversation, not a working set.
+#:
+#: This stays small deliberately. It is a FLOOR, not a target: the supervisor tiers up from
+#: here to the model's declared maximum when it knows the VRAM, and raising the floor itself
+#: would hand a CPU server a quarter-million-token window against an 8 GiB pool.
 DEFAULT_CODE_MAX_MODEL_LEN = 16384
+
+#: pi issues one request at a time, so one stream is both what the server should admit and
+#: what the window should be priced at. The chat default of 16 (priced at 8) describes a
+#: server nobody is running here, and it is expensive: the same 96 GB card and checkpoint
+#: reach 131072 at eight streams and the model's full 262144 at one, because the window's KV
+#: cost is multiplied by the concurrency it must hold.
+#:
+#: The cost of 1 is that a second client — glq-chat pointed at this server, say — queues
+#: instead of batching. Correct for an agent, and `--max-num-seqs` re-prices the window with
+#: it for anyone who wants otherwise.
+DEFAULT_CODE_MAX_NUM_SEQS = 1
 
 
 def _find_pi() -> Path | None:
@@ -106,6 +121,19 @@ def main(argv=None) -> int:
         # downloads it, but this install may predate that or have skipped picode.
         ensure_gemma4_template()
 
+    # The model card's sampling, pinned server-side because pi cannot send `top_k` at all
+    # (not an OpenAI field, and the pi config has no slot for it). Appended, not substituted:
+    # correct sampling with no tool parser is a useless coding session.
+    tool_args = tool_args + (sampling_serve_args(args.model) or [])
+
+    # Declared host-offloadable bytes: the supervisor sizes the pool and window from
+    # what actually lands in VRAM, and turns PLE offload on for a checkpoint that
+    # cannot serve without it. (0, 0) for everything that declares nothing.
+    _offload = checkpoint_offload_bytes(args.model)
+    # One value for both knobs, so what the server admits and what the window was priced for
+    # can never disagree. Letting them drift is how a pool sized for one request ends up
+    # admitting eight.
+    _seqs = args.max_num_seqs or DEFAULT_CODE_MAX_NUM_SEQS
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -117,11 +145,18 @@ def main(argv=None) -> int:
         max_model_len_floor=DEFAULT_CODE_MAX_MODEL_LEN,
         model_max_len=(None if args.max_model_len is not None or not args.model
                        else _model_max_len(args.model)),
-        max_num_seqs=args.max_num_seqs,
+        max_num_seqs=_seqs,
+        window_concurrency=_seqs,
         timeout=args.ready_timeout,
         extra_args=tool_args,
         weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
+        # Declared host-offloadable bytes, so the supervisor sizes the pool and the window
+        # from what actually lands in VRAM and turns PLE offload on for a checkpoint that
+        # cannot serve without it. 0/0 for everything that declares nothing, which is every
+        # checkpoint today except Qwen3.8-Flash-Next.
+        ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
+        nontext_bytes=_offload[2],
     )
 
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the

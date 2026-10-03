@@ -74,6 +74,67 @@ if __name__ == "__main__":
 
 `glq` registers with vLLM automatically via its plugin entry point — no extra import needed.
 
+{% if is_moe %}
+## Fit it on a smaller card — weight offload (vLLM ≥ 0.30.0)
+
+vLLM can keep weights in pinned host RAM and let the GPU read them over PCIe. This model is a
+**mixture of experts**, which is the case where that is cheap: only the routed experts are read
+per token, so experts sitting in host memory cost nothing until they are selected. Restrict the
+offload to them with `--cpu-offload-params experts`.
+
+```bash
+vllm serve {{ repo_id }} \
+    --quantization glq \
+    --offload-backend uva \
+    --cpu-offload-gb 24 \
+    --cpu-offload-params experts \
+    --max-model-len {{ max_ctx }}{% if has_ple %} \
+    --max-num-seqs 1{% endif %}{% if multimodal %} \
+    --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'{% endif %}
+
+```
+
+`--cpu-offload-gb` is the host-memory budget in GiB — raise it to free more VRAM, at the cost
+of decode speed. `--cpu-offload-params` takes **one** value; `experts,mlp` is read as a single
+literal string, not a list. Use `uva`, not the `prefetch` backend: prefetch bulk-copies whole
+layer groups, so it transfers experts that were never routed and loses the saving.
+
+`--max-model-len` is the longest sequence the engine will accept — prompt plus generated
+tokens — and it sizes the KV reservation per sequence. {{ max_ctx }} is this checkpoint's
+declared ceiling. Offload makes a long context **more** affordable rather than less, because
+the VRAM the weights give up goes to the KV pool.
+
+**`--max-model-len` and `--max-num-seqs` trade against each other**, and at full context the
+trade is steep: concurrency is roughly `KV pool ÷ max-model-len`. Pick one and derive the
+other from what vLLM reports as `GPU KV cache size` at startup — it prints both that and a
+`Maximum concurrency for N tokens per request` line. `--max-num-seqs 1` above is the
+conservative pairing for full context; if you serve shorter requests, lower `--max-model-len`
+and raise `--max-num-seqs` together, because sequences only consume the KV they actually use.
+{% if has_ple %}
+
+This checkpoint also has a per-layer-embedding (PLE) table, which GLQ can hold in host memory
+independently. The two stack — set `VLLM_PLE_CPU_OFFLOAD=1` (it is vLLM's default) and the PLE
+table does **not** count against `--cpu-offload-gb`. Note that each in-flight sequence reserves
+recurrent-layer state on the GPU, so leave headroom for it: a budget that loads the weights can
+still be too small to serve a request.
+{% endif %}
+{% if offload %}
+
+Measured{% if offload_hw %} on {{ offload_hw }}{% endif %}, B=1, one run per row:
+
+| host-memory budget | weights on GPU | KV cache | decode |
+|---|--:|--:|--:|
+{% for r in offload %}
+| {{ r.budget }} | {{ r.resident }} | {{ r.kv }} | {{ r.tokps }} |
+{% endfor %}
+
+Decode here is bounded by the PCIe link rather than by the GPU, so a card with less VRAM but
+the same link runs at a similar rate — VRAM buys context, not speed. Figures are specific to
+the machine they were measured on; a narrower PCIe link (x8, x4) will be proportionally slower.
+Quality under offload was not evaluated.
+{% endif %}
+{% endif %}
+
 ## Use with Transformers
 
 ```python

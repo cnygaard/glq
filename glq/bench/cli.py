@@ -53,6 +53,7 @@ def _cmd_run(args) -> int:
         n=args.n, budget=args.budget, avg_k=args.avg_k, gpu_mem_util=args.gpu_mem_util,
         max_num_seqs=args.max_num_seqs, dtype=args.dtype,
         max_model_len=args.max_model_len, kv_cache_dtype=args.kv_cache_dtype,
+        kv_transfer_config=args.kv_transfer_config,
         hf_token=None, task_config=task_config,
     )
     from .record import write_jsonl
@@ -138,6 +139,19 @@ def _emit(text: str, out: str | None) -> None:
 # --------------------------------------------------------------------------- #
 # Parser
 # --------------------------------------------------------------------------- #
+def _json_arg(raw: str):
+    """argparse type for a JSON object, so malformed input fails at parse time.
+
+    argparse turns a ValueError/TypeError from a type callable into a clean usage error; any
+    other exception would traceback, so the json error is re-raised as ValueError.
+    """
+    import json as _json
+    try:
+        return _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"not valid JSON: {e}") from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="glq-bench",
                                 description="Generalized model-performance benchmarking toolkit.")
@@ -175,6 +189,16 @@ def build_parser() -> argparse.ArgumentParser:
     # runs bf16 and reports it as a KV-quantization result.
     r.add_argument("--kv-cache-dtype", dest="kv_cache_dtype", default=None,
                    help="fp8 | turboquant_4bit_nc | ... (default: engine default)")
+    # Parsed by argparse, not by the runner: a typo in a long JSON blob should fail here and
+    # not four minutes into an engine start. vLLM's own recipes configure CPU/disk KV offload
+    # through this, e.g. the OffloadingConnector config published for Qwen3.8-Flash-Next.
+    r.add_argument("--kv-transfer-config", dest="kv_transfer_config", default=None,
+                   type=_json_arg,
+                   help='JSON passed to vLLM as --kv-transfer-config, e.g. CPU KV offload: '
+                        '\'{"kv_connector": "OffloadingConnector", "kv_role": "kv_both", '
+                        '"kv_connector_extra_config": {"cpu_bytes_to_use": 68719476736}}\'. '
+                        'Recorded in ServingMeta and in the reconstructed serve command, '
+                        'because it changes both the memory topology and the speed of a run.')
     r.add_argument("--task-config", dest="task_config", default=None,
                    help='JSON merged into every task config, last word. Model-level knobs '
                         'live here because they belong to the chat template, not the task '
