@@ -295,3 +295,116 @@ def test_discover_carries_moe_with_one_config_fetch_per_repo(monkeypatch):
     ckpts = D.discover(fetch=fetch)
     assert len(ckpts) == 1 and ckpts[0].moe is True and ckpts[0].trellis is True
     assert sum("config.json" in u for u in calls) == 1
+
+
+# ---- host-offloadable bytes from config.json ---------------------------------------------
+#
+# Written by glq.quantize_model at save time, where the exact tensor sizes are free. Not
+# recomputed from the Hub: a Flash-Next safetensors header is 39.45 MB against
+# huggingface_hub's 25 MB parse cap, so get_safetensors_metadata raises on it.
+
+def test_offload_bytes_read_from_quantization_config():
+    cfg = {"quantization_config": {"ple_offload_bytes": 25600000000,
+                                   "expert_offload_bytes": 38800000000}}
+    assert D.offload_bytes(cfg) == (25600000000, 38800000000, 0)
+
+
+def test_missing_fields_mean_assume_resident():
+    """The behaviour before these existed. A checkpoint that predates them must rank exactly
+    as it does today, so the allowance can only be gained by declaring it -- never by a
+    default that could promise a model onto a card too small to hold it."""
+    assert D.offload_bytes({"quantization_config": {"bpw": 3}}) == (0, 0, 0)
+    assert D.offload_bytes({}) == (0, 0, 0)
+
+
+def test_a_non_dict_config_is_not_an_offload_claim():
+    """The Hub can hand back an error page or an LFS pointer; that is not a declaration."""
+    assert D.offload_bytes("<html>nope</html>") == (0, 0, 0)
+    assert D.offload_bytes({"quantization_config": "glq"}) == (0, 0, 0)
+
+
+def test_nonsense_values_are_ignored_rather_than_trusted():
+    """A negative or non-numeric claim would credit VRAM that does not exist."""
+    for bad in (-1, 0, "lots", None, [1]):
+        assert D.offload_bytes(
+            {"quantization_config": {"ple_offload_bytes": bad}}) == (0, 0, 0)
+
+
+def test_discover_carries_the_bytes_onto_the_checkpoint():
+    """One config fetch per repo supplies traits AND the offload bytes; a second fetch for
+    the same body would double the listing's network cost."""
+    def fetch(url):
+        if "/api/collections/" in url:
+            return {"items": [{"type": "model", "id": "org/one",
+                               "gated": False, "private": False}]}
+        if url.endswith("config.json"):
+            return {"quantization_config": {"variant": "3inst",
+                                            "ple_offload_bytes": 25600000000,
+                                            "expert_offload_bytes": 100},
+                    "num_local_experts": 128}
+        return [{"path": "model.safetensors", "size": 77000000000}]
+
+    out = D.discover(fetch=fetch)
+    assert len(out) == 1
+    assert out[0].ple_offload_bytes == 25600000000
+    assert out[0].expert_offload_bytes == 100
+    assert out[0].trellis is True and out[0].moe is True
+    assert out[0].resident_floor_bytes == 77000000000 - 25600000000 - 100
+
+
+# -------------------------------------- bytes a text-only serve never loads
+
+# `resident = size - ple - experts` still overstated VRAM by the MTP head and vision tower:
+# 15.72 GiB predicted against a measured 10.1 GiB on Qwen3.8-Flash-Next. Two window tiers on
+# a 24 GB card. `nontext_bytes` closes it, and is deliberately a SEPARATE field from the two
+# offload counts because it needs no pinned host RAM -- nothing reads those weights.
+
+def test_nontext_bytes_are_read_alongside_the_offload_counts():
+    from glq.installer.discovery import offload_bytes
+    cfg = {"quantization_config": {"ple_offload_bytes": 10, "expert_offload_bytes": 20,
+                                   "nontext_bytes": 30}}
+    assert offload_bytes(cfg) == (10, 20, 30)
+
+
+def test_a_config_without_nontext_bytes_reads_zero():
+    """Every checkpoint published before this field exists must size exactly as it does
+    today -- absent means 'all resident', which can never over-promise."""
+    from glq.installer.discovery import offload_bytes
+    cfg = {"quantization_config": {"ple_offload_bytes": 10, "expert_offload_bytes": 20}}
+    assert offload_bytes(cfg) == (10, 20, 0)
+
+
+def test_the_resident_floor_subtracts_the_non_text_bytes():
+    """The point of the field: Flash-Next's floor drops from 48.4 GiB to 42.7 GiB, which is
+    what the hardware actually holds."""
+    from glq.installer.discovery import Checkpoint
+    GIB = 2 ** 30
+    c = Checkpoint("org/x", int(77.52 * GIB), True, True,
+                   ple_offload_bytes=int(23.84 * GIB),
+                   expert_offload_bytes=int(42.63 * GIB),
+                   nontext_bytes=int(5.69 * GIB))
+    assert c.resident_floor_bytes == 0 or c.resident_floor_bytes < int(6 * GIB)
+
+
+def test_the_floor_never_goes_negative_on_a_malformed_config():
+    """The three fields are independent numbers in a published file; a wrong one must clamp
+    rather than produce a negative footprint that fits every card."""
+    from glq.installer.discovery import Checkpoint
+    c = Checkpoint("org/x", 100, nontext_bytes=10 ** 9)
+    assert c.resident_floor_bytes == 0
+
+
+def test_non_text_bytes_are_not_treated_as_pinnable_host_memory():
+    """`recommend._resident_floor` caps the offload credit at what host RAM can PIN. Non-text
+    bytes are not pinned -- they are never loaded -- so they must not consume that budget, or
+    a box with modest RAM loses the credit it is entitled to."""
+    from glq.installer.discovery import Checkpoint
+    from glq.installer.recommend import _resident_floor
+    GIB = 2 ** 30
+    # 8 GiB of RAM pins 4 GiB; the PLE table is 3 GiB (fits), non-text is 20 GiB (irrelevant).
+    c = Checkpoint("org/x", int(40 * GIB), True, True,
+                   ple_offload_bytes=int(3 * GIB), expert_offload_bytes=0,
+                   nontext_bytes=int(20 * GIB))
+    floor = _resident_floor(c, ram_bytes=int(8 * GIB))
+    assert floor == int(40 * GIB) - int(3 * GIB) - int(20 * GIB), (
+        f"non-text bytes were charged against pinnable RAM: floor={floor / GIB:.1f} GiB")

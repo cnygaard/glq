@@ -251,3 +251,87 @@ def test_an_explicit_model_flag_still_wins(monkeypatch, tmp_path):
                               cfg={"model": GEMMA, "code_model": QWEN})
     code.main(["--model", SMOL])
     assert made[0]["model"] == SMOL
+
+
+# ------------------------------------------------- one stream, and a window sized for it
+
+# `--max-model-len 262144` was unreachable on the coding path for two reasons at once: the
+# window planner priced every window at chat concurrency (8 streams = ~52 GiB of KV), and
+# `--max-num-seqs` came from the chat default of 16. pi issues one request at a time, so both
+# were describing a server nobody was running.
+
+def test_a_coding_session_is_priced_as_the_single_stream_it_is(monkeypatch, tmp_path):
+    """One stream is the difference between 131072 and the model's full 262144 on the same
+    card, so this is the parameter that decides whether the window is reachable at all."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", SMOL])
+    assert made[0]["max_num_seqs"] == 1
+    assert made[0]["window_concurrency"] == 1
+
+
+def test_the_admitted_concurrency_and_the_priced_concurrency_cannot_disagree(monkeypatch,
+                                                                            tmp_path):
+    """Raising --max-num-seqs must re-price the window too. Letting them drift is how a
+    server ends up admitting eight requests into a pool sized for one."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", SMOL, "--max-num-seqs", "4"])
+    assert made[0]["max_num_seqs"] == 4
+    assert made[0]["window_concurrency"] == 4
+
+
+def test_the_coding_window_actually_reaches_the_declared_maximum(monkeypatch, tmp_path):
+    """End of the chain, with the REAL supervisor rather than the fake: a 96 GB card and
+    Flash-Next's post-offload resident size must produce 262144 and a pool that holds it.
+    The fake supervisor above cannot prove this — it echoes the floor back."""
+    import glq.supervisor as sup_mod
+    GIB = 2**30
+    window = sup_mod.plan_max_model_len(
+        weights_bytes=int(49.53 * GIB), vram_bytes=95 * GIB, model_max_len=262144,
+        floor=code.DEFAULT_CODE_MAX_MODEL_LEN,
+        concurrency=code.DEFAULT_CODE_MAX_NUM_SEQS)
+    assert window == 262144
+    util = sup_mod.plan_gpu_memory_utilization(
+        weights_bytes=int(49.53 * GIB), vram_bytes=95 * GIB,
+        kv_bytes=sup_mod.window_kv_bytes(window, code.DEFAULT_CODE_MAX_NUM_SEQS))
+    pool = util * 95 * GIB - int(49.53 * GIB) - sup_mod._RUNTIME_OVERHEAD_BYTES
+    assert pool >= 6.55 * GIB, f"262144 promised against {pool / GIB:.2f} GiB of KV"
+
+
+def test_the_coding_floor_stays_small_for_boxes_with_no_vram_reading(monkeypatch, tmp_path):
+    """The floor is what a CPU box and an unknown card fall back to. Raising it to 262144
+    would hand a CPU server a quarter-million-token window against an 8 GiB pool — the
+    tiering is what lifts the window, never the floor."""
+    assert code.DEFAULT_CODE_MAX_MODEL_LEN == 16384
+
+
+def test_the_served_model_s_own_sampling_is_pinned(monkeypatch, tmp_path):
+    """pi cannot send top_k — it is not in the OpenAI schema — so a Qwen coding session
+    samples at vLLM's top_k=0 unless the server pins the card's 20."""
+    import json
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", QWEN])
+    extra = made[0]["extra_args"]
+    cfg = json.loads(extra[extra.index("--override-generation-config") + 1])
+    assert cfg["top_k"] == 20
+
+
+def test_sampling_args_do_not_displace_the_tool_args(monkeypatch, tmp_path):
+    """Both go through extra_args; a coding session with correct sampling and no tool
+    parser is useless, so this asserts they coexist rather than one replacing the other."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", QWEN])
+    extra = " ".join(made[0]["extra_args"])
+    assert "--enable-auto-tool-choice" in extra
+    assert "--tool-call-parser qwen3_xml" in extra
+    assert "--override-generation-config" in extra
+
+
+def test_all_three_non_resident_counts_reach_the_supervisor(monkeypatch, tmp_path):
+    """The wiring, which is the part that silently does nothing when it breaks: a planner
+    that never receives `nontext_bytes` sizes exactly as it did before and nothing fails."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    monkeypatch.setattr(code, "checkpoint_offload_bytes", lambda repo: (11, 22, 33))
+    code.main(["--model", QWEN])
+    assert made[0]["ple_offload_bytes"] == 11
+    assert made[0]["expert_offload_bytes"] == 22
+    assert made[0]["nontext_bytes"] == 33

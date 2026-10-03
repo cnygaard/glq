@@ -38,6 +38,7 @@ from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
                             DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS,
                             DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
+from glq.tooling import recommended_sampling as _recommended_sampling
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 GLQ_CONFIG = Path(os.environ.get("GLQ_HOME", Path.home() / ".glq")) / "config.json"
@@ -52,8 +53,8 @@ def _installed_config() -> dict:
 
 def default_model(cfg: dict, command: str) -> str | None:
     """The model a command serves when --model is absent: the installer's per-command
-    pick (`code_model`/`chat_model` — glq-code prefers Qwen for native hermes tool
-    calling, glq-chat prefers gemma-4 for MoE decode speed; see
+    pick (`code_model`/`chat_model` — glq-code prefers Qwen, whose own chat template
+    emits tool markup, glq-chat prefers gemma-4 for MoE decode speed; see
     installer.recommend.PREFERRED_FAMILIES), else the generic install-time choice.
     Absent keys mean an older config — behavior is then exactly the pre-split default."""
     return cfg.get(f"{command}_model") or cfg.get("model")
@@ -110,15 +111,18 @@ def max_tokens_ceiling(max_model_len: int) -> int:
     return max(256, max_model_len // 2)
 
 
-#: The sampling gemma-4's card specifies for all use cases. It is also what vLLM would apply
-#: on its own — `--generation-config` defaults to `auto`, so the server reads the checkpoint's
-#: `generation_config.json` for any field the request omits. That made the old defaults the
-#: worst of both: temperature was overridden with 0.7 while top_p and top_k were left to the
-#: model. Sending all three keeps one visible, consistent answer to "what am I sampling with".
+#: The slider defaults, per model family — see `tooling._FAMILY_SAMPLING` for the values and
+#: which of them vLLM would have applied anyway. Sending all three keeps one visible,
+#: consistent answer to "what am I sampling with"; the old defaults were the worst of both,
+#: overriding temperature with 0.7 while leaving top_p and top_k to the checkpoint.
 #:
-#: These are gemma-4's numbers, not universal ones — SmolLM3's card asks for 0.6 and no top_k.
-#: The sliders exist so that is a drag, not a reinstall.
-RECOMMENDED_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+#: This used to be a single dict of gemma-4's numbers applied to every model, so a Qwen
+#: session sampled at top_k=64 where its card asks for 20. The sliders mean a user CAN fix
+#: that by dragging, but a default nobody's card asked for is not a default.
+recommended_sampling = _recommended_sampling
+
+#: Kept as gemma-4's row for anything still importing the constant.
+RECOMMENDED_SAMPLING = _recommended_sampling("gemma-4")
 
 
 def completion_kwargs(*, model, messages, temperature, top_p, top_k, max_tokens):
@@ -191,13 +195,15 @@ def build_ui(base_url: str, models: list[str], api_key: str = "glq",
             model = gr.Dropdown(choices=models, value=served, label="GLQ checkpoint",
                                 allow_custom_value=True,
                                 visible=show_model_picker(models))
-            temperature = gr.Slider(0.0, 2.0, value=RECOMMENDED_SAMPLING["temperature"],
+            # The served model's own card, not one family's numbers for everybody.
+            sampling = recommended_sampling(served)
+            temperature = gr.Slider(0.0, 2.0, value=sampling["temperature"],
                                     step=0.05, label="temperature")
-            top_p = gr.Slider(0.0, 1.0, value=RECOMMENDED_SAMPLING["top_p"], step=0.01,
+            top_p = gr.Slider(0.0, 1.0, value=sampling["top_p"], step=0.01,
                               label="top_p")
             # 0 = off, so a model whose card asks for no top_k (SmolLM3) can be served from
             # the same UI by dragging this to zero rather than editing a flag.
-            top_k = gr.Slider(0, 200, value=RECOMMENDED_SAMPLING["top_k"], step=1,
+            top_k = gr.Slider(0, 200, value=sampling["top_k"], step=1,
                               label="top_k (0 = off)")
             ceiling = max_tokens_ceiling(max_model_len)
             max_tokens = gr.Slider(64, ceiling, value=min(1024, ceiling), step=64,
@@ -292,6 +298,29 @@ def _checkpoint_bytes(repo_id: str):
         return repo_size_bytes(repo_id) or None
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return None
+
+
+def checkpoint_offload_bytes(repo_id: str) -> tuple[int, int, int]:
+    """(ple, expert, nontext) non-resident bytes for this checkpoint, 0s if unknown.
+
+    The first two can live in HOST memory; the third (MTP head, vision tower) is not loaded
+    at all by a text-only serve, so it costs neither VRAM nor pinned RAM.
+
+    Same never-block contract as `_checkpoint_bytes`: one small config.json read, and any
+    failure means "assume every weight is resident" — today's behaviour — rather than
+    stopping the chat or, worse, planning an offload the checkpoint cannot support.
+
+    Shared by glq-chat and glq-code so the two cannot drift apart on it, which is the same
+    reason `sizing_weights_bytes` is shared.
+    """
+    if not repo_id:
+        return 0, 0, 0
+    try:
+        from glq.installer.discovery import _fetch_json, offload_bytes
+        return offload_bytes(
+            _fetch_json(f"https://huggingface.co/{repo_id}/resolve/main/config.json"))
+    except Exception:                                       # noqa: BLE001 - offline, 404, …
+        return 0, 0, 0
 
 
 def sizing_weights_bytes(args, device=None):
@@ -393,6 +422,10 @@ def main(argv=None) -> int:
               f"they ship as an extra so a serving-only install stays small.)")
         return 3
 
+    # Declared host-offloadable bytes: the supervisor sizes the pool and window from
+    # what actually lands in VRAM, and turns PLE offload on for a checkpoint that
+    # cannot serve without it. (0, 0) for everything that declares nothing.
+    _offload = checkpoint_offload_bytes(args.model)
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -412,6 +445,12 @@ def main(argv=None) -> int:
         # the weights and the page cache inside one RAM budget.
         weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
+        # Declared host-offloadable bytes, so the supervisor sizes the pool and the window
+        # from what actually lands in VRAM and turns PLE offload on for a checkpoint that
+        # cannot serve without it. 0/0 for everything that declares nothing, which is every
+        # checkpoint today except Qwen3.8-Flash-Next.
+        ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
+        nontext_bytes=_offload[2],
     )
 
     # Ctrl-C already unwinds through the context manager below, but `kill` and a closed

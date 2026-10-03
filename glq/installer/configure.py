@@ -89,8 +89,8 @@ def write_glq_config(path, *, model: str, base_url: str, components, available,
     record of the installer's decisions — worth having when someone reports that it served
     a model they did not expect.
 
-    `code_model`/`chat_model` are the per-command defaults (glq-code prefers Qwen for its
-    native hermes tool calling, glq-chat prefers gemma-4 for its MoE decode speed — see
+    `code_model`/`chat_model` are the per-command defaults (glq-code prefers Qwen, whose own
+    chat template emits tool markup, glq-chat prefers gemma-4 for its MoE decode speed — see
     recommend.PREFERRED_FAMILIES). Written only when chosen: absence is what tells
     glq-code/glq-chat to fall back to the generic `model`, so old configs keep old behavior.
     """

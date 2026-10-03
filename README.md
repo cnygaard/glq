@@ -259,7 +259,7 @@ vllm serve xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw \
     --offload-backend uva \
     --cpu-offload-gb 12 \
     --cpu-offload-params experts \
-    --max-model-len 4096 \
+    --max-model-len 64000 \
     --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'
 ```
 
@@ -267,6 +267,13 @@ vllm serve xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw \
 to parameters whose name contains that segment. Pass **one value** — `experts,mlp` is read as
 a single literal string, not a list. The `--limit-mm-per-prompt` line is needed only because
 this checkpoint carries a vision tower; without it a text-only serve fails at startup.
+
+`--max-model-len` is the longest sequence the engine will accept — prompt plus generated
+tokens — and it sizes the KV reservation per sequence. This checkpoint declares 262,144, so
+raise it as far as your KV pool allows; offload makes a long context **more** affordable, not
+less, because the VRAM the weights give up goes to the KV pool (see the KV column growing in
+the table below). The measurements below were taken at `--max-model-len 4096`, which is a
+benchmark setting and not a serving recommendation.
 
 Measured on one **L4 (24 GB, sm_89, PCIe 4 ×16)**, vLLM 0.30.0, torch 2.13.0, glq 0.8.23,
 `gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw`, B=1, 64 decode steps, one run per row:

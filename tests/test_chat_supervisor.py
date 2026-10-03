@@ -1356,19 +1356,20 @@ GIB = 2**30
 
 def test_an_l4_serving_the_26b_stays_at_the_floor():
     """No regression on the cards the 8192 default was designed for: 23 GiB card,
-    14.4 GiB weights → pool 0.89·23 ≈ 20.5 GiB, headroom ≈ 2.1 GiB after overhead;
-    16384×8×24.6 KiB ≈ 3.1 GiB does not fit."""
+    14.4 GiB weights → headroom 0.92·23 − 14.4 − 4 ≈ 2.8 GiB;
+    16384×8×26.2 KiB ≈ 3.3 GiB does not fit."""
     got = sup_mod.plan_max_model_len(weights_bytes=int(14.4 * GIB),
                                      vram_bytes=23 * GIB, model_max_len=262144)
     assert got == 8192
 
 
-def test_a_96gib_card_reaches_the_top_tier():
-    """96 GiB, same 26B: pool floors at 0.45 → 43 GiB, headroom ≈ 24 GiB;
-    65536×8×24.6 KiB ≈ 12.3 GiB fits with room to spare."""
+def test_a_96gib_card_reaches_the_models_declared_maximum():
+    """96 GiB, same 26B: headroom 0.92·96 − 14.4 − 4 ≈ 69.9 GiB, and
+    262144×8×26.2 KiB ≈ 52.4 GiB fits. The old ceiling was the tier list stopping at
+    65536, not anything the card could not afford."""
     got = sup_mod.plan_max_model_len(weights_bytes=int(14.4 * GIB),
                                      vram_bytes=96 * GIB, model_max_len=262144)
-    assert got == 65536
+    assert got == 262144
 
 
 def test_the_declared_maximum_clamps_the_tier():
@@ -1404,8 +1405,103 @@ def test_the_floor_is_a_parameter_for_glq_code():
 def test_the_supervisor_plans_the_window_when_not_pinned():
     sup, _ = _sup(healthy_after=2, max_model_len=None, model_max_len=262144,
                   weights_bytes=int(14.4 * GIB), vram_bytes=96 * GIB)
-    assert sup.max_model_len == 65536
+    assert sup.max_model_len == 262144
     sup.start()
+
+
+# -------------------------------------------- the pool and the window are one decision
+
+# The window planner used to measure its headroom against the pool `plan_gpu_memory_utilization`
+# was *already* going to reserve — and that pool holds only `_MIN_KV_BYTES` beyond the weights.
+# So for any large model the headroom was 2 GiB regardless of card size, and extending
+# `_WINDOW_TIERS` alone changed nothing: measured on a 96 GB Blackwell serving Flash-Next at
+# 49.53 GiB resident, util 0.585, pool 2.00 GiB, window 8192. A long window is only real if the
+# pool grows to hold it, so the two are now decided together.
+
+#: Flash-Next after PLE offload, on the RTX PRO 6000 the offload work was measured on.
+_FLASHNEXT = dict(weights_bytes=int(49.53 * GIB), vram_bytes=95 * GIB, model_max_len=262144)
+
+
+def _planned(concurrency, **kw):
+    """(window, util) from the pair of planners, as the supervisor pairs them."""
+    window = sup_mod.plan_max_model_len(concurrency=concurrency, **kw)
+    util = sup_mod.plan_gpu_memory_utilization(
+        weights_bytes=kw["weights_bytes"], vram_bytes=kw["vram_bytes"],
+        kv_bytes=sup_mod.window_kv_bytes(window, concurrency))
+    return window, util
+
+
+@pytest.mark.parametrize("name,concurrency,kw,window", [
+    # The case the user hit: a 96 GB card serving an 8192 window.
+    ("96 GB chat", 8, _FLASHNEXT, 131072),
+    ("96 GB code", 1, _FLASHNEXT, 262144),
+    # 24 GB with the experts in host memory — the smallest box that serves this at all.
+    ("24 GB code", 1, dict(weights_bytes=int(12.15 * GIB), vram_bytes=23 * GIB,
+                           model_max_len=262144), 131072),
+    ("23 GiB chat", 8, dict(weights_bytes=int(14.4 * GIB), vram_bytes=23 * GIB,
+                            model_max_len=262144), 8192),
+])
+def test_the_pool_is_sized_to_hold_the_window_it_promised(name, concurrency, kw, window):
+    """The invariant that makes a long window real rather than announced: the KV the
+    promised window needs must fit the pool actually being reserved. Breaking either
+    planner alone breaks this."""
+    got, util = _planned(concurrency, **kw)
+    assert got == window, f"{name}: window {got}, expected {window}"
+
+    pool = util * kw["vram_bytes"] - kw["weights_bytes"] - sup_mod._RUNTIME_OVERHEAD_BYTES
+    needed = sup_mod.window_kv_bytes(got, concurrency)
+    assert needed <= pool + 1, (
+        f"{name}: promised a {got}-token window at {concurrency} concurrent request(s) "
+        f"needing {needed / GIB:.2f} GiB of KV, but reserved only {pool / GIB:.2f} GiB")
+
+
+def test_the_small_card_plan_is_unchanged_to_the_digit():
+    """`_WINDOW_CONCURRENCY`'s comment exists to keep a 23 GiB L4 serving the 26B, so that
+    case is asserted against today's exact numbers rather than a tolerance. 8192×8×26.2 KiB
+    = 1.64 GiB is below `_MIN_KV_BYTES`, so the floor binds and nothing moves."""
+    window, util = _planned(8, weights_bytes=int(14.4 * GIB), vram_bytes=23 * GIB,
+                            model_max_len=262144)
+    assert window == 8192
+    assert round(util, 3) == 0.887
+    pool = util * 23 * GIB - int(14.4 * GIB) - sup_mod._RUNTIME_OVERHEAD_BYTES
+    assert round(pool / GIB, 2) == 2.00
+
+
+def test_one_stream_affords_a_window_eight_cannot():
+    """Why glq-code gets its own concurrency: the same box and checkpoint reach the model's
+    full 262144 for a single request and only 131072 at chat concurrency. pi is one stream."""
+    assert _planned(1, **_FLASHNEXT)[0] == 262144
+    assert _planned(8, **_FLASHNEXT)[0] == 131072
+
+
+def test_the_per_token_anchor_covers_the_worst_measured_family():
+    """vLLM's own refusal on Flash-Next: "To serve at least one request with the model's max
+    seq len (262144), 6.55 GiB KV cache is needed". The anchor was gemma-4's 6.15 GiB and its
+    comment claimed that was the worst case among the served families, which this falsifies —
+    planning on 6.15 promises 262144 and then lands ~0.4 GiB short."""
+    assert sup_mod.window_kv_bytes(262144, 1) >= int(6.55 * GIB)
+
+
+def test_an_explicit_window_also_gets_a_pool_that_holds_it():
+    """`--max-model-len 262144` used to be paired with a 2 GiB pool, because only the
+    *planned* window fed the pool plan. Pinning the window is not a reason to under-reserve
+    for it."""
+    sup, _ = _sup(healthy_after=2, max_model_len=262144, max_num_seqs=1,
+                  window_concurrency=1, weights_bytes=int(49.53 * GIB),
+                  vram_bytes=95 * GIB)
+    pool = (sup.gpu_memory_utilization * 95 * GIB - int(49.53 * GIB)
+            - sup_mod._RUNTIME_OVERHEAD_BYTES)
+    assert pool >= 6.55 * GIB, f"only {pool / GIB:.2f} GiB of KV for a 262144 window"
+
+
+def test_a_pinned_small_window_does_not_shrink_the_pool_below_the_floor():
+    """The other direction: a 4096 window needs 0.1 GiB of KV, and reserving that would
+    starve activations. `_MIN_KV_BYTES` is the floor it falls back to."""
+    sup, _ = _sup(healthy_after=2, max_model_len=4096, weights_bytes=int(14.4 * GIB),
+                  vram_bytes=23 * GIB)
+    pool = (sup.gpu_memory_utilization * 23 * GIB - int(14.4 * GIB)
+            - sup_mod._RUNTIME_OVERHEAD_BYTES)
+    assert round(pool / GIB, 2) == 2.00
 
 
 def test_an_explicit_window_is_used_verbatim_with_no_planning():
@@ -1774,3 +1870,64 @@ def test_cpu_oom_hint_names_the_kvcache_pool_not_gpu_flags():
     hint = sup._drain()
     assert "--gpu-memory-utilization" not in hint
     assert "VLLM_CPU_KVCACHE_SPACE" in hint
+
+
+def test_the_window_is_not_promised_against_the_bare_minimum():
+    """Sizing the pool to exactly vLLM's stated requirement leaves nothing for block
+    granularity or a second request's partial blocks, and vLLM refuses AT STARTUP when it
+    comes up short. Measured on the real Flash-Next numbers: a 95 GiB card planned a 262144
+    window against a pool of exactly 6.55 GiB, which is the figure vLLM gives as its
+    MINIMUM for one such request."""
+    window, util = _planned(1, weights_bytes=int(53.72 * GIB), vram_bytes=95 * GIB,
+                            model_max_len=262144)
+    assert window == 262144
+    pool = util * 95 * GIB - int(53.72 * GIB) - sup_mod._RUNTIME_OVERHEAD_BYTES
+    assert pool > 6.55 * GIB * 1.05, f"only {pool / GIB:.2f} GiB for a 6.55 GiB requirement"
+
+
+def test_the_cushion_is_invisible_where_the_floor_already_binds():
+    """The cushion must not cost a small card anything: 8192×8 needs 1.64 GiB, and
+    `_MIN_KV_BYTES` is 2 GiB, so the floor keeps the L4 plan exactly where it was."""
+    window, util = _planned(8, weights_bytes=int(14.4 * GIB), vram_bytes=23 * GIB,
+                            model_max_len=262144)
+    assert window == 8192
+    assert round(util, 3) == 0.887
+
+
+def test_the_cushion_does_not_buy_a_window_the_card_cannot_hold():
+    """A 24 GB card with everything offloaded still tops out at 131072 — the cushion is
+    applied when CHOOSING the tier as well as when reserving, so the two cannot disagree."""
+    assert _planned(1, weights_bytes=int(12.15 * GIB), vram_bytes=23 * GIB,
+                    model_max_len=262144)[0] == 131072
+
+
+def test_the_utilisation_on_the_command_line_is_readable():
+    """The planned fraction is a raw float, so the serve command carried
+    `--gpu-memory-utilization 0.6723162690529302` — 17 digits of noise in the line users
+    read in the log and paste into a shell. Rounded UP, never down: rounding down would give
+    back a few MB of the KV pool that was just sized deliberately."""
+    sup, spawned = _sup(healthy_after=2, weights_bytes=int(53.72 * GIB),
+                        vram_bytes=int(95.6 * GIB), model_max_len=262144,
+                        max_num_seqs=1, window_concurrency=1)
+    sup.start()
+    argv = spawned[0].argv
+    printed = argv[argv.index("--gpu-memory-utilization") + 1]
+    assert len(printed) <= 5, f"unreadable fraction on the command line: {printed}"
+    assert float(printed) >= sup.gpu_memory_utilization, (
+        f"{printed} gives back memory the plan reserved "
+        f"({sup.gpu_memory_utilization})")
+
+
+def test_the_anchor_covers_every_measured_pool():
+    """Two serve logs on an RTX PRO 6000 (vLLM 0.30.0, Flash-Next, PLE offload) report the
+    pool directly, and both imply MORE per token than vLLM's one-request refusal message did:
+
+        72.07 GiB / 2,744,055 tokens = 28,201 B   (131072 window, 38 GiB expert offload)
+        11.17 GiB /   445,792 tokens = 26,903 B   (262144 window, PLE offload only)
+
+    The two differ by 4.8% because a GDN hybrid's linear-attention layers hold constant-size
+    state PER SEQUENCE, not per token, so one B/token figure is config-dependent by
+    construction -- which is why this is a conservative anchor and not a model of vLLM's KV
+    math. Cover the worst of them."""
+    assert sup_mod._KV_BYTES_PER_TOKEN >= 28201, (
+        f"anchor {sup_mod._KV_BYTES_PER_TOKEN} is below a measured 28201 B/token")

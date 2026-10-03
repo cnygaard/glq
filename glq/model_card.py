@@ -180,6 +180,12 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
     # A dense model reads every weight every token and offload is bandwidth-bound instead, so
     # the section stays out of those cards rather than inviting a bad configuration.
     qc = cfg.get("quantization_config") or {}
+    # The serve example must not understate the context: a hardcoded number silently caps
+    # the model far below what it supports (a 4096 left over from a benchmark config made
+    # one card advertise 4096 while carrying an AIME result measured at 262,144). Read it
+    # from the checkpoint; fall back to a conservative 32768 only if absent.
+    _tc = cfg.get("text_config") or cfg
+    max_ctx = int(_tc.get("max_position_embeddings") or 32768)
     is_moe = any("experts" in k for k in layer_bpw)
     has_ple = bool(qcfg.get("ple_codebook") or qc.get("ple_codebook")) \
         or any(".ple." in k or "ngram_embedding" in k for k in layer_bpw)
@@ -211,6 +217,7 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
         "multimodal": multimodal,
         "is_moe": is_moe,
         "has_ple": has_ple,
+        "max_ctx": max_ctx,
         # Optional measured offload rows: [{"budget","resident","kv","tokps"}]. Numbers are
         # card-specific (they depend on the card's PCIe link), so the template carries the
         # instructions and the caller supplies any measurements.

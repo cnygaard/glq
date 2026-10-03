@@ -37,10 +37,35 @@ class Checkpoint:
     #: n_routed_experts > 1). None = could not tell. The CPU backend refuses MoE, so the
     #: CPU recommendation gate treats None as ineligible — conservative by design.
     moe: bool | None = None
+    #: Bytes that can live in pinned HOST memory instead of VRAM, declared by the quantizer
+    #: in config.json. 0 = not declared, which means "assume resident" — the behaviour before
+    #: these existed, so an older checkpoint is never promised onto a card that cannot hold it.
+    ple_offload_bytes: int = 0
+    expert_offload_bytes: int = 0
+    #: Bytes outside the text decoder (MTP head, vision tower) that a text-only serve never
+    #: loads. A THIRD thing, not a kind of offload: these need no pinned host RAM because
+    #: nothing reads them. 0 = not declared, i.e. assume loaded.
+    nontext_bytes: int = 0
 
     @property
     def size_gib(self) -> float:
         return self.size_bytes / GIB
+
+    @property
+    def resident_floor_bytes(self) -> int:
+        """Smallest VRAM footprint reachable with everything offloadable in host memory.
+
+        What a card actually has to hold. Flash-Next is 77.5 GiB of safetensors but 42.7 GiB
+        here, which is the difference between the installer offering it and refusing it on
+        every card including a 96 GB one.
+
+        `nontext_bytes` is subtracted on the same footing even though it is not offloaded:
+        from a card's point of view a weight in host RAM and a weight never read are the same
+        absence. Measured: at a 38 GiB expert budget the two-term arithmetic predicted
+        15.72 GiB and vLLM reported 10.1 GiB.
+        """
+        return max(0, self.size_bytes - self.ple_offload_bytes
+                   - self.expert_offload_bytes - self.nontext_bytes)
 
     @property
     def short_name(self) -> str:
@@ -151,6 +176,12 @@ def repo_traits(repo_id: str, fetch=_fetch_json) -> tuple[bool | None, bool | No
         cfg = fetch(f"https://huggingface.co/{repo_id}/resolve/main/config.json")
     except Exception:                                                 # noqa: BLE001
         return None, None
+    return _traits_from_cfg(cfg)
+
+
+def _traits_from_cfg(cfg) -> tuple[bool | None, bool | None]:
+    """(trellis, moe) from an already-parsed config body. Split out so ``discover`` can read
+    the traits AND the offload bytes from one fetch instead of two."""
     # Anything but a JSON object means the Hub handed back something we don't understand
     # (an error page, an LFS pointer, a redirect body) — unknown, not "not trellis".
     if not isinstance(cfg, dict):
@@ -170,11 +201,45 @@ def repo_is_trellis(repo_id: str, fetch=_fetch_json) -> bool | None:
     return repo_traits(repo_id, fetch=fetch)[0]
 
 
+def offload_bytes(cfg) -> tuple[int, int, int]:
+    """(ple, expert, nontext) non-resident bytes from an already-parsed config.json.
+
+    The first two move to host RAM; the third (MTP head, vision tower) is never loaded at all
+    by a text-only serve and so needs no pinned memory. All three are written by
+    ``glq.quantize_model``, which keeps them mutually exclusive.
+
+    Pure, so it is testable without a fetch. Written by ``glq.quantize_model`` at save time,
+    where the exact tensor sizes are free; see ``_offloadable_bytes`` there for why they are
+    not recomputed from the Hub (a Flash-Next safetensors header is 39.45 MB, over
+    huggingface_hub's 25 MB parse cap).
+
+    **Missing keys mean 0, i.e. "assume every weight is resident"** — the behaviour before
+    these fields existed. A checkpoint that predates them is therefore ranked exactly as it is
+    today and can never be promised onto a card too small to hold it; the only way to gain the
+    allowance is to declare it.
+    """
+    q = cfg.get("quantization_config") if isinstance(cfg, dict) else None
+    if not isinstance(q, dict):
+        return 0, 0, 0
+
+    def _n(key):
+        v = q.get(key)
+        return int(v) if isinstance(v, (int, float)) and v > 0 else 0
+
+    return _n("ple_offload_bytes"), _n("expert_offload_bytes"), _n("nontext_bytes")
+
+
 def discover(fetch=_fetch_json) -> list[Checkpoint]:
     """Every offerable checkpoint: on-disk size, trellis-ness and MoE-ness (one config
     fetch per repo for both traits)."""
     out = []
     for rid in collection_repo_ids(fetch=fetch):
-        trellis, moe = repo_traits(rid, fetch=fetch)
-        out.append(Checkpoint(rid, repo_size_bytes(rid, fetch=fetch), trellis, moe))
+        try:
+            cfg = fetch(f"https://huggingface.co/{rid}/resolve/main/config.json")
+        except Exception:                                             # noqa: BLE001
+            cfg = None
+        trellis, moe = _traits_from_cfg(cfg)
+        ple, expert, nontext = offload_bytes(cfg if isinstance(cfg, dict) else {})
+        out.append(Checkpoint(rid, repo_size_bytes(rid, fetch=fetch), trellis, moe,
+                              ple, expert, nontext))
     return out

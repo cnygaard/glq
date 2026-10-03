@@ -101,6 +101,79 @@ def pad_hessian(H, block_size=8):
     return H
 
 
+#: First path segment of a head a text-only serve does not load. MTP is the
+#: multi-token-prediction (speculative) head: 31 tensors, 4.856 GiB on Qwen3.8-Flash-Next.
+_NONTEXT_HEAD_SEGMENTS = ("mtp",)
+
+#: Any path segment naming a non-text tower. 0.836 GiB on the same checkpoint.
+_NONTEXT_TOWER_SEGMENTS = ("visual", "vision_tower", "audio_tower")
+
+
+def _is_nontext(name: str) -> bool:
+    """Is this tensor outside the text decoder, i.e. never loaded by a text-only serve?
+
+    Matched on dotted SEGMENTS, not substrings: `model.layers.0.mtpool.weight` contains
+    "mtp" and is an ordinary text weight, and dropping it from the resident estimate would
+    under-state the footprint — the direction that promises a card it cannot hold.
+    """
+    parts = name.split(".")
+    return (parts[0] in _NONTEXT_HEAD_SEGMENTS
+            or any(p in _NONTEXT_TOWER_SEGMENTS for p in parts))
+
+
+def _offloadable_bytes(state_dict: dict) -> tuple[int, int, int]:
+    """(ple_offload_bytes, expert_offload_bytes, nontext_bytes) — bytes not resident in VRAM.
+
+    Recorded in ``quantization_config`` so the installer can size a card from the *resident*
+    footprint instead of the file size. Without it `recommend.rank` gates on total safetensors
+    bytes and judges a PLE checkpoint unservable on every card: Qwen3.8-Flash-Next is 72.2 GiB
+    of weights but only 49.53 GiB resident with the n-gram table offloaded, and 12.15 GiB with
+    the experts offloaded too (measured, RTX PRO 6000 / vLLM 0.30.0).
+
+    Computed here rather than read back later because this is the only place the exact tensor
+    sizes are free. `huggingface_hub.get_safetensors_metadata` cannot substitute: a Flash-Next
+    header is 39.45 MB against its 25 MB cap. Deriving from config.json dimensions was tried
+    and could not reproduce the real row count, so it is not relied on.
+
+    **PLE counts `trellis_packed` only, not the whole PLE group.** That is what actually leaves
+    VRAM: resident went 73.3 -> 49.53 GiB, a 23.77 GiB drop matching `trellis_packed`
+    (23.842 GiB), which is how we know `Wscale` (0.596 GiB) stays resident. Summing the group
+    would over-promise, and over-promising means a model that loads and then cannot serve.
+    Shell-coded PLE tables are excluded deliberately: GLQ's offload path refuses them, so
+    claiming their bytes would advertise a configuration that does not run.
+
+    **`nontext_bytes` is a third, different thing** and must not be confused with the other
+    two: those bytes move to host RAM, these are never loaded at all, so they need no pinned
+    memory. Without them "resident = size - ple - experts" still overstated VRAM, because vLLM
+    loads only the text decoder. Measured on Flash-Next at a 38 GiB expert budget: the
+    arithmetic predicted 15.72 GiB and `Model loading took` reported **10.1 GiB**. On a 24 GB
+    card that gap is two window tiers — 32768 against the 131072 the hardware affords.
+
+    It is only valid for a **text-only serve**: the MTP head does load if speculative decoding
+    is enabled. `glq-chat` and `glq-code` never enable it, which is what makes the subtraction
+    sound for the consumers that exist.
+
+    **The three categories are mutually exclusive, non-text first.** Two tensors on Flash-Next
+    (`mtp.layers.0.mlp.experts.{down_proj,gate_up_proj}`) match both "experts" and the MTP
+    head; counting them twice is how `expert_offload_bytes` came to read 47.31 GiB against
+    42.63 GiB of real expert tensors, and a consumer subtracting both would under-state
+    resident — the dangerous direction.
+    """
+    ple = expert = nontext = 0
+    for name, t in state_dict.items():
+        try:
+            nbytes = t.numel() * t.element_size()
+        except AttributeError:                                        # not a tensor
+            continue
+        if _is_nontext(name):
+            nontext += nbytes
+        elif "experts" in name:
+            expert += nbytes
+        elif "ngram_embedding" in name and name.endswith("trellis_packed"):
+            ple += nbytes
+    return ple, expert, nontext
+
+
 def _artifact_padded_weights(arts: dict) -> int:
     """Padded weight count (m_pad * n_pad) for a quantized sublayer's artifact dict.
 
@@ -3276,6 +3349,19 @@ def quantize(
         config_dict["quantization_config"]["ple_bpw"] = int(_ple_sp['bpw'])
     if trust_remote_code:
         config_dict["quantization_config"]["trust_remote_code"] = True
+    # Bytes the serving side can keep in host RAM, so the installer sizes a card from the
+    # resident footprint rather than the file size. Emitted only when non-zero, so a dense
+    # checkpoint's config.json is unchanged. Absent means "assume resident" downstream, which
+    # is the pre-existing behaviour and cannot over-promise.
+    _ple_off, _expert_off, _nontext = _offloadable_bytes(state_dict)
+    if _ple_off:
+        config_dict["quantization_config"]["ple_offload_bytes"] = int(_ple_off)
+    if _expert_off:
+        config_dict["quantization_config"]["expert_offload_bytes"] = int(_expert_off)
+    if _nontext:
+        # Not host-offloaded — not loaded at all by a text-only serve. Kept separate because
+        # these bytes need no pinned RAM, unlike the two above.
+        config_dict["quantization_config"]["nontext_bytes"] = int(_nontext)
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
 
