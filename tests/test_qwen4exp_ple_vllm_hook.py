@@ -343,3 +343,109 @@ def test_glqs_pinned_class_overrides_only_the_lookup_seam():
     assert issubclass(cls, base)
     assert cls._lookup is not base._lookup
     assert "__init__" not in cls.__dict__
+
+
+# ------------------------------------------- out-of-range PLE ids must not fault
+
+# Measured on an RTX PRO 6000 (vLLM 0.30.0, glq 0.8.23): serving Flash-Next with PLE offload
+# stops at startup during PIECEWISE CUDA-graph capture with
+#
+#   IndexKernelUtils.cu:19: vectorized_gather_kernel ... Assertion `ind >= 0 &&
+#   ind < ind_dim_size && "vectorized gather kernel index out of bounds"` failed
+#
+# and CUDA_LAUNCH_BLOCKING=1 put the launching call in GLQ's own code:
+#   ngram_embedding.py:506 -> _qwen4exp_ple._lookup -> embedding_method.embedding
+#   -> quantized_linear._dequant_embedding_row  (trellis_packed.index_select)
+#
+# vLLM's own pinned kernel is written for exactly this: it computes
+#   in_range  = (id >= tp_vocab_start) & (id < tp_vocab_end)
+#   local_idx = where(in_range, id - tp_vocab_start, 0)
+#   values    = load(..., mask=load_mask, other=0.0)
+# so an id outside the shard yields a ZERO row and never faults. GLQ passed global ids
+# straight to index_select on a shard-local table, so the same id is a hard fault.
+#
+# This was half-known: `test_offload_above_etp_1_is_refused_because_glq_does_not_mask_the
+# _vocab` documents the missing mask and refuses ETP>1 because of it. What it did not
+# anticipate is out-of-range ids arriving at ETP=1 as well.
+
+def _fake_pinned_class(monkeypatch, start=0, end=1000):
+    """GLQ's pinned-host class over a fake base, with a recording embedding method."""
+    import torch
+
+    seen = {}
+
+    class FakeBase:
+        embedding_dim = 4
+
+        def __init__(self):
+            self.shard_indices = type("S", (), {"org_vocab_start_index": start,
+                                                "org_vocab_end_index": end})()
+            self.embedding_method = self
+
+        def embedding(self, layer, input_ids):
+            seen["ids"] = input_ids.clone()
+            # One distinguishable non-zero row per gathered index, so a zeroed row is
+            # visibly different from a gathered one.
+            base = (input_ids.reshape(-1).float() + 1.0).unsqueeze(-1)
+            return (base * torch.ones(1, self.embedding_dim)).reshape(
+                *input_ids.shape, self.embedding_dim)
+
+    cls = _qwen4exp_ple._glq_pinned_host_cls(FakeBase)
+    return cls(), seen
+
+
+def test_an_out_of_range_id_yields_a_zero_row_instead_of_faulting(monkeypatch):
+    """The startup failure, as a unit test: id 5000 is past the table's 1000 rows."""
+    import torch
+    layer, seen = _fake_pinned_class(monkeypatch, start=0, end=1000)
+    out = layer._lookup(torch.tensor([7, 5000, 11]))
+
+    assert torch.equal(out[1], torch.zeros(4)), f"out-of-range row not zeroed: {out[1]}"
+    assert not torch.equal(out[0], torch.zeros(4)), "an in-range row was zeroed"
+    assert seen["ids"].max().item() < 1000, (
+        f"id {seen['ids'].max().item()} was handed to the gather — this is the index that "
+        f"asserts on a real table")
+
+
+def test_a_negative_id_is_also_made_safe(monkeypatch):
+    """`index_select` rejects negatives just as hard, and the assert names both bounds."""
+    import torch
+    layer, seen = _fake_pinned_class(monkeypatch, start=0, end=1000)
+    out = layer._lookup(torch.tensor([-1, 3]))
+    assert torch.equal(out[0], torch.zeros(4))
+    assert seen["ids"].min().item() >= 0
+
+
+def test_in_range_ids_are_gathered_exactly_as_before(monkeypatch):
+    """The fix must be invisible to every id that already worked — this path serves a
+    measured AIME run at 99.58%, and a mask that perturbs valid rows would be far worse
+    than the startup failure it fixes."""
+    import torch
+    layer, seen = _fake_pinned_class(monkeypatch, start=0, end=1000)
+    ids = torch.tensor([[0, 1], [500, 999]])
+    out = layer._lookup(ids)
+    assert torch.equal(seen["ids"], ids)
+    assert out.shape == (2, 2, 4)
+    assert (out != 0).all()
+
+
+def test_the_shard_offset_is_subtracted_like_vllms_kernel(monkeypatch):
+    """`local_idx = global_idx - tp_vocab_start`. A no-op at ETP=1 (start is 0), but
+    getting it backwards would decode foreign rows silently the moment sharding is allowed
+    — which is the failure the ETP>1 refusal exists to prevent."""
+    import torch
+    layer, seen = _fake_pinned_class(monkeypatch, start=100, end=200)
+    layer._lookup(torch.tensor([150]))
+    assert seen["ids"].tolist() == [50], seen["ids"].tolist()
+
+
+def test_the_output_keeps_the_dtype_and_shape_the_prefetch_buffer_expects(monkeypatch):
+    """`_lookup` writes into `_prefetch_buffer` via `output.copy_`, which is shape- and
+    dtype-checked by vLLM. Masking must not promote the dtype."""
+    import torch
+    layer, _ = _fake_pinned_class(monkeypatch, start=0, end=1000)
+    rows = layer._lookup(torch.tensor([1, 5000]))
+    out = torch.empty_like(rows)
+    layer._lookup(torch.tensor([1, 5000]), output=out)
+    assert out.dtype == rows.dtype
+    assert torch.equal(out, rows)

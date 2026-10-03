@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import warnings
 
+import torch
+
 
 def _glq_method(quant_config, prefix):
     """GLQ's method for this table, or None to defer to vLLM's answer.
@@ -153,8 +155,34 @@ def _glq_pinned_host_cls(base):
             the exact shape and dtype ``_prefetch_buffer`` expects -- and it picks up the UVA
             view via ``layer.glq_uva_packed``. So this is the resident decode path, unchanged,
             pointed at host-resident rows.
+
+            The ids are **range-masked first**, mirroring vLLM's own pinned kernel:
+
+                in_range  = (id >= tp_vocab_start) & (id < tp_vocab_end)
+                local_idx = where(in_range, id - tp_vocab_start, 0)
+                values    = load(..., mask=load_mask, other=0.0)
+
+            so an id outside this shard's rows contributes a zero row. Without the mask, an
+            out-of-range id reaches ``trellis_packed.index_select`` and faults the device:
+            measured on an RTX PRO 6000 (vLLM 0.30.0), serving Flash-Next with PLE offload
+            stopped during PIECEWISE CUDA-graph capture on
+            ``vectorized_gather_kernel ... index out of bounds``, which
+            ``CUDA_LAUNCH_BLOCKING=1`` traced to this call. The resident path never hit it
+            because only the offload path routes through here.
+
+            All three ops are capture-safe (comparison, subtract, ``where``) and none syncs
+            to the host, which is required: this runs inside the graph being captured.
             """
-            rows = self.embedding_method.embedding(self, input_ids)
+            start = int(self.shard_indices.org_vocab_start_index)
+            end = int(self.shard_indices.org_vocab_end_index)
+            in_range = (input_ids >= start) & (input_ids < end)
+            safe_ids = torch.where(in_range, input_ids - start,
+                                   torch.zeros_like(input_ids))
+            rows = self.embedding_method.embedding(self, safe_ids)
+            # `where` rather than `rows[~in_range] = 0`: boolean-mask assignment is a
+            # data-dependent write that CUDA-graph capture will not take.
+            rows = torch.where(in_range.unsqueeze(-1), rows,
+                               torch.zeros((), dtype=rows.dtype, device=rows.device))
             if output is None:
                 return rows
             output.copy_(rows)
