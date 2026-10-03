@@ -58,7 +58,8 @@ def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bflo
                      max_model_len: int | None = None, gpu_mem_util: float = 0.9,
                      multimodal: bool = False, cudagraph: bool = True,
                      max_num_seqs: int = 64,
-                     kv_cache_dtype: str | None = None) -> dict:
+                     kv_cache_dtype: str | None = None,
+                     kv_transfer_config: dict | None = None) -> dict:
     # vLLM's max_num_seqs default is 1024 — a batch-server number. On hybrid-GDN models
     # every decode sequence reserves a Mamba cache block before a single request exists,
     # and the bf16 Qwen3.8-27B arm refused to start at 0.75 util on a 96 GiB card:
@@ -82,6 +83,13 @@ def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bflo
     # "auto", which is not the same thing to every engine version.
     if kv_cache_dtype and kv_cache_dtype != "auto":
         kw["kv_cache_dtype"] = kv_cache_dtype
+    # Kept as a plain DICT here, deliberately. vLLM's EngineArgs wants a KVTransferConfig, but
+    # this dict is copied verbatim into ServingMeta.llm_kwargs and the record is JSONL —
+    # `to_json` uses `default=str`, so a dataclass would land in the record as its repr,
+    # provenance nobody can parse back. `load()` converts it for the LLM() call only. Copied
+    # rather than aliased so a caller mutating its dict afterwards cannot rewrite the record.
+    if kv_transfer_config:
+        kw["kv_transfer_config"] = json.loads(json.dumps(kv_transfer_config))
     return kw
 
 
@@ -101,6 +109,11 @@ def serving_command(model: str, kw: dict) -> str:
     # dtype that produced it, and this command string is what the record shows.
     if kw.get("kv_cache_dtype"):
         parts += ["--kv-cache-dtype", str(kw["kv_cache_dtype"])]
+    # CPU/disk KV offload changes both the memory topology and the speed of a run, so a
+    # command string that omits it describes a different run. Rendered as JSON because that is
+    # exactly what `vllm serve --kv-transfer-config` takes.
+    if kw.get("kv_transfer_config"):
+        parts += ["--kv-transfer-config", json.dumps(kw["kv_transfer_config"])]
     if kw.get("trust_remote_code"):
         parts += ["--trust-remote-code"]
     if kw.get("limit_mm_per_prompt"):
@@ -198,7 +211,8 @@ def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
          max_model_len: int | None = None, gpu_mem_util: float = 0.9,
          arch: str | None = None, multimodal: bool | None = None,
          max_num_seqs: int = 64,
-         kv_cache_dtype: str | None = None) -> LoadedModel:
+         kv_cache_dtype: str | None = None,
+         kv_transfer_config: dict | None = None) -> LoadedModel:
     """Construct the vLLM engine and capture load footprint + serving command.
 
     ``max_num_seqs`` is exposed because on a hybrid-GDN model it is the only knob that
@@ -211,14 +225,24 @@ def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
     kw = build_llm_kwargs(model, quant=quant, dtype=dtype, max_model_len=max_model_len,
                           gpu_mem_util=gpu_mem_util, multimodal=multimodal,
                           max_num_seqs=max_num_seqs,
-                          kv_cache_dtype=kv_cache_dtype)
+                          kv_cache_dtype=kv_cache_dtype,
+                          kv_transfer_config=kv_transfer_config)
+
+    # The engine wants a KVTransferConfig; the record wants a dict (see build_llm_kwargs).
+    # Convert into a SEPARATE mapping for LLM() so `kw` — which is what serving_command
+    # renders and ServingMeta stores — keeps the JSON-serialisable form. `kv_transfer_config`
+    # is not an explicit LLM() parameter; it rides **kwargs into EngineArgs.
+    llm_kw = kw
+    if kw.get("kv_transfer_config"):
+        from vllm.config import KVTransferConfig
+        llm_kw = {**kw, "kv_transfer_config": KVTransferConfig(**kw["kv_transfer_config"])}
 
     # vLLM emits "Model loading took X GiB" (the weights footprint) at INFO from the
     # EngineCore subprocess, on *stdout* once we pin the logging config. Capture both
     # fd 1 and fd 2 (the subprocess inherits them) around LLM(), then parse.
     captured = ""
     with _vllm_logging_to_stdout(), _capture_fd_tee(1) as tf_out, _capture_fd_tee(2) as tf_err:
-        llm = LLM(**kw)
+        llm = LLM(**llm_kw)
         tf_out.seek(0)
         tf_err.seek(0)
         captured = (tf_out.read().decode("utf-8", "replace") + "\n"
@@ -237,6 +261,11 @@ def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
         gpu_memory_utilization=gpu_mem_util,
         max_model_len=max_model_len,
         load_gpu_mem_gib=load_mem,
+        # Both were previously reachable only by digging through llm_kwargs. kv_cache_dtype
+        # was declared on ServingMeta and never passed, so every record reported None for it
+        # regardless of what was served.
+        kv_cache_dtype=kv_cache_dtype,
+        kv_transfer_config=kw.get("kv_transfer_config"),
     )
     try:
         tok = llm.get_tokenizer()
