@@ -1455,16 +1455,20 @@ def test_the_pool_is_sized_to_hold_the_window_it_promised(name, concurrency, kw,
         f"needing {needed / GIB:.2f} GiB of KV, but reserved only {pool / GIB:.2f} GiB")
 
 
-def test_the_small_card_plan_is_unchanged_to_the_digit():
-    """`_WINDOW_CONCURRENCY`'s comment exists to keep a 23 GiB L4 serving the 26B, so that
-    case is asserted against today's exact numbers rather than a tolerance. 8192×8×26.2 KiB
-    = 1.64 GiB is below `_MIN_KV_BYTES`, so the floor binds and nothing moves."""
+def test_the_small_card_plan_keeps_its_window_and_starts():
+    """`_WINDOW_CONCURRENCY`'s comment exists to keep a 23 GiB L4 serving the 26B.
+
+    This asserted `util == 0.887` exactly, which was the wrong invariant: that number encoded
+    a 4 GiB flat overhead allowance, and the allowance was measurably 1.44 GiB short on a
+    larger model. util is now 0.906 for this case — it reserves 0.43 GiB MORE, which is the
+    point. What must not change is the window, and that the pool still covers the need when
+    judged against gemma-4's REAL ~3.7 GiB overhead rather than the planner's own assumption."""
     window, util = _planned(8, weights_bytes=int(14.4 * GIB), vram_bytes=23 * GIB,
                             model_max_len=262144)
     assert window == 8192
-    assert round(util, 3) == 0.887
-    pool = util * 23 * GIB - int(14.4 * GIB) - sup_mod._RUNTIME_OVERHEAD_BYTES
-    assert round(pool / GIB, 2) == 2.00
+    real_kv = util * 23 * GIB - int(14.4 * GIB) - 3.7 * GIB
+    assert real_kv >= sup_mod.window_kv_bytes(8192, 8) / 1.15, (
+        f"only {real_kv / GIB:.2f} GiB of real KV on the card this guard protects")
 
 
 def test_one_stream_affords_a_window_eight_cannot():
@@ -1500,7 +1504,7 @@ def test_a_pinned_small_window_does_not_shrink_the_pool_below_the_floor():
     sup, _ = _sup(healthy_after=2, max_model_len=4096, weights_bytes=int(14.4 * GIB),
                   vram_bytes=23 * GIB)
     pool = (sup.gpu_memory_utilization * 23 * GIB - int(14.4 * GIB)
-            - sup_mod._RUNTIME_OVERHEAD_BYTES)
+            - sup_mod.runtime_overhead_bytes(int(14.4 * GIB)))
     assert round(pool / GIB, 2) == 2.00
 
 
@@ -1886,12 +1890,15 @@ def test_the_window_is_not_promised_against_the_bare_minimum():
 
 
 def test_the_cushion_is_invisible_where_the_floor_already_binds():
-    """The cushion must not cost a small card anything: 8192×8 needs 1.64 GiB, and
-    `_MIN_KV_BYTES` is 2 GiB, so the floor keeps the L4 plan exactly where it was."""
+    """The cushion must not cost a small card a window: 8192×8 needs 1.64 GiB against a
+    2 GiB `_MIN_KV_BYTES` floor, so the floor is what sets the pool and the cushion changes
+    nothing. Asserted on the pool the floor produces, not on a util digit — util also carries
+    the overhead allowance, which is a separate term and moved for its own reasons."""
     window, util = _planned(8, weights_bytes=int(14.4 * GIB), vram_bytes=23 * GIB,
                             model_max_len=262144)
     assert window == 8192
-    assert round(util, 3) == 0.887
+    pool = util * 23 * GIB - int(14.4 * GIB) - sup_mod.runtime_overhead_bytes(int(14.4 * GIB))
+    assert round(pool / GIB, 2) == 2.00
 
 
 def test_the_cushion_does_not_buy_a_window_the_card_cannot_hold():
@@ -1931,3 +1938,72 @@ def test_the_anchor_covers_every_measured_pool():
     math. Cover the worst of them."""
     assert sup_mod._KV_BYTES_PER_TOKEN >= 28201, (
         f"anchor {sup_mod._KV_BYTES_PER_TOKEN} is below a measured 28201 B/token")
+
+
+# -------------------------------------- the overhead allowance is not one constant
+
+# A user hit this on a 96 GB card after the nontext_bytes change:
+#
+#   ValueError: To serve at least one request with the model's max seq len (262144),
+#   6.55 GiB KV cache is needed, which is larger than the available KV cache memory
+#   (5.91 GiB) ... estimated maximum model length is 235200
+#
+# From that run's own log (util 0.628, `Model loading took 48.65 GiB`, `Available KV cache
+# memory 5.95 GiB`, 95.6 GiB card), vLLM's real non-weight non-KV overhead works out at
+#
+#   0.628 x 95.6 - 48.65 - 5.95 = 5.44 GiB
+#
+# against a flat `_RUNTIME_OVERHEAD_BYTES` of 4.00 GiB. The existing
+# `test_the_overhead_allowance_matches_what_vllm_actually_took` records ~3.7 GiB for a 13.9 GiB
+# gemma-4, so the figure is MODEL-DEPENDENT and no single constant serves both: raising the
+# flat value to 6 GiB fixes this case and makes a 23 GiB L4 refuse to start, because weights
+# 14.4 + 6 leaves 0.76 GiB under the 0.92 utilization cap where 1.72 is needed.
+#
+# nontext_bytes did not cause this. It removed the slack that hid it: resident had been
+# over-estimated by ~4.3 GiB, which was quietly paying for the missing overhead.
+
+def test_the_overhead_allowance_grows_with_the_model():
+    """One constant cannot cover a 14 GiB dense model and a 49 GiB 48-layer MoE."""
+    small = sup_mod.runtime_overhead_bytes(int(14.4 * GIB))
+    large = sup_mod.runtime_overhead_bytes(int(48.65 * GIB))
+    assert large > small, "overhead does not scale with the model"
+
+
+def test_the_allowance_covers_both_measured_overheads():
+    """The two data points this is calibrated against. Conservative on both sides -- under
+    the real figure is a startup failure, so the envelope must sit above it."""
+    GEMMA_MEASURED = 3.7 * GIB          # 13.9 GiB gemma-4, from the existing overhead test
+    FLASHNEXT_MEASURED = 5.44 * GIB     # 48.65 GiB Flash-Next, from the failing run's log
+    assert sup_mod.runtime_overhead_bytes(int(13.9 * GIB)) >= GEMMA_MEASURED
+    assert sup_mod.runtime_overhead_bytes(int(48.65 * GIB)) >= FLASHNEXT_MEASURED
+
+
+def test_the_failing_configuration_now_reserves_enough():
+    """The exact case from the report: 48.65 GiB resident, 95.6 GiB card, one stream, 262144.
+    Judged against the REAL overhead of 5.44 GiB, not the one the planner assumes -- a plan
+    that only balances against its own assumption is what failed here."""
+    res, vram = int(48.65 * GIB), int(95.6 * GIB)
+    win = sup_mod.plan_max_model_len(weights_bytes=res, vram_bytes=vram,
+                                     model_max_len=262144, floor=16384, concurrency=1)
+    assert win == 262144, f"window dropped to {win}"
+    util = sup_mod.plan_gpu_memory_utilization(
+        weights_bytes=res, vram_bytes=vram, kv_bytes=sup_mod.window_kv_bytes(win, 1))
+    real_kv = util * vram - res - 5.44 * GIB
+    assert real_kv >= 6.55 * GIB, (
+        f"only {real_kv / GIB:.2f} GiB of real KV for the 6.55 GiB vLLM asks for")
+
+
+def test_a_23gib_l4_still_starts():
+    """The regression a flat 6 GiB would have caused. Judged against gemma-4's real 3.7 GiB."""
+    res, vram = int(14.4 * GIB), int(23 * GIB)
+    for concurrency, floor in ((8, 8192), (1, 16384)):
+        win = sup_mod.plan_max_model_len(weights_bytes=res, vram_bytes=vram,
+                                         model_max_len=262144, floor=floor,
+                                         concurrency=concurrency)
+        util = sup_mod.plan_gpu_memory_utilization(
+            weights_bytes=res, vram_bytes=vram,
+            kv_bytes=sup_mod.window_kv_bytes(win, concurrency))
+        real_kv = util * vram - res - 3.7 * GIB
+        need = win * concurrency * sup_mod._KV_BYTES_PER_TOKEN
+        assert real_kv >= need, (
+            f"c={concurrency}: {real_kv / GIB:.2f} GiB real KV against {need / GIB:.2f} needed")

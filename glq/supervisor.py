@@ -45,12 +45,45 @@ DEFAULT_READY_TIMEOUT = 900.0
 DEFAULT_REPORT_EVERY = 5.0
 
 
-#: What vLLM needs on top of the weights before a single KV block exists: activations,
-#: workspace, CUDA-graph capture, and whatever the loaded model costs beyond the sum of its
-#: `.safetensors`. Budgeting 2 GiB was measured wrong on an L4 — a 13.9 GiB checkpoint in an
-#: 18.0 GiB budget left 0.42 GiB of KV, so the real overhead was ~3.7 GiB. 4 GiB, from that
-#: measurement rather than from taste.
+#: Floor for what vLLM needs on top of the weights before a single KV block exists:
+#: activations, workspace, CUDA-graph capture, non-torch allocations. Budgeting 2 GiB was
+#: measured wrong on an L4 — a 13.9 GiB checkpoint in an 18.0 GiB budget left 0.42 GiB of KV,
+#: so the real overhead was ~3.7 GiB. 4 GiB, from that measurement rather than from taste.
+#:
+#: Kept as the FLOOR rather than the whole answer; see `runtime_overhead_bytes`.
 _RUNTIME_OVERHEAD_BYTES = 4 * 1024 ** 3
+
+#: Share of the resident weights added to the floor above. Non-torch allocations and
+#: CUDA-graph memory scale with layer count and model size, so one constant cannot serve both
+#: models that have been measured:
+#:
+#:     gemma-4 26B, 13.9 GiB resident, L4          ~3.70 GiB   (the measurement above)
+#:     Qwen3.8-Flash-Next, 48.65 GiB, RTX PRO 6000  5.44 GiB
+#:
+#: The second came from a user-reported startup failure, derived from that run's own log:
+#: `0.628 x 95.6 - 48.65 (Model loading took) - 5.95 (Available KV cache memory) = 5.44`.
+#: A flat 4 GiB under-reserved by 1.44 GiB there; a flat 6 GiB covers it and makes a 23 GiB
+#: L4 refuse to start, because 14.4 + 6 leaves 0.76 GiB under `_MAX_UTILIZATION` where 1.72
+#: is needed. Hence proportional.
+#:
+#: 3% is calibrated so the one measured shortfall is covered (4 + 0.03x48.65 = 5.46 against
+#: 5.44) while staying conservative on the smaller model (4.42 against 3.70). **Two data
+#: points is an envelope, not a model** — widen it when a third beats it, and do not fit it
+#: more tightly on the strength of these two.
+_RUNTIME_OVERHEAD_WEIGHT_FRACTION = 0.03
+
+
+def runtime_overhead_bytes(weights_bytes) -> int:
+    """Non-weight, non-KV VRAM to reserve for a model of this resident size.
+
+    Everything the pool must hold besides weights and KV blocks. See
+    `_RUNTIME_OVERHEAD_WEIGHT_FRACTION` for why this is not a constant and what the two
+    measurements behind it are.
+    """
+    if not weights_bytes:
+        return _RUNTIME_OVERHEAD_BYTES
+    return _RUNTIME_OVERHEAD_BYTES + int(
+        int(weights_bytes) * _RUNTIME_OVERHEAD_WEIGHT_FRACTION)
 
 #: A KV pool below this serves no useful context, so it is part of what must fit rather than
 #: something to leave to chance.
@@ -102,7 +135,7 @@ def plan_gpu_memory_utilization(*, weights_bytes, vram_bytes, kv_bytes=None):
     if not weights_bytes or not vram_bytes:
         return DEFAULT_GPU_MEMORY_UTILIZATION
     kv = max(_MIN_KV_BYTES, int(kv_bytes or 0))
-    needed = weights_bytes + _RUNTIME_OVERHEAD_BYTES + kv
+    needed = weights_bytes + runtime_overhead_bytes(weights_bytes) + kv
     return min(max(needed / vram_bytes, DEFAULT_GPU_MEMORY_UTILIZATION), _MAX_UTILIZATION)
 
 
@@ -260,7 +293,8 @@ def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
     """
     if not weights_bytes or not vram_bytes or not model_max_len:
         return floor
-    headroom = _MAX_UTILIZATION * vram_bytes - weights_bytes - _RUNTIME_OVERHEAD_BYTES
+    headroom = (_MAX_UTILIZATION * vram_bytes - weights_bytes
+                - runtime_overhead_bytes(weights_bytes))
     chosen = floor
     for tier in _WINDOW_TIERS:
         if window_kv_bytes(tier, concurrency) <= headroom:

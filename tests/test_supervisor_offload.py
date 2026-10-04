@@ -180,7 +180,7 @@ FN_NT = dict(FN, nontext_bytes=int(5.69 * GIB))
 FN_PUBLISHED = dict(weights_bytes=int(77.56 * GIB), ple_offload_bytes=25_600_122_880,
                     expert_offload_bytes=50_803_802_112, model_max_len=262144)
 FN_CORRECTED = dict(FN_PUBLISHED, expert_offload_bytes=45_770_637_312,
-                    nontext_bytes=6_112_163_808)
+                    nontext_bytes=5_214_301_696)   # MTP head only; see quantize tests
 
 
 def _code_sup(vram_gib, **kw):
@@ -192,16 +192,21 @@ def _code_sup(vram_gib, **kw):
 
 def test_the_window_doubles_on_a_24gb_card_once_the_counts_are_right():
     """The payoff, on the card that motivated it and with the published numbers rather than a
-    fixture: 32768 -> 65536 for the same checkpoint and the same policy.
+    fixture: 16384 -> 32768 for the same checkpoint and the same policy.
 
-    Not 131072, which the raw arithmetic suggests. `WEIGHT_FRACTION = 0.75` is satisfied at
-    ~15 GiB resident on a 23 GiB card, so the planner stops offloading there; reaching the
-    ~10 GiB that affords 131072 would mean deliberately offloading more experts, which is a
+    These were 32768 -> 65536 while the overhead allowance was a flat 4 GiB. That allowance was
+    measurably 1.44 GiB short on this checkpoint and is now proportional, which costs this card
+    one tier -- correctly, because the old pair was reachable only by under-reserving what vLLM
+    then needed. A doubling either way; the base moved because the arithmetic got honest.
+
+    Not 131072, which the raw resident figure suggests. `WEIGHT_FRACTION = 0.75` is satisfied
+    at ~15 GiB resident on a 23 GiB card, so the planner stops offloading there; reaching the
+    ~10 GiB that affords a longer window would mean deliberately offloading more experts, a
     PCIe-decode-speed trade this policy does not make on its own."""
     before = _code_sup(23.0, **FN_PUBLISHED)
     after = _code_sup(23.0, **FN_CORRECTED)
-    assert before.max_model_len == 32768
-    assert after.max_model_len == 65536
+    assert before.max_model_len == 16384
+    assert after.max_model_len == 32768
 
 
 def test_the_same_fix_also_offloads_fewer_experts():

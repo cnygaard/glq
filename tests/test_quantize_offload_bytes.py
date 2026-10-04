@@ -99,11 +99,13 @@ MTP_EXPERT = "mtp.layers.0.mlp.experts.gate_up_proj"
 VISION = "model.visual.blocks.0.attn.qkv.weight"
 
 
-def test_the_mtp_head_and_vision_tower_are_declared_non_text():
+def test_the_mtp_head_is_declared_non_text():
+    """The vision tower deliberately is NOT — see
+    `test_the_vision_tower_is_not_claimed_as_non_text` for the measurement that excluded it."""
     ple, exp, nontext = _helper()({"mtp.fc_embedding.weight": _T(100),
                                    VISION: _T(50),
                                    "model.layers.0.mlp.gate_proj.trellis_packed": _T(7)})
-    assert nontext == 300
+    assert nontext == 200
     assert (ple, exp) == (0, 0)
 
 
@@ -141,3 +143,27 @@ def test_the_classifier_matches_path_segments_not_substrings():
     _, _, nontext = _helper()({"model.layers.0.mtpool.weight": _T(10),
                                "model.layers.0.visualizer_proj.weight": _T(10)})
     assert nontext == 0
+
+
+def test_the_vision_tower_is_not_claimed_as_non_text():
+    """Declaring the MTP + vision tensor SUM was wrong in the unsafe direction.
+
+    Measured on Qwen3.8-Flash-Next with `--language-model-only`: disk minus the offloaded PLE
+    table is 53.72 GiB and `Model loading took 48.65 GiB`, so **5.07 GiB** is genuinely not
+    loaded. The tensor sum of MTP (4.856) + vision (0.836) is 5.692 — 0.62 GiB more than that,
+    so some of the vision tower is accounted for even when the flag says it is skipped. Over-
+    claiming here under-states resident, which is what makes a card look able to hold a model
+    it cannot: this 0.62 GiB was half of a 1.97 GiB shortfall that stopped a real serve.
+
+    MTP alone (4.856) is under the measured 5.07 and is definitively not loaded without
+    speculative decoding, so that is what gets declared.
+    """
+    ple, exp, nontext = _helper()({"mtp.fc_embedding.weight": _T(1000),
+                                   "model.visual.blocks.0.attn.qkv.weight": _T(500)})
+    assert nontext == 2000, "vision bytes are being claimed as non-text"
+
+
+def test_mtp_is_still_claimed_in_full():
+    """The large half of the saving, and the unambiguous one."""
+    _, _, nontext = _helper()({MTP_EXPERT: _T(400), "mtp.fc_hidden.weight": _T(100)})
+    assert nontext == 1000
