@@ -136,6 +136,7 @@ Scripted — `--yes`, `--dry-run`, or no terminal at all (CI, `ssh host 'cmd'`,
 | `chat` | the Gradio chat UI | ✓ |
 | `picode` | the pi coding agent (installs node via nvm) — run with `glq-code`, which starts a tool-calling vLLM for it and frees the GPU when pi exits | opt-in |
 | `quantize` | the deps for quantizing your own models (`glq[quantize]`) | opt-in |
+| `bench` | the deps for `glq-bench` (`glq[bench]`) — `datasets` for the quality tasks, `pandas` for the decode sweep | opt-in |
 
 Other flags: `--dry-run` prints every command without running it; `--list` shows the
 checkpoints and exits; `--start` / `--no-start` decide the handoff without being
@@ -147,9 +148,16 @@ asked; `--no-modify-path` leaves your shell rc file alone (by default the venv's
 it, serves the Gradio UI on <http://localhost:7860>, and stops the server again when
 you press Ctrl-C — vLLM has no idle unload, so a server left running keeps its share
 of the card. It sizes the VRAM reservation from the checkpoint — weights, runtime
-overhead and a usable cache — and sizes the context window from the card's KV
-headroom, in tiers from 8192 up to 65536, clamped to the model's own maximum (a
-24 GB card serving a 26B stays at 8192; a 96 GB card reaches 65536).
+overhead and a cache big enough for the context it is about to serve — and picks that
+context from what the card could afford, in tiers from 8192 up to 262144, clamped to
+the model's own maximum. The window and the pool are one decision: a window is only
+offered if the pool is then sized to hold it, priced at the concurrency the server
+will admit — eight concurrent requests for a chat server, one for `glq-code`, since a
+coding agent is a single stream and the same card affords a much longer window for it.
+
+What that gives depends on the checkpoint and the command, so one worked example
+(gemma-4 26B-A4B at 4 bpw, 14.4 GiB resident): a 24 GB card serves 8192 for chat and
+65536 for `glq-code`; a 96 GB card reaches the model's full 262144 for both.
 `--gpu-memory-utilization` / `--max-model-len` pin either; `--no-serve` attaches to
 a server you started yourself.
 
