@@ -31,7 +31,7 @@ architecture fallbacks dequantize instead).
   [Trellis codebook](#trellis-codebook---codebook-trellis--qtip-derived-tcq).
 - **2–8 bpw**, **no group-size constraint**, optional **per-layer mixed precision**.
 - **Serve anywhere** — a vLLM plugin (weight + MoE + embedding) and an
-  HF Transformers integration. `pip install glq`, load, run.
+  HF Transformers integration — `pip install 'glq[vllm]'` or `'glq[hf]'`, load, run.
 - **Small footprint** — smallest of the ~4-bit quantizers we measured (vs AWQ /
   NVFP4 on a 26B); a 31B fits ≈16.5 GiB at 5 bpw where bf16 needs ≈58 GiB, with
   quality within noise of bf16 on our paired reasoning evals.
@@ -203,7 +203,7 @@ Or serve the fastest GLQ checkpoint on vLLM (the trellis-3INST decode —
 single-stream speed at bf16 parity, 1.9 GiB of weights):
 
 ```bash
-pip install glq vllm      # glq ≥ 0.7.0 (trellis kernel storage layout)
+pip install 'glq[vllm]'   # glq ≥ 0.7.0 (trellis kernel storage layout)
 vllm serve xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel --quantization glq
 ```
 
