@@ -95,7 +95,10 @@ def test_build_card_uniform(tmp_path):
     assert "glq" in fm["tags"]
     # GLQ sections present
     assert "## Install" in body
-    assert "pip install glq" in body
+    # The INSTALLABLE command, not any occurrence of the substring: the block also says
+    # "a plain `pip install glq` leaves `vllm` not a command", so a looser assertion passes
+    # on the sentence warning against it even if the card gives no working command.
+    assert "pip install 'glq[vllm]'" in body
     assert 'quantization="glq"' in body
     assert "## Use with Transformers" in body
     assert "AutoModelForCausalLM" in body          # not multimodal
@@ -154,7 +157,7 @@ def test_build_card_trellis(tmp_path):
     # codebook-aware tags
     assert "trellis" in fm["tags"] and "e8-lattice" not in fm["tags"]
     # shared GLQ scaffolding still present
-    assert "pip install glq" in body and "GLQ on GitHub" in body
+    assert "pip install 'glq[vllm]'" in body and "GLQ on GitHub" in body
 
 
 def test_build_card_shell_unchanged_default(tmp_path):
@@ -209,3 +212,71 @@ def test_the_high_bpw_branch_still_says_something_useful(tmp_path):
     assert "2–4 bits/weight" in card
     head = card[: card.find("## Install")]
     assert "modest" not in head or len(head.split("modest")[1].split("\n")[0]) > 40
+
+
+def _card(tmp_path, **kw):
+    """A built card body for the Install-block tests."""
+    out = _write_quant_dir(tmp_path, **kw)
+    return build_card(out, "google/gemma-4-e4b-it",
+                      repo_id="xv0y5ncu/Test-GLQ-4bpw", write=True)
+
+
+# ----------------------------------------------- the Install block must cover what it shows
+
+# Reported from a real attempt: the card said `pip install glq`, the reader followed it, and
+# then `vllm` was not a command. glq's own dependencies are `torch` and `numpy` -- vLLM is
+# not among them, and `transformers`/`accelerate` are behind the `hf` extra whose own
+# pyproject comment already records that `pip install glq` alone fails that snippet. So the
+# single line was insufficient for EVERY usage section on the card.
+
+def _install_block(body: str) -> str:
+    """The Install section, up to the next heading."""
+    assert "## Install" in body
+    after = body.split("## Install", 1)[1]
+    return after.split("\n## ", 1)[0]
+
+
+def test_the_install_block_installs_vllm_because_the_card_tells_you_to_use_it(tmp_path):
+    body = _split_frontmatter(_card(tmp_path))[1]
+    block = _install_block(body)
+    assert "vllm serve" in body or "from vllm import" in body, "no vLLM usage to support"
+    assert "glq[vllm]" in block, (
+        f"the card shows vLLM usage but never installs it:\n{block}")
+
+
+def test_the_install_block_creates_a_virtual_environment(tmp_path):
+    """`vllm` has to land on PATH for `vllm serve` to resolve, and a venv is what makes the
+    console scripts reachable without touching the system interpreter."""
+    block = _install_block(_split_frontmatter(_card(tmp_path))[1])
+    assert "python -m venv" in block
+    assert "activate" in block
+
+
+def test_vllm_and_glq_are_installed_in_one_transaction(tmp_path):
+    """Two separate pip installs let pip resolve torch twice and silently move it under the
+    other package. The extra makes it one command and one resolution."""
+    block = _install_block(_split_frontmatter(_card(tmp_path))[1])
+    assert "glq[vllm]" in block
+    assert "pip install vllm\n" not in block, "vLLM installed on its own"
+
+
+def test_the_transformers_path_gets_its_extra(tmp_path):
+    """`import glq.hf_integration` needs transformers, and device_map="auto" needs
+    accelerate -- that is exactly what the `hf` extra is for."""
+    body = _split_frontmatter(_card(tmp_path))[1]
+    if "## Use with Transformers" not in body:
+        return
+    block = _install_block(body)
+    assert "glq[hf]" in block, f"transformers path shown but its extra never named:\n{block}"
+
+
+def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path):
+    """A card that creates `env` and activates `venv` leaves the reader in the system
+    interpreter, which is the failure this whole block exists to prevent."""
+    import re
+    block = _install_block(_split_frontmatter(_card(tmp_path))[1])
+    created = re.search(r"python -m venv (\S+)", block)
+    activated = re.search(r"source (\S+)/bin/activate", block)
+    assert created and activated, block
+    assert created.group(1) == activated.group(1), (
+        f"creates {created.group(1)} but activates {activated.group(1)}")

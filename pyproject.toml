@@ -27,6 +27,16 @@ classifiers = [
 # and the README's device_map="auto" needs accelerate. Verified on a clean Ubuntu 24.04
 # box: `pip install glq` alone fails that snippet on both, in that order.
 hf = ["transformers", "accelerate"]
+# The vLLM serving path, which is what the model cards and the README lead with: glq
+# registers itself through `[project.entry-points."vllm.general_plugins"]` below, so vLLM
+# loads GLQ rather than the reverse, and nothing in core pulls it. `pip install glq` left
+# `vllm` not a command for anyone following a card — reported from a real attempt.
+#
+# An extra rather than two pip commands, because `pip install 'glq[vllm]'` is ONE resolution:
+# installing them separately lets the second transaction move the torch the first chose.
+# Deliberately unpinned — glq_vllm carries both the <=0.29.0 and the >=0.30.0 dispatch
+# points, so a floor here would refuse installs that work.
+vllm = ["vllm"]
 cuda = ["triton"]
 dev = ["pytest"]
 # boto3: `glq-quantize -r --resume-bucket` persists per-layer shards to S3, which is what

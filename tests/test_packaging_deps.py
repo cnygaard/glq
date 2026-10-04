@@ -124,3 +124,43 @@ def test_boto3_stays_out_of_the_core_dependencies():
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
         core = tomllib.load(fh)["project"]["dependencies"]
     assert not any("boto3" in d for d in core), "boto3 does not belong in core deps"
+
+
+def test_vllm_is_declared_by_an_extra_so_the_serving_path_is_installable():
+    """glq's own deps are torch and numpy, so `pip install glq` leaves `vllm` not a command
+    -- reported from a real attempt after following the model card, which shows three vLLM
+    sections and installed none of it.
+
+    An extra rather than a core dependency: vLLM is heavy and platform-specific, and the HF
+    path does not want it. An extra rather than two pip commands: `pip install 'glq[vllm]'`
+    is one transaction, so pip resolves a single torch for both instead of letting the second
+    install move the first one's.
+
+    Symmetric with `hf`, which exists for exactly this reason -- its own comment records that
+    `pip install glq` alone fails the transformers snippet.
+    """
+    import tomllib
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+        extras = tomllib.load(fh)["project"]["optional-dependencies"]
+    assert "vllm" in extras, (
+        "no `vllm` extra; the card's vLLM sections have nothing that installs vLLM")
+    assert any(d == "vllm" or d.startswith("vllm") for d in extras["vllm"])
+
+
+def test_the_vllm_extra_is_not_pinned_to_one_release():
+    """glq_vllm deliberately spans releases -- it carries both the <=0.29.0 and the >=0.30.0
+    dispatch points -- so a floor here would refuse installs that work. Any pin added later
+    should come from a measured failure, not from the newest version that happened to be out.
+    """
+    import tomllib
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+        spec = tomllib.load(fh)["project"]["optional-dependencies"]["vllm"]
+    assert spec == ["vllm"], f"unexplained pin on the vllm extra: {spec}"
+
+
+def test_vllm_stays_out_of_the_core_dependencies():
+    """A CPU install, a quantize-only box and the HF path all serve without it."""
+    import tomllib
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+        core = tomllib.load(fh)["project"]["dependencies"]
+    assert not any("vllm" in d for d in core), "vLLM does not belong in core deps"

@@ -22,8 +22,19 @@
 ## Install
 
 ```bash
-pip install glq
+python -m venv .venv
+source .venv/bin/activate
+pip install 'glq[vllm]'
 ```
+
+`glq` itself only needs torch, so a plain `pip install glq` leaves `vllm` not a command and
+every snippet below fails. The `[vllm]` extra pulls the server in the **same** pip
+transaction, which matters: installing them separately lets the second resolve its own torch
+over the first one's. The venv is what puts `vllm` on `PATH`.
+
+For the Transformers path instead of vLLM, `pip install 'glq[hf]'` — that extra adds
+`transformers` and `accelerate`, which `import glq.hf_integration` and `device_map="auto"`
+need respectively.
 {% if is_trellis and avg_bpw >= 5 %}
 
 > **Requires `glq >= 0.8.0`** — that release added stacked residual VQ end to end: the
