@@ -105,20 +105,29 @@ def pad_hessian(H, block_size=8):
 #: multi-token-prediction (speculative) head: 31 tensors, 4.856 GiB on Qwen3.8-Flash-Next.
 _NONTEXT_HEAD_SEGMENTS = ("mtp",)
 
-#: Any path segment naming a non-text tower. 0.836 GiB on the same checkpoint.
-_NONTEXT_TOWER_SEGMENTS = ("visual", "vision_tower", "audio_tower")
+#: Non-text towers, deliberately NOT counted. `--language-model-only` is supposed to skip
+#: them, but the measurement says otherwise: on Qwen3.8-Flash-Next, disk minus the offloaded
+#: PLE table is 53.72 GiB and `Model loading took 48.65 GiB`, so 5.07 GiB is genuinely absent
+#: — while MTP (4.856) + vision (0.836) sums to 5.692. Some of the tower is accounted for
+#: regardless of the flag, so claiming it over-states the saving by ~0.62 GiB, and
+#: over-claiming here under-states resident. That is the direction that makes a card look able
+#: to hold a model it cannot: this 0.62 GiB was half of a 1.97 GiB shortfall that stopped a
+#: real serve at 262144. Kept as a named tuple rather than deleted so the reason survives.
+_NONTEXT_TOWER_SEGMENTS_NOT_CLAIMED = ("visual", "vision_tower", "audio_tower")
 
 
 def _is_nontext(name: str) -> bool:
     """Is this tensor outside the text decoder, i.e. never loaded by a text-only serve?
 
+    Only the MTP head qualifies — it is definitively not loaded without speculative decoding.
+    See `_NONTEXT_TOWER_SEGMENTS_NOT_CLAIMED` for why the vision tower is excluded even though
+    a text-only serve nominally skips it.
+
     Matched on dotted SEGMENTS, not substrings: `model.layers.0.mtpool.weight` contains
     "mtp" and is an ordinary text weight, and dropping it from the resident estimate would
     under-state the footprint — the direction that promises a card it cannot hold.
     """
-    parts = name.split(".")
-    return (parts[0] in _NONTEXT_HEAD_SEGMENTS
-            or any(p in _NONTEXT_TOWER_SEGMENTS for p in parts))
+    return name.split(".")[0] in _NONTEXT_HEAD_SEGMENTS
 
 
 def _offloadable_bytes(state_dict: dict) -> tuple[int, int, int]:
