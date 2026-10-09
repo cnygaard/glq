@@ -71,9 +71,53 @@ def _run_pi(cmd, env) -> int:
     return subprocess.call(cmd, env=env)
 
 
+#: Worked examples, because the `--` convention lived in one `help=` string on a positional
+#: and the README never showed a glq-code command line at all.
+_EPILOG = """examples:
+  glq-code                               serve, and start a fresh pi session
+  glq-code -- --continue                 = pi --continue   (resume the last session)
+  glq-code -- --resume                   = pi --resume     (pick a session to resume)
+  glq-code --max-model-len 65536 -- -c   glq-code's own flags first, pi's after `--`
+
+Everything after `--` is handed to pi verbatim; run `pi --help` for its flags. Note they
+take two dashes or one letter -- `--resume` or `-r`, never `-resume`."""
+
+
+class _PiAwareParser(argparse.ArgumentParser):
+    """argparse, plus a hint that names the `--` separator when a pi flag was meant.
+
+    `nargs=REMAINDER` cannot absorb a leading-dash token: argparse's option branch claims it
+    first, so `glq-code --continue` exits 2 on `unrecognized arguments: --continue` and leaves
+    the reader to guess that a separator exists. This appends the fix to exactly that message.
+
+    Conditional on the extras looking like flags, deliberately. A hint on every parse failure
+    is standing noise, and standing noise trains a reader past the error that matters -- the
+    same reasoning `spot_scout.partition_scannable` records for `AuthFailure`.
+    """
+
+    def error(self, message):                                   # noqa: D102 - argparse hook
+        if message.startswith("unrecognized arguments:"):
+            flags = [a for a in message.split(":", 1)[1].split() if a.startswith("-")]
+            if flags:
+                message = (f"{message}\n  pi's own flags go after a `--` separator:  "
+                           f"glq-code -- {' '.join(flags)}")
+        super().error(message)
+
+
 def main(argv=None) -> int:
     cfg = _installed_config()
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # allow_abbrev=False because prefix matching SILENTLY redirects abbreviated pi flags into
+    # glq-code's own options, and several are unique prefixes: `--c` -> --cpu-offload-gb (which
+    # then eats the next token as its int), `--r`/`--re` -> --ready-timeout (likewise),
+    # `--v` -> --verbose (pi never gets it), `--no-s` -> --no-serve (vLLM is not started at
+    # all). `glq-code --c 3` parsed cleanly and did the wrong thing, which is the failure class
+    # this project treats as worst. Off, each of those becomes an error the hint explains.
+    #
+    # The cost is that glq-code's own flags must now be spelled in full: `--max-model` used to
+    # work and no longer does.
+    p = _PiAwareParser(description=__doc__.splitlines()[0], epilog=_EPILOG,
+                       allow_abbrev=False,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default=default_model(cfg, "code"),
                    help="checkpoint to serve (default: the installer's code pick, "
                         "then its generic one)")
