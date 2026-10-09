@@ -335,3 +335,25 @@ def test_all_three_non_resident_counts_reach_the_supervisor(monkeypatch, tmp_pat
     assert made[0]["ple_offload_bytes"] == 11
     assert made[0]["expert_offload_bytes"] == 22
     assert made[0]["nontext_bytes"] == 33
+
+
+def test_cpu_offload_gb_reaches_the_supervisor(monkeypatch, tmp_path):
+    """The escape hatch for the offload policy. Without it there is no way to ask for a longer
+    window than `WEIGHT_FRACTION` happens to allow: the budget is computed inside the
+    supervisor, and hand-running `vllm serve` loses `flashinfer_env()`."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", QWEN, "--cpu-offload-gb", "42"])
+    assert made[0]["expert_offload_gib"] == 42
+
+
+def test_an_absent_cpu_offload_gb_leaves_the_planner_in_charge(monkeypatch, tmp_path):
+    """None, not 0 -- 0 is a real answer meaning 'serve this resident'."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", QWEN])
+    assert made[0]["expert_offload_gib"] is None
+
+
+def test_cpu_offload_gb_zero_is_distinguishable_from_unset(monkeypatch, tmp_path):
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", QWEN, "--cpu-offload-gb", "0"])
+    assert made[0]["expert_offload_gib"] == 0
