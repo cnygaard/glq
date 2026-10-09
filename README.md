@@ -111,6 +111,19 @@ tool-calling vLLM and runs pi against it):
 curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh | bash -s -- --components core,vllm,chat,picode
 ```
 
+`glq-code` takes its own flags first and hands **everything after a `--` separator** to pi
+verbatim, so pi's session flags work unchanged:
+
+```bash
+glq-code                               # a fresh session
+glq-code -- --continue                 # = pi --continue   (resume the last session)
+glq-code -- --resume                   # = pi --resume     (pick a session)
+glq-code --max-model-len 65536 -- -c   # glq-code's flags, then pi's
+```
+
+The separator is required: without it argparse claims the flag for `glq-code` and the run
+stops rather than reaching pi. `pi --help` lists the rest.
+
 CPU-only serving on a machine that has a GPU you don't want used (no flag needed on a
 machine without one — the installer detects it):
 

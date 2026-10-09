@@ -151,12 +151,15 @@ def test_models_json_is_refreshed_for_the_served_model(monkeypatch, tmp_path):
 
 
 def test_pi_gets_the_provider_the_model_and_the_passthrough_args(monkeypatch, tmp_path):
+    """Asserted on the WHOLE argv, not its tail. `cmd[-2:]` passed even when the literal
+    separator leaked into pi's arguments, because the leak lands at index 5, not the end --
+    and argparse does keep the `--` inside a REMAINDER capture (`pi_args` really is
+    `['--', '--continue', ...]`), so the strip in code.py is load-bearing, not defensive."""
     _, _, ran, _ = _run_code(monkeypatch, tmp_path)
     code.main(["--model", SMOL, "--", "--continue", "fix the tests"])
     cmd, _env = ran[0]
-    assert cmd[1:3] == ["--provider", "glq"]
-    assert cmd[3:5] == ["--model", SMOL]
-    assert cmd[-2:] == ["--continue", "fix the tests"]
+    assert cmd[1:] == ["--provider", "glq", "--model", SMOL,
+                       "--continue", "fix the tests"], cmd
 
 
 def test_pis_child_path_contains_its_own_bin_dir(monkeypatch, tmp_path):
@@ -357,3 +360,102 @@ def test_cpu_offload_gb_zero_is_distinguishable_from_unset(monkeypatch, tmp_path
     _, made, _, _ = _run_code(monkeypatch, tmp_path)
     code.main(["--model", QWEN, "--cpu-offload-gb", "0"])
     assert made[0]["expert_offload_gib"] == 0
+
+
+# ------------------------------------- the `--` separator: discoverable, and loud when wrong
+
+# `glq-code -- --continue` already worked; what it lacked was any way to find out. Two failure
+# modes, verified by lifting the real parser out of main() and exercising it:
+#
+#   glq-code --continue   -> exit 2, "unrecognized arguments: --continue", no mention of `--`
+#   glq-code --c 3        -> SILENTLY set cpu_offload_gb=3 (prefix match), pi never saw it
+#
+# The second is the dangerous one: `--c`/`--r`/`--v`/`--no-s` are unique prefixes of glq-code's
+# own options, so an abbreviated pi flag is swallowed AND can eat the following token as its
+# value. `allow_abbrev=False` turns each into an error that the hint then explains.
+
+def _parse_fails(monkeypatch, tmp_path, argv):
+    """(exit_code, stderr) for an invocation that should not reach pi at all."""
+    import contextlib, io
+    _run_code(monkeypatch, tmp_path)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        with pytest.raises(SystemExit) as e:
+            code.main(argv)
+    return e.value.code, err.getvalue()
+
+
+@pytest.mark.parametrize("flag", ["--continue", "--resume", "-c", "-r"])
+def test_a_pi_flag_without_the_separator_names_the_separator(monkeypatch, tmp_path, flag):
+    """The whole point: the old message was `unrecognized arguments: --continue` and left the
+    reader to guess. REMAINDER cannot absorb a leading-dash token -- the option branch claims
+    it first -- so the separator is mandatory and the error has to say so."""
+    rc, err = _parse_fails(monkeypatch, tmp_path, ["--model", SMOL, flag])
+    assert rc == 2
+    assert "--" in err and "pi" in err.lower(), err
+    assert f"-- {flag}" in err, f"the hint does not show the fix for {flag}:\n{err}"
+
+
+@pytest.mark.parametrize("argv,swallowed_by", [
+    (["--c", "3"], "cpu_offload_gb"),
+    (["--r", "99"], "ready_timeout"),
+    (["--v"], "verbose"),
+    (["--no-s"], "serve"),
+])
+def test_an_abbreviated_pi_flag_is_not_silently_captured(monkeypatch, tmp_path, argv,
+                                                         swallowed_by):
+    """Each of these is a unique prefix of a glq-code option, so prefix matching consumed it
+    and pi never received the flag the user typed. `--c 3` reading as `--cpu-offload-gb 3` is
+    the worst: it looks like it worked, and it also ate the `3`.
+
+    This test fails today by SUCCEEDING -- the command parses fine and silently does the wrong
+    thing -- which is why it is the regression guard for `allow_abbrev=False`."""
+    rc, err = _parse_fails(monkeypatch, tmp_path, ["--model", SMOL, *argv])
+    assert rc == 2, f"{argv} still parses; it is being captured as {swallowed_by}"
+
+
+@pytest.mark.parametrize("argv", [
+    ["--cpu-offload-gb", "42"],
+    ["--max-model-len", "65536"],
+    ["--max-num-seqs", "4"],
+    ["--no-serve"],
+    ["--verbose"],
+])
+def test_the_full_spellings_still_work(monkeypatch, tmp_path, argv):
+    """Disabling abbreviation must not touch the real flags."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", SMOL, *argv])
+    assert made, f"{argv} no longer reaches the supervisor"
+
+
+def test_an_unrelated_parse_error_gets_no_separator_hint(monkeypatch, tmp_path):
+    """A hint on every parse failure is noise, and standing noise trains a reader past the
+    error that matters -- the same reasoning spot_scout records for AuthFailure. So the hint
+    is conditional on the extras looking like flags."""
+    rc, err = _parse_fails(monkeypatch, tmp_path,
+                           ["--model", SMOL, "--max-model-len", "not-a-number"])
+    assert rc == 2
+    assert "separator" not in err.lower(), err
+
+
+def test_the_help_shows_how_to_reach_pi(monkeypatch, tmp_path):
+    """The convention lived in one `help=` string on a positional nobody reads. The examples
+    block is where someone looks first."""
+    import contextlib, io
+    _run_code(monkeypatch, tmp_path)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        with pytest.raises(SystemExit):
+            code.main(["--help"])
+    text = out.getvalue()
+    assert "-- --continue" in text, text
+    assert "-- --resume" in text, text
+    assert "pi --help" in text, "the help should point at pi's own flag list"
+
+
+def test_plain_glq_code_passes_pi_nothing_extra(monkeypatch, tmp_path):
+    """An empty REMAINDER must not leave a stray separator or empty string in pi's argv."""
+    _, _, ran, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", SMOL])
+    cmd, _env = ran[0]
+    assert cmd[1:] == ["--provider", "glq", "--model", SMOL], cmd
