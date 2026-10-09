@@ -250,3 +250,54 @@ def test_speculative_decoding_is_never_enabled_so_the_mtp_subtraction_holds():
     argv = " ".join(str(a) for a in _sup(95.0, **FN_NT).argv())
     for flag in ("--speculative", "--num-speculative-tokens", "speculative_config"):
         assert flag not in argv, f"{flag} would load the MTP head this plan excludes"
+
+
+# ------------------------------------------- the explicit offload budget escape hatch
+
+# `plan_expert_offload_gib` stops as soon as resident fits `WEIGHT_FRACTION` of VRAM, without
+# asking whether the headroom it left affords a useful window. Measured on a 23 GiB L4 serving
+# Flash-Next: it offloads 34 GiB, leaving resident 14.86 and a 32768 window at util 0.920 --
+# where 42 GiB (the declared maximum) leaves 6.86 resident and reaches the full 262144 while
+# LOWERING util to 0.825. Until that policy question is settled with a decode measurement there
+# was no way to ask for the longer window at all: the budget is computed inside the supervisor,
+# and hand-running `vllm serve` loses `flashinfer_env()` (on sm_120 it then stops on ninja).
+
+def test_an_explicit_budget_is_used_verbatim():
+    """Same contract as --gpu-memory-utilization: an explicit flag wins over the plan."""
+    sup = _code_sup(23.0, expert_offload_gib=42, **FN_CORRECTED)
+    assert sup.expert_offload_gib == 42
+    argv = " ".join(str(a) for a in sup.argv())
+    assert "--cpu-offload-gb 42" in argv
+
+
+def test_the_explicit_budget_lengthens_the_window_it_was_asked_for():
+    """The point of the flag -- the window is sized from the resident footprint the budget
+    produces, so raising the budget is what buys the context."""
+    planned = _code_sup(23.0, **FN_CORRECTED)
+    forced = _code_sup(23.0, expert_offload_gib=42, **FN_CORRECTED)
+    assert forced.max_model_len > planned.max_model_len
+
+
+def test_zero_turns_offload_off_rather_than_meaning_unset():
+    """`--cpu-offload-gb 0` has to be distinguishable from not passing it, or there is no way
+    to say "serve this resident" on a card where the planner would offload."""
+    sup = _code_sup(23.0, expert_offload_gib=0, **FN_CORRECTED)
+    assert sup.expert_offload_gib == 0
+    assert "--cpu-offload-gb" not in " ".join(str(a) for a in sup.argv())
+
+
+def test_an_absent_flag_still_plans():
+    planned = _code_sup(23.0, **FN_CORRECTED)
+    assert planned.expert_offload_gib > 0        # the 34 GiB the policy chooses
+
+
+def test_a_budget_beyond_the_declared_experts_is_reported_not_silently_clipped():
+    """Asking for more than the checkpoint has means vLLM offloads less than requested, so the
+    footprint prediction is wrong in the dangerous direction. The flag still wins -- it is an
+    escape hatch -- but it must say so rather than letting the user believe the number."""
+    import io
+    out = io.StringIO()
+    sup = _code_sup(23.0, expert_offload_gib=999, out=out, **FN_CORRECTED)
+    sup.argv()
+    assert sup.expert_offload_gib == 999
+    assert "declared" in out.getvalue().lower() or "999" in out.getvalue()

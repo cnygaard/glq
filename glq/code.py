@@ -81,6 +81,13 @@ def main(argv=None) -> int:
     p.add_argument("--gpu-memory-utilization", type=float, default=None,
                    help="fraction of VRAM vLLM may reserve (default: sized from the "
                         "checkpoint)")
+    # The offload policy stops once resident fits WEIGHT_FRACTION of VRAM, without asking
+    # whether the headroom it left affords a useful window -- measured on a 23 GiB L4 serving
+    # Flash-Next, it picks 34 GiB and a 32768 context where 42 GiB reaches 262144 and lowers
+    # utilization. This is how to ask for the longer window. `0` serves resident.
+    p.add_argument("--cpu-offload-gb", type=int, default=None, metavar="N",
+                   help="GiB of MoE experts to keep in host RAM, overriding the plan "
+                        "(0 = none; raising it buys context and costs PCIe decode time)")
     p.add_argument("--max-model-len", type=int, default=None,
                    help=f"context window to serve (default: sized from VRAM headroom, "
                         f"floor {DEFAULT_CODE_MAX_MODEL_LEN} — a coding agent carries "
@@ -157,6 +164,7 @@ def main(argv=None) -> int:
         # checkpoint today except Qwen3.8-Flash-Next.
         ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
         nontext_bytes=_offload[2],
+        expert_offload_gib=args.cpu_offload_gb,
     )
 
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the

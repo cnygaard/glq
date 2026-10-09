@@ -584,7 +584,7 @@ class VllmSupervisor:
                  max_model_len_floor=DEFAULT_MAX_MODEL_LEN, fp8_kv=False,
                  max_num_seqs=None, device=None, ram_bytes=None,
                  ple_offload_bytes=0, expert_offload_bytes=0, nontext_bytes=0,
-                 window_concurrency=_WINDOW_CONCURRENCY):
+                 window_concurrency=_WINDOW_CONCURRENCY, expert_offload_gib=None):
         self.model = model
         self.port = int(port)
         self.base_url = base_url or f"http://127.0.0.1:{self.port}/v1"
@@ -600,8 +600,19 @@ class VllmSupervisor:
         #: two window tiers on a 24 GB card. Sound only because this supervisor never enables
         #: speculative decoding, which WOULD load the MTP head.
         self.nontext_bytes = int(nontext_bytes or 0)
+        # An explicit budget wins, exactly as `--gpu-memory-utilization` does: the planner
+        # stops once resident fits `WEIGHT_FRACTION` of VRAM and never asks whether the
+        # headroom it left affords a useful window, so on a 23 GiB L4 it chooses 34 GiB and a
+        # 32768 context where 42 GiB reaches 262144 AND lowers utilization. Until that policy
+        # is settled with a decode measurement, this is how a user asks for the long window.
+        #
+        # `None` means "plan it"; 0 is a real answer meaning "serve this resident", which is
+        # why the two cannot be collapsed.
+        self._expert_offload_forced = expert_offload_gib is not None
         self.expert_offload_gib = 0
-        if self.ple_offload_bytes or self.expert_offload_bytes:
+        if self._expert_offload_forced:
+            self.expert_offload_gib = max(0, int(expert_offload_gib))
+        elif self.ple_offload_bytes or self.expert_offload_bytes:
             self.expert_offload_gib = plan_expert_offload_gib(
                 weights_bytes=weights_bytes, ple_offload_bytes=self.ple_offload_bytes,
                 expert_offload_bytes=self.expert_offload_bytes,
@@ -740,6 +751,13 @@ class VllmSupervisor:
         """
         if self.expert_offload_gib <= 0:
             return []
+        declared = self.expert_offload_bytes // 1024**3
+        if self._expert_offload_forced and declared and self.expert_offload_gib > declared:
+            # The flag still wins, but vLLM can only offload what exists, so the resident
+            # prediction the window was sized from is wrong in the dangerous direction.
+            self._say(f"  note: asked to offload {self.expert_offload_gib} GiB of experts "
+                      f"but this checkpoint declares {declared} GiB; vLLM will offload less "
+                      f"than that and the footprint will exceed the plan")
         return ["--offload-backend", "uva",
                 "--cpu-offload-gb", str(self.expert_offload_gib),
                 "--cpu-offload-params", "experts"]
