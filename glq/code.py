@@ -25,7 +25,7 @@ from pathlib import Path
 from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
                       _server_port, _vram_bytes, checkpoint_offload_bytes,
                       default_model, positive_seconds, sizing_weights_bytes)
-from glq.installer.configure import write_pi_models
+from glq.installer.configure import pi_max_tokens, write_pi_models
 from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
 from glq.tooling import (ensure_gemma4_template, sampling_serve_args,
@@ -220,7 +220,7 @@ def main(argv=None) -> int:
     write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
                     args.base_url, [args.model],
                     context_window=supervisor.max_model_len,
-                    max_tokens=max(1024, supervisor.max_model_len // 4))
+                    max_tokens=pi_max_tokens(supervisor.max_model_len))
 
     # `kill` and a closed terminal end the process without unwinding the context
     # manager below; turn them into SystemExit so the server still comes down.
