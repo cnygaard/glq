@@ -19,8 +19,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from glq.supervisor import (VllmSupervisor, child_env,  # noqa: E402
-                            plan_expert_offload_gib)
+from glq.supervisor import (WINDOW_OFFLOAD_MAX_EXTRA_GIB,  # noqa: E402
+                            VllmSupervisor, child_env, kv_headroom_bytes,
+                            plan_expert_offload_gib, window_kv_bytes)
 
 GIB = 2 ** 30
 #: Flash-Next as the quantizer declares it.
@@ -183,39 +184,51 @@ FN_CORRECTED = dict(FN_PUBLISHED, expert_offload_bytes=45_770_637_312,
                     nontext_bytes=5_214_301_696)   # MTP head only; see quantize tests
 
 
-def _code_sup(vram_gib, **kw):
-    """A glq-code-shaped plan: one stream, the coding floor."""
+def _code_sup(vram_gib, ram_gib=124.0, **kw):
+    """A glq-code-shaped plan: one stream, the coding floor, and the window-for-offload trade.
+
+    `window_offload_extra_gib` is what `glq-code` passes and `glq-chat` does not; defaulting it
+    here rather than in each test keeps "the code shape" one thing.
+    """
+    kw.setdefault("window_offload_extra_gib", WINDOW_OFFLOAD_MAX_EXTRA_GIB)
     return VllmSupervisor(model="org/flash-next", device="cuda", window_concurrency=1,
                           max_num_seqs=1, vram_bytes=int(vram_gib * GIB),
-                          ram_bytes=int(124 * GIB), max_model_len_floor=16384, **kw)
+                          ram_bytes=int(ram_gib * GIB), max_model_len_floor=16384, **kw)
 
 
-def test_the_window_doubles_on_a_24gb_card_once_the_counts_are_right():
+def test_the_window_grows_on_a_24gb_card_once_the_counts_are_right():
     """The payoff, on the card that motivated it and with the published numbers rather than a
-    fixture: 16384 -> 32768 for the same checkpoint and the same policy.
+    fixture: 16384 -> 131072 for the same checkpoint and the same policy.
 
-    These were 32768 -> 65536 while the overhead allowance was a flat 4 GiB. That allowance was
-    measurably 1.44 GiB short on this checkpoint and is now proportional, which costs this card
-    one tier -- correctly, because the old pair was reachable only by under-reserving what vLLM
-    then needed. A doubling either way; the base moved because the arithmetic got honest.
+    The history matters, because this pair has moved twice and each move was the arithmetic
+    getting more honest rather than the feature getting better. It was 32768 -> 65536 while the
+    overhead allowance was a flat 4 GiB -- measurably 1.44 GiB short on this checkpoint, so the
+    old pair was reachable only by under-reserving what vLLM then needed; proportional overhead
+    cost this card a tier, correctly, leaving 16384 -> 32768. The window-aware budget then
+    raised the second arm again, and this time nothing was borrowed to pay for it.
 
-    Not 131072, which the raw resident figure suggests. `WEIGHT_FRACTION = 0.75` is satisfied
-    at ~15 GiB resident on a 23 GiB card, so the planner stops offloading there; reaching the
-    ~10 GiB that affords a longer window would mean deliberately offloading more experts, a
-    PCIe-decode-speed trade this policy does not make on its own."""
+    `before` is unimproved ON PURPOSE and is the control: the published counts over-state what
+    must leave the card, so even at the pinnable-RAM cap (38 GiB) the 15.72 GiB that stays
+    resident leaves under 1 GiB of KV headroom and no tier above the floor is affordable. The
+    corrected counts reach 131072 while offloading one GiB LESS, which is the whole claim --
+    the context came from counting right, not from spending more PCIe."""
     before = _code_sup(23.0, **FN_PUBLISHED)
     after = _code_sup(23.0, **FN_CORRECTED)
     assert before.max_model_len == 16384
-    assert after.max_model_len == 32768
-
-
-def test_the_same_fix_also_offloads_fewer_experts():
-    """Both sides of the saving, and the other one is decode speed: 38 GiB of experts in host
-    memory becomes 33 GiB, and every offloaded expert is paid for again on each token that
-    routes to it."""
-    before = _code_sup(23.0, **FN_PUBLISHED)
-    after = _code_sup(23.0, **FN_CORRECTED)
+    assert after.max_model_len == 131072
     assert after.expert_offload_gib < before.expert_offload_gib
+
+
+def test_the_same_fix_also_hands_back_utilization():
+    """The third side of the saving. Counting the MTP head correctly buys context (the test
+    above) and costs one GiB less offload, and what is left over is given back to the card
+    rather than reserved: util 0.920 -> 0.877 on the 23 GiB arm, 0.703 -> 0.651 on the 96 GiB
+    one. The 0.920 is `_MAX_UTILIZATION`, i.e. the published counts saturate the card AND get
+    the shortest window -- the worst corner of both trades."""
+    for vram in (23.0, 95.6):
+        before = _code_sup(vram, **FN_PUBLISHED)
+        after = _code_sup(vram, **FN_CORRECTED)
+        assert after.gpu_memory_utilization < before.gpu_memory_utilization
 
 
 def test_a_96gb_card_keeps_its_window_and_reserves_less_for_it():
@@ -254,13 +267,12 @@ def test_speculative_decoding_is_never_enabled_so_the_mtp_subtraction_holds():
 
 # ------------------------------------------- the explicit offload budget escape hatch
 
-# `plan_expert_offload_gib` stops as soon as resident fits `WEIGHT_FRACTION` of VRAM, without
-# asking whether the headroom it left affords a useful window. Measured on a 23 GiB L4 serving
-# Flash-Next: it offloads 34 GiB, leaving resident 14.86 and a 32768 window at util 0.920 --
-# where 42 GiB (the declared maximum) leaves 6.86 resident and reaches the full 262144 while
-# LOWERING util to 0.825. Until that policy question is settled with a decode measurement there
-# was no way to ask for the longer window at all: the budget is computed inside the supervisor,
-# and hand-running `vllm serve` loses `flashinfer_env()` (on sm_120 it then stops on ninja).
+# The budget is computed inside the supervisor, and hand-running `vllm serve` to override it
+# loses `flashinfer_env()` (on sm_120 it then stops on ninja) -- so without a flag there is no
+# way to disagree with the plan at all. That mattered most when the plan stopped at
+# `WEIGHT_FRACTION`; the window-aware budget below now reaches 131072 on a 23 GiB L4 unaided,
+# and this flag has become what it should be: the override for the cases the policy cannot see,
+# including `0` for "serve it resident and keep every token fast".
 
 def test_an_explicit_budget_is_used_verbatim():
     """Same contract as --gpu-memory-utilization: an explicit flag wins over the plan."""
@@ -301,3 +313,180 @@ def test_a_budget_beyond_the_declared_experts_is_reported_not_silently_clipped()
     sup.argv()
     assert sup.expert_offload_gib == 999
     assert "declared" in out.getvalue().lower() or "999" in out.getvalue()
+
+
+# ------------------------------------------------------- the window-aware offload budget
+
+# The budget used to stop as soon as resident fit `WEIGHT_FRACTION` of VRAM, without asking
+# whether the headroom it left affords a useful window. Two failures came out of that, and the
+# first is not an optimization:
+#
+#   * a PINNED `--max-model-len` could not drive the budget. Offload was planned first and the
+#     pool sized for the window afterwards, clamped at `_MAX_UTILIZATION` -- so on a 23 GiB L4
+#     the plan offloaded 34 GiB, leaving 1.85 GiB of KV headroom against the 7.92 GiB a 262144
+#     window needs, and vLLM refused at startup. That is the 0.8.24 report (`6.55 GiB KV cache
+#     is needed ... larger than the available 5.91 GiB`); 0.8.25 made the overhead allowance
+#     honest without connecting the window to the budget.
+#   * the auto window stopped short for the agent that wants context: 32768 on that L4, where
+#     +3 GiB of offload reaches 131072.
+#
+# The trade is measured rather than assumed, on two cards -- see `WINDOW_OFFLOAD_MAX_EXTRA_GIB`
+# for the arms. ~0.55%/GiB of decode on an RTX PRO 4500, ~1.10%/GiB on an RTX PRO 6000; the
+# percentage is NOT portable (a fixed PCIe cost is a larger share of a faster step) while
+# ~0.47 ms/token/GiB is, across two PCIe 5 x16 boxes.
+#
+# The pricing chain was then gated against vLLM itself rather than inferred. Serving Flash-Next
+# on a 96 GiB RTX PRO 6000 at the plan's own choice (util 0.652, window 262144, offload 0,
+# vLLM 0.31.0): `Model loading took 48.65 GiB` against a predicted 48.86 resident, and
+# `Available KV cache memory: 8.24 GiB` / `GPU KV cache size: 328,790 tokens` against a
+# reservation of 7.92 GiB -- hence `Maximum concurrency for 262,144 tokens per request: 1.25x`,
+# and a real request completed. vLLM's own per-token cost there is 26,912 B, which makes
+# `_KV_BYTES_PER_TOKEN = 28_201` conservative by 4.8%: the safe direction, and the first check
+# of that anchor AT a 262144 window rather than extrapolated from pools measured at 8192.
+
+
+def test_a_pinned_window_drives_the_budget():
+    """The failure this fixes. A user asking for 262144 on a 23 GiB card used to get the
+    fits-the-card budget and a pool that cannot hold one request in that window.
+
+    Asserted on HEADROOM rather than on a budget number, because the headroom is the thing
+    vLLM then checks."""
+    sup = _code_sup(23.0, ram_gib=192.0, max_model_len=262144, **FN_CORRECTED)
+    resident = (FN_CORRECTED["weights_bytes"] - FN_CORRECTED["ple_offload_bytes"]
+                - FN_CORRECTED["nontext_bytes"] - sup.expert_offload_gib * GIB)
+    assert kv_headroom_bytes(resident, int(23.0 * GIB)) >= window_kv_bytes(262144, 1)
+
+
+def test_a_pinned_window_is_not_subject_to_the_auto_cap():
+    """`glq-chat` does not trade decode for a window it was not asked for, but a window the
+    user NAMED is not a trade -- it is an instruction. So the pinned path must work with the
+    cap at its chat default of 0."""
+    chat_shaped = VllmSupervisor(
+        model="org/flash-next", device="cuda", window_concurrency=1, max_num_seqs=1,
+        vram_bytes=int(23.0 * GIB), ram_bytes=int(192.0 * GIB),
+        max_model_len=262144, window_offload_extra_gib=0, **FN_CORRECTED)
+    baseline = _code_sup(23.0, ram_gib=192.0, window_offload_extra_gib=0,
+                         **FN_CORRECTED).expert_offload_gib
+    assert chat_shaped.expert_offload_gib > baseline
+
+
+def test_an_unaffordable_pinned_window_is_served_anyway_and_reported():
+    """`_KV_BYTES_PER_TOKEN` is a conservative envelope over the worst pool ever observed, so
+    a window this arithmetic calls unaffordable may still serve -- and vLLM's own startup check
+    is the authoritative one. Clamping would shorten windows that would have worked, so the
+    pinned value is passed through untouched and the shortfall is REPORTED.
+
+    Same contract as `--cpu-offload-gb 999`: honored verbatim, never silently adjusted."""
+    import io
+    out = io.StringIO()
+    sup = _code_sup(23.0, ram_gib=124.0, max_model_len=262144, out=out, **FN_CORRECTED)
+    sup.argv()
+    assert sup.max_model_len == 262144           # not clamped
+    said = out.getvalue().lower()
+    assert "262144" in said and "cpu-offload-gb" in said
+
+
+def test_the_auto_window_tiers_up_within_the_budget():
+    """The measured payoff on the card that motivated this: 32768 -> 131072 for +3 GiB of
+    offload, about 1.7% of decode at the slope above.
+
+    262144 is NOT reached here and that is correct -- it needs ~40 GiB, which 124 GiB of host
+    RAM cannot pin beside the 23.84 GiB PLE table."""
+    sup = _code_sup(23.0, **FN_CORRECTED)
+    assert sup.expert_offload_gib == 37
+    assert sup.max_model_len == 131072
+
+
+def test_the_auto_window_reaches_the_full_context_on_a_32gb_card():
+    """The g7, where the trade is bracketed by measurement rather than extrapolated: the
+    chosen 32 GiB sits between the 27 GiB and 34 GiB arms that were benched."""
+    sup = _code_sup(31.9, **FN_CORRECTED)
+    assert sup.expert_offload_gib == 32
+    assert sup.max_model_len == 262144
+
+
+def test_it_picks_the_smallest_offload_that_reaches_the_tier():
+    """Walking the tiers downward is what makes this land on the sweet spot instead of the
+    declared maximum. On the g7, 32 GiB and 38 GiB both serve 262144; every GiB beyond the
+    first one that reaches the tier is decode speed spent for nothing."""
+    sup = _code_sup(31.9, **FN_CORRECTED)
+    lower = _code_sup(31.9, expert_offload_gib=sup.expert_offload_gib - 1, **FN_CORRECTED)
+    assert lower.max_model_len < sup.max_model_len
+
+
+def test_the_window_the_search_accepted_is_the_window_that_gets_served():
+    """The search and `plan_max_model_len` must agree: the budget is chosen by asking which
+    tier a resident footprint affords, and the window is then planned from that same
+    footprint. If those two ever disagree the plan promises a window it did not buy."""
+    for vram in (23.0, 31.9, 95.6):
+        sup = _code_sup(vram, **FN_CORRECTED)
+        resident = (FN_CORRECTED["weights_bytes"] - FN_CORRECTED["ple_offload_bytes"]
+                    - FN_CORRECTED["nontext_bytes"] - sup.expert_offload_gib * GIB)
+        assert kv_headroom_bytes(resident, int(vram * GIB)) >= window_kv_bytes(
+            sup.max_model_len, 1), f"{vram} GiB promised {sup.max_model_len}"
+
+
+def test_a_tier_the_caps_cannot_reach_is_refused_not_promised():
+    """The cap interaction that would otherwise produce a window the card cannot hold: the
+    pinnable-RAM and declared-expert caps can clip the budget BELOW what the tier needs, and
+    accepting the clipped value would announce a context that does not fit.
+
+    Same card, same checkpoint, more host RAM -- and only the one with RAM to pin reaches
+    262144."""
+    assert _code_sup(23.0, ram_gib=124.0, **FN_CORRECTED).max_model_len == 131072
+    assert _code_sup(23.0, ram_gib=192.0, **FN_CORRECTED).max_model_len == 262144
+
+
+def test_the_extra_never_exceeds_the_declared_budget():
+    """The one weakly-justified constant here, so it is asserted rather than trusted. On every
+    card measured the caps bind first and this never does, which is where a constant backed by
+    three points on one box belongs."""
+    base = plan_expert_offload_gib(
+        weights_bytes=FN_CORRECTED["weights_bytes"],
+        ple_offload_bytes=FN_CORRECTED["ple_offload_bytes"],
+        expert_offload_bytes=FN_CORRECTED["expert_offload_bytes"],
+        nontext_bytes=FN_CORRECTED["nontext_bytes"],
+        vram_bytes=int(23.0 * GIB), ram_bytes=int(192.0 * GIB))
+    sup = _code_sup(23.0, ram_gib=192.0, **FN_CORRECTED)
+    assert sup.expert_offload_gib <= base + WINDOW_OFFLOAD_MAX_EXTRA_GIB
+
+
+def test_a_big_card_keeps_a_zero_budget():
+    """No offload where none is needed. A 96 GiB card already affords 262144 resident, so
+    there is no tier to buy and nothing to pay for it with."""
+    sup = _code_sup(95.6, **FN_CORRECTED)
+    assert sup.expert_offload_gib == 0
+    assert sup.max_model_len == 262144
+
+
+# ---- what must NOT move ----------------------------------------------------------------
+
+def test_the_chat_default_plans_exactly_as_before():
+    """`glq-chat` opts out: a session at 8k tokens must not pay PCIe on every token for a
+    window it never fills. Asserted to the digit on all three planned values, because this is
+    the guard that keeps the change inert for every checkpoint and card glq-chat serves."""
+    for vram in (23.0, 31.9, 45.0, 95.6):
+        before = _sup(vram, **FN)
+        after = _sup(vram, window_offload_extra_gib=0, **FN)
+        assert (after.expert_offload_gib, after.max_model_len,
+                after.gpu_memory_utilization) == (
+            before.expert_offload_gib, before.max_model_len, before.gpu_memory_utilization)
+
+
+def test_a_dense_checkpoint_is_still_untouched():
+    """The planners are on every install path, and the trade must not reach a checkpoint with
+    no experts to offload."""
+    s = VllmSupervisor(model="org/smollm3", device="cuda", weights_bytes=int(1.9 * GIB),
+                       vram_bytes=int(23 * GIB), model_max_len=65536,
+                       window_offload_extra_gib=WINDOW_OFFLOAD_MAX_EXTRA_GIB)
+    assert s.expert_offload_gib == 0
+    assert not [a for a in s.argv() if "offload" in a]
+
+
+def test_an_explicit_budget_still_beats_the_window_aware_plan():
+    """The escape hatch outranks the richer policy exactly as it outranked the poorer one --
+    including 0, which on this card now means giving up three window tiers on purpose."""
+    assert _code_sup(23.0, expert_offload_gib=20, **FN_CORRECTED).expert_offload_gib == 20
+    zero = _code_sup(23.0, expert_offload_gib=0, **FN_CORRECTED)
+    assert zero.expert_offload_gib == 0
+    assert "--cpu-offload-gb" not in " ".join(str(a) for a in zero.argv())

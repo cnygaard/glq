@@ -27,7 +27,7 @@ from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
                       default_model, positive_seconds, sizing_weights_bytes)
 from glq.installer.configure import pi_max_tokens, write_pi_models
 from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
-                            VllmSupervisor)
+                            WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
 from glq.tooling import (ensure_gemma4_template, sampling_serve_args,
                          tool_serve_args)
 
@@ -125,10 +125,10 @@ def main(argv=None) -> int:
     p.add_argument("--gpu-memory-utilization", type=float, default=None,
                    help="fraction of VRAM vLLM may reserve (default: sized from the "
                         "checkpoint)")
-    # The offload policy stops once resident fits WEIGHT_FRACTION of VRAM, without asking
-    # whether the headroom it left affords a useful window -- measured on a 23 GiB L4 serving
-    # Flash-Next, it picks 34 GiB and a 32768 context where 42 GiB reaches 262144 and lowers
-    # utilization. This is how to ask for the longer window. `0` serves resident.
+    # The plan now sizes this for the window as well as for the card, so this flag is the
+    # override for what the policy cannot see -- a long session that will never fill the
+    # context (`0` keeps every token fast), or a card where the measured PCIe cost is worse
+    # than the g7 figures behind WINDOW_OFFLOAD_MAX_EXTRA_GIB.
     p.add_argument("--cpu-offload-gb", type=int, default=None, metavar="N",
                    help="GiB of MoE experts to keep in host RAM, overriding the plan "
                         "(0 = none; raising it buys context and costs PCIe decode time)")
@@ -209,6 +209,12 @@ def main(argv=None) -> int:
         ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
         nontext_bytes=_offload[2],
         expert_offload_gib=args.cpu_offload_gb,
+        # glq-code opts into spending a bounded amount of extra offload on a longer window;
+        # glq-chat does not. For a coding agent the window IS the product -- pi carries file
+        # contents, diffs and multi-turn tool results, and runs ONE stream, so a tier costs it
+        # an eighth of what it would cost a chat server. Measured on a g7: 65536 -> 262144 for
+        # 5 GiB of offload, about 3% of decode. See WINDOW_OFFLOAD_MAX_EXTRA_GIB.
+        window_offload_extra_gib=WINDOW_OFFLOAD_MAX_EXTRA_GIB,
     )
 
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
