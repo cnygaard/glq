@@ -22,13 +22,65 @@ API_KEY_PLACEHOLDER = "glq"
 PROVIDER = "glq"
 
 
+#: Divisor on the served window giving the per-turn OUTPUT budget pi may ask for. A HALF, which
+#: on a 262144 window is 131072 — exactly the final-response length Qwen3.8-Flash-Next's card
+#: asks for.
+#:
+#: Why not the whole window: `max_tokens` and the prompt are drawn from the same window, so
+#: asking for all of it leaves nothing for input. Measured on vLLM 0.31.0 against a 262144
+#: window — `max_tokens=262144` returns **HTTP 400** ("you requested 262144 output tokens and
+#: your prompt contains 325 characters (more than 0 characters, which is the upper bound for 0
+#: input tokens)") while 65536 returns 200. Qwen's "262144 reasoning tokens" is the window it
+#: wants, not an achievable per-turn output ask; the two are easy to conflate.
+#:
+#: Why not a smaller share either — this was a quarter first, on the theory that the rest had
+#: to be held back for a growing transcript. **That theory was wrong**: pi clamps the ask
+#: itself, every turn,
+#:
+#:     available = contextWindow - estimateContextTokens(context) - CONTEXT_SAFETY_MARGIN
+#:     ask       = min(maxTokens, max(MIN_MAX_TOKENS, available))      # MIN_MAX_TOKENS = 1
+#:
+#: so this value is a pure ceiling and costs the transcript nothing — a lower share only caps
+#: reasoning for no gain. That ceiling is what truncated a TB-4.0 trial at exactly 16384 output
+#: tokens (`finish_reason: length`, mid-`<think>`, so no tool call was ever emitted).
+#:
+#: A half rather than the whole window because the clamp's `available` rests on an *estimate*:
+#: if it undershoots by more than `CONTEXT_SAFETY_MARGIN` the request exceeds the window and
+#: 400s instead of degrading. Halving keeps every turn clear of that edge, which is the one
+#: failure mode here that is loud rather than graceful.
+_PI_OUTPUT_SHARE = 2
+
+#: Smallest useful per-turn output budget, for windows too small for the share above to leave
+#: anything to answer in.
+_PI_MIN_MAX_TOKENS = 1024
+
+
+def pi_max_tokens(context_window) -> int:
+    """Per-turn output budget for pi, given the served window.
+
+    One rule in one place: `glq-code` and the harbor bench agent both configure pi, and the
+    harbor one shipped with **no** `maxTokens` at all — so pi fell back to its own 16384
+    default and silently truncated every long reasoning turn mid-`<think>`, emitting no tool
+    call. The agent then had nothing to execute and stopped having spent the tokens. See
+    `_PI_OUTPUT_SHARE` for why this is not simply the window.
+    """
+    return max(_PI_MIN_MAX_TOKENS, int(context_window or 0) // _PI_OUTPUT_SHARE)
+
+
 def pi_models_json(base_url: str, model_ids,
-                   context_window=None, max_tokens=None) -> dict:
-    """The `glq` provider block for pi, in the shape of `examples/pi/models.json`."""
-    return {"providers": {PROVIDER: {
+                   context_window=None, max_tokens=None,
+                   provider: str = PROVIDER,
+                   api_key: str = API_KEY_PLACEHOLDER) -> dict:
+    """The provider block for pi, in the shape of `examples/pi/models.json`.
+
+    `provider`/`api_key` are overridable so the harbor bench agent — which names its provider
+    from the `-m glq/<id>` split — shares this builder instead of hand-rolling the dict. The
+    output-budget reasoning below is the reason that matters.
+    """
+    return {"providers": {provider: {
         "baseUrl": base_url,
         "api": "openai-completions",       # the dialect vLLM's server speaks
-        "apiKey": API_KEY_PLACEHOLDER,
+        "apiKey": api_key,
         # Without these, pi asks for the FULL window as its output budget and vLLM
         # 400s every request — measured live: max_tokens=16384 against a 16384 window
         # left "0 input tokens" for the prompt, and pi's --print mode swallowed the

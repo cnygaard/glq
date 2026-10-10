@@ -107,10 +107,13 @@ TASKS: dict[str, TaskSpec] = {
     # can see errors compound. standardized=False until a bf16 arm exists: with no reference
     # the %-of-bf16 index cannot use it, and including it would distort the index.
     # kind="throughput" because it runs its own vllm server and harbor subprocess.
+    # No `dataset` default here on purpose: the adapter already falls back to its own
+    # `_DATASET`, so repeating it would be a second place to update when Terminal-Bench tags a
+    # new version — and the one that gets forgotten, since this file is nowhere near the
+    # harbor code. The registry is loaded eagerly, so importing the constant is not an option.
     "terminal_bench": TaskSpec(
         "terminal_bench", "glq.bench.tasks.terminal_bench", metric="reward_mean",
-        standardized=False, kind="throughput",
-        defaults={"dataset": "terminal-bench/terminal-bench-2", "n_attempts": 1}),
+        standardized=False, kind="throughput", defaults={"n_attempts": 1}),
     # Reserved so the picker table's coding column has a name before it has a harness:
     # LiveCodeBench is not an lm-eval task and needs the standalone LCB repo with a code
     # execution sandbox. Raises rather than silently reporting nothing.

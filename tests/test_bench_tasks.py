@@ -367,3 +367,124 @@ def test_an_unknown_family_still_gets_tool_calling():
     cmd = tb.serve_command("org/something-new", "glq", {}, port=8000, served_id="m")
     assert "--enable-auto-tool-choice" in cmd
     assert cmd[cmd.index("--tool-call-parser") + 1] == "hermes"
+
+
+def test_terminal_bench_serves_the_model_families_sampling():
+    """Sampling belongs to the model, and on an agentic run the SERVER has to carry it: pi
+    cannot send `top_k` at all -- it is not an OpenAI field and pi's config has no slot for it
+    -- so a top_k the server does not pin is a top_k that never applies. Qwen's own card asks
+    for temperature 1.0 / top_p 0.95 / top_k 20 in thinking mode, and `glq-code` already pins
+    exactly that via the same helper. This task served whatever vLLM defaulted to."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.serve_command("xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4", "glq",
+                           {}, port=8000, served_id="m")
+    cfg = cmd[cmd.index("--override-generation-config") + 1]
+    assert '"top_k":20' in cfg and '"temperature":1.0' in cfg and '"top_p":0.95' in cfg
+
+
+def test_terminal_bench_keeps_the_familys_other_serve_flags():
+    """`--language-model-only` is in the family args and was being dropped, because this
+    function pulled the two parser VALUES out of `tool_serve_args` and discarded the rest.
+    Without it a multimodal checkpoint loads vision and audio towers that a terminal agent
+    never uses -- VRAM spent on weights nothing reads, and on some archs a crash on a
+    `<|video|>` placeholder."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.serve_command("xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4", "glq",
+                           {}, port=8000, served_id="m")
+    assert "--language-model-only" in cmd
+    # and the trio is still decided here, not duplicated from the family list
+    assert cmd.count("--tool-call-parser") == 1
+    assert cmd.count("--enable-auto-tool-choice") == 1
+    assert cmd.count("--reasoning-parser") == 1
+
+
+def test_terminal_bench_caps_max_num_seqs():
+    """vLLM defaults max_num_seqs to 1024, and on a hybrid-GDN architecture every decode slot
+    reserves a Mamba cache block before a single request exists. That default has already been
+    measured REFUSING startup on a 96 GB card -- `max_num_seqs (1024) exceeds available Mamba
+    cache blocks (399)` -- and Qwen3.8-Flash-Next is exactly such a model, so leaving this to
+    vLLM means the agentic run cannot start at all.
+
+    8 covers the concurrent rollouts harbor runs against one server and keeps both the Mamba
+    cache and the per-step logits buffer small."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.serve_command("xv/M-GLQ", "glq", {}, port=8000, served_id="m")
+    assert cmd[cmd.index("--max-num-seqs") + 1] == "8"
+    cmd2 = tb.serve_command("xv/M-GLQ", "glq", {"max_num_seqs": 32}, port=8000, served_id="m")
+    assert cmd2[cmd2.index("--max-num-seqs") + 1] == "32"
+
+
+def test_a_custom_agent_is_passed_as_the_agent_not_an_import_path_flag():
+    """harbor removed `--agent-import-path`. Since 0.24.0 `-a/--agent` takes either a builtin
+    name or a `module.path:ClassName`, so the old flag is rejected at argument parsing and the
+    whole run dies before a container starts.
+
+    The oracle leg CANNOT catch this: it runs a builtin agent and never goes through ours.
+    Extracted from run() for the same reason serve_command was -- a flag the agent depends on
+    should be assertable without starting Docker, which is how this one rotted unnoticed."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.harbor_command("/usr/bin/harbor",
+                            dataset="terminal-bench/terminal-bench@4.0.0", served_id="m",
+                            n_attempts=1, n_tasks=3, host_ip="172.17.0.1",
+                            jobs_dir="/tmp/j", n_concurrent=3)
+    assert "--agent-import-path" not in cmd
+    assert cmd[cmd.index("-a") + 1] == "benchmarks.harbor_pi_glq:PiGLQAgent"
+    assert cmd[cmd.index("-d") + 1] == "terminal-bench/terminal-bench@4.0.0"
+    assert cmd[cmd.index("-m") + 1] == "glq/m"
+    assert cmd[cmd.index("-l") + 1] == "3"
+    assert cmd[cmd.index("-k") + 1] == "1"
+    assert cmd[cmd.index("--allow-agent-host") + 1] == "172.17.0.1"
+
+
+def test_the_job_is_named_rather_than_discovered():
+    """harbor's `--job-name` makes the job directory known BEFORE harbor starts, which the
+    artifact mirror needs (there is nothing to sync to if the target is only learned at the
+    end) and which replaces a genuinely fragile heuristic.
+
+    `run()` used to locate its result by diffing `jobs_dir` and taking `sorted(new)[-1]`. A
+    second harbor job writing a later-sorting timestamped directory into the same `jobs_dir`
+    would then have been parsed as the benchmark's own result -- hit for real while running a
+    cookbook smoke test alongside a live bench, and avoided only by passing a separate
+    `jobs_dir` by hand."""
+    from glq.bench.tasks import terminal_bench as tb
+    cmd = tb.harbor_command("/usr/bin/harbor", dataset="d", served_id="m", n_attempts=1,
+                            n_tasks=1, host_ip="172.17.0.1", jobs_dir="/tmp/j",
+                            job_name="glq-tb-abc123")
+    assert cmd[cmd.index("--job-name") + 1] == "glq-tb-abc123"
+
+
+def test_the_job_name_is_unique_per_run():
+    """Two runs into one jobs_dir must not collide, which is the whole point of not using a
+    bare timestamp the way harbor's default does."""
+    from glq.bench.tasks import terminal_bench as tb
+    names = {tb.job_name() for _ in range(50)}
+    assert len(names) == 50
+
+
+def test_the_artifact_prefix_names_the_model_and_the_job():
+    """A mirrored job has to be findable later: prefix by model and job name, and keep the
+    repo id's slash so the S3 listing reads like the Hub does."""
+    from glq.bench.tasks import terminal_bench as tb
+    prefix = tb.artifact_prefix("xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4",
+                                "glq-tb-abc123")
+    assert prefix.startswith("terminal_bench/")
+    assert "Qwen3.8-Flash-Next" in prefix
+    assert prefix.endswith("glq-tb-abc123")
+    assert ".." not in prefix and not prefix.startswith("/")
+
+
+def test_the_default_dataset_is_a_pinned_version_tag():
+    """Terminal-Bench is a CONTINUOUS benchmark now: versions are tags on one repo addressed
+    `name@version`, where 2.0 had its own `terminal-bench-2` repo. harbor 0.24.0 documents
+    --dataset as "Dataset name@version".
+
+    Pinned rather than floating on `main`, because a benchmark whose task set changes silently
+    between runs makes two recorded numbers incomparable -- and 4.0 removed 8 of 3.0's tasks
+    and revised 20."""
+    from glq.bench.tasks import terminal_bench as tb
+    assert "@" in tb._DATASET, "a floating dataset id makes two runs incomparable"
+    assert not tb._DATASET.endswith("terminal-bench-2")
+    # And exactly ONE place holds it. The registry used to carry its own copy, which is the
+    # one that would be forgotten on the next version tag -- it sits nowhere near the harbor
+    # code, and the adapter already falls back to `_DATASET`.
+    assert "dataset" not in registry.get_task("terminal_bench").defaults

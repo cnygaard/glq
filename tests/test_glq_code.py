@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import glq.code as code  # noqa: E402
+from glq.installer import configure  # noqa: E402
 
 
 class _FakeSup:
@@ -196,8 +197,13 @@ def test_models_json_carries_the_window_and_a_capped_output_budget(monkeypatch,
                                                                    tmp_path):
     """pi treats maxTokens as its per-turn output ask; without a cap it requests the full
     window and vLLM 400s every call (measured: the first live glq-code run produced an
-    empty assistant turn and a silent exit). A quarter of the window leaves room for the
-    transcript to grow across tool turns."""
+    empty assistant turn and a silent exit).
+
+    HALF the window, not a quarter: pi clamps the ask against the remaining context itself
+    every turn, so this is a ceiling rather than a reservation and a smaller share would cap
+    reasoning for no gain. The ratio lives in `configure.pi_max_tokens` — one copy, because
+    the harbor bench agent omitted this field entirely and truncated every long reasoning
+    turn at pi's own 16384 default."""
     wrote = {}
 
     def record(path, base_url, ids, **kw):
@@ -207,7 +213,7 @@ def test_models_json_carries_the_window_and_a_capped_output_budget(monkeypatch,
     monkeypatch.setattr(code, "write_pi_models", record)
     code.main(["--model", SMOL, "--max-model-len", "16384"])
     assert wrote["context_window"] == 16384
-    assert wrote["max_tokens"] == 4096
+    assert wrote["max_tokens"] == configure.pi_max_tokens(16384) == 8192
 
 
 def test_glq_code_plans_its_window_with_the_coding_floor(monkeypatch, tmp_path):
@@ -222,8 +228,8 @@ def test_glq_code_plans_its_window_with_the_coding_floor(monkeypatch, tmp_path):
 
 
 def test_the_pi_budget_follows_the_planned_window(monkeypatch, tmp_path):
-    """maxTokens = window/4 must use the window actually served, which in auto mode is
-    the supervisor's choice, not an args value that no longer exists."""
+    """The output budget must follow the window actually SERVED, which in auto mode is the
+    supervisor's choice and not an args value that no longer exists."""
     wrote = {}
 
     def record(path, base_url, ids, **kw):
@@ -234,7 +240,7 @@ def test_the_pi_budget_follows_the_planned_window(monkeypatch, tmp_path):
     monkeypatch.setattr(code, "_model_max_len", lambda repo: 262144)
     code.main(["--model", SMOL])
     assert wrote["context_window"] == 16384     # the fake supervisor's resolved window
-    assert wrote["max_tokens"] == 4096
+    assert wrote["max_tokens"] == configure.pi_max_tokens(16384) == 8192
 
 
 QWEN = "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw"
@@ -341,9 +347,10 @@ def test_all_three_non_resident_counts_reach_the_supervisor(monkeypatch, tmp_pat
 
 
 def test_cpu_offload_gb_reaches_the_supervisor(monkeypatch, tmp_path):
-    """The escape hatch for the offload policy. Without it there is no way to ask for a longer
-    window than `WEIGHT_FRACTION` happens to allow: the budget is computed inside the
-    supervisor, and hand-running `vllm serve` loses `flashinfer_env()`."""
+    """The escape hatch for the offload policy, now that the plan sizes for the window too: a
+    session that will never fill the context can keep every token fast with `0`, and a card
+    whose PCIe cost is worse than the g7 figures can disagree with the budget. The plan is
+    computed inside the supervisor, and hand-running `vllm serve` loses `flashinfer_env()`."""
     _, made, _, _ = _run_code(monkeypatch, tmp_path)
     code.main(["--model", QWEN, "--cpu-offload-gb", "42"])
     assert made[0]["expert_offload_gib"] == 42

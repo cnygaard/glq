@@ -118,6 +118,47 @@ def test_model_entries_can_carry_the_output_budget():
     assert entry["maxTokens"] == 4096
 
 
+def test_pi_max_tokens_leaves_room_for_the_prompt():
+    """`max_tokens` and the prompt share ONE window, so a per-turn output ask equal to the
+    window cannot be satisfied with any input at all. Measured live against vLLM 0.31.0 on a
+    262144-token window: `max_tokens=262144` returns **HTTP 400** -- "you requested 262144
+    output tokens and your prompt contains 325 characters (more than 0 characters, which is
+    the upper bound for 0 input tokens)" -- while 65536 returns 200.
+
+    Worse than a loud 400: pi's `--print` mode swallows it into an empty assistant turn, so
+    the agent appears to run and simply does nothing.
+
+    A HALF rather than a smaller share, because pi clamps the ask against the remaining window
+    on every turn, so this is a pure ceiling and holding more back would cap reasoning for no
+    gain. 131072 is also the final-response length Qwen3.8-Flash-Next's card asks for."""
+    assert C.pi_max_tokens(262144) == 131072
+    for window in (8192, 32768, 131072, 262144):
+        assert C.pi_max_tokens(window) < window, "no room left for the prompt"
+
+
+def test_pi_max_tokens_has_a_floor():
+    """A tiny window must not produce an output budget too small to answer in; the floor is
+    what keeps a small-window model usable rather than mute."""
+    assert C.pi_max_tokens(1024) >= 1024
+    assert C.pi_max_tokens(0) >= 1024
+
+
+def test_the_provider_and_key_can_be_overridden():
+    """The harbor agent names its provider from the `-m glq/<id>` split and may carry a
+    different placeholder key, but it must share this builder -- the output-budget reasoning
+    above is the whole reason the builder exists, and a second hand-rolled copy of this dict
+    is how the harbor agent shipped with NO maxTokens at all, capping every turn at pi's
+    16384 default against a 262144 window."""
+    doc = C.pi_models_json("http://172.17.0.1:8000/v1", ["glq-model"],
+                           provider="glq", api_key="dummy",
+                           context_window=262144,
+                           max_tokens=C.pi_max_tokens(262144))
+    prov = doc["providers"]["glq"]
+    assert prov["apiKey"] == "dummy"
+    assert prov["models"][0]["maxTokens"] == 131072
+    assert prov["models"][0]["contextWindow"] == 262144
+
+
 def test_limits_are_omitted_when_not_given():
     """The plain shape stays byte-compatible for callers that do not know the window."""
     entry = C.pi_models_json("http://x/v1", ["org/m"])["providers"]["glq"]["models"][0]
