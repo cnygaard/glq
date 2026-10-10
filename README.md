@@ -171,8 +171,17 @@ coding agent is a single stream and the same card affords a much longer window f
 What that gives depends on the checkpoint and the command, so one worked example
 (gemma-4 26B-A4B at 4 bpw, 14.4 GiB resident): a 24 GB card serves 8192 for chat and
 65536 for `glq-code`; a 96 GB card reaches the model's full 262144 for both.
-`--gpu-memory-utilization` / `--max-model-len` pin either; `--no-serve` attaches to
-a server you started yourself.
+`--gpu-memory-utilization` / `--max-model-len` / `--cpu-offload-gb` pin the pool, the
+window and the host-offload budget respectively; `--no-serve` attaches to a server you
+started yourself.
+
+For a checkpoint that declares offloadable MoE experts — Qwen3.8-Flash-Next today — the
+budget is sized for the window as well as for the card: a window you pin with
+`--max-model-len` drives how much goes to host RAM, and `glq-code` will additionally
+spend a bounded amount of extra offload to reach a longer tier, since one stream on a
+small card is where context is worth the most. `glq-chat` does not make that trade, and
+neither does anything that already fits. Every offloaded expert is re-read over PCIe on
+each token that routes to it, so `--cpu-offload-gb 0` is how you buy the speed back.
 
 The first start takes minutes — weights download, model load, CUDA-graph capture —
 so it reports progress in vLLM's own words while it waits and writes the full server
