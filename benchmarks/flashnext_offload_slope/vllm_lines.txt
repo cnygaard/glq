@@ -1,0 +1,26 @@
+RESULT label=offload0 batch=1 per_seq_tokps=31.949 n_tokens=256 tokps_range=31.939-31.960 n_repeats=3
+RESULT label=offload24 batch=1 per_seq_tokps=23.472 n_tokens=256 tokps_range=23.460-23.489 n_repeats=3
+RESULT label=offload8 batch=1 per_seq_tokps=28.379 n_tokens=256 tokps_range=28.373-28.383 n_repeats=3
+=== PER-ARM vLLM LINES ===
+--- gate_262144
+[ngram_embedding.py:234] Initialized PLE embedding language_model.model.layers.1.ple.ple_embedding.ngram_embedding: quantization_method=GLQEmbeddingMethod, weight_dtype=torch.bfloat16, weight_device=cpu, pinned=True
+[flash_attn.py:1167] Using FlashAttention version 2
+[model_runner.py:407] Model loading took 48.65 GiB memory and 342.961891 seconds
+[gpu_worker.py:692] Available KV cache memory: 8.24 GiB
+[kv_cache_utils.py:2464] GPU KV cache size: 328,790 tokens, Maximum concurrency for 262,144 tokens per request: 1.25x
+--- gate_offload8
+[ngram_embedding.py:234] Initialized PLE embedding language_model.model.layers.1.ple.ple_embedding.ngram_embedding: quantization_method=GLQEmbeddingMethod, weight_dtype=torch.bfloat16, weight_device=cpu, pinned=True
+[flash_attn.py:1167] Using FlashAttention version 2
+[model_runner.py:407] Model loading took 40.11 GiB memory and 65.432872 seconds
+[gpu_worker.py:692] Available KV cache memory: 16.74 GiB
+[kv_cache_utils.py:2464] GPU KV cache size: 669,429 tokens, Maximum concurrency for 262,144 tokens per request: 2.55x
+--- gate_offload24
+[ngram_embedding.py:234] Initialized PLE embedding language_model.model.layers.1.ple.ple_embedding.ngram_embedding: quantization_method=GLQEmbeddingMethod, weight_dtype=torch.bfloat16, weight_device=cpu, pinned=True
+[flash_attn.py:1167] Using FlashAttention version 2
+[model_runner.py:407] Model loading took 24.22 GiB memory and 87.710471 seconds
+[gpu_worker.py:692] Available KV cache memory: 32.55 GiB
+[kv_cache_utils.py:2464] GPU KV cache size: 1,301,833 tokens, Maximum concurrency for 262,144 tokens per request: 4.97x
+=== HW ===
+NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 1, 16
+Model name:                              Intel(R) Xeon(R) Platinum 8559C
+Mem:             124           3          52           0          70         121

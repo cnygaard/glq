@@ -362,10 +362,12 @@ def main(argv=None) -> int:
                    help=f"fraction of VRAM vLLM may reserve "
                         f"(default {DEFAULT_GPU_MEMORY_UTILIZATION}; the rest stays free "
                         f"for whatever else uses the GPU)")
-    # The offload policy stops once resident fits WEIGHT_FRACTION of VRAM, without asking
-    # whether the headroom it left affords a useful window -- measured on a 23 GiB L4 serving
-    # Flash-Next, it picks 34 GiB and a 32768 context where 42 GiB reaches 262144 and lowers
-    # utilization. This is how to ask for the longer window. `0` serves resident.
+    # glq-chat deliberately does NOT trade decode speed for a longer auto window the way
+    # glq-code does (`window_offload_extra_gib` stays 0): a conversation that never passes a
+    # few thousand tokens would pay PCIe on every token for context it will not fill, and it
+    # prices its window at 8 concurrent requests, so a tier costs eight times what it costs a
+    # single-stream agent. A window the user PINS with --max-model-len still drives the budget.
+    # This flag is how to ask for more anyway; `0` serves resident.
     p.add_argument("--cpu-offload-gb", type=int, default=None, metavar="N",
                    help="GiB of MoE experts to keep in host RAM, overriding the plan "
                         "(0 = none; raising it buys context and costs PCIe decode time)")

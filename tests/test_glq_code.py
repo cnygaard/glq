@@ -346,6 +346,18 @@ def test_all_three_non_resident_counts_reach_the_supervisor(monkeypatch, tmp_pat
     assert made[0]["nontext_bytes"] == 33
 
 
+def test_the_window_for_offload_trade_is_opted_into(monkeypatch, tmp_path):
+    """glq-code buys context with offload; glq-chat does not. The supervisor defaults the trade
+    OFF, so this opt-in is the whole difference between the two front-ends -- and asserting the
+    argument rather than a resulting window is what makes the test fail if the wiring is
+    dropped, since the planner also reaches many windows without spending anything."""
+    from glq.supervisor import WINDOW_OFFLOAD_MAX_EXTRA_GIB
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", QWEN])
+    assert made[0]["window_offload_extra_gib"] == WINDOW_OFFLOAD_MAX_EXTRA_GIB
+    assert WINDOW_OFFLOAD_MAX_EXTRA_GIB > 0
+
+
 def test_cpu_offload_gb_reaches_the_supervisor(monkeypatch, tmp_path):
     """The escape hatch for the offload policy, now that the plan sizes for the window too: a
     session that will never fill the context can keep every token fast with `0`, and a card

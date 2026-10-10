@@ -112,6 +112,29 @@ DEFAULT_CPU_MAX_NUM_SEQS = 4
 _MAX_UTILIZATION = 0.92
 
 
+def kv_headroom_bytes(resident_bytes, vram_bytes) -> int:
+    """KV bytes the card can still hold once this much resident weight, plus its overhead, is in.
+
+    One affordability question asked from two ends, which is why it lives in one place:
+    `plan_max_model_len` asks *which window tier fits this footprint*, and
+    `plan_expert_offload_gib` asks *how much weight must leave for this window to fit*. The
+    same inequality. Inverting `runtime_overhead_bytes` algebraically to answer the second
+    would be a second copy of that formula to keep in step with the next measurement that
+    widens it — and the comment on `_RUNTIME_OVERHEAD_WEIGHT_FRACTION` promises there will be
+    one.
+
+    Measured against `_MAX_UTILIZATION` — what the card *could* give — not against the minimal
+    pool. That distinction is not cosmetic: sizing against the minimal pool leaves 2 GiB of
+    headroom on a 96 GB card and on a 23 GiB one alike, which is what made the window planner
+    inert for exactly the checkpoints it was written for.
+    """
+    if not vram_bytes:
+        return 0
+    resident = max(0, int(resident_bytes or 0))
+    return int(_MAX_UTILIZATION * float(vram_bytes) - resident
+               - runtime_overhead_bytes(resident))
+
+
 def plan_gpu_memory_utilization(*, weights_bytes, vram_bytes, kv_bytes=None):
     """How much of the card vLLM may reserve, sized from the checkpoint.
 
@@ -156,12 +179,20 @@ _PINNED_RAM_FRACTION = 0.5
 
 
 def plan_expert_offload_gib(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
-                            vram_bytes, ram_bytes=None, nontext_bytes=0) -> int:
+                            vram_bytes, ram_bytes=None, nontext_bytes=0,
+                            kv_bytes=0) -> int:
     """GiB of MoE expert weights to hold in host RAM so the remainder fits the card.
 
     Returns 0 — no offload flags at all — whenever the model already fits, so a box that does
     not need this never pays the PCIe cost. Also 0 when any input is unknown or the checkpoint
     declares no offloadable experts: guessing would be worse than serving as before.
+
+    `kv_bytes` is what the served window needs (see `window_kv_bytes`), and passing it is what
+    makes a long window real rather than merely announced. Fitting `WEIGHT_FRACTION` of the
+    card is only the *first* requirement; on a 23 GiB L4 serving Flash-Next it is satisfied at
+    14.86 GiB resident, which leaves 1.85 GiB of KV headroom against the 7.92 GiB a 262144
+    window needs — so vLLM loaded the weights and then refused to start. With the window
+    priced in, the two requirements are taken together and the tighter one wins.
 
     Measured anchors on Qwen3.8-Flash-Next (72.2 GiB of weights, 23.84 GiB of PLE):
     a 24 GiB budget left 24.31 GiB resident and served; 36 GiB left 12.15 GiB.
@@ -176,9 +207,25 @@ def plan_expert_offload_gib(*, weights_bytes, ple_offload_bytes, expert_offload_
     after_ple = (int(weights_bytes) - int(ple_offload_bytes or 0)
                  - int(nontext_bytes or 0))
     need = after_ple - WEIGHT_FRACTION * float(vram_bytes)
+    if need > 0:
+        # The margin belongs to THIS branch only. It is a cushion on a proxy: `WEIGHT_FRACTION`
+        # holds back 25% of the card as a stand-in for KV and activations, so a little more is
+        # prudent. Where `kv_bytes` states the KV outright, `runtime_overhead_bytes` covers the
+        # activations and `_KV_SAFETY_FACTOR` already pads the KV — adding this on top would
+        # double-count a cushion and buy PCIe cost with nothing to show for it.
+        need += _EXPERT_OFFLOAD_MARGIN_BYTES
+    if kv_bytes:
+        # Shed whole GiB until the window fits, asking `kv_headroom_bytes` rather than
+        # inverting the overhead formula; see that function. ~50 iterations at worst.
+        step = 1024**3
+        shed, limit = 0, max(0, math.ceil(after_ple / step))
+        while shed < limit and kv_headroom_bytes(after_ple - shed * step,
+                                                 vram_bytes) < int(kv_bytes):
+            shed += 1
+        need = max(need, shed * step)
     if need <= 0:
         return 0
-    gib = math.ceil((need + _EXPERT_OFFLOAD_MARGIN_BYTES) / 1024**3)
+    gib = math.ceil(need / 1024**3)
     # Never claim more than the checkpoint actually has, or vLLM silently offloads less than
     # we planned for and the footprint prediction is wrong in the dangerous direction.
     gib = min(gib, int(int(expert_offload_bytes) // 1024**3))
@@ -240,6 +287,45 @@ _WINDOW_CONCURRENCY = 8
 _KV_SAFETY_FACTOR = 1.15
 
 
+#: Offload a caller may spend, beyond what fitting the card requires, to reach a longer window.
+#: `0` — the default, and what `glq-chat` uses — means never trade: a chat session at 8k tokens
+#: must not pay PCIe on every token for context it will not fill. `glq-code` opts in, because
+#: for a coding agent the window IS the product.
+#:
+#: The cost is measured rather than assumed — Flash-Next-3bpw-ple4, fixed concurrency B=1,
+#: 3 repeats per arm, two cards:
+#:
+#:     RTX PRO 4500, 31.9 GiB, window 8192     27 GiB  14.496 tok/s
+#:                                             34      13.877   (-4.3%)
+#:                                             42      13.310   (-8.2%)   -> 0.55%/GiB
+#:     RTX PRO 6000, 96 GiB, window 262144      0 GiB  31.949 tok/s
+#:                                              8      28.379  (-11.2%)
+#:                                             24      23.472  (-26.5%)   -> 1.10%/GiB
+#:
+#: **The percentage is not portable and must not be quoted as the cost.** It doubles on the
+#: faster card for the reason a fixed cost always does: the same transfer is a larger share of
+#: a shorter step. What IS stable is the absolute per-token cost — 0.409 ms/GiB on the 4500 and
+#: 0.460-0.493 ms/GiB on the 6000 (three points, essentially linear) — and it is stable because
+#: both boxes are **PCIe 5 x16**, not because it is a property of the GPU.
+#:
+#: The bottleneck is the link, not host memory: PCIe 5 x16 is ~55 GB/s effective against
+#: ~358 GB/s for DDR5-5600 across the 8 channels of the Xeon in that box, a 6.5x margin. Per
+#: token the GPU fetches only the ROUTED experts, which at 0.47 ms/GiB works out to ~26 MB of
+#: traffic per GiB offloaded, i.e. ~2.5% of the offloaded bytes — the routing sparsity. Expect
+#: roughly double on a PCIe 4 box, and more on a model with denser routing.
+#:
+#: So 8 GiB costs ~4.4% where this policy actually fires and ~9% where it does not, and that
+#: asymmetry is structural rather than lucky: the trade only fires on a card too small to hold
+#: the model, which is the slower card with the gentler percentage. A 96 GiB card plans zero
+#: offload and never pays the steep slope that card would charge.
+#:
+#: Still a rail, not a fitted value. On every card checked the declared-expert and pinnable-RAM
+#: caps bind first — a 23 GiB L4 spends 3 GiB, a 32 GiB g7 spends 5 — which is where a
+#: constant resting on two boxes belongs: bounding the unmeasured tail, not deciding the
+#: common case.
+WINDOW_OFFLOAD_MAX_EXTRA_GIB = 8
+
+
 def _fraction_arg(util: float) -> str:
     """A VRAM fraction as it should appear on a command line: three decimals, rounded UP.
 
@@ -293,8 +379,7 @@ def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
     """
     if not weights_bytes or not vram_bytes or not model_max_len:
         return floor
-    headroom = (_MAX_UTILIZATION * vram_bytes - weights_bytes
-                - runtime_overhead_bytes(weights_bytes))
+    headroom = kv_headroom_bytes(weights_bytes, vram_bytes)
     chosen = floor
     for tier in _WINDOW_TIERS:
         if window_kv_bytes(tier, concurrency) <= headroom:
@@ -584,7 +669,8 @@ class VllmSupervisor:
                  max_model_len_floor=DEFAULT_MAX_MODEL_LEN, fp8_kv=False,
                  max_num_seqs=None, device=None, ram_bytes=None,
                  ple_offload_bytes=0, expert_offload_bytes=0, nontext_bytes=0,
-                 window_concurrency=_WINDOW_CONCURRENCY, expert_offload_gib=None):
+                 window_concurrency=_WINDOW_CONCURRENCY, expert_offload_gib=None,
+                 window_offload_extra_gib=0):
         self.model = model
         self.port = int(port)
         self.base_url = base_url or f"http://127.0.0.1:{self.port}/v1"
@@ -600,11 +686,12 @@ class VllmSupervisor:
         #: two window tiers on a 24 GB card. Sound only because this supervisor never enables
         #: speculative decoding, which WOULD load the MTP head.
         self.nontext_bytes = int(nontext_bytes or 0)
-        # An explicit budget wins, exactly as `--gpu-memory-utilization` does: the planner
-        # stops once resident fits `WEIGHT_FRACTION` of VRAM and never asks whether the
-        # headroom it left affords a useful window, so on a 23 GiB L4 it chooses 34 GiB and a
-        # 32768 context where 42 GiB reaches 262144 AND lowers utilization. Until that policy
-        # is settled with a decode measurement, this is how a user asks for the long window.
+        #: How many concurrent requests the window is priced for. 1 for an agent driving a
+        #: single stream, `_WINDOW_CONCURRENCY` for a chat server. Set before the offload plan
+        #: because that plan now prices a window, and a window priced at the wrong concurrency
+        #: is the wrong window.
+        self.window_concurrency = max(1, int(window_concurrency))
+        # An explicit budget wins, exactly as `--gpu-memory-utilization` does.
         #
         # `None` means "plan it"; 0 is a real answer meaning "serve this resident", which is
         # why the two cannot be collapsed.
@@ -613,11 +700,11 @@ class VllmSupervisor:
         if self._expert_offload_forced:
             self.expert_offload_gib = max(0, int(expert_offload_gib))
         elif self.ple_offload_bytes or self.expert_offload_bytes:
-            self.expert_offload_gib = plan_expert_offload_gib(
-                weights_bytes=weights_bytes, ple_offload_bytes=self.ple_offload_bytes,
-                expert_offload_bytes=self.expert_offload_bytes,
-                vram_bytes=vram_bytes, ram_bytes=ram_bytes,
-                nontext_bytes=self.nontext_bytes)
+            self.expert_offload_gib = self._plan_offload(
+                weights_bytes=weights_bytes, vram_bytes=vram_bytes, ram_bytes=ram_bytes,
+                max_model_len=max_model_len, model_max_len=model_max_len,
+                floor=max_model_len_floor,
+                extra_cap=max(0, int(window_offload_extra_gib or 0)))
         resident_bytes = weights_bytes
         if weights_bytes:
             resident_bytes = max(0, int(weights_bytes) - self.ple_offload_bytes
@@ -625,9 +712,6 @@ class VllmSupervisor:
                                  - self.expert_offload_gib * 1024**3)
         self.vllm_bin = vllm_bin or os.path.join(os.path.dirname(sys.executable), "vllm")
         self.extra_args = list(extra_args)
-        #: How many concurrent requests the window is priced for. 1 for an agent driving a
-        #: single stream, `_WINDOW_CONCURRENCY` for a chat server.
-        self.window_concurrency = max(1, int(window_concurrency))
         # The window is decided BEFORE the pool, and the pool is then sized to hold it. The
         # reverse order is what made the window planner inert on exactly the configurations
         # it was written for: the minimal pool leaves 2 GiB of headroom whatever the card, so
@@ -676,6 +760,8 @@ class VllmSupervisor:
             except Exception:                            # noqa: BLE001 - pool falls to 8 GiB
                 ram_bytes = None
         self._ram_bytes = ram_bytes
+        #: Kept so the shortfall note can re-ask the affordability question the plan asked.
+        self._vram_bytes = vram_bytes
         # A --gpu-memory-utilization on the CPU backend would be silently meaningless;
         # remember it so start() can say so once instead of dropping it wordlessly.
         self._ignored_gpu_flag = (self.device == "cpu"
@@ -715,6 +801,7 @@ class VllmSupervisor:
         # bf16 for the architectures where fp16 NaNs or is refused outright.
         # An explicit --dtype in extra_args still wins: vLLM takes the last occurrence.
         dtype = tooling.preferred_dtype(self.model, self.device)
+        self._say_window_shortfall()
         if self.device == "cpu":
             # --gpu-memory-utilization means nothing to the CPU backend, and its
             # fullgraph compile cannot trace the fused CPU decode path — --enforce-eager
@@ -738,6 +825,88 @@ class VllmSupervisor:
                 *self._offload_args(),
                 *kv_compression.serve_args(self.fp8_kv),
                 *self.extra_args]
+
+    def _plan_offload(self, *, weights_bytes, vram_bytes, ram_bytes, max_model_len,
+                      model_max_len, floor, extra_cap) -> int:
+        """Expert offload sized for the served window as well as for the card.
+
+        Two cases, and only the second is a policy question:
+
+        * **A pinned `max_model_len`** is an instruction, not a trade — the user named the
+          window, so it is priced in with no cap and no opt-in. This is the path that was
+          broken: the budget ignored the pinned window, the pool was then sized to hold it and
+          clamped at `_MAX_UTILIZATION`, and vLLM refused at startup.
+        * **An auto window** means spending decode time on context nobody asked for, so it is
+          bounded by `extra_cap` and off unless the caller opts in. See
+          `WINDOW_OFFLOAD_MAX_EXTRA_GIB` for the measured cost.
+        """
+        def budget(kv_bytes):
+            return plan_expert_offload_gib(
+                weights_bytes=weights_bytes, ple_offload_bytes=self.ple_offload_bytes,
+                expert_offload_bytes=self.expert_offload_bytes, vram_bytes=vram_bytes,
+                ram_bytes=ram_bytes, nontext_bytes=self.nontext_bytes, kv_bytes=kv_bytes)
+
+        base = budget(0)
+        if max_model_len is not None:
+            return max(base, budget(window_kv_bytes(max_model_len,
+                                                    self.window_concurrency)))
+        # `model_max_len` unknown means `plan_max_model_len` will return the floor whatever we
+        # do here, so buying a tier would pay PCIe for a window that is never requested.
+        if extra_cap <= 0 or not weights_bytes or not vram_bytes or not model_max_len:
+            return base
+
+        def resident_at(gib):
+            return max(0, int(weights_bytes) - self.ple_offload_bytes
+                       - self.nontext_bytes - gib * 1024**3)
+
+        ceiling = min(int(model_max_len), _WINDOW_TIERS[-1])
+        # Downward, so the answer is the SMALLEST offload reaching the BEST tier. Upward would
+        # land on the declared maximum and pay for GiB that buy no further context: on the g7,
+        # 32 and 38 both serve 262144, and the difference is ~3% of decode for nothing.
+        for tier in sorted((t for t in _WINDOW_TIERS if t <= ceiling), reverse=True):
+            if tier <= floor:
+                break               # at or below the floor the window is already free
+            kv = window_kv_bytes(tier, self.window_concurrency)
+            cand = budget(kv)
+            if cand > base + extra_cap:
+                continue
+            # Not redundant with the search inside `budget`: the declared-expert and
+            # pinnable-RAM caps can clip `cand` BELOW what this tier needs, and accepting a
+            # clipped value would announce a window the card cannot hold.
+            if kv_headroom_bytes(resident_at(cand), vram_bytes) >= kv:
+                return cand
+        return base
+
+    def _window_shortfall_bytes(self) -> int:
+        """How far the plan falls short of holding the window it is about to serve, or 0.
+
+        Only ever non-zero for a window that was PINNED — the auto path refuses a tier it
+        cannot afford, rather than announcing one.
+        """
+        if self.device == "cpu" or not self._vram_bytes or not self.weights_bytes:
+            return 0
+        resident = max(0, int(self.weights_bytes) - self.ple_offload_bytes
+                       - self.nontext_bytes - self.expert_offload_gib * 1024**3)
+        need = window_kv_bytes(self.max_model_len, self.window_concurrency)
+        return max(0, need - kv_headroom_bytes(resident, self._vram_bytes))
+
+    def _say_window_shortfall(self) -> None:
+        """Report a window the plan cannot pay for — without changing it.
+
+        Deliberately a note and not a clamp. `_KV_BYTES_PER_TOKEN` is a conservative envelope
+        over the worst pool ever observed, not a per-model figure, so a window this arithmetic
+        calls unaffordable may well serve; vLLM's own startup check is the authoritative one.
+        Clamping on our estimate would shorten windows that would have worked. Same contract
+        as `--cpu-offload-gb 999`: honored verbatim, reported rather than silently adjusted.
+        """
+        short = self._window_shortfall_bytes()
+        if not short:
+            return
+        self._say(f"  note: --max-model-len {self.max_model_len} needs roughly "
+                  f"{short / 1024**3:.2f} GiB more KV than this card can hold alongside the "
+                  f"weights, so vLLM may refuse to start. Raise --cpu-offload-gb (now "
+                  f"{self.expert_offload_gib}) to move more experts to host RAM, or ask for a "
+                  f"shorter window")
 
     def _offload_args(self) -> list[str]:
         """Expert-offload flags, or nothing at all when the model already fits.
