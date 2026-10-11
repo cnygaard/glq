@@ -81,9 +81,14 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
     - w2_Qidxs, w2_SU, w2_SV, w2_Wscale: same pattern for down_proj
     """
 
-    def __init__(self, quant_config, moe=None):
+    def __init__(self, quant_config, moe=None, prefix: str | None = None):
         super().__init__(moe)
         self.quant_config = quant_config
+        # The layer's own name. `get_quant_method` has it; nothing downstream did, so a
+        # routing trace could not tell two layers apart — and a residency table keyed on a
+        # parsed index would collide decoder layer 0 with mtp.layers.0 (vLLM renumbers the
+        # draft block, the checkpoint does not). Optional so older callers still construct.
+        self.prefix = prefix
         # e8p MoE: register int64 TC-packed buffers + decode via the e8p path.
         # Loading is codebook-agnostic (vLLM's prefix expert-mapping carries the
         # `Qidxs_e8p` suffix; GLQ's shape-based _glq_weight_loader handles the
@@ -755,6 +760,14 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         GLQLinearMethod via the layer_bpw whitelist). ``**kwargs`` absorbs any
         further runner-only kwargs added by newer vLLM versions.
         """
+        # S0: record this forward's routing when asked. Inert by default — `active_trace`
+        # returns None unless GLQ_MOE_TRACE_ROUTING names a path — and it never touches the
+        # compute path, so a traced run and an untraced one produce identical tokens.
+        from .expert_trace import active_trace as _active_trace
+        _tr = _active_trace()
+        if _tr is not None:
+            _tr.record(self.prefix, topk_ids)
+
         if getattr(layer, 'glq_is_trellis', False):
             import os as _os
             from glq import inference_kernel as _ik

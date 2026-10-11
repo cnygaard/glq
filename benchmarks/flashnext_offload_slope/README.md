@@ -11,7 +11,7 @@ concurrency, `ignore_eos` at temperature 0, 256 tokens, warmup discarded, 3 repe
 `Δms/GiB` and `%/GiB` are measured against each card's own first row. Raw records with full
 provenance in `decode_slope.jsonl`; rescued vLLM lines in `vllm_lines.txt`.
 
-| card | window | offload | resident | tok/s | ms/token | Δms/GiB | cummulative % | %/GiB | KV pool | KV tokens | max ctx @c=1 |
+| card | window | offload | resident | tok/s | ms/token | Δms/GiB | cum % | %/GiB | KV pool | KV tokens | max ctx @c=1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | PRO 4500 (32 GiB) | 8192 | 27 | 21.67 | 14.496 | 68.98 | — | — | — | 1.52 | ~60,600 ˟ | 32,768 ˟ |
 | PRO 4500 | 8192 | 34 | 14.60 | 13.877 | 72.06 | 0.440 | 4.3% | 0.610 | 8.54 | ~340,700 ˟ | 262,144 ˟ |

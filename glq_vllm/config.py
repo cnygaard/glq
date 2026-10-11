@@ -335,7 +335,7 @@ class GLQvLLMConfig(QuantizationConfig):
                     if why:
                         raise NotImplementedError(why)
                 from .fused_moe_method import GLQFusedMoEMethod
-                return GLQFusedMoEMethod(self, moe=layer.moe_config)
+                return GLQFusedMoEMethod(self, moe=layer.moe_config, prefix=prefix)
         except (ImportError, AttributeError):
             pass
 

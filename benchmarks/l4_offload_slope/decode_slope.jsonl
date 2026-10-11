@@ -1,0 +1,6 @@
+{"record": "provenance", "card": "NVIDIA L4 (gr6.4xlarge, 23034 MiB, PCIe 4)", "date": "2026-10-11", "vllm": "0.31.0", "model": "xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4-3mtp", "args": "--batches 1 --decode 256 --repeats 3 --max-model-len 4096 --gpu-mem 0.85 --mm0 --dtype bfloat16 --offload-params experts --offload-backend uva", "measure": "per_seq_tokps from benchmarks/run_model.py, B=1, ignore_eos, temperature 0, warmup discarded"}
+{"record": "arm", "offload_requested": 44, "offload_actual": 41.48, "resident_gib": 6.85, "kv_tokens": 81920, "tokps": 6.434, "tokps_lo": 6.434, "tokps_hi": 6.434}
+{"record": "arm", "offload_requested": 40, "offload_actual": 40.3, "resident_gib": 8.03, "kv_tokens": 71338, "tokps": 6.521, "tokps_lo": 6.521, "tokps_hi": 6.521}
+{"record": "arm", "offload_requested": 38, "offload_actual": 38.54, "resident_gib": 9.8, "kv_tokens": 54954, "tokps": 6.653, "tokps_lo": 6.653, "tokps_hi": 6.653}
+{"record": "arm", "offload_requested": 36, "offload_actual": 36.18, "resident_gib": 12.15, "kv_tokens": 33450, "tokps": 6.834, "tokps_lo": 6.832, "tokps_hi": 6.836}
+{"record": "arm", "offload_requested": 32, "offload_actual": 32.36, "resident_gib": 15.98, "kv_tokens": null, "tokps": null, "note": "refused: No available memory for the cache blocks at --gpu-mem 0.85"}
