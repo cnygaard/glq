@@ -63,6 +63,10 @@ def main(argv=None) -> int:
                     help="score the slot count a VRAM arena of this size affords")
     ap.add_argument("--blob-mib", type=float, default=_DEFAULT_BLOB_MIB,
                     help=f"MiB per expert blob (default {_DEFAULT_BLOB_MIB}, Flash-Next 3bpw)")
+    ap.add_argument("--per-routing", action="store_true",
+                    help="score the OLD per-routing policy instead of the step policy the "
+                         "live arena runs (which protects the slots a step reads). The "
+                         "per-routing form under-reports; kept only to reproduce S0.")
     ap.add_argument("--phase", default="decode", choices=PHASES,
                     help="which forwards to score (default decode — 'all' is dominated by "
                          "vLLM's dummy profiling pass and reports ~2x the truth)")
@@ -134,7 +138,8 @@ def main(argv=None) -> int:
                 if not per_layer_mode and ev is not None:
                     continue          # the global counter is the baseline; don't cross it
                 r = score_trace(recs, n_layers=n_layers, n_experts=n_experts, slots=slots,
-                                per_layer=per_layer_mode, eviction=ev)
+                                per_layer=per_layer_mode, eviction=ev,
+                                step_mode=not args.per_routing)
                 print(f"  {slots:>7} {slots // max(n_layers, 1):>7}  "
                       f"{'per-layer' if per_layer_mode else 'GLOBAL':<10} "
                       f"{ev or 'none':<9} {r.hit_rate:>9.4f}  {r.evictions:>10}  "

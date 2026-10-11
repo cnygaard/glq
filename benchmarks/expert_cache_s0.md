@@ -68,6 +68,48 @@ phase the 6.517 tok/s baseline measures, so it is the only phase the decision ca
 The general lesson is the one this repo keeps relearning: a benchmark that silently includes a
 warmup or profiling artifact does not fail, it just answers a different question convincingly.
 
+## ⚠ Update (S1): these rates were scored with the wrong semantics, and are a floor
+
+The table below scored **per-routing** admission (`lookup_or_admit`), which is what the
+offline policy did when S0 was written. The live arena cannot work that way: a per-routing
+admit can hand out as an eviction candidate a slot that a *later routing of the same step* is
+about to read, and because the fused op reads the arena **after** the fill, the matmul would
+then read a slot holding a different expert — plausible output from the wrong weights.
+
+So `ResidencyPolicy.plan_step` resolves a whole step at once and protects the slots that step
+reads. Minimal demonstration of the difference, 2 slots, warm `{A, B}`, step `[C, A]`:
+per-routing scores **0 hits / 2 misses**, step semantics **1 / 1**.
+
+Because protection strictly avoids evicting a would-be hit, **step semantics is never worse**,
+so every rate below is a floor. Re-scored on the same trace (`--per-routing` reproduces the old
+column):
+
+| slots/layer | per-routing | step (live) | delta |
+|--:|--:|--:|--:|
+| 16 | 0.3823 | 0.4159 | +0.0335 |
+| 32 | 0.5409 | 0.5540 | +0.0131 |
+| 64 | 0.6959 | 0.7019 | +0.0061 |
+| 92 | 0.7791 | 0.7824 | +0.0033 |
+| **120** | 0.8311 | **0.8325** | +0.0014 |
+| 185 | 0.8916 | 0.8919 | +0.0003 |
+
+The gap closes as the arena grows, which is the signature of a pathology that needs a tight
+cache to bite. At the shipping rung it is +0.0014, so **S0's conclusion is unchanged** and the
+prediction moves 1.58× → **1.59×**.
+
+At the corrected blob size (1,850,900 B — the arena excludes the per-layer `SV`, see
+`moe_shapes.bytes_per_slot`), 10 GiB is exactly **120 slots/layer**, and the live policy
+comparison there is:
+
+| admission | eviction | hit rate | evictions |
+|---|---|--:|--:|
+| GLOBAL | none | 0.5341 | 0 |
+| per-layer | none | 0.5421 | 0 |
+| per-layer | **LRU** | **0.8327** | 23,765 |
+| per-layer | LFU | 0.8062 | 28,451 |
+
+LRU still beats LFU under live semantics, so S0's policy choice stands.
+
 ## The decode-only curve
 
 Replayed through the same `ResidencyPolicy` the live cache would use, so the number means

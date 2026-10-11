@@ -148,11 +148,11 @@ class ResidencyPolicy:
 
         if self.eviction is None:
             return None
-        victim = self._pick_victim(lo, hi)
-        if victim is None:
+        candidate = self._pick_eviction_candidate(lo, hi)
+        if candidate is None:
             return None
-        self._evict(victim)
-        return self._claim(key, victim)
+        self._evict(candidate)
+        return self._claim(key, candidate)
 
     def _claim(self, key: tuple[int, int], slot: int) -> int:
         self._residency[key] = slot
@@ -167,14 +167,14 @@ class ResidencyPolicy:
             self._residency.pop(owner, None)
             self.evictions += 1
 
-    def _pick_victim(self, lo: int, hi: int) -> int | None:
+    def _pick_eviction_candidate(self, lo: int, hi: int) -> int | None:
         """Least-recently-used or least-frequently-used slot **within this layer's range
         only** — evicting across a layer boundary would corrupt another layer's residency."""
         best, best_key = None, None
         for slot in range(lo, hi):
             owner = self._slot_owner.get(slot)
             if owner is None:
-                return slot                              # an unclaimed slot needs no victim
+                return slot                              # an unclaimed slot needs no candidate
             rank = (self._used.get(owner, 0) if self.eviction == "lru"
                     else self._count.get(owner, 0))
             if best_key is None or rank < best_key:
@@ -194,6 +194,91 @@ class ResidencyPolicy:
         self.misses += 1
         admitted = self.admit(layer, expert)
         return (admitted if admitted is not None else NOT_RESIDENT), False
+
+    # ---- step semantics, which is what the live arena must use ----------
+
+    def _slot_last_use(self, slot: int) -> int:
+        """Use stamp of whatever occupies `slot`; 0 for never-claimed.
+
+        0 sorts first, so an empty slot is always preferred over an occupied one — the same
+        preference `_pick_eviction_candidate` expresses by returning an unclaimed slot immediately.
+        """
+        owner = self._slot_owner.get(slot)
+        return self._used.get(owner, 0) if owner is not None else 0
+
+    def _slot_count(self, slot: int) -> int:
+        """Routing count of whatever occupies `slot`; 0 for never-claimed (so it sorts
+        first, same preference as `_slot_last_use`)."""
+        owner = self._slot_owner.get(slot)
+        return self._count.get(owner, 0) if owner is not None else 0
+
+    def plan_step(self, layer: int, expert_ids) -> tuple[list[int], list[int]]:
+        """Resolve a whole step's routings at once: `(slot_of_routing, experts_to_fill)`.
+
+        **Why this exists next to `lookup_or_admit`, rather than replacing it.** The two are
+        genuinely different policies, and only this one is safe for the arena:
+
+        `lookup_or_admit` admits one routing at a time, and can hand out as a candidate a slot
+        that a *later routing of the same step* is about to read. Offline that merely costs a
+        hit (measured: slots=2, warm {A,B}, step `[C, A]` scores **0 hits / 2 misses** where
+        this method scores 1/1). **Live it would be a correctness bug**: the fused op reads the
+        arena after the fill, so the matmul would read a slot holding a different expert —
+        plausible output from the wrong weights.
+
+        So a step's hit slots are protected from candidate selection, misses are admitted in
+        **first-appearance order** (the order `lookup_or_admit` would have used), and one slot
+        serves every routing of a repeated expert. Because protection strictly avoids evicting
+        a would-be hit, this policy's hit rate is **>= the per-routing one** — S0's 0.8233 is
+        therefore a conservative floor for what the arena achieves.
+        """
+        ids = [int(e) for e in expert_ids]
+        lo, hi = self.layer_slot_range(layer)
+        if hi - lo < len(ids):
+            raise ValueError(
+                f"{len(ids)} routings in one step cannot be served by {hi - lo} slots for "
+                f"layer {layer}: every expert routed in a step must be resident "
+                f"simultaneously, so a larger step would evict a routing before it is read.")
+
+        slots = [self.slot_of(layer, e) for e in ids]
+        protected = {s for s in slots if s != NOT_RESIDENT}
+
+        wanted: dict[int, int] = {}                 # expert -> first routing position
+        for pos, (e, s) in enumerate(zip(ids, slots)):
+            if s == NOT_RESIDENT and e not in wanted:
+                wanted[e] = pos
+
+        if wanted:
+            free = [sl for sl in range(lo, hi)
+                    if sl not in protected and sl not in self._slot_owner]
+            if self.eviction is None:
+                # Scoring-only configuration: the baseline a real policy has to beat. The
+                # live arena cannot run this — exactness needs every routed expert in the
+                # arena, so a routing that gets no slot has nowhere to read from.
+                cands = [(0, sl) for sl in free]
+            else:
+                rank = (self._slot_last_use if self.eviction == "lru"
+                        else self._slot_count)
+                cands = sorted((rank(sl), sl) for sl in range(lo, hi)
+                               if sl not in protected)
+            for (e, _pos), (_u, candidate) in zip(wanted.items(), cands):
+                owner = self._slot_owner.pop(candidate, None)
+                if owner is not None:
+                    self._residency.pop(owner, None)
+                    self.evictions += 1
+                key = (layer, e)
+                self._residency[key] = candidate
+                self._slot_owner[candidate] = key
+                self.admissions += 1
+
+        slots = [self.slot_of(layer, e) for e in ids]
+        # Stamp in routing order so intra-step recency is defined, and a repeated expert's
+        # stamp is its LAST use.
+        for e in ids:
+            self.touch(layer, e)
+        missed = sum(1 for e in ids if e in wanted)
+        self.hits += len(ids) - missed
+        self.misses += missed
+        return slots, list(wanted)
 
     @property
     def admitted_per_layer(self) -> list[int]:
@@ -232,7 +317,8 @@ class ScoreResult:
 
 
 def score_trace(trace, n_layers: int, n_experts: int, slots: int,
-                per_layer: bool = True, eviction: str | None = None) -> ScoreResult:
+                per_layer: bool = True, eviction: str | None = None,
+                step_mode: bool = False) -> ScoreResult:
     """Replay `trace` — an iterable of `(layer, [expert ids])` — through `ResidencyPolicy`.
 
     This is S0: it answers "what hit rate would a cache of this size reach on GLQ's actual
@@ -243,6 +329,19 @@ def score_trace(trace, n_layers: int, n_experts: int, slots: int,
     pol = ResidencyPolicy(n_layers=n_layers, n_experts=n_experts, slots=slots,
                           per_layer=per_layer, eviction=eviction)
     lookups = 0
+    if step_mode:
+        # What the LIVE arena does: resolve a whole record's routings at once, protecting the
+        # slots this step reads. Strictly >= the per-routing rate, because the per-routing
+        # form can evict a slot a later routing of the same step needs. Measured on real
+        # decode routing: +0.0335 at 16 slots/layer, +0.0014 at 120 — the gap closes as the
+        # arena grows, since the pathology needs a tight cache to bite.
+        for layer, ids in trace:
+            lookups += len(ids)
+            pol.plan_step(int(layer), ids)
+        return ScoreResult(slots=slots, per_layer=per_layer, eviction=eviction,
+                           lookups=lookups, hits=pol.hits, misses=pol.misses,
+                           admissions=pol.admissions, evictions=pol.evictions,
+                           admitted_per_layer=pol.admitted_per_layer)
     for layer, ids in trace:
         for e in ids:
             lookups += 1
