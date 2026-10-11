@@ -98,7 +98,7 @@ def test_a_10_GiB_budget_buys_120_slots_per_layer():
 def test_slots_scale_with_the_budget_and_never_exceed_the_expert_count():
     assert slots_for_budget(8 * 1024**3, n_layers=FN_LAYERS, **FN) == 96
     assert slots_for_budget(11 * 1024**3, n_layers=FN_LAYERS, **FN) == 132
-    # Past full residency there is nothing left to cache; more slots would be dead VRAM.
+    # Past full residency there is nothing left to cache; more slots would be idle VRAM.
     huge = slots_for_budget(400 * 1024**3, n_layers=FN_LAYERS,
                             n_experts=FN_EXPERTS, **FN)
     assert huge == FN_EXPERTS

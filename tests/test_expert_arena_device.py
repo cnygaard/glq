@@ -107,14 +107,15 @@ def test_a_fill_copies_the_missing_experts_byte_for_byte():
 @cuda_only
 def test_a_HIT_leaves_the_slot_untouched_and_moves_no_bytes():
     """★ The saving. A hit must issue no load from the source — that is why the kernel early
-    returns rather than copying unconditionally. Proven by poisoning the source after the
-    first fill: if a hit re-copied, the poison would appear in the arena."""
+    returns rather than copying unconditionally. Shown by overwriting the source with a
+    sentinel after the first fill: if a hit re-copied, the sentinel would appear in the
+    arena."""
     src = _sources(device="cuda")
     a = ExpertArena(_decision(8), src, n_experts=16)
     a.fill(plan_step(a.state, torch.tensor([3], dtype=torch.int32, device="cuda")))
     before = a.buffers["w13_trellis_packed"].clone()
 
-    src["w13_trellis_packed"].fill_(-123)          # poison the SOURCE only
+    src["w13_trellis_packed"].fill_(-123)          # overwrite the SOURCE only
     plan = plan_step(a.state, torch.tensor([3], dtype=torch.int32, device="cuda"))
     assert int(plan.fill_src[0]) < 0, "expert 3 should be resident now"
     a.fill(plan)
