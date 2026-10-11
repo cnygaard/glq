@@ -198,3 +198,24 @@ def test_manifest_is_valid_json_with_the_run_key(tmp_path):
         m = json.load(f)
     assert m["run_key"] == "rk-abc"
     assert "0" in m["layers"] and "sha256" in m["layers"]["0"]
+
+
+def test_mtp_bpw_is_in_the_run_key():
+    """A 3 bpw draft head and an 8 bpw one produce different weights from otherwise
+    identical settings, so they must not share a manifest — resuming across them would
+    blend two head configurations into one checkpoint with nothing erroring."""
+    base = dict(model="m", codebook="trellis", bpw=4, nsamples=128, seqlen=2048,
+                variant="3inst", sd_prefix="model.layers", version="0.8.2", bpw_map=None)
+    k3 = R.compute_run_key(**base, mtp_bpw=3)
+    assert k3 == R.compute_run_key(**base, mtp_bpw=3)
+    assert R.compute_run_key(**base, mtp_bpw=8) != k3
+
+
+def test_not_quantizing_the_mtp_head_keeps_the_existing_run_key():
+    """Backward compatibility, and it is load-bearing rather than cosmetic: run keys address
+    the S3 manifest, so unconditionally adding a field would orphan every store already up
+    there — a resumable 77 GiB Flash-Next run would silently restart from layer 0. Omitting
+    the field when there is no draft head keeps those keys addressable."""
+    base = dict(model="m", codebook="trellis", bpw=4, nsamples=128, seqlen=2048,
+                variant="3inst", sd_prefix="model.layers", version="0.8.2", bpw_map=None)
+    assert R.compute_run_key(**base, mtp_bpw=None) == R.compute_run_key(**base)

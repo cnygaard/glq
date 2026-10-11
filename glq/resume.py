@@ -27,7 +27,8 @@ import json
 import os
 import tempfile
 
-__all__ = ["ResumeStore", "ResumeKeyMismatch", "compute_run_key",
+__all__ = ["ResumeStore", "ResumeKeyMismatch", "compute_run_key", "shard_from_checkpoint",
+           "detect_sd_prefix", "derive_run_key",
            "dequantize_artifacts"]
 
 _MANIFEST = "manifest.json"
@@ -38,19 +39,28 @@ class ResumeKeyMismatch(RuntimeError):
 
 
 def compute_run_key(*, model, codebook, bpw, nsamples, seqlen, variant, sd_prefix,
-                    version, bpw_map=None):
+                    version, bpw_map=None, mtp_bpw=None):
     """Stable digest of every setting that changes the produced weights.
 
     Resuming a 4 bpw manifest into a 3 bpw run would blend two configurations into one
     checkpoint without erroring anywhere, so the key must cover anything that alters
     output. Extra settings are cheap to add here and expensive to discover later.
+
+    ``mtp_bpw`` is added **only when set**, which is deliberate and not merely tidy: the key
+    addresses the S3 manifest, so unconditionally widening the payload would change every
+    existing key and orphan the stores already uploaded — a resumable 77 GiB run would
+    restart from layer 0 with nothing reporting why. A checkpoint with no draft head
+    therefore keeps the digest it has always had.
     """
-    payload = json.dumps({
+    fields = {
         "model": str(model), "codebook": str(codebook), "bpw": bpw,
         "nsamples": nsamples, "seqlen": seqlen, "variant": str(variant),
         "sd_prefix": str(sd_prefix), "version": str(version),
         "bpw_map": bpw_map if bpw_map is None else dict(sorted(bpw_map.items())),
-    }, sort_keys=True, separators=(",", ":"))
+    }
+    if mtp_bpw is not None:
+        fields["mtp_bpw"] = int(mtp_bpw)
+    payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
@@ -297,3 +307,235 @@ def dequantize_artifacts(arts, in_features, out_features, codebook_type,
             f"E8RHTLinear(codebook_type={codebook_type!r}) — the shard was written by a "
             "different codebook or glq version than this run.")
     return mod.dequantize()
+
+
+def shard_from_checkpoint(*, checkpoint_dir, store, sd_prefix, layers=None,
+                          verbose=True):
+    """Rebuild resume shards from a finished GLQ checkpoint. ``-> {layer indices written}``.
+
+    A 77 GiB quantize is hours of GPU time, and for a published model that work already
+    exists on HuggingFace. Re-sharding it into the resume layout lets a new run replay the
+    finished layers and quantize only what is new — adding the MTP draft head, say — rather
+    than starting at layer 0.
+
+    This is re-sharding, not conversion: the resume shard layout is deliberately the same
+    flattening the final checkpoint uses (``f"{layer_prefix}.{key}"``), so the tensors go
+    across untouched and ``load_layer`` reassembles them by the same prefix split.
+
+    **``layer_metrics.json`` is the authority on what is quantized**, rather than a list of
+    artifact names kept in sync by hand: the checkpoint ships one entry per quantized matrix
+    (24,576 of them are per-expert on Flash-Next), so a prefix is quantized exactly when it
+    appears there. That also recovers ``metrics`` and the ``proxy_loss`` the mixed-precision
+    allocator needs, which no amount of tensor-name inspection could.
+
+    The run_key is the caller's: it must match the run that will resume, and `ResumeStore`
+    refuses a mismatch rather than blending two configurations.
+    """
+    import re                                              # noqa: PLC0415
+    from safetensors import safe_open                      # noqa: PLC0415
+
+    metrics_path = os.path.join(checkpoint_dir, "layer_metrics.json")
+    if not os.path.exists(metrics_path):
+        raise ValueError(
+            f"{checkpoint_dir} has no layer_metrics.json, so there is no record of which "
+            "matrices were quantized or what their proxy_loss was. Both are needed to "
+            "resume; a checkpoint without it cannot be re-sharded.")
+    with open(metrics_path) as f:
+        all_metrics = json.load(f)
+
+    shard_files = sorted(f for f in os.listdir(checkpoint_dir)
+                         if f.endswith(".safetensors"))
+    if not shard_files:
+        raise ValueError(f"{checkpoint_dir} contains no .safetensors files")
+
+    # prefix -> layer index, for the quantized prefixes under this sd_prefix only.
+    pat = re.compile(rf"^{re.escape(sd_prefix)}\.(\d+)\.")
+    prefix_layer = {}
+    for prefix in all_metrics:
+        m = pat.match(prefix)
+        if m:
+            prefix_layer[prefix] = int(m.group(1))
+    if not prefix_layer:
+        raise ValueError(
+            f"no quantized prefix in layer_metrics.json starts with sd_prefix "
+            f"{sd_prefix!r} (saw e.g. {next(iter(all_metrics), '<empty>')!r}). A wrapped "
+            "checkpoint uses 'model.language_model.layers'; a plain one 'model.layers'. "
+            "Raising rather than writing an empty store, which would look like success and "
+            "send the run back to layer 0 at full cost.")
+
+    want = None if layers is None else set(layers)
+    # layer -> prefix -> {artifact key: tensor}
+    by_layer: dict[int, dict] = {}
+    for sf in shard_files:
+        with safe_open(os.path.join(checkpoint_dir, sf), framework="pt") as fh:
+            for key in fh.keys():
+                if "." not in key:
+                    continue
+                prefix, art = key.rsplit(".", 1)
+                idx = prefix_layer.get(prefix)
+                if idx is None:
+                    continue           # unquantized (norms, embeddings) or another prefix
+                if want is not None and idx not in want:
+                    continue
+                by_layer.setdefault(idx, {}).setdefault(prefix, {})[art] = (
+                    fh.get_tensor(key))
+
+    written = set()
+    for idx in sorted(by_layer):
+        arts = by_layer[idx]
+        metrics = {p: all_metrics[p] for p in arts if p in all_metrics}
+        losses = {p: m["proxy_loss"] for p, m in metrics.items() if "proxy_loss" in m}
+        store.save_layer(idx, arts, metrics=metrics, proxy_losses=losses)
+        written.add(idx)
+        if verbose:
+            print(f"  layer {idx}: {len(arts)} matrices re-sharded")
+    if verbose:
+        print(f"re-sharded {len(written)} layers into {store.local_dir}")
+    return written
+
+
+def detect_sd_prefix(checkpoint_dir):
+    """The checkpoint's own decoder-layer prefix, read off ``layer_metrics.json``.
+
+    Asking the caller invites the one mistake that actually bites — ``model.layers`` against a
+    wrapped ``model.language_model.layers`` checkpoint — and the answer is in the file.
+
+    Splits on the **first** numeric segment, not the last: a per-expert prefix like
+    ``model.language_model.layers.0.mlp.experts.0.gate_proj`` carries two, and the decoder
+    index is the outer one. A greedy match returns ``...layers.0.mlp.experts``, which then
+    groups every expert of every layer under "layer 0". Whichever prefix covers the most
+    entries wins, so a stray non-layer key cannot outvote the decoder.
+    """
+    import re                                              # noqa: PLC0415
+    from collections import Counter                        # noqa: PLC0415
+
+    with open(os.path.join(checkpoint_dir, "layer_metrics.json")) as f:
+        metrics = json.load(f)
+    counts = Counter()
+    for prefix in metrics:
+        m = re.match(r"^(.*?)\.(\d+)\.", prefix)
+        if m:
+            counts[m.group(1)] += 1
+    if not counts:
+        raise ValueError(
+            f"no prefix in {checkpoint_dir}/layer_metrics.json looks like "
+            "'<something>.<N>.<sublayer>', so the decoder-layer prefix cannot be detected; "
+            "pass sd_prefix explicitly.")
+    return counts.most_common(1)[0][0]
+
+
+def derive_run_key(checkpoint_dir, version=None, sd_prefix=None, mtp_bpw=None):
+    """Run key for a run that will RESUME from this checkpoint.
+
+    Every field `compute_run_key` hashes is recorded in the checkpoint — codebook, bpw,
+    nsamples, seqlen and source_model in ``quantize_config.json``, variant in
+    ``config.json``'s ``quantization_config`` — except the glq version, which must be the
+    version of the resuming run rather than the older one that produced the published
+    weights. Deriving beats asking: a mistyped ``nsamples`` yields a store the resuming run
+    refuses, and it refuses it after the download.
+
+    ``mtp_bpw`` declares that the resuming run will quantize the MTP draft head, because the
+    key covers that too — without it, a store built here is refused by a run launched with
+    ``--mtp-bpw``, which breaks the one workflow this tool exists for. Note what is being
+    recorded: the shards hold decoder layers only, and the MTP post-pass runs after the loop
+    and is never checkpointed, so this changes no stored byte. It declares intent so the two
+    keys agree.
+    """
+    with open(os.path.join(checkpoint_dir, "quantize_config.json")) as f:
+        qc = json.load(f)
+    cfg_path = os.path.join(checkpoint_dir, "config.json")
+    variant = None
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            variant = json.load(f).get("quantization_config", {}).get("variant")
+
+    bpw = qc["bpw"]
+    if float(bpw) != int(bpw):
+        raise ValueError(
+            f"{checkpoint_dir} was quantized at a fractional (mixed-precision) bpw "
+            f"{bpw}. The run key hashes the bpw_map handed IN to the allocator, and the "
+            "checkpoint records only the per-layer assignment that came out, so the key "
+            "cannot be reconstructed. Guessing would address the wrong manifest while "
+            "looking correct. Pass run_key explicitly if you know it.")
+
+    if version is None:
+        from . import __version__ as version                # noqa: PLC0415
+    return compute_run_key(
+        model=qc["source_model"], codebook=qc["codebook"], bpw=int(bpw),
+        nsamples=qc["nsamples"], seqlen=qc["seqlen"], variant=variant,
+        sd_prefix=sd_prefix or detect_sd_prefix(checkpoint_dir),
+        version=version, bpw_map=None, mtp_bpw=mtp_bpw)
+
+
+def build_import_parser():
+    """CLI for re-sharding a published checkpoint into a resume store.
+
+    Only ``--checkpoint`` and ``--store-dir`` are required: everything the run key hashes is
+    derived from the checkpoint's own config, because those values must match the resuming
+    run exactly and hand-entering them is the failure this tool exists to avoid. The rest are
+    escape hatches for the cases derivation cannot cover (a mixed-precision checkpoint, an
+    unusual layer prefix).
+    """
+    import argparse                                        # noqa: PLC0415
+
+    p = argparse.ArgumentParser(
+        prog="python -m glq.resume",
+        description="Rebuild a GLQ resume store from a finished checkpoint, so a new "
+                    "quantize run replays the published layers instead of redoing them.")
+    p.add_argument("--checkpoint", required=True,
+                   help="HF repo id or local directory of the finished GLQ checkpoint")
+    p.add_argument("--store-dir", required=True,
+                   help="where to write the shards; point the resuming run's "
+                        "<output>/_resume at this, or use --bucket to mirror it")
+    p.add_argument("--bucket", default=None,
+                   help="S3 bucket to mirror the shards into, for --resume-bucket")
+    p.add_argument("--prefix", default="", help="key prefix within the bucket")
+    p.add_argument("--run-key", default=None,
+                   help="override the derived run key (needed for a mixed-precision "
+                        "checkpoint, whose key cannot be reconstructed)")
+    p.add_argument("--sd-prefix", default=None,
+                   help="override the detected decoder-layer prefix")
+    p.add_argument("--mtp-bpw", type=int, default=None,
+                   help="the --mtp-bpw the resuming run will use. The run key covers it, so "
+                        "without this a store built here is refused by a run that quantizes "
+                        "the draft head — which is the main reason to build one. Declares "
+                        "intent only: the shards are decoder layers and are unaffected")
+    p.add_argument("--layers", default=None,
+                   help="comma-separated subset, e.g. 0,1,2 — a cheap dry run before "
+                        "committing to the full re-shard")
+    return p
+
+
+def main(argv=None):
+    p = build_import_parser()
+    args = p.parse_args(argv)
+
+    path = args.checkpoint
+    if not os.path.isdir(path):
+        from huggingface_hub import snapshot_download       # noqa: PLC0415
+        print(f"downloading {path} ...")
+        # The weights are the bulk and they are all needed; no allow_patterns.
+        path = snapshot_download(repo_id=path)
+
+    sd_prefix = args.sd_prefix or detect_sd_prefix(path)
+    run_key = args.run_key or derive_run_key(path, sd_prefix=sd_prefix,
+                                             mtp_bpw=args.mtp_bpw)
+    print(f"sd_prefix = {sd_prefix}")
+    print(f"run_key   = {run_key}")
+    print("  the resuming run must produce this same key, which means the same model, "
+          "codebook, bpw, nsamples, seqlen, variant AND glq version. It prints its own "
+          "key at startup; if they differ the store is refused rather than blended.")
+
+    store = ResumeStore(local_dir=args.store_dir, run_key=run_key,
+                        bucket=args.bucket, prefix=args.prefix)
+    layers = None
+    if args.layers:
+        layers = [int(x) for x in args.layers.split(",") if x.strip()]
+    written = shard_from_checkpoint(checkpoint_dir=path, store=store,
+                                    sd_prefix=sd_prefix, layers=layers)
+    print(f"next_layer() = {store.next_layer()} "
+          f"({len(written)} layer(s) now checkpointed)")
+
+
+if __name__ == "__main__":
+    main()

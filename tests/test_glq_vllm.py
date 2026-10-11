@@ -1395,3 +1395,82 @@ def test_glq_shard_loader_normalizes_group_shard_ids():
     q = torch.zeros(4, 16, dtype=torch.int16)
     layer2.trellis_packed._glq_shard_loader(layer2.trellis_packed, q, shard_id="q")
     assert torch.equal(layer2.trellis_packed.get_shard(0), q)
+
+
+# ---- the MoE whitelist: unquantized MoE layers must not be claimed ----------------------
+
+def _moe_layer_cls():
+    """vLLM's weight-holding MoE layer, under either of its two names.
+
+    0.25 split the 0.23 ``FusedMoE`` nn.Module into a factory function plus ``RoutedExperts``;
+    `get_quant_method` receives the latter. Mirrors the lookup in `GLQvLLMConfig`.
+    """
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        return RoutedExperts
+    except ImportError:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        return FusedMoE
+
+
+@requires_vllm
+def test_an_unquantized_moe_layer_is_not_claimed():
+    """The MTP head's experts are NOT quantized — `quantize_model._is_nontext` classifies the
+    whole `mtp.*` segment as non-text, so those tensors pass through in their original layout.
+    The linear branch already declines layers absent from `layer_bpw`; the MoE branch did not,
+    so it claimed the MTP experts and created GLQ buffers while the checkpoint carried raw
+    `down_proj`. The result, measured on an L4 with vLLM 0.31.0:
+
+        AttributeError: Layer mtp.layers.48.mlp.experts has no parameter 'w2_weight'
+                        for checkpoint weight 'mtp.layers.48.mlp.experts.down_proj'
+
+    Declining the layer lets vLLM install its own unquantized MoE method, which creates the
+    `w13_weight`/`w2_weight` the MTP loader expects. This is what makes
+    `--speculative-config '{"method":"mtp",...}'` loadable at all."""
+    from glq_vllm.config import GLQvLLMConfig
+
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel",
+        # a real checkpoint enumerates only the layers it quantized; mtp.* is absent
+        "layer_bpw": {"model.layers.0.mlp.experts": 3},
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    assert cfg.get_quant_method(layer, "mtp.layers.48.mlp.experts") is None, (
+        "glq_vllm claimed an MoE layer the checkpoint never quantized; vLLM will then look "
+        "for GLQ buffers that do not exist")
+
+
+@requires_vllm
+def test_a_quantized_moe_layer_is_still_claimed():
+    """The no-regression half, and it covers every MoE serve we have: the main decoder's
+    experts ARE in layer_bpw and must keep getting the GLQ method."""
+    from glq_vllm.config import GLQvLLMConfig
+    from glq_vllm.fused_moe_method import GLQFusedMoEMethod
+
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel",
+        "layer_bpw": {"model.layers.0.mlp.experts": 3},
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()          # only read once the layer is claimed
+    method = cfg.get_quant_method(layer, "model.layers.0.mlp.experts")
+    assert isinstance(method, GLQFusedMoEMethod)
+
+
+@requires_vllm
+def test_an_empty_layer_bpw_still_claims_moe_layers():
+    """Older checkpoints enumerate nothing, and the guard must behave exactly as the linear
+    branch's `if self.layer_bpw and ...` does: with no map there is nothing to be absent from,
+    so the layer is claimed. Dropping this would stop every pre-layer_bpw MoE checkpoint from
+    serving."""
+    from glq_vllm.config import GLQvLLMConfig
+    from glq_vllm.fused_moe_method import GLQFusedMoEMethod
+
+    cfg = GLQvLLMConfig.from_config({"bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel"})
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()
+    assert isinstance(cfg.get_quant_method(layer, "anything.mlp.experts"),
+                      GLQFusedMoEMethod)

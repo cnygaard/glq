@@ -237,6 +237,25 @@ class GLQvLLMConfig(QuantizationConfig):
                 from vllm.model_executor.layers.fused_moe.layer import (
                     FusedMoE as _MoELayer)       # vLLM <= 0.23
             if isinstance(layer, _MoELayer):
+                # Same guard the LinearBase branch above applies, and for the same reason: a
+                # layer absent from `layer_bpw` was NOT quantized, so claiming it makes vLLM
+                # look for GLQ buffers the checkpoint does not contain. Until MTP nothing
+                # exercised an unquantized MoE layer, so this was missing here.
+                #
+                # The MTP head is the case: `quantize_model._is_nontext` classifies the whole
+                # `mtp.*` segment as non-text and passes those tensors through untouched, so
+                # with `--speculative-config '{"method":"mtp",...}'` vLLM builds the draft
+                # model's MoE and died on
+                #
+                #   AttributeError: Layer mtp.layers.48.mlp.experts has no parameter
+                #                   'w2_weight' for checkpoint weight '...experts.down_proj'
+                #
+                # Returning None lets vLLM install its own unquantized MoE method, which
+                # creates the w13_weight/w2_weight its MTP loader expects. Guarded on
+                # `self.layer_bpw` being non-empty so pre-layer_bpw checkpoints — which
+                # enumerate nothing and quantize everything — keep being claimed.
+                if self.layer_bpw and self._lookup_bpw(prefix) is None:
+                    return None
                 from vllm.platforms import current_platform
                 if getattr(current_platform, "device_type", "") == "cpu":
                     # Trellis MoE serves on CPU through the per-expert fallback

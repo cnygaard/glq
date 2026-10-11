@@ -130,8 +130,74 @@ def _is_nontext(name: str) -> bool:
     return name.split(".")[0] in _NONTEXT_HEAD_SEGMENTS
 
 
-def _offloadable_bytes(state_dict: dict) -> tuple[int, int, int]:
+#: Stacked routed-expert tensors, which arrive as one `[num_experts, ...]` parameter rather
+#: than a 2-D matrix and must be unstacked per expert before quantizing — the same shape the
+#: main decoder's MoE path already handles.
+_STACKED_EXPERT_LEAVES = ("gate_up_proj", "down_proj")
+
+
+def resolve_mtp_bpw(flag, model_bpw) -> int:
+    """Bits per weight for the MTP draft head.
+
+    Defaults to the model's own bpw: one rung for the whole checkpoint keeps `layer_bpw`, the
+    config and the footprint accounting simple. The flag exists because the draft's fidelity
+    sets the ACCEPTANCE RATE, which is the entire payoff of speculation — a more faithful
+    drafter accepts more tokens — so the tradeoff against its footprint is worth sweeping.
+    Unquantized the head is 4.69 GiB (512 experts, bf16); at 3 bpw it is roughly 0.6 GiB, so
+    even 8 bpw is a large saving.
+
+    Rounded DOWN for a fractional model bpw: that figure is a per-layer *average* for the
+    decoder, but the head is one layer on one rung, and trellis takes uniform integer bpw only
+    (2-4 native, 5-8 stacked RVQ). Down also errs toward the smaller draft, which is the safe
+    direction on the card that motivated this work.
+    """
+    return int(flag) if flag else int(model_bpw)
+
+
+def mtp_sublayer_weights(keys) -> dict[str, list[str]]:
+    """Quantizable MTP-head weights, grouped by sublayer prefix: ``{prefix: [keys]}``.
+
+    The MTP head is a **vLLM-only** structure. HF's Qwen4Exp discards it on load
+    (``_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]``) and ships no block class for it, so
+    there is no HF module to construct and no forward to hook. The quantizer therefore works on
+    the tensors directly, and this function is the discovery half: it says what there is to
+    quantize without needing a model at all.
+
+    Matched on the leading dotted SEGMENT, like `_is_nontext` — `model.layers.0.mtpool.weight`
+    contains "mtp" and is an ordinary text weight, and quantizing it as if it were the draft
+    head would corrupt the decoder.
+
+    Only 2-D weight matrices and stacked expert tensors are returned. Norms, biases and the
+    router gate are left as they are, exactly as the main decoder path leaves them.
+    """
+    out: dict[str, list[str]] = {}
+    for key in keys:
+        parts = key.split(".")
+        if parts[0] != "mtp":
+            continue
+        leaf = parts[-1]
+        if leaf in _STACKED_EXPERT_LEAVES:
+            # Stacked [E, ...]: hand back the whole tensor; the caller unstacks per expert.
+            prefix = ".".join(parts[:-1])
+        elif leaf == "weight" and len(parts) >= 3:
+            prefix = ".".join(parts[:-1])
+            # Norms and the router are 1-D or tiny; the decoder path leaves them unquantized
+            # and the MTP head must match, or the artifact set will not line up with what
+            # vLLM's loader expects for those modules.
+            if parts[-2].endswith("layernorm") or parts[-2] in ("norm", "gate"):
+                continue
+        else:
+            continue                      # biases, scales, anything else: untouched
+        out.setdefault(prefix, []).append(key)
+    return out
+
+
+def _offloadable_bytes(state_dict: dict, mtp_is_loaded: bool = False) -> tuple[int, int, int]:
     """(ple_offload_bytes, expert_offload_bytes, nontext_bytes) — bytes not resident in VRAM.
+
+    ``mtp_is_loaded`` says the draft head was quantized in this run, so a serve can and will
+    load it: its bytes are resident and must not be subtracted. Passed in rather than inferred
+    from the names, which begin with ``mtp`` whether or not the head is usable.
 
     Recorded in ``quantization_config`` so the installer can size a card from the *resident*
     footprint instead of the file size. Without it `recommend.rank` gates on total safetensors
@@ -175,7 +241,8 @@ def _offloadable_bytes(state_dict: dict) -> tuple[int, int, int]:
         except AttributeError:                                        # not a tensor
             continue
         if _is_nontext(name):
-            nontext += nbytes
+            if not mtp_is_loaded:
+                nontext += nbytes
         elif "experts" in name:
             expert += nbytes
         elif "ngram_embedding" in name and name.endswith("trellis_packed"):
@@ -760,6 +827,64 @@ def _collect_stacked_experts(layer):
     return out
 
 
+def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
+                              dequantize_fn=None):
+    """Put the dequantized weights back into a replayed layer. ``-> n_restored``.
+
+    Not optional and not bookkeeping: layer N's Hessians come from activations that passed
+    through the quantized layers 0..N-1, so a replayed layer must carry its *quantized*
+    weights into the calibration forward. Restoring nothing calibrates every later layer
+    against a distribution the finished checkpoint never produces, and nothing raises.
+
+    Both weight layouts, because an ``isinstance(mod, nn.Linear)`` walk covers only one:
+
+    * plain ``nn.Linear`` — attention and the dense MLP;
+    * **stacked routed experts**, 3-D ``nn.Parameter``s with no nn.Linear children. On
+      Flash-Next, gemma-4 26B-A4B and Qwen4Exp these are the overwhelming majority of a
+      layer's weights, so missing them is not a rounding detail. It is also invisible from a
+      dense model, which is why `tests/test_resume_replay_experts.py` builds a stacked layer.
+    """
+    if dequantize_fn is None:
+        from .resume import dequantize_artifacts as dequantize_fn   # noqa: PLC0415
+
+    n_restored = 0
+    for name, mod in layer.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        arts = arts_map.get(f"{prefix}.{name}")
+        if arts is None:
+            continue                    # e.g. a whitelisted bf16-only linear
+        W_hat = dequantize_fn(arts, mod.in_features, mod.out_features, codebook_type,
+                              codebook=codebook)
+        mod.weight.data = W_hat.to(mod.weight.dtype).to(mod.weight.device)
+        n_restored += 1
+
+    for mn, emod in _collect_stacked_experts(layer):
+        gup, dwn = emod.gate_up_proj, emod.down_proj
+        n_exp, two_inter, hdim = gup.shape
+        inter = two_inter // 2
+        for e in range(n_exp):
+            # gate+up were quantized jointly and stored split; recombine by ROW in that
+            # order, which is the layout both the forward and the save-side split assume.
+            g = arts_map.get(f"{prefix}.{mn}.{e}.gate_proj")
+            u = arts_map.get(f"{prefix}.{mn}.{e}.up_proj")
+            if g is not None and u is not None:
+                gw = dequantize_fn(g, hdim, inter, codebook_type, codebook=codebook)
+                uw = dequantize_fn(u, hdim, inter, codebook_type, codebook=codebook)
+                with torch.no_grad():
+                    gup.data[e] = torch.cat([gw, uw], dim=0).to(
+                        dtype=gup.dtype, device=gup.device)
+                n_restored += 1
+            d = arts_map.get(f"{prefix}.{mn}.{e}.down_proj")
+            if d is not None:
+                dw = dequantize_fn(d, dwn.shape[2], dwn.shape[1], codebook_type,
+                                   codebook=codebook)
+                with torch.no_grad():
+                    dwn.data[e] = dw.to(dtype=dwn.dtype, device=dwn.device)
+                n_restored += 1
+    return n_restored
+
+
 def _collect_linears(layer, profile):
     """Every nn.Linear in the block, minus the profile's ``skip_linears`` suffixes.
 
@@ -889,6 +1014,31 @@ def get_rotary_emb(text_model, profile=None):
     if hasattr(text_model, 'model') and hasattr(text_model.model, 'rotary_emb'):
         return text_model.model.rotary_emb
     return None
+
+
+def _discover_rotary_cls(meta_model, profile):
+    """Class of the rotary module this architecture uses, or None.
+
+    Streaming never fully builds the model, so the calibration forward re-instantiates the
+    rotary off-meta *by class* (a meta model's rotary has meta-tensor ``inv_freq``). This is
+    how that class is found.
+
+    Delegates to `get_rotary_emb` rather than re-deriving, so the two paths cannot disagree —
+    including its deliberate "this architecture has no rotary" case (``rotary_attr`` None
+    with ``layers_attr`` set, e.g. NemotronH), which must keep returning None.
+
+    The capture used to be gated on ``profile['rotary_attr']``, which only the NAMED arch
+    profiles set. A default-profile arch — Llama, SmolLM2, SmolLM3 — got no rotary, so the
+    forward passed no ``position_embeddings`` and transformers 5.x attention raised. That
+    made ``--streaming`` unusable on exactly the small dense models worth dry-running on.
+    """
+    try:
+        rot = get_rotary_emb(meta_model, profile)
+    except (AttributeError, KeyError):
+        # A profile can name an attribute a newer transformers moved. The standard layout is
+        # a better answer than ending a multi-hour quantize on a failed lookup.
+        rot = get_rotary_emb(meta_model, None)
+    return type(rot) if rot is not None else None
 
 
 def _uses_mrope(cfg, profile=None) -> bool:
@@ -1297,6 +1447,222 @@ def split_trellis_packed(packed, gate_rows, up_rows, n):
         f"trellis gate_up split: (gate+up) tiles {g + u} != axis-0 {packed.shape[0]} "
         f"(n={n} disagrees with the packed shape, or the m-dim is RHT-padded)")
     return packed[:g].clone(), packed[g:g + u].clone()
+
+
+# Output-row-indexed artifacts get row-split between gate/up; the rest
+# (input-side SV, scalar Wscale/inv_resid_scale) are shared -> duplicated.
+# E8P stores TC-packed Qidxs*_e8p whose axis-0 is in 16-row mma tiles
+# (m_pad//16), so those split at rows//16; shell Qidxs/SU and *_e81b are
+# one entry per row. SV/Wscale/inv_resid_scale* are shared (input-side/scalar).
+_ROW_ARTS = {'Qidxs', 'Qidxs2', 'Qidxs3', 'SU'}
+_SHARED_ARTS = {'SV', 'Wscale', 'inv_resid_scale', 'inv_resid_scale2'}
+
+
+# trellis: `tlut` is the codebook LUT (hyb only) — one table for the whole layer,
+# so both halves get a copy, exactly like SV/Wscale.
+def _is_shared_art(k):
+    return k in _SHARED_ARTS or k.startswith('inv_resid_scale') or k == 'tlut'
+
+
+def _is_row_art(k):
+    return k in _ROW_ARTS or k.endswith('_e8p') or k.endswith('_e81b')
+
+
+def _split_gate_up_arts(arts, gate_rows, up_rows):
+    """Row-split jointly-quantized [gate; up] artifacts into per-proj dicts.
+    e8p TC-packed ``*_e8p`` buffers are tiled in 16-row mma tiles (axis-0 =
+    rows//16); shell Qidxs/SU and ``*_e81b`` are one entry per row. Asserts
+    the gate/up boundary is tile-aligned and the split covers the buffer.
+
+    Module-level rather than nested in the quantize loop so the MTP post-pass
+    (`quantize_mtp_head`) can reuse it: the draft head's experts are stacked the same way
+    and need the identical tile-aligned split, which is too subtle to have two copies of.
+    """
+    gate_arts, up_arts = {}, {}
+    # n for the trellis split comes from the shared RHT column signs — the only
+    # artifact that carries the input width. The size assert inside the splitter is
+    # what catches it being wrong.
+    _n = int(arts['SV'].numel()) if 'SV' in arts else None
+    for k, v in arts.items():
+        if _is_shared_art(k):
+            gate_arts[k] = v.clone()
+            up_arts[k] = v.clone()
+        elif k.startswith('trellis_packed'):
+            assert _n is not None, "trellis gate_up split needs SV to recover n"
+            gate_arts[k], up_arts[k] = split_trellis_packed(
+                v, gate_rows, up_rows, _n)
+        elif _is_row_art(k):
+            t = 16 if k.endswith('_e8p') else 1
+            assert gate_rows % t == 0 and up_rows % t == 0, (
+                f"gate_up split: rows ({gate_rows},{up_rows}) not multiples "
+                f"of mma tile {t} for {k!r}")
+            g, u = gate_rows // t, up_rows // t
+            assert g + u == v.shape[0], (
+                f"gate_up split for {k!r}: (gate+up)//{t}={g + u} != axis-0 "
+                f"{v.shape[0]} (non-16-aligned or RHT-padded m-dim)")
+            gate_arts[k] = v[:g].clone()
+            up_arts[k] = v[g:g + u].clone()
+        else:
+            raise ValueError(
+                f"gate_up split: unhandled artifact key {k!r}; classify it "
+                f"in _is_row_art / _is_shared_art")
+    return gate_arts, up_arts
+
+
+def codebook_bpw(codebook):
+    """Bits per weight this codebook object encodes at, or None if it does not say.
+
+    For trellis the rate lives **in the codebook**, not in any argument:
+    ``quantize_layer_trellis_rht(W, H, cb, ...)`` has no ``bpw`` parameter. Stacked RVQ
+    (5-8 bpw) is K=4 plus a residual stage, so the rate is the SUM over ``rvq_stages`` —
+    reading ``codebook.K`` alone would report every stacked rate as 4.
+
+    Returns None for shell/e8p, which carry their rate elsewhere. None means "cannot tell",
+    and a wrong number would be worse than none: the caller's guard would then reject runs
+    that are actually correct.
+    """
+    if not getattr(codebook, "is_trellis", False):
+        return None
+    stages = getattr(codebook, "rvq_stages", None) or [codebook]
+    try:
+        return sum(int(c.K) for c in stages)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+class _ShardTensorView:
+    """Read-only lazy ``{key: tensor}`` view over safetensors shards.
+
+    Lets the MTP post-pass take the same mapping interface as an in-memory state dict, so it
+    reads only the keys it actually quantizes instead of the whole 77 GiB weight map.
+
+    It does **not** stream within a tensor: the caller holds one stacked expert parameter
+    (3.125 GiB for ``gate_up_proj``) for the duration of its per-expert loop. Fixing that
+    needs a `get_slice` read per expert, which is worth doing only if host RAM turns out to
+    bind — on the box that quantizes a model this size it does not, and the footprint this
+    work exists to fix is GPU-side at serve time.
+    """
+
+    def __init__(self, weight_map, shard_paths):
+        self._weight_map = weight_map
+        self._shard_paths = shard_paths
+
+    def keys(self):
+        return self._weight_map.keys()
+
+    def __contains__(self, key):
+        return key in self._weight_map
+
+    def __getitem__(self, key):
+        return _load_tensor_from_shards(self._weight_map, self._shard_paths, key)
+
+    def get(self, key, default=None):
+        return self[key] if key in self._weight_map else default
+
+
+def quantize_mtp_head(state_dict, codebook, bpw, *, hessians=None,
+                      quantize_fn=None, block_diagonal=True, verbose=True):
+    """Quantize the multi-token-prediction draft head. ``-> (artifacts, metrics, superseded)``.
+
+    Runs as a post-pass over the raw ``mtp.*`` tensors rather than inside the decoder loop,
+    because the head is a **vLLM-only** structure: the decoder loop walks
+    ``profile['layers_attr']`` (e.g. ``model.layers``), and ``mtp.layers.48`` is a separate
+    module tree it never visits. HF cannot help here either — Qwen4Exp discards the head
+    (``_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]``) and ships no block class for it, so
+    there is nothing to construct and no forward to hook.
+
+    **Why this exists:** unquantized the head is 4.69 GiB (512 experts, bf16 — measured from
+    vLLM's own ``FusedMoEConfig``), and ``--cpu-offload-gb`` cannot avoid it, because
+    ``uva.py:_maybe_offload_to_cpu`` does ``p.data.to("cpu")`` — the parameter has to exist on
+    the device before it can be moved off, so the peak is paid in ``create_weights`` regardless
+    of the budget. 42, 48 and 50 GiB all failed identically. Quantized, speculative decoding
+    fits on a 24 GB-class card.
+
+    **Hessians are identity unless supplied.** The decoder's calibration is sequential — layer
+    N's Hessian comes from activations that already passed through quantized layers 0..N-1 —
+    and reproducing that for the head would mean reimplementing its forward (including the
+    512-way routing that decides which expert sees which token) with no HF module to borrow.
+    Identity makes LDLQ fall back to nearest-neighbour, the same fallback the decoder path
+    already uses for an expert no calibration token happened to route to. The cost is bounded
+    and one-directional: speculation is **verified**, so a less faithful draft lowers the
+    acceptance rate and never changes an output token. ``hessians`` is the seam for doing
+    better later; it is not wired to a calibration source yet, so do not report an
+    identity-Hessian run as calibrated.
+    """
+    groups = mtp_sublayer_weights(state_dict.keys())
+    if not groups:
+        # No draft head: contribute nothing and touch nothing. Every published checkpoint
+        # except Flash-Next takes this branch, which is what keeps them byte-identical.
+        return {}, {}, set()
+
+    # The requested rate has to BE the codebook's rate, because the trellis encoder takes
+    # it from the codebook and ignores any `bpw` argument. Mismatched, the head would be
+    # encoded at the model's rung and declared at this one: it quantizes, saves and uploads
+    # clean, then fails at serve time on a buffer size, pointing nowhere near here.
+    _cb_bpw = codebook_bpw(codebook)
+    if _cb_bpw is not None and _cb_bpw != int(bpw):
+        raise ValueError(
+            f"MTP head requested at {int(bpw)} bpw but the codebook encodes at {_cb_bpw}. "
+            "The trellis encoder reads its rate from the codebook, so this would silently "
+            "produce a mis-declared head. Build a codebook for the requested bpw "
+            "(trellis_rvq_recipe(bpw) -> TrellisCodebook per stage) and pass that.")
+
+    if quantize_fn is None:
+        quantize_fn = quantize_layer_e8_shell_rht
+    hessians = hessians or {}
+    artifacts, metrics, superseded = {}, {}, set()
+
+    def _quant(name, W):
+        """Encode one 2-D matrix, reusing the decoder's exact per-sublayer entry point so the
+        head lands on the same codebook, scales and layout as the model it drafts for."""
+        H = hessians.get(name)
+        if H is None:
+            H = torch.eye(W.shape[1], dtype=torch.float32)
+        _, arts, met = quantize_fn(W, H, codebook, bpw=bpw,
+                                   block_diagonal=block_diagonal)
+        met = dict(met)
+        met["bpw"] = bpw
+        return arts, met
+
+    for prefix in sorted(groups):
+        leaves = {k.rsplit(".", 1)[1] for k in groups[prefix]}
+        stacked = leaves & set(_STACKED_EXPERT_LEAVES)
+        if not stacked:
+            W = state_dict[groups[prefix][0]]
+            arts, met = _quant(prefix, W.float())
+            artifacts[prefix], metrics[prefix] = arts, met
+            continue
+
+        # Routed experts, stacked as [E, ...] exactly like the decoder's MoE path. Unstack
+        # per expert and store under `experts.{e}.{gate,up,down}_proj` — the naming read off
+        # a published checkpoint's layer_metrics.json, which is what lets GLQFusedMoEMethod
+        # load the draft with no second expert mapping.
+        gup = state_dict.get(f"{prefix}.gate_up_proj")
+        dwn = state_dict.get(f"{prefix}.down_proj")
+        n_exp = (gup if gup is not None else dwn).shape[0]
+        if verbose:
+            print(f"  mtp: {prefix} -> {n_exp} experts at {bpw} bpw")
+        for e in range(n_exp):
+            if gup is not None:
+                # [gate; up] share one input, so they are quantized jointly (one Wscale)
+                # and the result row-split back, same as the decoder.
+                arts, met = _quant(f"{prefix}.{e}.gate_up_proj", gup[e].float())
+                inter = gup.shape[1] // 2
+                gate_arts, up_arts = _split_gate_up_arts(arts, inter, inter)
+                artifacts[f"{prefix}.{e}.gate_proj"] = gate_arts
+                artifacts[f"{prefix}.{e}.up_proj"] = up_arts
+                metrics[f"{prefix}.{e}.gate_proj"] = dict(met)
+                metrics[f"{prefix}.{e}.up_proj"] = dict(met)
+            if dwn is not None:
+                arts, met = _quant(f"{prefix}.{e}.down_proj", dwn[e].float())
+                artifacts[f"{prefix}.{e}.down_proj"] = arts
+                metrics[f"{prefix}.{e}.down_proj"] = met
+        for leaf in stacked:
+            # The stacked originals are replaced, not supplemented: shipping both would add
+            # the full bf16 head back to the file while vLLM loaded the quantized copy.
+            superseded.add(f"{prefix}.{leaf}")
+
+    return artifacts, metrics, superseded
 
 
 def quantize_experts_e8_shell_rht_batched(W_stack, H_stack, codebook, bpw=2,
@@ -1834,6 +2200,7 @@ def quantize(
     resume: bool = False,
     resume_bucket: str = None,
     resume_prefix: str = None,
+    mtp_bpw: int = None,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -1854,6 +2221,10 @@ def quantize(
             (required for models that exceed system RAM)
         workers: parallel workers for CPU quantization
             (0=auto, 1=sequential, ignored on GPU)
+        mtp_bpw: quantize the multi-token-prediction draft head at this bpw, or 0 to
+            match the model's own. None (default) leaves it as it is. Opt-in because it
+            changes the output of a checkpoint that has such a head, and the flag is
+            what carries that into the resume run key. See `quantize_mtp_head`.
     """
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
@@ -1994,15 +2365,10 @@ def quantize(
                 _layers = _resolve_attr(_model, profile['layers_attr'])
             else:
                 _layers = get_decoder_layers(_model, profile)
-            # Capture the rotary class so the calibration forward can build a
-            # real (off-meta) rotary later. Attentions that hard-unpack
-            # position_embeddings (e.g. sarvam_moe) require it; the meta model's
-            # rotary has meta-tensor inv_freq, so we re-instantiate by class.
-            if profile.get('rotary_attr'):
-                try:
-                    _rotary_cls = type(_resolve_attr(_model, profile['rotary_attr']))
-                except (AttributeError, KeyError):
-                    _rotary_cls = None
+            # Capture the rotary class so the calibration forward can build a real
+            # (off-meta) rotary later — attentions that hard-unpack position_embeddings
+            # (sarvam_moe) require it, and transformers 5.x Llama attention needs it at all.
+            _rotary_cls = _discover_rotary_cls(_model, profile)
         BlockClass = type(_layers[0])
         n_layers = len(_layers)
         del _model, _layers
@@ -2289,11 +2655,17 @@ def quantize(
             model=model_name, codebook=codebook_type, bpw=bpw, nsamples=nsamples,
             seqlen=seqlen, variant=default_trellis_variant(),
             sd_prefix=sd_prefix, version=_glq_version,
-            bpw_map=bpw_map if isinstance(bpw_map, dict) else None)
+            bpw_map=bpw_map if isinstance(bpw_map, dict) else None,
+            mtp_bpw=None if mtp_bpw is None else resolve_mtp_bpw(mtp_bpw, bpw))
         resume_store = _resume.ResumeStore(
             local_dir=os.path.join(output_dir, "_resume"), run_key=run_key,
             bucket=resume_bucket or os.environ.get("GLQ_RESUME_BUCKET") or None,
             prefix=resume_prefix or f"{os.path.basename(output_dir)}/{run_key}")
+        # Printed because it is the only way to tell whether a prepared store will be
+        # accepted: the key hashes model/codebook/bpw/nsamples/seqlen/variant AND the glq
+        # version, and a mismatch is refused rather than blended. `python -m glq.resume`
+        # reports the key it derived, so the two can be compared before the run commits.
+        print(f"  resume run_key = {run_key}")
         _done = resume_store.completed_layers()
         _start = resume_store.next_layer()
         print(f"  resume: {len(_done)} layer(s) checkpointed, replaying to layer {_start}"
@@ -2422,18 +2794,9 @@ def quantize(
             all_artifacts.update(arts_map)
             all_layer_metrics.update(metrics_map)
             all_proxy_losses.update(losses_map)
-            n_restored = 0
-            for name, mod in layer.named_modules():
-                if not isinstance(mod, nn.Linear):
-                    continue
-                arts = arts_map.get(f"{sd_prefix}.{layer_idx}.{name}")
-                if arts is None:
-                    continue                    # e.g. a whitelisted bf16-only linear
-                W_hat = dequantize_artifacts(
-                    arts, mod.in_features, mod.out_features, codebook_type,
-                    codebook=codebook)
-                mod.weight.data = W_hat.to(mod.weight.dtype).to(mod.weight.device)
-                n_restored += 1
+            n_restored = _restore_replayed_weights(
+                layer, arts_map, f"{sd_prefix}.{layer_idx}", codebook_type, codebook,
+                dequantize_fn=dequantize_artifacts)
             hidden_states = _forward_calibration(layer, hidden_states, layer_idx)
             print(f"  replayed from checkpoint ({n_restored} matrices restored) "
                   f"{time.perf_counter() - t_layer:.1f}s")
@@ -2635,57 +2998,6 @@ def quantize(
                 mod = linears[name]
                 mod.weight.data = W_hat.to(dtype=mod.weight.dtype,
                                            device=mod.weight.device)
-
-        # Output-row-indexed artifacts get row-split between gate/up; the rest
-        # (input-side SV, scalar Wscale/inv_resid_scale) are shared -> duplicated.
-        # E8P stores TC-packed Qidxs*_e8p whose axis-0 is in 16-row mma tiles
-        # (m_pad//16), so those split at rows//16; shell Qidxs/SU and *_e81b are
-        # one entry per row. SV/Wscale/inv_resid_scale* are shared (input-side/scalar).
-        _ROW_ARTS = {'Qidxs', 'Qidxs2', 'Qidxs3', 'SU'}
-        _SHARED_ARTS = {'SV', 'Wscale', 'inv_resid_scale', 'inv_resid_scale2'}
-
-        # trellis: `tlut` is the codebook LUT (hyb only) — one table for the whole layer,
-        # so both halves get a copy, exactly like SV/Wscale.
-        def _is_shared_art(k):
-            return k in _SHARED_ARTS or k.startswith('inv_resid_scale') or k == 'tlut'
-
-        def _is_row_art(k):
-            return k in _ROW_ARTS or k.endswith('_e8p') or k.endswith('_e81b')
-
-        def _split_gate_up_arts(arts, gate_rows, up_rows):
-            """Row-split jointly-quantized [gate; up] artifacts into per-proj dicts.
-            e8p TC-packed ``*_e8p`` buffers are tiled in 16-row mma tiles (axis-0 =
-            rows//16); shell Qidxs/SU and ``*_e81b`` are one entry per row. Asserts
-            the gate/up boundary is tile-aligned and the split covers the buffer."""
-            gate_arts, up_arts = {}, {}
-            # n for the trellis split comes from the shared RHT column signs — the only
-            # artifact that carries the input width. The size assert inside the splitter is
-            # what catches it being wrong.
-            _n = int(arts['SV'].numel()) if 'SV' in arts else None
-            for k, v in arts.items():
-                if _is_shared_art(k):
-                    gate_arts[k] = v.clone()
-                    up_arts[k] = v.clone()
-                elif k.startswith('trellis_packed'):
-                    assert _n is not None, "trellis gate_up split needs SV to recover n"
-                    gate_arts[k], up_arts[k] = split_trellis_packed(
-                        v, gate_rows, up_rows, _n)
-                elif _is_row_art(k):
-                    t = 16 if k.endswith('_e8p') else 1
-                    assert gate_rows % t == 0 and up_rows % t == 0, (
-                        f"gate_up split: rows ({gate_rows},{up_rows}) not multiples "
-                        f"of mma tile {t} for {k!r}")
-                    g, u = gate_rows // t, up_rows // t
-                    assert g + u == v.shape[0], (
-                        f"gate_up split for {k!r}: (gate+up)//{t}={g + u} != axis-0 "
-                        f"{v.shape[0]} (non-16-aligned or RHT-padded m-dim)")
-                    gate_arts[k] = v[:g].clone()
-                    up_arts[k] = v[g:g + u].clone()
-                else:
-                    raise ValueError(
-                        f"gate_up split: unhandled artifact key {k!r}; classify it "
-                        f"in _is_row_art / _is_shared_art")
-            return gate_arts, up_arts
 
         def _store_artifacts(name, arts):
             """Record quantized artifacts under their checkpoint prefix(es).
@@ -3159,6 +3471,46 @@ def quantize(
     from safetensors.torch import save_file
     from safetensors import safe_open
 
+    # ---- MTP draft head ----
+    # After the decoder loop, because `mtp.layers.N` is a separate module tree the loop (which
+    # walks profile['layers_attr']) never visits. Streaming-only by construction: HF discards
+    # `mtp.*` on load, so in the non-streaming path there is no such tensor to find and
+    # `quantize_mtp_head` returns empty. That is also the only mode a 77 GiB model fits in.
+    mtp_layer_bpw: dict[str, int] = {}
+    if mtp_bpw is not None and streaming:
+        _mtp_bpw = resolve_mtp_bpw(mtp_bpw, bpw)
+        print(f"\nQuantizing MTP draft head at {_mtp_bpw} bpw ...")
+        # A trellis codebook IS its rate, so a head on a different rung than the decoder
+        # needs its own — reusing the model's would encode at the model's bpw while
+        # layer_bpw declared the head's. `quantize_mtp_head` refuses the mismatch; this
+        # builds the codebook that satisfies it.
+        # Imported here rather than reusing the names bound in the trellis branch above:
+        # those are branch-local, and depending on them would turn a refactor into a
+        # NameError hours into a run.
+        _mtp_cb = codebook
+        if codebook_bpw(codebook) not in (None, _mtp_bpw):
+            from .trellis import TrellisCodebook as _TCB, trellis_rvq_recipe as _recipe
+            _mtp_stages = [_TCB(variant=default_trellis_variant(), K=_k, device=device)
+                           for _k in _recipe(int(_mtp_bpw))]
+            _mtp_cb = _mtp_stages[0]
+            _mtp_cb.rvq_stages = _mtp_stages
+        _mtp_arts, _mtp_metrics, _mtp_superseded = quantize_mtp_head(
+            _ShardTensorView(weight_map, shard_paths), _mtp_cb, _mtp_bpw,
+            block_diagonal=not (codebook_type == "e8p"
+                                and bool(os.environ.get("GLQ_E8P_POW2"))))
+        all_artifacts.update(_mtp_arts)
+        all_layer_metrics.update(_mtp_metrics)
+        dropped_stacked_keys |= _mtp_superseded
+        # The head rides its own rung, so it cannot inherit the loop's `int(bpw)` default
+        # below: vLLM sizes `trellis_packed` at 16*layer_bpw[p], and a wrong entry here is a
+        # wrong buffer size at load, not a quality question.
+        mtp_layer_bpw = {p: _mtp_bpw for p in _mtp_arts}
+        print(f"  MTP head: {len(_mtp_arts)} matrices, "
+              f"{len(_mtp_superseded)} stacked originals superseded")
+    elif mtp_bpw is not None:
+        print("\n--mtp-bpw ignored: the MTP head only reaches the checkpoint via "
+              "--streaming (HF discards `mtp.*` on load)")
+
     quantized_prefixes = set(all_artifacts.keys())
     superseded_keys = _superseded_original_keys(
         all_artifacts, weight_map if streaming else {},
@@ -3320,7 +3672,9 @@ def quantize(
     PLE_PREFIX = _ple_sp['prefix'] if _ple_sp else None
     layer_bpw_out: dict[str, int] = {}
     for p in all_artifacts.keys():
-        if bpw_map is not None and p in bpw_map:
+        if p in mtp_layer_bpw:
+            layer_bpw_out[p] = int(mtp_layer_bpw[p])
+        elif bpw_map is not None and p in bpw_map:
             layer_bpw_out[p] = int(bpw_map[p])
         elif PLE_PREFIX is not None and p == PLE_PREFIX:
             layer_bpw_out[p] = int(_ple_sp['bpw'])
@@ -3362,7 +3716,8 @@ def quantize(
     # resident footprint rather than the file size. Emitted only when non-zero, so a dense
     # checkpoint's config.json is unchanged. Absent means "assume resident" downstream, which
     # is the pre-existing behaviour and cannot over-promise.
-    _ple_off, _expert_off, _nontext = _offloadable_bytes(state_dict)
+    _ple_off, _expert_off, _nontext = _offloadable_bytes(
+        state_dict, mtp_is_loaded=bool(mtp_layer_bpw))
     if _ple_off:
         config_dict["quantization_config"]["ple_offload_bytes"] = int(_ple_off)
     if _expert_off:
@@ -3526,6 +3881,14 @@ def build_parser():
     parser.add_argument("--bpw", type=float, default=2,
                         help="Bits per weight: 2, 3, 4 (uniform) or "
                              "fractional like 2.5 (auto mixed-precision)")
+    parser.add_argument("--mtp-bpw", type=int, default=None,
+                        help="quantize the multi-token-prediction draft head at this bpw "
+                             "(0 = the model's own); omit to leave it alone. Needs "
+                             "--streaming, the only mode the head reaches the checkpoint in. "
+                             "Quantizing it is what makes vLLM --speculative-config loadable: "
+                             "unquantized the head is 4.69 GiB of bf16 experts that must be "
+                             "materialised on the GPU before any --cpu-offload-gb can move "
+                             "it. Raising this trades footprint for draft acceptance rate")
     parser.add_argument("--bpw-map", type=str, default=None,
                         help="JSON file with per-layer bpw assignment "
                              "(overrides --bpw)")
@@ -3622,6 +3985,7 @@ def main():
         resume=args.resume,
         resume_bucket=args.resume_bucket,
         resume_prefix=args.resume_prefix,
+        mtp_bpw=args.mtp_bpw,
     )
 
 
