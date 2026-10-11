@@ -165,3 +165,90 @@ def test_arena_weights_raises_for_a_name_neither_side_has():
 
     with pytest.raises(AttributeError):
         _ = ArenaWeights({}, _Layer()).w13_trellis_packed
+
+
+# ---------------------------------------------------------------------------
+# ★ CUDA-graph capturability
+# ---------------------------------------------------------------------------
+
+@cuda_only
+def test_the_whole_arena_step_is_CUDA_GRAPH_CAPTURABLE():
+    """★ The arena must not cost the CUDA graph, because the graph is worth far more.
+
+    `torch.ops.glq.fused_moe_trellis_3inst` exists so the MoE decode step stays capturable
+    under FULL cudagraph — its own comment says the fallback loop's `topk_ids.unique()` is
+    what forces `--enforce-eager`, and trellis MoE under graph measured **91.6 vs 8.5 tok/s**.
+    An arena that reintroduces a dynamic shape or a host sync would trade a 10x for a 1.6x.
+
+    Measured on an L4: `torch.unique`, `bool(t.any())`, `int(t.sum())` and `nonzero` each
+    invalidate capture; `argsort` and `index_copy_` are fine. So the plan has to be built from
+    fixed-shape ops with every state update in place.
+    """
+    from glq_vllm.expert_arena import ArenaDecision, ExpertArena, plan_step
+
+    src = {"w13_trellis_packed": torch.randint(-100, 100, (64, 16, 4), dtype=torch.int16,
+                                               device="cuda")}
+    arena = ExpertArena(ArenaDecision(True, slots=32, bytes_per_slot=1, n_layers=1,
+                                      reason="t"), src, n_experts=64)
+    arena.warmup()
+    ids = torch.arange(10, dtype=torch.int32, device="cuda")
+    plan_step(arena.state, ids)            # eager once, so any lazy init is done
+    arena.fill(plan_step(arena.state, ids))
+
+    g = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):              # raises if anything is dynamic or syncs
+        arena.fill(plan_step(arena.state, ids))
+    torch.cuda.synchronize()
+
+
+@cuda_only
+def test_a_captured_graph_REPLAYS_the_same_decisions_as_eager():
+    """Capturing is not enough: the replay must still resolve residency correctly. A graph
+    that records stale addresses would replay a fixed answer and look fast while serving the
+    wrong slots."""
+    from glq_vllm.expert_arena import ArenaDecision, ExpertArena, plan_step
+
+    src = {"w13_trellis_packed": torch.arange(64 * 16 * 4, dtype=torch.int16,
+                                              device="cuda").reshape(64, 16, 4)}
+
+    def _fresh():
+        a = ExpertArena(ArenaDecision(True, slots=16, bytes_per_slot=1, n_layers=1,
+                                      reason="t"), src, n_experts=64)
+        a.warmup()
+        return a
+
+    steps = [torch.arange(s, s + 4, dtype=torch.int32, device="cuda")
+             for s in (0, 4, 0, 8, 4)]
+
+    eager = _fresh()
+    want = []
+    for ids in steps:
+        p = plan_step(eager.state, ids)
+        eager.fill(p)
+        want.append(p.slot_of.tolist())
+
+    graphed = _fresh()
+    ids_buf = torch.zeros(4, dtype=torch.int32, device="cuda")
+    p0 = plan_step(graphed.state, ids_buf)      # warm the shapes
+    graphed.fill(p0)
+    graphed.state.residency.fill_(-1)
+    graphed.state.slot_owner.fill_(-1)
+    graphed.state.slot_last_use.zero_()
+    graphed.state.clock.zero_()
+    graphed.state.counters.zero_()
+
+    g = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):
+        plan = plan_step(graphed.state, ids_buf)
+        graphed.fill(plan)
+    torch.cuda.synchronize()
+
+    got = []
+    for ids in steps:
+        ids_buf.copy_(ids)
+        g.replay()
+        torch.cuda.synchronize()
+        got.append(plan.slot_of.tolist())
+    assert got == want, f"captured replay diverged from eager: {got} != {want}"

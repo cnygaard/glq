@@ -218,9 +218,14 @@ class ArenaState:
         self.n_slots = int(n_slots)
         self.device = device
         i32 = torch.int32
-        self.residency = torch.full((self.n_experts,), _NOT_RESIDENT, dtype=i32,
+        # ★ One SCRATCH element past the end of each table. Under CUDA-graph capture a write
+        # cannot be skipped — there is no data-dependent control flow — so a routing that
+        # must not update residency writes to the scratch element instead. That is what
+        # replaces the `if` an eager implementation would use, and it is why these are
+        # n+1 long. Nothing ever reads the scratch row.
+        self.residency = torch.full((self.n_experts + 1,), _NOT_RESIDENT, dtype=i32,
                                     device=device)
-        self.slot_owner = torch.full((self.n_slots,), _NOT_RESIDENT, dtype=i32,
+        self.slot_owner = torch.full((self.n_slots + 1,), _NOT_RESIDENT, dtype=i32,
                                      device=device)
         #: Monotone use stamp per slot. int64 so the clock cannot wrap inside a run: the
         #: tie-break below folds the slot index into this key.
@@ -261,108 +266,106 @@ class StepPlan:
 def plan_step(state: ArenaState, expert_ids) -> StepPlan:
     """Resolve one step's routings against the arena, admitting misses by LRU.
 
-    **Vectorized, and provably the same selection as the serial `ResidencyPolicy`.** A serial
-    admit evicts the least-recently-used slot and then *touches* it, so it is no longer least
-    recent and the next admit takes the second-least: serial admission of M misses selects
-    exactly the M least-recently-used slots. This takes those M in one shot, assigning them to
-    misses in routing order — the same pairing. `tests/test_expert_arena_plan.py` asserts the
-    agreement rather than trusting this paragraph.
+    **★ Every operation here is fixed-shape and in-place, because this runs inside a CUDA
+    graph.** Measured on an L4, each of `torch.unique`, `bool(t.any())`, `int(t.sum())` and
+    `torch.nonzero` invalidates capture with `cudaErrorStreamCaptureInvalidated`, while
+    `argsort` and `index_copy_` are fine. An earlier version of this function used the first
+    four, worked perfectly eagerly, and would have silently forced `--enforce-eager` — trading
+    the trellis MoE graph (**91.6 vs 8.5 tok/s**) for the arena's 1.6x. So:
 
-    Two invariants the fused op depends on, because it reads the arena *after* the fill:
+    * dedup comes from an `(R, R)` comparison instead of `torch.unique` (R <= 80, so 6,400
+      element ops — free at this scale);
+    * a write that must not happen is redirected to a **scratch element** past the end of the
+      table, since capture has no data-dependent control flow to skip it with;
+    * state is mutated through `scatter_`/`add_`/advanced-index assignment only. Rebinding
+      `state.x = <new tensor>` would record the graph against an address the next replay never
+      writes.
 
-    * distinct experts in a step get distinct slots, and
-    * nothing admitted in a step may evict anything else from that same step.
-
-    Both follow from excluding this step's hit slots from candidacy outright, together with
-    the `n_slots >= max_tokens * top_k` precondition. Relying on recency alone would not be
-    enough: a slot last used long ago but read by *this* step is exactly the one an LRU scan
-    would pick.
+    **Provably the same selection as `ResidencyPolicy.plan_step`**, which the tests assert
+    rather than assume: a step's hit slots are protected from candidacy, and misses are
+    admitted in first-appearance order taking the least-recently-used unprotected slots.
     """
     import torch
 
     ids = expert_ids.to(torch.int64).reshape(-1)
     n_routings = ids.numel()
-    if n_routings > state.n_slots:
+    S, E = state.n_slots, state.n_experts
+    if n_routings > S:
+        # A shape, so this is a host-side check and safe under capture.
         raise ValueError(
-            f"{n_routings} routings in one step cannot be served by {state.n_slots} slots: "
-            f"every expert routed in a step must be resident SIMULTANEOUSLY, so a step "
-            f"larger than the arena would evict a routing before the matmul reads it. Raise "
-            f"{BUDGET_ENV} or lower {MAX_TOKENS_ENV}.")
+            f"{n_routings} routings in one step cannot be served by {S} slots: every expert "
+            f"routed in a step must be resident SIMULTANEOUSLY, so a step larger than the "
+            f"arena would evict a routing before the matmul reads it. Raise {BUDGET_ENV} or "
+            f"lower {MAX_TOKENS_ENV}.")
 
-    slot = state.residency[ids].to(torch.int64)                      # -1 where missing
-    is_hit = slot >= 0
+    dev = ids.device
+    pos = torch.arange(n_routings, device=dev, dtype=torch.int64)
+    slot0 = state.residency[ids].to(torch.int64)
+    is_hit = slot0 >= 0
 
-    # ★ Protect this step's hit slots from candidate selection *explicitly*, rather than by
-    # stamping them first. A slot read by any routing of this step must survive the step: the
-    # fused op reads the arena after the fill, so evicting one would leave the matmul reading
-    # a slot that holds a different expert. `ResidencyPolicy.plan_step` protects the same set,
-    # which is why the two agree; `lookup_or_admit` does NOT, and must not be used here.
-    protected = torch.zeros(state.n_slots, dtype=torch.bool, device=ids.device)
-    if bool(is_hit.any()):
-        protected[slot[is_hit]] = True
+    # Dedup, fixed shape. `same[j, r]` is "routing j wants the same expert as r".
+    same = ids[:, None] == ids[None, :]
+    is_dup = (same & (pos[:, None] < pos[None, :])).any(dim=0)
+    # First routing position wanting each expert, so duplicates can share its slot.
+    first_idx = torch.where(same, pos[:, None],
+                            torch.full_like(same, n_routings, dtype=torch.int64)
+                            ).min(dim=0).values
 
-    # One fill per DISTINCT missing expert: two tokens routing to the same cold expert must
-    # share a slot. Separate slots would still be bit-exact (verbatim copies) but would pay
-    # PCIe twice and burn a slot.
-    miss_ids = ids[~is_hit]
-    uniq, inverse = torch.unique(miss_ids, sorted=True, return_inverse=True)
-    n_new = uniq.numel()
+    # One admission per distinct missing expert, in first-appearance order. The rank is a
+    # running count over the same (R, R) comparison used for dedup above — `pos[None, :] <=
+    # pos[:, None]` masks to positions at or before r — rather than a separate running-total
+    # call. Same result, one fewer primitive, and it reuses a matrix already materialised.
+    need = (~is_hit) & (~is_dup)
+    at_or_before = pos[None, :] <= pos[:, None]
+    rank = (need[None, :] & at_or_before).sum(dim=1) - 1
 
-    # Admit in FIRST-APPEARANCE order, not sorted-expert order. The serial policy admits
-    # routing by routing, so routing 0's expert takes the first candidate; `torch.unique` hands
-    # back sorted ids, which would pair candidates with experts by id instead and disagree with
-    # the policy on every step whose routings are not already ascending.
-    if n_new:
-        first_pos = torch.zeros(n_new, dtype=torch.int64, device=ids.device)
-        appear = torch.arange(inverse.numel(), device=ids.device, dtype=torch.int64)
-        first_pos.scatter_reduce_(0, inverse, appear, reduce="amin", include_self=False)
-        order = torch.argsort(first_pos)
-        rank = torch.empty_like(order)
-        rank[order] = torch.arange(n_new, device=ids.device, dtype=torch.int64)
-        uniq = uniq[order]
-        inverse = rank[inverse]
-        first_pos = first_pos[order]
+    # ★ Protect this step's hit slots from candidacy. Not by recency — a slot last used long
+    # ago but read by THIS step is exactly what an LRU scan would pick, and evicting it would
+    # leave the matmul reading a different expert.
+    # `prot[idx] = True` would copy a Python scalar from CPU, which capture refuses
+    # ("Cannot copy between CPU and CUDA tensors during CUDA graph capture"). Scatter a
+    # device-side source instead. Non-hits address the scratch element and write False there,
+    # and cannot collide with a hit because a hit's slot is always < S.
+    prot = torch.zeros(S + 1, dtype=torch.bool, device=dev)
+    prot.scatter_(0, torch.where(is_hit, slot0, torch.full_like(slot0, S)), is_hit)
 
-    fill_src = torch.full((n_routings,), _NOT_RESIDENT, dtype=torch.int32,
-                          device=ids.device)
-    if n_new:
-        # Eviction candidates: the n_new least-recently-used UNPROTECTED slots. The key folds the slot
-        # index in so ties break by ascending index, matching ResidencyPolicy's lo..hi scan
-        # (which hands out never-claimed slots in index order). Protected slots are pushed
-        # past every candidate rather than removed, so the shape stays static for Triton.
-        idx = torch.arange(state.n_slots, device=ids.device, dtype=torch.int64)
-        key = state.slot_last_use * state.n_slots + idx
-        key = torch.where(protected, key + (1 << 62), key)
-        candidates = torch.argsort(key)[:n_new]
+    # Candidates ascending by (last use, slot index). The index tie-break matches
+    # ResidencyPolicy's lo..hi scan, which hands out never-claimed slots in index order.
+    sidx = torch.arange(S, device=dev, dtype=torch.int64)
+    key = state.slot_last_use * S + sidx
+    key = torch.where(prot[:S], key + (1 << 62), key)
+    order = torch.argsort(key)
 
-        evicted = state.slot_owner[candidates].to(torch.int64)
-        still_owned = evicted >= 0
-        if bool(still_owned.any()):
-            state.residency[evicted[still_owned]] = _NOT_RESIDENT
+    chosen = order[rank.clamp(0, S - 1)]
+    slot = torch.where(need, chosen, slot0)
+    slot = slot.gather(0, first_idx.clamp(max=max(n_routings - 1, 0)))
 
-        state.residency[uniq] = candidates.to(torch.int32)
-        state.slot_owner[candidates] = uniq.to(torch.int32)
+    # Evict the previous owner of each chosen slot, then publish — in that order, so a slot
+    # reused this step is not cleared after being claimed. Non-admissions address the scratch
+    # element, which nothing reads.
+    s_at = torch.where(need, slot, torch.full_like(slot, S))
+    prev = state.slot_owner[s_at].to(torch.int64)
+    clr = torch.where(need & (prev >= 0), prev, torch.full_like(prev, E))
+    # Same reason as `prot` above: the right-hand side must live on the device, so build the
+    # sentinel as a tensor rather than assigning the Python int.
+    state.residency[clr] = torch.full_like(clr, _NOT_RESIDENT, dtype=torch.int32)
+    e_at = torch.where(need, ids, torch.full_like(ids, E))
+    state.residency[e_at] = s_at.to(torch.int32)
+    state.slot_owner[s_at] = e_at.to(torch.int32)
 
-        new_slots = candidates[inverse]
-        slot = slot.clone()
-        slot[~is_hit] = new_slots
-        # Mark the fill on the FIRST routing that needs each expert; duplicates read the same
-        # slot and must not trigger a second copy of identical bytes.
-        miss_pos = torch.nonzero(~is_hit, as_tuple=True)[0]
-        fill_src[miss_pos[first_pos]] = uniq.to(torch.int32)
-
-    # Stamp in ROUTING order, so intra-step recency is defined the same way the reference
-    # defines it and a repeated expert's stamp is its LAST use. `amax` makes the duplicate
-    # case deterministic (highest routing position wins) rather than scatter-order dependent.
-    base = state.clock + 1
-    stamps = base + torch.arange(n_routings, device=ids.device, dtype=torch.int64)
-    state.slot_last_use.scatter_reduce_(0, slot, stamps, reduce="amax",
+    # Stamp in routing order so intra-step recency is defined as the reference defines it,
+    # and a repeated expert's stamp is its LAST use. `amax` keeps duplicates deterministic.
+    state.clock.add_(1)
+    state.slot_last_use.scatter_reduce_(0, slot, state.clock + pos, reduce="amax",
                                         include_self=True)
-    state.clock = base + n_routings - 1
+    state.clock.add_(n_routings)
 
-    state.counters[0] += int(is_hit.sum())
-    state.counters[1] += int((~is_hit).sum())
-    state.counters[2] += n_new
+    state.counters[0] += is_hit.sum()
+    state.counters[1] += (~is_hit).sum()
+    state.counters[2] += need.sum()
+
+    fill_src = torch.where(need, ids.to(torch.int32),
+                           torch.full_like(ids, _NOT_RESIDENT, dtype=torch.int32))
     return StepPlan(slot.to(torch.int32), fill_src)
 
 
@@ -422,7 +425,7 @@ class ExpertArena:
                        BLOCK=FILL_BLOCK)
 
     def warmup(self) -> None:
-        """Compile the fill kernel and touch every buffer **before** graph capture.
+        """Compile the fill kernel **before** graph capture.
 
         Triton JITs on first launch. Letting that happen inside `cudaStreamCapture` is at
         best a recorded compile and at worst the capture failure the `trellis_capture_sm120`
@@ -434,6 +437,22 @@ class ExpertArena:
         zeros = torch.zeros(1, dtype=torch.int32, device=self.state.residency.device)
         self.fill(StepPlan(zeros, torch.full_like(zeros, _NOT_RESIDENT)))
         torch.cuda.synchronize(self.state.residency.device)
+
+    def maybe_report(self, every: int = 0) -> None:
+        """Print the hit accounting every `every` eager calls. Never during capture.
+
+        Reading a counter needs a host sync, which capture forbids — and under FULL cudagraph
+        `apply`'s Python runs only at capture time, so a graphed decode produces no reports at
+        all. That is why the mechanism evidence for a graphed arm comes from a matched EAGER
+        arm (identical routing, so an identical hit rate) rather than from the graphed run.
+        """
+        import torch
+
+        if not every or torch.cuda.is_current_stream_capturing():
+            return
+        self._calls = getattr(self, "_calls", 0) + 1
+        if self._calls % int(every) == 0:
+            print(f"glq: {self.report()}", flush=True)
 
     def report(self) -> str:
         st = self.state

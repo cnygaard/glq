@@ -402,6 +402,13 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         self._try_build_arena(layer)
 
     @staticmethod
+    def _arena_report_every() -> int:
+        """Eager calls between hit-rate reports; 0 (default) is silent. Evidence that the
+        cache engaged, since a cache at a 0% hit rate still emits correct tokens."""
+        import os as _os
+        return int(_os.environ.get("GLQ_MOE_ARENA_REPORT_EVERY", "0"))
+
+    @staticmethod
     def _arena_max_tokens() -> int:
         """Token cap for the arena path, read per call so it is visible to every captured
         shape. The cap is a *correctness* bound, not a preference — see
@@ -891,6 +898,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                     arena.fill(plan)
                     ids = plan.slot_of.view(topk_ids.shape)
                     W = _ArenaWeights(arena.buffers, layer)
+                    arena.maybe_report(self._arena_report_every())
                 output = torch.ops.glq.fused_moe_trellis_3inst(
                     x.half().contiguous(),
                     ids.to(torch.int64),
