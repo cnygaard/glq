@@ -399,6 +399,82 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 r2 = getattr(layer, f"{pfx}_trellis_packed2").shape[-1] // 16
                 ok = ok and 1 <= r2 <= 4
         layer.glq_trellis_fused_ok = bool(ok)
+        self._try_build_arena(layer)
+
+    @staticmethod
+    def _arena_max_tokens() -> int:
+        """Token cap for the arena path, read per call so it is visible to every captured
+        shape. The cap is a *correctness* bound, not a preference — see
+        `expert_arena.slots_for_budget`."""
+        import os as _os
+
+        from .expert_arena import DEFAULT_MAX_TOKENS, MAX_TOKENS_ENV
+        return int(_os.environ.get(MAX_TOKENS_ENV, DEFAULT_MAX_TOKENS))
+
+    def _try_build_arena(self, layer) -> None:
+        """Attempt the VRAM expert arena for this layer; set ``layer.glq_arena`` or leave it
+        None and say why.
+
+        ``_try_`` as in `inference_kernel._try_load_cuda_ext`: declining is an ordinary
+        outcome, not an error, and it must never block model loading. It declines when the
+        budget is unset (the default, so the existing path stays byte-identical), when nothing
+        is offloaded, when top_k is unknown, or when the budget cannot meet the simultaneity
+        precondition.
+
+        The reason is printed in every case, including success: a cache that is silently
+        disabled returns perfectly correct tokens, just slowly, which is how Strata's
+        global-counter bug survived at a 2.97% hit rate.
+        """
+        import os as _os
+
+        layer.glq_arena = None
+        if not getattr(layer, 'glq_trellis_fused_ok', False):
+            return
+        try:
+            from .expert_arena import ExpertArena, arena_decision_from_env
+        except Exception as e:                        # noqa: BLE001 - never block loading
+            print(f"glq: expert arena unavailable ({type(e).__name__}: {e})", flush=True)
+            return
+
+        names = [f"{p}_{s}" for p in ("w13", "w2")
+                 for s in ("trellis_packed", "trellis_packed2", "SU", "Wscale",
+                           "inv_resid_scale2")]
+        sources = {n: getattr(layer, n) for n in names if hasattr(layer, n)}
+        if not sources or sources[names[0]].device.type != 'cuda':
+            return
+
+        # Bytes of this layer's experts that are NOT on the card. vLLM's UVA offload leaves a
+        # device-addressable tensor whose storage is host memory, so `is_cuda` alone cannot
+        # tell — ask the storage. With nothing offloaded the arena has no traffic to remove.
+        offloaded = sum(t.numel() * t.element_size() for t in sources.values()
+                        if not t.is_cuda or t.data_ptr() == 0 or t.is_pinned())
+        # The budget is a TOTAL across the model, so every layer must agree on how many ways
+        # it splits. The config already enumerates the quantized MoE containers, so take the
+        # count from there rather than defaulting to 1 — a wrong count here would hand one
+        # layer the whole budget and refuse the rest.
+        n_moe = len(getattr(self.quant_config, '_moe_containers', ()) or ()) or 1
+        top_k = int(getattr(self.moe, 'experts_per_token', 0)
+                    or getattr(layer, 'top_k', 0) or 0)
+        if top_k <= 0:
+            print(f"glq[{self.prefix}]: expert arena needs top_k and the layer reports "
+                  f"none; the simultaneity precondition cannot be checked, so refusing",
+                  flush=True)
+            return
+
+        d = arena_decision_from_env(
+            _os.environ, n_layers=n_moe, n_experts=layer.glq_num_experts, top_k=top_k,
+            hidden_size=layer.glq_hidden_size, inter=layer.glq_intermediate_size,
+            w13_out=layer.glq_w13_out, bpw=layer.glq_bpw, offloaded_bytes=offloaded)
+        print(f"glq[{self.prefix}]: {d.reason}", flush=True)
+        if not d.enabled:
+            return
+        try:
+            layer.glq_arena = ExpertArena(d, sources, n_experts=layer.glq_num_experts)
+            layer.glq_arena.warmup()        # compile Triton BEFORE cudagraph capture
+        except Exception as e:                        # noqa: BLE001
+            layer.glq_arena = None
+            print(f"glq[{self.prefix}]: expert arena not built ({type(e).__name__}: {e})",
+                  flush=True)
 
     def _apply_trellis(self, layer, x, topk_weights, topk_ids):
         """Trellis MoE **fallback**: per-expert loop reusing ``E8RHTLinear._trellis_linear_apply``
@@ -798,16 +874,33 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 dtype = x.dtype
                 meta = layer._glq_trellis_moe_meta
                 m13, m2 = meta['w13'], meta['w2']
+                # Expert arena: fill any missing routing into a slot, then read the arena
+                # instead of the offloaded source. `ids` replaces topk_ids and `W` selects
+                # the weight tensors; everything else is unchanged, which is what keeps this
+                # bit-exact — the fused op's reduce is a fixed-order k loop, so substituting
+                # slots changes only WHERE a routing's weights are read from.
+                #
+                # Gated on token count (static, so each captured graph takes one branch) and
+                # on the simultaneity precondition already asserted at build time.
+                arena = getattr(layer, 'glq_arena', None)
+                ids, W = topk_ids, layer
+                if arena is not None and x.shape[0] <= self._arena_max_tokens():
+                    from .expert_arena import ArenaWeights as _ArenaWeights
+                    from .expert_arena import plan_step as _plan_step
+                    plan = _plan_step(arena.state, topk_ids)
+                    arena.fill(plan)
+                    ids = plan.slot_of.view(topk_ids.shape)
+                    W = _ArenaWeights(arena.buffers, layer)
                 output = torch.ops.glq.fused_moe_trellis_3inst(
                     x.half().contiguous(),
-                    topk_ids.to(torch.int64),
+                    ids.to(torch.int64),
                     topk_weights.float().contiguous(),
-                    layer.w13_trellis_packed, layer.w13_trellis_packed2,
-                    layer.w13_SU, layer.w13_SV, layer.w13_Wscale,
-                    layer.w13_inv_resid_scale2,
-                    layer.w2_trellis_packed, layer.w2_trellis_packed2,
-                    layer.w2_SU, layer.w2_SV, layer.w2_Wscale,
-                    layer.w2_inv_resid_scale2,
+                    W.w13_trellis_packed, W.w13_trellis_packed2,
+                    W.w13_SU, layer.w13_SV, W.w13_Wscale,
+                    W.w13_inv_resid_scale2,
+                    W.w2_trellis_packed, W.w2_trellis_packed2,
+                    W.w2_SU, layer.w2_SV, W.w2_Wscale,
+                    W.w2_inv_resid_scale2,
                     layer.glq_hidden_size, layer.glq_intermediate_size, layer.glq_w13_out,
                     m13['n_pad'], m13['m_pad'], m2['n_pad'], m2['m_pad'],
                     m13['_bn'], m13['_bm'], m13['_bnm'], m13['_bmm'],

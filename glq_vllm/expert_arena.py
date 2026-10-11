@@ -140,6 +140,61 @@ def arena_buffer_shapes(decision: ArenaDecision, *, hidden_size: int, inter: int
 
 
 # ---------------------------------------------------------------------------
+# The fill kernel
+# ---------------------------------------------------------------------------
+#
+# **Why a kernel and not `index_copy_`.** A fixed-shape
+# ``arena.index_copy_(0, slots, src.index_select(0, experts))`` is device-side and
+# graph-capturable, but its row count is static, so it would copy *every* routing's blob every
+# step whether that routing hit or missed — the same PCIe traffic as today, and zero saving.
+# Skipping the hits needs a data-dependent row count, which needs a host sync, which breaks
+# the graph capture the fused MoE op exists to preserve.
+#
+# A kernel resolves that: the **launch** is fixed-size (graph-safe) while the **work** is
+# dynamic. A program whose routing hit returns before issuing any load, so no UVA page fault
+# is taken and no bytes cross the link. That early return *is* the optimisation.
+
+def _fill_kernel():
+    """The Triton row-gather, compiled on first use.
+
+    Deliberately no `@triton.autotune`: CLAUDE.md forbids capture-time autotune under CUDA
+    graphs, and an autotuner would also make the first captured replay measure a different
+    kernel from the one it recorded.
+    """
+    global _FILL
+    if _FILL is not None:
+        return _FILL
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _gather_rows(src_ptr, dst_ptr, fill_src_ptr, slot_ptr, n_elems,
+                     BLOCK: tl.constexpr):
+        r = tl.program_id(0)
+        e = tl.load(fill_src_ptr + r)
+        # ★ The saving. `fill_src[r] < 0` means routing r is already resident, and returning
+        # here issues no load from `src_ptr` — which is host memory over PCIe when the
+        # experts are offloaded.
+        if e >= 0:
+            s = tl.load(slot_ptr + r)
+            off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+            mask = off < n_elems
+            # int64 offsets: a layer's packed tensor is ~314M elements at 512 experts, and
+            # the product with a slot index must not wrap.
+            src = src_ptr + e.to(tl.int64) * n_elems + off
+            dst = dst_ptr + s.to(tl.int64) * n_elems + off
+            tl.store(dst, tl.load(src, mask=mask), mask=mask)
+
+    _FILL = _gather_rows
+    return _FILL
+
+
+_FILL = None
+#: Elements per program. Fixed, for the reasons in `_fill_kernel`.
+FILL_BLOCK = 1024
+
+
+# ---------------------------------------------------------------------------
 # Residency state and the per-step plan
 # ---------------------------------------------------------------------------
 
@@ -309,3 +364,97 @@ def plan_step(state: ArenaState, expert_ids) -> StepPlan:
     state.counters[1] += int((~is_hit).sum())
     state.counters[2] += n_new
     return StepPlan(slot.to(torch.int32), fill_src)
+
+
+# ---------------------------------------------------------------------------
+# The arena itself
+# ---------------------------------------------------------------------------
+
+class ExpertArena:
+    """Device-resident slots for one MoE layer's hottest experts.
+
+    Holds one buffer per per-expert source tensor, each with `n_slots` rows instead of
+    `n_experts`, so a buffer is **layout-identical to a slice of its source**. That identity
+    is the whole design: `glq_cuda.cu` reaches a per-expert weight as
+    ``base + eidx * estride``, so the fused op reads the arena correctly when handed the
+    arena as the base and a slot id as ``eidx`` — with the already-compiled kernel, no edit to
+    `glq/csrc/*`, no JIT rebuild, no sm_86/89/120 portability question.
+    """
+
+    def __init__(self, decision: ArenaDecision, sources: dict, n_experts: int):
+        import torch
+
+        if not decision.enabled:
+            raise ValueError(f"refusing to build a disabled arena: {decision.reason}")
+        self.decision = decision
+        self.n_slots = decision.slots
+        self.state = ArenaState(n_experts=n_experts, n_slots=self.n_slots,
+                                device=next(iter(sources.values())).device)
+        self.sources = sources
+        self.buffers = {}
+        #: Elements per expert per tensor, which is also the row stride the kernel walks.
+        self.row_elems = {}
+        for name, src in sources.items():
+            if src.shape[0] != n_experts:
+                raise ValueError(
+                    f"{name} has leading dim {src.shape[0]}, expected {n_experts}. Only "
+                    f"per-expert tensors belong in the arena — a per-layer tensor (SV) read "
+                    f"at a slot index would silently be the wrong expert's data.")
+            self.buffers[name] = torch.empty((self.n_slots,) + tuple(src.shape[1:]),
+                                             dtype=src.dtype, device=src.device)
+            self.row_elems[name] = src[0].numel()
+
+    # ---- the per-step path ------------------------------------------------
+
+    def fill(self, plan: StepPlan) -> None:
+        """Copy every missing routing's blob into its slot. One launch per tensor.
+
+        Launch count is `len(sources)` per layer per step; the two packed tensors carry
+        >99% of the bytes and the rest are a few KiB, so batching the small ones is an
+        obvious later win — measure before bothering.
+        """
+        kern = _fill_kernel()
+        n_routings = plan.fill_src.numel()
+        for name, src in self.sources.items():
+            elems = self.row_elems[name]
+            grid = (n_routings, (elems + FILL_BLOCK - 1) // FILL_BLOCK)
+            kern[grid](src, self.buffers[name], plan.fill_src, plan.slot_of, elems,
+                       BLOCK=FILL_BLOCK)
+
+    def warmup(self) -> None:
+        """Compile the fill kernel and touch every buffer **before** graph capture.
+
+        Triton JITs on first launch. Letting that happen inside `cudaStreamCapture` is at
+        best a recorded compile and at worst the capture failure the `trellis_capture_sm120`
+        note could not isolate — so pay it during weight processing instead, where it is
+        just load time.
+        """
+        import torch
+
+        zeros = torch.zeros(1, dtype=torch.int32, device=self.state.residency.device)
+        self.fill(StepPlan(zeros, torch.full_like(zeros, _NOT_RESIDENT)))
+        torch.cuda.synchronize(self.state.residency.device)
+
+    def report(self) -> str:
+        st = self.state
+        return (f"arena {self.n_slots} slots: hit_rate={st.hit_rate():.4f} "
+                f"hits={st.hits} misses={st.misses} fills={st.fills}")
+
+
+class ArenaWeights:
+    """Reads an arena buffer where one exists, else the layer's own tensor.
+
+    Exists so the `fused_moe_trellis_3inst` call site is written once. The alternative — two
+    near-identical 20-argument calls — is exactly how a divergence hides: one of them gets a
+    fix and the other does not.
+    """
+
+    __slots__ = ("_buffers", "_layer")
+
+    def __init__(self, buffers, layer):
+        self._buffers = buffers
+        self._layer = layer
+
+    def __getattr__(self, name):
+        buf = self._buffers.get(name)
+        return buf if buf is not None else getattr(self._layer, name)
