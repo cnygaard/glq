@@ -19,7 +19,7 @@ structural.** Strata measured a globally-shared slot counter at **2.97%** hit ra
 top_k experts in *every* layer, so with 256 slots against 48x10=480 lookups per position
 *"the cache fills entirely inside the first position it ever sees and never changes again."*
 
-Measured on Flash-Next's own decode routing (`benchmarks/expert_cache_trace/`), the gap is
+Measured on Flash-Next's own decode routing (`benchmarks/expert_cache_s0.md`), the gap is
 **0.5236 GLOBAL vs 0.5300 per-layer** — nothing. The pathology needs
 `slots < n_layers * top_k`; a 10 GiB arena affords 5565 slots against 480, i.e. 11.6
 positions, so the first position cannot monopolise it. `per_layer=True` stays the default

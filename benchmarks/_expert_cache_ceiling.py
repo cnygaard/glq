@@ -1,7 +1,7 @@
 """Turn a measured offload slope + a measured hit rate into a PREDICTED tok/s.
 
 This is the gate the expert-cache plan needed and did not have. S0 produced a hit-rate curve
-(`benchmarks/expert_cache_trace/`), but a hit rate is not a speedup: it only pays to the
+(`benchmarks/expert_cache_s0.md`), but a hit rate is not a speedup: it only pays to the
 extent the decode step is actually spent moving expert bytes over PCIe. This script makes that
 conversion explicit and falsifiable, so the decision to build an arena rests on arithmetic
 somebody can check rather than on the hit rate looking large.

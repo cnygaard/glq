@@ -5,25 +5,41 @@ its own design this way (`Memory/cache_allocation.py`) rather than by reasoning,
 is what told it its cache was *"never short of capacity — it was handing all of it to two
 layers."*
 
-**Provenance.** `routing_flashnext.npz`, recorded 2026-10-11 on an **L4** (`gr6.4xlarge`,
-22.5 GiB, PCIe 4), model
-`xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4-3mtp` (48 layers x 512 experts,
-top_k 10), vLLM 0.31.0, `--max-model-len 4096 --gpu-mem 0.85 --dtype bfloat16
---cpu-offload-gb 40 --offload-params experts --offload-backend uva`, B=1, 256 decode tokens.
-220,211 records / 2,202,110 lookups. Score it with:
+## ⚠ The trace itself is not in this repo
+
+`routing_flashnext.npz` lives in the **glq-benchmarks** repo
+(`records/expert_cache_trace/routing_flashnext.npz`), not here, for two reasons:
+
+* it is raw per-run data, and this project already routes that to glq-benchmarks rather than
+  into the source tree;
+* it is **model output** — the sequence of expert *indices* each token selected — derived from
+  a GLQ quantization of [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
+  which is released under the **Qwen Community License 1.0**
+  ([licence text](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)) — a custom
+  licence, not Apache 2.0. glq itself is GPL-3.0-only, so third-party-derived data stays out of
+  the source tree rather than sitting under a licence it was never offered under.
+
+Everything below is measurement and analysis, which is this project's own. Point the scorer at
+wherever you have the file:
 
 ```bash
 python benchmarks/_expert_cache_score.py \
-    benchmarks/expert_cache_trace/routing_flashnext.npz --gib 10
+    ../glq-benchmarks/records/expert_cache_trace/routing_flashnext.npz --gib 10
 ```
 
-**Base model and licence.** The checkpoint traced here is a GLQ quantization of
-[`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), which is released
-under the **Qwen Community License 1.0** —
-[licence text](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE). Note that is
-a custom licence with its own notice requirement, not Apache 2.0. `routing_flashnext.npz`
-contains no weights: it is the sequence of routed expert *indices* per forward, i.e. which of
-the 512 experts each token selected in each of the 48 layers.
+**Provenance of that file.** Recorded 2026-10-11 on an **L4** (`gr6.4xlarge`, 22.5 GiB,
+PCIe 4), model `xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4-3mtp` (48 layers x 512
+experts, top_k 10), vLLM 0.31.0, `--max-model-len 4096 --gpu-mem 0.85 --dtype bfloat16
+--cpu-offload-gb 40 --offload-params experts --offload-backend uva`, B=1, 256 decode tokens.
+220,211 records / 2,202,110 lookups. To regenerate it from scratch:
+
+```bash
+GLQ_MOE_TRACE_ROUTING=/opt/dlami/nvme/routing.npz GLQ_MOE_TRACE_FLUSH_EVERY=500 \
+python benchmarks/run_model.py --model <ckpt> --runtime vllm \
+    --batches 1 --decode 256 --repeats 1 --eager \
+    --max-model-len 4096 --gpu-mem 0.85 --mm0 --dtype bfloat16 \
+    --cpu-offload-gb 40 --offload-params experts --offload-backend uva
+```
 
 `--eager` was required to record it at all: the recorder sits in `GLQFusedMoEMethod.apply`,
 and under CUDA graphs that Python runs only at capture time. Routing does not depend on graph

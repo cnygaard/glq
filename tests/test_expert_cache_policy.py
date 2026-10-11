@@ -12,7 +12,7 @@ slots/layer and **70.4%** at 64 — because a shared counter fills entirely insi
 token position it sees (*"about 26 layers of POSITION 0"*) and never changes again.
 
 **S0 has since settled this on the real trace, and the answer is not Strata's.** On
-Flash-Next's own decode routing (`benchmarks/expert_cache_trace/`) global and per-layer tie:
+Flash-Next's own decode routing (`benchmarks/expert_cache_s0.md`) global and per-layer tie:
 **0.5236 vs 0.5300** at 115 slots/layer. The pathology requires `slots < n_layers * top_k` —
 Strata had 256 slots against 480 lookups per position; a 10 GiB arena has 5,565, i.e. 11.6
 positions, so no single position can monopolise it. The *mechanism* tested below is real and
