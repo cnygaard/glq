@@ -1,4 +1,7 @@
 {
+ "base_model": "google/gemma-4-26B-A4B-it",
+ "license": "apache-2.0",
+ "license_url": "https://ai.google.dev/gemma/docs/gemma_4_license",
  "model": "google/gemma-4-26B-A4B-it",
  "n_keys": 1013,
  "note": "safetensors header only - shapes and dtypes, no weight data",

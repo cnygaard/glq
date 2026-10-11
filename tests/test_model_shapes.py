@@ -31,6 +31,25 @@ def test_at_least_the_two_reference_models_are_recorded():
 
 
 @pytest.mark.parametrize("slug", RECORDED)
+def test_every_manifest_names_its_BASE_MODEL_and_that_model_s_LICENSE(slug):
+    """A manifest is derived from somebody else's release, and it is checked into a public
+    repo. It carries no weights — only tensor names, shapes and dtypes — but the base model's
+    terms still govern what was derived from, and the licenses differ between the two
+    recorded here: gemma-4 is Apache 2.0 while Qwen3.8-Flash-Next is the **Qwen Community
+    License 1.0**, a custom license with its own notice requirement. Guessing "probably
+    Apache" for a Qwen model would be wrong.
+
+    Asserted rather than documented because `record.py` writes new manifests mechanically,
+    and an unattributed one would otherwise be committed without anybody noticing.
+    """
+    m = load(slug)
+    for field in ("base_model", "license", "license_url"):
+        val = m.meta.get(field)
+        assert val, f"{slug}: manifest does not record {field}"
+    assert m.meta["license_url"].startswith("http"), f"{slug}: license_url is not a link"
+
+
+@pytest.mark.parametrize("slug", RECORDED)
 def test_expansion_reproduces_the_recorded_key_count_exactly(slug):
     """The compression is lossless or it is misleading. Flash-Next collapses 297,256 keys to
     149 patterns (45.8 KiB); if expansion drifted, every test reading the manifest would

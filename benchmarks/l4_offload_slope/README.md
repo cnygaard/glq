@@ -10,6 +10,13 @@ build/don't-build decision rested on it.
 
 It was wrong by 1.8×, in the favourable direction.
 
+**Base model and licence.** The checkpoint measured here is a GLQ quantization of
+[`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), released under the
+**Qwen Community License 1.0** ([licence
+text](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)) — a custom licence,
+not Apache 2.0. Everything in this directory is timing and memory measurement plus rescued
+engine log lines; no model content.
+
 **Provenance.** L4 (`gr6.4xlarge`, 23,034 MiB, PCIe 4), 2026-10-11, vLLM 0.31.0, model
 `xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4-3mtp`. Every arm identical except
 `--cpu-offload-gb`: `--batches 1 --decode 256 --repeats 3 --max-model-len 4096 --gpu-mem 0.85

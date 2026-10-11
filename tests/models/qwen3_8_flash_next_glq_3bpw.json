@@ -1,4 +1,7 @@
 {
+ "base_model": "Qwen/Qwen3.8-Flash-Next",
+ "license": "Qwen Community License 1.0",
+ "license_url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE",
  "model": "xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4",
  "n_keys": 297256,
  "note": "safetensors header only - shapes and dtypes, no weight data",

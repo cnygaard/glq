@@ -17,6 +17,14 @@ python benchmarks/_expert_cache_score.py \
     benchmarks/expert_cache_trace/routing_flashnext.npz --gib 10
 ```
 
+**Base model and licence.** The checkpoint traced here is a GLQ quantization of
+[`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), which is released
+under the **Qwen Community License 1.0** —
+[licence text](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE). Note that is
+a custom licence with its own notice requirement, not Apache 2.0. `routing_flashnext.npz`
+contains no weights: it is the sequence of routed expert *indices* per forward, i.e. which of
+the 512 experts each token selected in each of the 48 layers.
+
 `--eager` was required to record it at all: the recorder sits in `GLQFusedMoEMethod.apply`,
 and under CUDA graphs that Python runs only at capture time. Routing does not depend on graph
 capture, so an eager trace is a valid trace — only its tok/s would be unrepresentative, and

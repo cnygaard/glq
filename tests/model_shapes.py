@@ -51,6 +51,16 @@ class ModelShapes:
         """Concrete tensor count in the source checkpoint."""
         return self._d["n_keys"]
 
+    @property
+    def meta(self) -> dict:
+        """Everything recorded except the shapes — provenance and licensing.
+
+        Carries ``base_model`` / ``license`` / ``license_url``: a manifest holds no weights,
+        but it is derived from somebody else's released model and lives in a public repo, so
+        the base model's terms travel with it.
+        """
+        return {k: v for k, v in self._d.items() if k != "shapes"}
+
     def __repr__(self):
         return (f"<ModelShapes {self.model!r} {self.n_keys} keys "
                 f"{len(self._shapes)} patterns recorded {self._d['recorded']}>")

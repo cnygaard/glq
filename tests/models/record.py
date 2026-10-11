@@ -90,7 +90,8 @@ def _header_shapes_hub(repo):
     return out
 
 
-def build_manifest(shapes, *, model, source):
+def build_manifest(shapes, *, model, source, base_model=None, license_id=None,
+                   license_url=None):
     patterns = {}
     for key, (dtype, shape) in shapes.items():
         pat, idx = collapse(key)
@@ -126,6 +127,14 @@ def build_manifest(shapes, *, model, source):
         "source": source,
         "recorded": _dt.date.today().isoformat(),
         "note": "safetensors header only - shapes and dtypes, no weight data",
+        # Attribution travels INSIDE the manifest, not in a sibling README, because the
+        # manifest is what gets copied around and read programmatically. A GLQ checkpoint is
+        # a derivative of somebody else's model and the base model's terms govern it; the
+        # licenses genuinely differ (gemma-4 is Apache 2.0, Qwen3.8-Flash-Next is the Qwen
+        # Community License 1.0), so this is recorded per model and never defaulted.
+        "base_model": base_model or "",
+        "license": license_id or "",
+        "license_url": license_url or "",
         "n_keys": len(shapes),
         "shapes": out,
     }
@@ -146,6 +155,17 @@ def main(argv=None):
     src.add_argument("--repo", help="HF repo id (header fetched, weights are not)")
     ap.add_argument("--model", default=None, help="name to record (default: the source)")
     ap.add_argument("--out", required=True)
+    # Required, not optional with a default: a GLQ checkpoint is a derivative of somebody
+    # else's model, the manifest goes into a public repo, and the licenses differ per model
+    # (gemma-4 Apache 2.0, Qwen3.8-Flash-Next the Qwen Community License 1.0). Defaulting
+    # any of these would put a guessed license on a real model.
+    ap.add_argument("--base-model", required=True,
+                    help="the upstream model this checkpoint derives from, e.g. "
+                         "Qwen/Qwen3.8-Flash-Next")
+    ap.add_argument("--license", required=True, dest="license_id",
+                    help="the BASE model's license id, e.g. apache-2.0")
+    ap.add_argument("--license-url", required=True,
+                    help="link to the base model's license text")
     args = ap.parse_args(argv)
 
     if args.checkpoint:
@@ -156,7 +176,8 @@ def main(argv=None):
         source = f"hub:{args.repo}"
 
     manifest = build_manifest(shapes, model=args.model or (args.repo or args.checkpoint),
-                              source=source)
+                              source=source, base_model=args.base_model,
+                              license_id=args.license_id, license_url=args.license_url)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
