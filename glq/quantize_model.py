@@ -154,7 +154,14 @@ def resolve_mtp_bpw(flag, model_bpw) -> int:
     return int(flag) if flag else int(model_bpw)
 
 
-def mtp_sublayer_weights(keys) -> dict[str, list[str]]:
+#: Trellis stores 16x16 tiles and the decoder reads output rows in groups of 32, so a matrix
+#: whose row count is not a multiple of 32 cannot serve however it is named. The decoder
+#: enforces this per architecture through ``skip_linears``; applying it structurally here
+#: means a future head gets the right answer under a name no skip list anticipated.
+_TRELLIS_OUT_MULTIPLE = 32
+
+
+def mtp_sublayer_weights(keys, *, shape_of=None, skip=()) -> dict[str, list[str]]:
     """Quantizable MTP-head weights, grouped by sublayer prefix: ``{prefix: [keys]}``.
 
     The MTP head is a **vLLM-only** structure. HF's Qwen4Exp discards it on load
@@ -167,8 +174,26 @@ def mtp_sublayer_weights(keys) -> dict[str, list[str]]:
     contains "mtp" and is an ordinary text weight, and quantizing it as if it were the draft
     head would corrupt the decoder.
 
-    Only 2-D weight matrices and stacked expert tensors are returned. Norms, biases and the
-    router gate are left as they are, exactly as the main decoder path leaves them.
+    Three filters, in order, and **none of them is a name rule for norms** — that was the
+    first version of this function and it was wrong. Measured against the real head:
+
+    1. ``shape_of`` — **1-D tensors are never quantized.** The head spells its norms
+       ``hc_norm``, ``k_norm``, ``q_norm``, ``pre_fc_norm_embedding``, ``pre_fc_norm_hidden``
+       and ``q_layernorm``; a rule keyed on "layernorm" catches two of nine, and quantizing a
+       norm as a matrix corrupts the head. Shape is the property that actually matters, and it
+       cannot drift with an architecture's naming.
+    2. ``skip`` — the architecture's own ``skip_linears``, passed in rather than restated, so
+       the head inherits the decoder's policy. For Qwen4Exp that covers ``shared_expert_gate``
+       [1, 2560] and ``block_inject_weight`` [4, 10240], which fail the serving gate below,
+       plus ``.indexer.`` — skipped on principle because it selects which tokens attend at all,
+       so perturbing it changes the sparse pattern rather than adding weight noise.
+    3. ``_TRELLIS_OUT_MULTIPLE`` — a structural backstop for anything the skip list misses.
+
+    The router (``mlp.gate``) is excluded by name and must be: it is 2-D, passes the serving
+    gate, and appears in no skip list, but its argmax decides which expert runs.
+
+    ``shape_of`` is optional only so a caller holding bare key names can still group them;
+    without it the shape filters cannot run, so `quantize_mtp_head` always supplies one.
     """
     out: dict[str, list[str]] = {}
     for key in keys:
@@ -181,15 +206,82 @@ def mtp_sublayer_weights(keys) -> dict[str, list[str]]:
             prefix = ".".join(parts[:-1])
         elif leaf == "weight" and len(parts) >= 3:
             prefix = ".".join(parts[:-1])
-            # Norms and the router are 1-D or tiny; the decoder path leaves them unquantized
-            # and the MTP head must match, or the artifact set will not line up with what
-            # vLLM's loader expects for those modules.
-            if parts[-2].endswith("layernorm") or parts[-2] in ("norm", "gate"):
+            if parts[-2] in ("gate",):
+                continue                  # the router: see the docstring
+            if "norm" in parts[-2]:
+                # Defence in depth, NOT the norm filter. `shape_of` is the filter, because
+                # names drift; this only means a caller holding bare key names still drops
+                # the obvious ones instead of silently selecting a norm to quantize.
                 continue
         else:
             continue                      # biases, scales, anything else: untouched
+
+        if skip and _skip_match(prefix, tuple(skip)):
+            continue
+
+        if shape_of is not None:
+            shape = shape_of(key)
+            if shape is None:
+                continue
+            stacked = leaf in _STACKED_EXPERT_LEAVES
+            if len(shape) != (3 if stacked else 2):
+                continue                  # norms (1-D), and anything unexpectedly shaped
+            # Rows of the matrix that will actually be encoded: for a stacked expert that
+            # is the per-expert slice, not the expert count.
+            rows = shape[1] if stacked else shape[0]
+            if rows % _TRELLIS_OUT_MULTIPLE:
+                continue
         out.setdefault(prefix, []).append(key)
     return out
+
+
+def ple_reuse_decision(prefix, declared_bpw, all_artifacts, all_layer_metrics) -> bool:
+    """Can the PLE table restored by resume be reused instead of re-quantized?
+
+    Reuse is **exactly** correct, not an approximation: PLE quantization builds an identity
+    Hessian and the block frees ``hidden_states`` before it starts ("we only need the embed"),
+    so it does not depend on calibration at all. The stored artifacts are bit-for-bit what
+    this run would recompute at the same rung.
+
+    Worth doing because the work is large and entirely redundant: on Qwen3.8-Flash-Next the
+    table is 19,532 chunks at 0.876 s each — **4.75 hours**, measured — and every arm of an
+    ``--mtp-bpw`` sweep would pay it again.
+
+    Refuses rather than guesses in three cases, because each produces a checkpoint that loads
+    wrong hours later with nothing pointing back here:
+
+    * **rung mismatch.** vLLM sizes ``trellis_packed`` from ``layer_bpw``, so 4 bpw artifacts
+      declared as 3 are a wrong buffer. This is live, not hypothetical: the published
+      Flash-Next checkpoint is ``ple_bpw: 4`` while this descriptor defaults to 3.
+    * **no recorded rung.** Silence is not agreement — an unverifiable reuse fails the same
+      way as a wrong one, only later.
+    * **incomplete artifacts.** A trellis table without ``rht_blocks`` cannot be decoded at a
+      non-power-of-two width, and that was the real state of the first store built here.
+    """
+    arts = all_artifacts.get(prefix)
+    if not arts:
+        return False
+
+    stored_bpw = (all_layer_metrics.get(prefix) or {}).get("bpw")
+    if stored_bpw is None:
+        raise ValueError(
+            f"resume restored the PLE table {prefix!r} but recorded no bpw for it, so its "
+            f"rung cannot be checked against the declared {declared_bpw}. Re-shard with a "
+            "checkpoint whose config.json carries ple_bpw, or set GLQ_PLE_BPW to assert the "
+            "rung deliberately.")
+    if int(stored_bpw) != int(declared_bpw):
+        raise ValueError(
+            f"PLE rung disagreement: the resumed artifacts for {prefix!r} are "
+            f"{int(stored_bpw)} bpw but this run declares {int(declared_bpw)}. vLLM sizes "
+            f"trellis_packed from the declaration, so this would load wrong. Set "
+            f"GLQ_PLE_BPW={int(stored_bpw)} to match the checkpoint you are extending.")
+
+    if "trellis_packed" in arts and "rht_blocks" not in arts:
+        raise ValueError(
+            f"the resumed PLE table {prefix!r} has trellis_packed but no rht_blocks, so the "
+            "inverse RHT cannot be rebuilt for a non-power-of-two width. The store is "
+            "incomplete — re-shard it with a glq that captures every artifact leaf.")
+    return True
 
 
 def _offloadable_bytes(state_dict: dict, mtp_is_loaded: bool = False) -> tuple[int, int, int]:
@@ -1559,8 +1651,21 @@ class _ShardTensorView:
     def get(self, key, default=None):
         return self[key] if key in self._weight_map else default
 
+    def shape_of(self, key):
+        """Shape from the safetensors HEADER — no tensor data is read.
 
-def quantize_mtp_head(state_dict, codebook, bpw, *, hessians=None,
+        Lets the MTP filter reject a 1-D norm without paying to load it, which matters
+        because the filter runs over every `mtp.*` key.
+        """
+        from safetensors import safe_open                # noqa: PLC0415
+        shard = self._weight_map.get(key)
+        if shard is None:
+            return None
+        with safe_open(self._shard_paths[shard], framework="pt") as fh:
+            return tuple(fh.get_slice(key).get_shape())
+
+
+def quantize_mtp_head(state_dict, codebook, bpw, *, hessians=None, skip=(),
                       quantize_fn=None, block_diagonal=True, verbose=True):
     """Quantize the multi-token-prediction draft head. ``-> (artifacts, metrics, superseded)``.
 
@@ -1589,7 +1694,16 @@ def quantize_mtp_head(state_dict, codebook, bpw, *, hessians=None,
     better later; it is not wired to a calibration source yet, so do not report an
     identity-Hessian run as calibrated.
     """
-    groups = mtp_sublayer_weights(state_dict.keys())
+    def _shape_of(key):
+        """Shape without materialising the tensor where the mapping can do that."""
+        if hasattr(state_dict, "shape_of"):
+            return state_dict.shape_of(key)
+        t = state_dict.get(key)
+        return None if t is None else tuple(t.shape)
+
+    # `skip` is the architecture's own skip_linears, so the head inherits the decoder's
+    # policy instead of a second copy of it maintained here.
+    groups = mtp_sublayer_weights(state_dict.keys(), shape_of=_shape_of, skip=skip)
     if not groups:
         # No draft head: contribute nothing and touch nothing. Every published checkpoint
         # except Flash-Next takes this branch, which is what keeps them byte-identical.
@@ -3292,6 +3406,13 @@ def quantize(
     # keeps rows independent so a per-row gather at inference is trivial.
     # Skipped on profiling passes (they uniformly use 2 bpw and exit early before here).
     ple_spec = _ple_embed_spec(arch, profile, cfg) if streaming else None
+    if ple_spec is not None and ple_reuse_decision(
+            ple_spec['prefix'], ple_spec['bpw'], all_artifacts, all_layer_metrics):
+        # Restored by resume replay, and provably identical to what re-quantizing would
+        # produce — see ple_reuse_decision. Skips 19,532 chunks / ~4.7 h on Qwen4Exp.
+        print(f"  PLE embed: reusing {len(all_artifacts[ple_spec['prefix']])} artifacts at "
+              f"{ple_spec['bpw']} bpw from the resume checkpoint (skipping re-quantization)")
+        ple_spec = None
     if ple_spec is not None:
         ple_embed_prefix = ple_spec['prefix']
         ple_embed_bpw = ple_spec['bpw']
@@ -3454,8 +3575,18 @@ def quantize(
     total_time = time.perf_counter() - t_start
     avg_sqnr = sum(all_sqnr) / len(all_sqnr) if all_sqnr else 0
     print(f"\n{'='*60}")
-    print(f"Quantized {len(all_sqnr)} sublayers in {total_time/60:.1f}m")
-    print(f"Average SQNR = {avg_sqnr:.2f} dB")
+    if all_sqnr:
+        print(f"Quantized {len(all_sqnr)} sublayers in {total_time/60:.1f}m")
+        print(f"Average SQNR = {avg_sqnr:.2f} dB")
+    else:
+        # Every layer came from the resume store, so this run encoded nothing in the loop.
+        # Printed as its own case because the old wording — "Quantized 0 sublayers" with
+        # "Average SQNR = 0.00 dB" — reads like a catastrophic result on a run that
+        # succeeded, and a fully-replayed run is the normal shape of a resumed one.
+        print(f"Replayed all {n_layers} layers from the resume checkpoint in "
+              f"{total_time/60:.1f}m — nothing re-encoded in the layer loop")
+        print("Average SQNR: n/a (no new encodes; see layer_metrics.json for the "
+              "restored values)")
     print(f"{'='*60}")
 
     # ---- Save ----
@@ -3496,6 +3627,7 @@ def quantize(
             _mtp_cb.rvq_stages = _mtp_stages
         _mtp_arts, _mtp_metrics, _mtp_superseded = quantize_mtp_head(
             _ShardTensorView(weight_map, shard_paths), _mtp_cb, _mtp_bpw,
+            skip=tuple(profile.get('skip_linears') or ()),
             block_diagonal=not (codebook_type == "e8p"
                                 and bool(os.environ.get("GLQ_E8P_POW2"))))
         all_artifacts.update(_mtp_arts)

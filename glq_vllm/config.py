@@ -56,6 +56,23 @@ class GLQvLLMConfig(QuantizationConfig):
         super().__init__()
         self.bpw = bpw
         self.layer_bpw = layer_bpw or {}
+        # MoE containers that ARE quantized. `layer_bpw` enumerates stacked experts one
+        # entry per expert per projection (`...mlp.experts.0.gate_proj`) and never the
+        # container, but vLLM asks `get_quant_method` about the container. Precomputed once
+        # because Flash-Next has 75,576 entries and 49 MoE layers would otherwise rescan
+        # them all. See `_moe_is_quantized`.
+        self._moe_containers = set()
+        #: MTP layer indices present in `layer_bpw`. vLLM RENUMBERS the draft block — the
+        #: checkpoint stores `mtp.layers.0.*` and vLLM places the head after the decoder's
+        #: 0..47, asking about `mtp.layers.48.*` and rewriting the weight names to match.
+        #: Without translating, every MTP lookup misses on the index alone.
+        self._mtp_layer_indices = set()
+        for _k in self.layer_bpw:
+            _p = _k.split(".")
+            if len(_p) >= 3 and _p[-2].isdigit():
+                self._moe_containers.add(".".join(_p[:-2]))
+            if len(_p) >= 3 and _p[0] == "mtp" and _p[1] == "layers" and _p[2].isdigit():
+                self._mtp_layer_indices.add(_p[2])
         self.codebook = codebook
         # Codebook and rate of the per-layer-embedding table, which need not match the
         # weights': a 3 bpw model can carry a 4 bpw table, and a shell run can carry a
@@ -119,6 +136,26 @@ class GLQvLLMConfig(QuantizationConfig):
             ple_bpw=config.get("ple_bpw", None),
         )
 
+    def _mtp_forms(self, prefix: str) -> set[str]:
+        """``prefix`` with the MTP layer index swapped for each index the checkpoint used.
+
+        vLLM places the draft block after the decoder (``mtp.layers.48`` on a 48-layer
+        model) while the checkpoint names it ``mtp.layers.0``, and the quantizer records
+        `layer_bpw` under the checkpoint's name. Confined to the ``mtp.*`` tree on purpose:
+        decoder layers genuinely differ from one another, so renumbering one of those would
+        hand a layer another layer's bpw and size its buffers wrongly.
+
+        Empty for a head that was not quantized, so an unquantized MTP head is still
+        declined at every index.
+        """
+        parts = prefix.split(".")
+        if len(parts) < 4 or parts[0] != "mtp" or parts[1] != "layers":
+            return set()
+        if not parts[2].isdigit():
+            return set()
+        rest = ".".join(parts[3:])
+        return {f"mtp.layers.{i}.{rest}" for i in self._mtp_layer_indices}
+
     def _lookup_bpw(self, prefix: str) -> int | None:
         """Return the bpw for ``prefix`` from ``layer_bpw``, or None.
 
@@ -137,7 +174,7 @@ class GLQvLLMConfig(QuantizationConfig):
         """
         if prefix in self.layer_bpw:
             return self.layer_bpw[prefix]
-        forms = {prefix}
+        forms = {prefix} | self._mtp_forms(prefix)
         if prefix.startswith("model.") and ".language_model." not in prefix:
             forms.add("model.language_model." + prefix[len("model."):])
         if prefix.startswith("language_model.model."):
@@ -156,6 +193,35 @@ class GLQvLLMConfig(QuantizationConfig):
             if f in self.layer_bpw:
                 best = max(best or 0, int(self.layer_bpw[f]))
         return best
+
+    def _moe_is_quantized(self, prefix: str) -> bool:
+        """Is this MoE container quantized in the checkpoint?
+
+        Cannot reuse `_lookup_bpw`, and that mistake cost a full serve run. `layer_bpw`
+        lists a stacked-expert MoE as one entry **per expert per projection** —
+        ``...mlp.experts.0.gate_proj`` — and never the container, while vLLM asks about the
+        container. So the linear lookup returns None for a perfectly quantized MoE layer,
+        the layer gets declined, and vLLM installs its own unquantized method: bf16
+        ``w13_weight``/``w2_weight``, **4.69 GiB per layer** on Flash-Next. The card is
+        exhausted about twenty layers in, and the traceback points at vLLM's allocator with
+        nothing naming the real cause.
+
+        Matched on dotted SEGMENTS via the precomputed container set, so ``...mlp.expert``
+        cannot match ``...mlp.experts.0.gate_proj`` the way ``startswith`` would.
+        """
+        if self._lookup_bpw(prefix) is not None:
+            return True                      # a directly-enumerated (non-stacked) MoE
+        forms = {prefix} | self._mtp_forms(prefix)
+        if prefix.startswith("model.") and ".language_model." not in prefix:
+            forms.add("model.language_model." + prefix[len("model."):])
+        if prefix.startswith("language_model.model."):
+            forms.add("model.language_model."
+                      + prefix[len("language_model.model."):])
+        if prefix.startswith("model.language_model."):
+            forms.add("language_model.model."
+                      + prefix[len("model.language_model."):])
+            forms.add("model." + prefix[len("model.language_model."):])
+        return any(f in self._moe_containers for f in forms)
 
     def _is_prefused(self, prefix: str) -> bool:
         """True iff ``prefix`` is a DIRECT layer_bpw entry — i.e. the checkpoint
@@ -254,7 +320,7 @@ class GLQvLLMConfig(QuantizationConfig):
                 # creates the w13_weight/w2_weight its MTP loader expects. Guarded on
                 # `self.layer_bpw` being non-empty so pre-layer_bpw checkpoints — which
                 # enumerate nothing and quantize everything — keep being claimed.
-                if self.layer_bpw and self._lookup_bpw(prefix) is None:
+                if self.layer_bpw and not self._moe_is_quantized(prefix):
                     return None
                 from vllm.platforms import current_platform
                 if getattr(current_platform, "device_type", "") == "cpu":

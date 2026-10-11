@@ -270,6 +270,13 @@ def run_vllm(args, failures):
         kw["compilation_config"] = {"cudagraph_mode": "FULL", "cudagraph_capture_sizes": caps}
     if args.mm0 or needs_mm0(archs):
         kw["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+    if args.speculative_config:
+        kw["speculative_config"] = json.loads(args.speculative_config)
+        # `LLM()` defaults disable_log_stats=True, and with stats off `get_metrics()`
+        # raises AssertionError — so the acceptance rate is unreadable and the run cannot
+        # show that speculation engaged. Measured: a 1.76x throughput jump that could not
+        # be attributed, which is exactly the ambiguity the assertion below exists to stop.
+        kw["disable_log_stats"] = False
 
     print(f"CONFIG {json.dumps({k: v for k, v in kw.items() if k != 'model'}, default=str)}",
           flush=True)
@@ -322,6 +329,76 @@ def run_vllm(args, failures):
         print(f"RESULT label={args.label} model={args.model} batch={b} "
               f"total_decode_tokps={tps:.3f} per_seq_tokps={tps / b:.3f} "
               f"ttft_ms={ttft_ms:.0f} n_tokens={ntok}{rng}{note}", flush=True)
+
+    if args.speculative_config:
+        acc = speculative_acceptance(llm, tee.text())
+        print(f"SPECULATION {json.dumps(acc, default=str)}", flush=True)
+        # Assert the mechanism. Throughput alone cannot distinguish "speculation ran and did
+        # not help" from "speculation never drafted a token" — and the second is a config or
+        # loader bug wearing the first one's clothes.
+        if acc.get("draft_tokens") == 0 or acc.get("drafts") == 0:
+            failures.append(
+                "speculative_config was set but ZERO draft tokens were proposed — the "
+                "draft model is not running, so the tok/s above is a non-speculative "
+                "number. Do not report it as a speculation result.")
+        elif acc.get("draft_tokens") is None and acc.get("drafts") is None:
+            failures.append(
+                "speculative_config was set but no draft counters could be read, so "
+                "whether speculation engaged is UNVERIFIED — treat the tok/s as "
+                "non-speculative until the acceptance rate is confirmed.")
+
+
+def speculative_acceptance(llm, log_text):
+    """``{drafted, accepted, acceptance_rate, source}`` for a speculative run.
+
+    Tries the engine's own counters first and falls back to parsing the log, because the
+    counter plumbing has moved between vLLM versions and a silent `None` here would let an
+    unverified throughput number be published as a speculation result.
+    """
+    out = {"draft_tokens": None, "accepted_tokens": None, "drafts": None,
+           "acceptance_rate": None, "accepted_per_draft": None, "source": None}
+    try:                                                   # v1 metrics on the engine core
+        m = llm.llm_engine.get_metrics()
+        counters = {}
+        for metric in m:
+            name = getattr(metric, "name", "") or ""
+            if "spec_decode" in name:
+                counters[name] = getattr(metric, "value", None)
+
+        # Match on the EXACT counter suffix. vLLM exposes both `num_drafts` (draft STEPS)
+        # and `num_draft_tokens` (tokens proposed), and a substring match on "num_draft"
+        # picks whichever the dict happens to yield first. That produced
+        # accepted/drafted = 490/407 = 1.20 and called it an acceptance rate — a plausible
+        # number that is not the quantity named, which is worse than no number.
+        def _pick(suffix):
+            for k, v in counters.items():
+                if k.endswith(suffix) or k.endswith(suffix + "_total"):
+                    return v
+            return None
+
+        dtok = _pick("num_draft_tokens")
+        atok = _pick("num_accepted_tokens")
+        ndrafts = _pick("num_drafts")
+        if dtok is not None or ndrafts is not None:
+            out.update(draft_tokens=dtok, accepted_tokens=atok, drafts=ndrafts,
+                       source="engine_metrics", raw={k: v for k, v in counters.items()})
+            if dtok:
+                # The acceptance rate proper: of the tokens the draft PROPOSED, how many
+                # the target model kept. Bounded by 1 by construction.
+                out["acceptance_rate"] = (atok or 0) / dtok
+            if ndrafts:
+                # Tokens kept per draft step. Bounded by num_speculative_tokens (+1 for the
+                # bonus token), so it can legitimately exceed 1 — do not confuse the two.
+                out["accepted_per_draft"] = (atok or 0) / ndrafts
+            return out
+    except Exception as e:                                 # noqa: BLE001 - version-dependent
+        out["source"] = f"engine_metrics unavailable ({type(e).__name__})"
+
+    m = re.search(r"[Aa]cceptance rate:?\s*([\d.]+)", log_text or "")
+    if m:
+        out.update(acceptance_rate=float(m.group(1)), draft_tokens=-1,
+                   source="serve log (rate only; counts unavailable)")
+    return out
 
 
 def is_cuda_device(device_map) -> bool:
@@ -586,6 +663,12 @@ def build_parser():
                     help="assert weight footprint matches this bpw budget within 15%%")
     ap.add_argument("--expect", default=None,
                     help="assert the coherence sample contains this substring")
+    ap.add_argument("--speculative-config", dest="speculative_config", default=None,
+                    help="JSON passed straight to vLLM's speculative_config, e.g. "
+                         "'{\"method\":\"mtp\",\"num_speculative_tokens\":3}'. The "
+                         "ACCEPTANCE RATE is reported and asserted: a speculative config "
+                         "that silently fails to draft shows up as unchanged throughput, "
+                         "which is indistinguishable from 'speculation does not help here'.")
     ap.add_argument("--label", default="")
     return ap
 

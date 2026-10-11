@@ -28,6 +28,7 @@ import os
 import tempfile
 
 __all__ = ["ResumeStore", "ResumeKeyMismatch", "compute_run_key", "shard_from_checkpoint",
+           "quantized_prefix_leaves",
            "detect_sd_prefix", "derive_run_key",
            "dequantize_artifacts"]
 
@@ -309,6 +310,76 @@ def dequantize_artifacts(arts, in_features, out_features, codebook_type,
     return mod.dequantize()
 
 
+#: Leaf names that mark a tensor as a quantization ARTIFACT rather than a plain weight.
+#: A prefix is quantized exactly when it owns at least one of these, which is what makes
+#: `_is_artifact_leaf` — not `layer_metrics.json` — the authority on what to re-shard.
+_ARTIFACT_LEAVES = frozenset({
+    "trellis_packed", "tlut",            # QTIP trellis
+    "Qidxs", "Qidxs2", "Qidxs3",         # shell / stacked RVQ indices
+    "SU", "SV", "Wscale",                # RHT row/col signs, scale
+})
+
+
+#: Leaf names that are ordinary parameters, never quantization artifacts. Used as the
+#: NEGATIVE half of the self-correcting rule below.
+_PLAIN_LEAVES = frozenset({"weight", "bias"})
+
+
+def _is_artifact_leaf(leaf: str) -> bool:
+    """Is this final key segment a quantization artifact?
+
+    Checked on the tensor keys because `layer_metrics.json` is **incomplete**, and silently
+    so. Measured on xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4: 73,728
+    quantized expert prefixes exist as tensors but only 24,576 appear in the metrics file —
+    every ``experts.{e}.gate_proj`` and ``up_proj`` is absent, because gate and up are
+    quantized *jointly* and the metrics land under the fused name while the artifacts are
+    stored split.
+
+    Keying off the metrics therefore dropped two thirds of the expert weights from the
+    store, and replay would then leave them at bf16 through the calibration forward — which
+    nothing reports. The only outward sign was the store being 16 GiB instead of ~43 GiB.
+    """
+    return (leaf in _ARTIFACT_LEAVES
+            or leaf.startswith("trellis_packed")       # trellis_packed2, ...
+            or leaf.startswith("inv_resid_scale")      # inv_resid_scale, ...2
+            or leaf.endswith("_e8p") or leaf.endswith("_e81b"))
+
+
+def quantized_prefix_leaves(keys) -> dict[str, set[str]]:
+    """``{prefix: {leaf, ...}}`` for every quantized prefix among ``keys``.
+
+    Two passes, because a whitelist of artifact names is not maintainable. Pass one finds
+    prefixes that own a *recognised* artifact leaf; pass two then takes **all** of that
+    prefix's non-plain leaves. So a layer type with an artifact nobody listed still travels
+    complete, as long as it also has one familiar one.
+
+    That is not hypothetical: the PLE table carries ``rht_blocks`` — the RHT block sizes the
+    inverse transform needs for a non-power-of-two width — which no other layer type
+    produces. A hand-kept list omitted it, and the table came back from the store
+    undecodable, with nothing reporting a problem.
+
+    The negative half matters equally. `ple_embedding.layer_multipliers` and
+    `ple.norm_key.weight` sit right beside the table under *different* prefixes and own no
+    artifact, so they stay out; sweeping them in would hand replay tensors with no module
+    behind them.
+    """
+    owners = set()
+    for key in keys:
+        if "." not in key:
+            continue
+        prefix, leaf = key.rsplit(".", 1)
+        if _is_artifact_leaf(leaf):
+            owners.add(prefix)
+    out: dict[str, set[str]] = {}
+    for key in keys:
+        if "." not in key:
+            continue
+        prefix, leaf = key.rsplit(".", 1)
+        if prefix in owners and leaf not in _PLAIN_LEAVES:
+            out.setdefault(prefix, set()).add(leaf)
+    return out
+
+
 def shard_from_checkpoint(*, checkpoint_dir, store, sd_prefix, layers=None,
                           verbose=True):
     """Rebuild resume shards from a finished GLQ checkpoint. ``-> {layer indices written}``.
@@ -322,11 +393,12 @@ def shard_from_checkpoint(*, checkpoint_dir, store, sd_prefix, layers=None,
     flattening the final checkpoint uses (``f"{layer_prefix}.{key}"``), so the tensors go
     across untouched and ``load_layer`` reassembles them by the same prefix split.
 
-    **``layer_metrics.json`` is the authority on what is quantized**, rather than a list of
-    artifact names kept in sync by hand: the checkpoint ships one entry per quantized matrix
-    (24,576 of them are per-expert on Flash-Next), so a prefix is quantized exactly when it
-    appears there. That also recovers ``metrics`` and the ``proxy_loss`` the mixed-precision
-    allocator needs, which no amount of tensor-name inspection could.
+    **The tensor keys are the authority on what is quantized** — see `_is_artifact_leaf`.
+    ``layer_metrics.json`` looks like the natural source and is not: it is incomplete, and
+    silently. On Flash-Next it records 24,576 expert prefixes while 73,728 exist, omitting
+    every jointly-quantized ``gate_proj``/``up_proj``. Keying off it dropped two thirds of
+    the expert weights. Metrics and ``proxy_loss`` are still read from it where present,
+    best-effort, and the shortfall is reported rather than hidden.
 
     The run_key is the caller's: it must match the run that will resume, and `ResumeStore`
     refuses a mismatch rather than blending two configurations.
@@ -334,63 +406,82 @@ def shard_from_checkpoint(*, checkpoint_dir, store, sd_prefix, layers=None,
     import re                                              # noqa: PLC0415
     from safetensors import safe_open                      # noqa: PLC0415
 
+    # layer_metrics.json supplies metrics and proxy_loss, and nothing else. It is
+    # explicitly NOT the authority on what is quantized — see _is_artifact_leaf.
+    all_metrics = {}
     metrics_path = os.path.join(checkpoint_dir, "layer_metrics.json")
-    if not os.path.exists(metrics_path):
-        raise ValueError(
-            f"{checkpoint_dir} has no layer_metrics.json, so there is no record of which "
-            "matrices were quantized or what their proxy_loss was. Both are needed to "
-            "resume; a checkpoint without it cannot be re-sharded.")
-    with open(metrics_path) as f:
-        all_metrics = json.load(f)
+    if os.path.exists(metrics_path):
+        with open(metrics_path) as f:
+            all_metrics = json.load(f)
+    elif verbose:
+        print("  note: no layer_metrics.json; shards will carry no metrics or proxy_loss. "
+              "Only mixed-precision allocation needs those, and that cannot be resumed "
+              "anyway (see derive_run_key).")
 
     shard_files = sorted(f for f in os.listdir(checkpoint_dir)
                          if f.endswith(".safetensors"))
     if not shard_files:
         raise ValueError(f"{checkpoint_dir} contains no .safetensors files")
 
-    # prefix -> layer index, for the quantized prefixes under this sd_prefix only.
-    pat = re.compile(rf"^{re.escape(sd_prefix)}\.(\d+)\.")
-    prefix_layer = {}
-    for prefix in all_metrics:
-        m = pat.match(prefix)
-        if m:
-            prefix_layer[prefix] = int(m.group(1))
-    if not prefix_layer:
-        raise ValueError(
-            f"no quantized prefix in layer_metrics.json starts with sd_prefix "
-            f"{sd_prefix!r} (saw e.g. {next(iter(all_metrics), '<empty>')!r}). A wrapped "
-            "checkpoint uses 'model.language_model.layers'; a plain one 'model.layers'. "
-            "Raising rather than writing an empty store, which would look like success and "
-            "send the run back to layer 0 at full cost.")
-
     want = None if layers is None else set(layers)
+    pat = re.compile(rf"^{re.escape(sd_prefix)}\.(\d+)\.")
     # layer -> prefix -> {artifact key: tensor}
     by_layer: dict[int, dict] = {}
     for sf in shard_files:
         with safe_open(os.path.join(checkpoint_dir, sf), framework="pt") as fh:
-            for key in fh.keys():
-                if "." not in key:
-                    continue
-                prefix, art = key.rsplit(".", 1)
-                idx = prefix_layer.get(prefix)
-                if idx is None:
-                    continue           # unquantized (norms, embeddings) or another prefix
+            wanted = quantized_prefix_leaves(fh.keys())
+            for prefix, leaves in wanted.items():
+                m = pat.match(prefix)
+                if m is None:
+                    continue           # outside the decoder (the MTP head, ...)
+                idx = int(m.group(1))
                 if want is not None and idx not in want:
                     continue
-                by_layer.setdefault(idx, {}).setdefault(prefix, {})[art] = (
-                    fh.get_tensor(key))
+                slot = by_layer.setdefault(idx, {}).setdefault(prefix, {})
+                for leaf in leaves:
+                    slot[leaf] = fh.get_tensor(f"{prefix}.{leaf}")
+
+    if not by_layer:
+        raise ValueError(
+            f"no quantized tensor under sd_prefix {sd_prefix!r} in {checkpoint_dir}. A "
+            "wrapped checkpoint uses 'model.language_model.layers', a plain one "
+            "'model.layers'. Raising rather than writing an empty store, which would look "
+            "like success and send the run back to layer 0 at full cost.")
+
+    # The PLE table's rung, which `layer_metrics.json` does not record for it. Reuse needs
+    # it: the published Flash-Next checkpoint is ple_bpw 4 while the descriptor currently
+    # defaults to 3, and reusing 4 bpw artifacts under a 3 bpw declaration would size the
+    # serving buffers wrongly. Injected as a metrics entry so it rides existing plumbing.
+    cfg_path = os.path.join(checkpoint_dir, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            _qc = json.load(f).get("quantization_config", {})
+        _ple_bpw = _qc.get("ple_bpw")
+        if _ple_bpw is not None:
+            for _p in [p for p in {k for v in by_layer.values() for k in v}
+                       if p.endswith("ngram_embedding")
+                       or p.endswith("embed_tokens_per_layer")]:
+                all_metrics.setdefault(_p, {})["bpw"] = int(_ple_bpw)
 
     written = set()
+    n_no_metrics = 0
     for idx in sorted(by_layer):
         arts = by_layer[idx]
         metrics = {p: all_metrics[p] for p in arts if p in all_metrics}
         losses = {p: m["proxy_loss"] for p, m in metrics.items() if "proxy_loss" in m}
+        n_no_metrics += len(arts) - len(metrics)
         store.save_layer(idx, arts, metrics=metrics, proxy_losses=losses)
         written.add(idx)
         if verbose:
             print(f"  layer {idx}: {len(arts)} matrices re-sharded")
     if verbose:
         print(f"re-sharded {len(written)} layers into {store.local_dir}")
+        if n_no_metrics:
+            # Reported rather than silent: this is normal (jointly-quantized gate/up carry
+            # no split-name metrics) but a large number is also how an actual problem would
+            # look, and it is the count that distinguishes the two.
+            print(f"  {n_no_metrics} matrices had artifacts but no layer_metrics entry — "
+                  "sharded anyway; metrics are best-effort, artifacts are not")
     return written
 
 

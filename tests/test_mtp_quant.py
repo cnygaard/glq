@@ -116,9 +116,14 @@ def test_the_cli_exposes_mtp_bpw():
 # the artifacts land under, which originals are superseded, and what is left alone.
 # ---------------------------------------------------------------------------
 
-def _fake_mtp_state_dict(n_experts=3, hidden=16, inter=8):
+def _fake_mtp_state_dict(n_experts=3, hidden=64, inter=32):
     """The shape Qwen3.8-Flash-Next's MTP head actually has, shrunk: one block with a
-    plain attention projection, stacked routed experts, and norms/router alongside."""
+    plain attention projection, stacked routed experts, and norms/router alongside.
+
+    Dimensions are multiples of 32 because that is a real constraint, not decoration: a
+    matrix whose output rows are not a multiple of 32 cannot serve as trellis, so the
+    filter rejects it. An earlier version of this fixture used 16x8 and was silently
+    rejected in full — a fixture that cannot pass the production gate tests nothing."""
     import torch
     return {
         "mtp.layers.0.input_layernorm.weight": torch.ones(hidden),
@@ -289,3 +294,151 @@ def test_a_matching_codebook_is_accepted():
                                    codebook=_FakeTrellisCodebook(3), bpw=3,
                                    quantize_fn=_stub_quantize)
     assert arts
+
+
+# ---------------------------------------------------------------------------
+# The real MTP head, measured from
+# xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4. The first filter was
+# written against a GUESS about what the head contains and quantized several
+# things it must not. These fixtures are the actual key/shape inventory, so the
+# filter is tested against the architecture rather than against my model of it.
+# ---------------------------------------------------------------------------
+
+#: The REAL head, read from a recorded shape manifest rather than typed out here.
+#: `tests/models/record.py` explains why: a hand-written fixture encodes the author's model
+#: of an architecture, and three fixtures in this file were wrong that way before the
+#: manifests existed — one used 16x8 shapes the production filter rejects outright, so its
+#: tests passed against a state that cannot occur.
+def _flashnext():
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from model_shapes import load
+    return load("qwen3_8_flash_next_glq_3bpw")
+
+
+#: The decoder's declared policy for this architecture, which the head must inherit.
+QWEN4EXP_SKIP = ('.in_proj_b', '.in_proj_a', '.shared_expert_gate',
+                 '.block_inject_weight', '.indexer.',
+                 '.input_mix_weight_down', '.input_mix_weight_up')
+
+
+def _real_groups():
+    """Run the PRODUCTION filter over the real key set, with the real shapes."""
+    from glq.quantize_model import mtp_sublayer_weights
+    m = _flashnext()
+    return mtp_sublayer_weights(m.keys(), shape_of=m.shape_of, skip=QWEN4EXP_SKIP)
+
+
+def test_no_one_dimensional_tensor_is_ever_quantized():
+    """Shape, not spelling. This head spells its norms `hc_norm`, `k_norm`, `q_norm`,
+    `pre_fc_norm_embedding`, `pre_fc_norm_hidden` and `q_layernorm` — only the last ends in
+    "layernorm", so a name rule catches two of nine. Quantizing a 1-D norm as a matrix would
+    corrupt the head, and no rule based on names can be trusted to keep up with an
+    architecture's naming."""
+    m = _flashnext()
+    got = _real_groups()
+    assert got, "the filter selected nothing — the manifest or the filter is broken"
+    for prefix in got:
+        for key in got[prefix]:
+            assert len(m.shape_of(key)) >= 2, f"1-D tensor selected: {key}"
+    assert not [p for p in got if "norm" in p]
+    # And the model really does contain the 1-D norms we are claiming to reject, or this
+    # test would pass against a manifest that simply lacks them.
+    for norm in ("mtp.layers.0.self_attn.q_norm.weight",
+                 "mtp.layers.0.attn_hyper_connection.hc_norm.weight",
+                 "mtp.pre_fc_norm_hidden.weight"):
+        assert len(m.shape_of(norm)) == 1, f"{norm} is not 1-D in the manifest"
+
+
+def test_the_decoders_own_skip_policy_is_honoured():
+    """Two of these FAIL the trellis out%32 serving gate — `shared_expert_gate` [1, 2560]
+    and `block_inject_weight` [4, 10240] — so a quantized version could not serve at all.
+    `.indexer.` is skipped for a different reason the decoder documents: it selects which
+    tokens attend, so perturbing it changes the sparse pattern rather than adding weight
+    noise. Inheriting the profile beats re-deriving the list here."""
+    got = _real_groups()
+    for banned in ("shared_expert_gate", "block_inject_weight", "indexer",
+                   "input_mix_weight"):
+        assert not [p for p in got if banned in p], f"{banned} was selected"
+
+
+def test_everything_the_head_SHOULD_quantize_is_selected():
+    """The other half: a filter that rejects everything also passes the tests above."""
+    got = _real_groups()
+    assert "mtp.fc_embedding" in got
+    assert "mtp.fc_hidden" in got
+    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        assert f"mtp.layers.0.self_attn.{leaf}" in got
+    for leaf in ("gate_proj", "up_proj", "down_proj"):
+        assert f"mtp.layers.0.mlp.shared_expert.{leaf}" in got
+    assert "mtp.layers.0.mlp.experts" in got      # the stacked pair, grouped
+
+
+def test_the_router_is_not_quantized():
+    """`mlp.gate` is 2-D [512, 2560] and passes out%32, so neither shape nor the skip list
+    excludes it. Its argmax decides which expert runs; quantizing it changes routing."""
+    assert not [p for p in _real_groups() if p.endswith("mlp.gate")]
+
+
+def test_a_matrix_failing_the_trellis_serving_gate_is_refused():
+    """Belt and braces beyond the profile's list: any 2-D matrix whose output rows are not
+    a multiple of 32 cannot serve as trellis, whatever it is called. A future architecture
+    will have such a layer under a name no skip list anticipates."""
+    from glq.quantize_model import mtp_sublayer_weights
+    shapes = {"mtp.layers.0.odd_thing.weight": (12, 2560)}   # 12 % 32 != 0
+    assert mtp_sublayer_weights(shapes.keys(), shape_of=shapes.get) == {}
+
+
+# ---------------------------------------------------------------------------
+# Reusing a PLE table that resume already restored. PLE quantization takes an
+# IDENTITY Hessian and the block frees hidden_states before it starts ("we only
+# need the embed"), so it is provably independent of calibration: the stored
+# artifacts are exactly what the run would recompute. On Qwen4Exp that is 19,532
+# chunks, measured at 0.876 s each -> 4.75 h of redundant work per run.
+# ---------------------------------------------------------------------------
+
+PLE_P = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+
+
+def test_a_restored_ple_table_is_reused():
+    from glq.quantize_model import ple_reuse_decision
+    arts = {PLE_P: {"trellis_packed": 1, "SV": 1, "Wscale": 1, "rht_blocks": 1}}
+    assert ple_reuse_decision(PLE_P, 4, arts, {PLE_P: {"bpw": 4}}) is True
+
+
+def test_an_absent_ple_table_is_quantized():
+    from glq.quantize_model import ple_reuse_decision
+    assert ple_reuse_decision(PLE_P, 4, {}, {}) is False
+
+
+def test_a_ple_rung_mismatch_is_refused_loudly():
+    """The published Flash-Next checkpoint is ple_bpw 4; the descriptor currently defaults to
+    3. Reusing those artifacts under a 3 bpw declaration would ship 4 bpw weights declared as
+    3, and vLLM sizes `trellis_packed` from the declaration — so it loads wrong, hours later,
+    pointing nowhere near here. The fix is a one-line GLQ_PLE_BPW, which the message names."""
+    import pytest
+    from glq.quantize_model import ple_reuse_decision
+    arts = {PLE_P: {"trellis_packed": 1}}
+    with pytest.raises(ValueError, match="GLQ_PLE_BPW"):
+        ple_reuse_decision(PLE_P, 3, arts, {PLE_P: {"bpw": 4}})
+
+
+def test_a_restored_table_with_no_recorded_rung_is_refused():
+    """Silence is not agreement. Without a recorded bpw the declaration cannot be checked,
+    and an unverifiable reuse is the same failure as a wrong one — just harder to find."""
+    import pytest
+    from glq.quantize_model import ple_reuse_decision
+    arts = {PLE_P: {"trellis_packed": 1}}
+    with pytest.raises(ValueError, match="recorded no bpw|cannot be checked"):
+        ple_reuse_decision(PLE_P, 4, arts, {})
+
+
+def test_an_incomplete_restored_table_is_refused():
+    """A table missing `rht_blocks` cannot be decoded for a non-power-of-two width. That was
+    the real state of the first store built, so this is a regression gate, not a hypothetical."""
+    import pytest
+    from glq.quantize_model import ple_reuse_decision
+    arts = {PLE_P: {"trellis_packed": 1, "SV": 1, "Wscale": 1}}   # no rht_blocks
+    with pytest.raises(ValueError, match="rht_blocks|incomplete"):
+        ple_reuse_decision(PLE_P, 4, arts, {PLE_P: {"bpw": 4}})

@@ -1,4 +1,4 @@
-"""spot_hunter's pure logic — the parts that decide what gets launched.
+"""spot_scout's pure logic — the parts that decide what gets launched.
 
 No AWS here: everything below is table-building, mapping and filtering, which is where the
 mistakes that cost a provisioning cycle live. The one live-API failure mode this file DOES
@@ -17,13 +17,13 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "infra"))
 
-SCRIPT = os.path.join(os.path.dirname(__file__), "..", "infra", "spot_hunter.py")
+SCRIPT = os.path.join(os.path.dirname(__file__), "..", "infra", "spot_scout.py")
 
-# `infra/` is gitignored (it holds the SSH key), so spot_hunter.py is not in the
+# `infra/` is gitignored (it holds the SSH key), so spot_scout.py is not in the
 # repository — these run for whoever is editing the script locally and skip everywhere
 # else, rather than failing a checkout that legitimately does not contain it.
-SH = pytest.importorskip("spot_hunter",
-                         reason="infra/spot_hunter.py is not present (infra/ is gitignored)")
+SH = pytest.importorskip("spot_scout",
+                         reason="infra/spot_scout.py is not present (infra/ is gitignored)")
 
 
 # ---- the lineups are well-formed ---------------------------------------------------------
@@ -304,7 +304,7 @@ def _selected_lineup(argv):
     orig = SH.latest_prices
     SH.latest_prices = _fake_latest_prices
     argv_orig = sys.argv
-    sys.argv = ["spot_hunter.py", "--regions", "eu-north-1", *argv]
+    sys.argv = ["spot_scout.py", "--regions", "eu-north-1", *argv]
     fake = _t.ModuleType("boto3")
     fake.Session = lambda **kw: _t.SimpleNamespace(client=lambda *a, **k: None)
     sys.modules["boto3"] = fake
@@ -453,7 +453,7 @@ def test_a_probe_instance_is_always_terminated(monkeypatch):
 
 def test_without_try_create_nothing_is_ever_launched(monkeypatch, capsys, tmp_path):
     """The default path is a read-only price scan and must stay one. A plain
-    `spot_hunter --top 10` that quietly started billing would be a nasty surprise."""
+    `spot_scout --top 10` that quietly started billing would be a nasty surprise."""
     import types as _t
 
     launched = []
@@ -480,7 +480,7 @@ def test_without_try_create_nothing_is_ever_launched(monkeypatch, capsys, tmp_pa
     fake.Session = lambda **kw: _t.SimpleNamespace(
         client=lambda *a, **k: _Client(), get_credentials=lambda: object())
     monkeypatch.setitem(sys.modules, "boto3", fake)
-    monkeypatch.setattr(sys, "argv", ["spot_hunter", "--regions", "eu-north-1",
+    monkeypatch.setattr(sys, "argv", ["spot_scout", "--regions", "eu-north-1",
                                       "--write-tf", str(tmp_path / "out.tf")])
 
     assert SH.main() == 0
@@ -574,7 +574,7 @@ def _fake_ec2(instances_by_region, terminated=None, regions=None):
         client=lambda _svc, region_name=None, **k: _Client(region_name),
         get_available_regions=lambda _svc: list(instances_by_region))
 
-    # `_probe_client` also does `from botocore.config import Config` (spot_hunter.py:641), and
+    # `_probe_client` also does `from botocore.config import Config` (spot_scout.py:641), and
     # stubbing boto3 alone left that reaching the real package. On a machine without botocore
     # the ImportError was swallowed per-region by `sweep_instances` and every sweep returned
     # [] -- which reads as "no instances found" rather than "could not look". `setdefault` so
@@ -680,7 +680,7 @@ def test_list_running_defaults_to_everywhere_not_the_hunt_default(monkeypatch):
                         lambda regions, kw, **k: seen.setdefault("scope", regions) and [])
     monkeypatch.setattr(SH, "print_running", lambda rows, scope, errors=(): None)
     monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
-    monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--list-running"])
+    monkeypatch.setattr(sys, "argv", ["spot_scout.py", "--list-running"])
     SH.main()
     assert seen["scope"] == ["us-east-1", "eu-west-1"]
     assert SH.DEFAULT_REGIONS != seen["scope"], "must not silently use the hunt default"
@@ -695,7 +695,7 @@ def test_list_running_honours_an_explicit_region(monkeypatch):
     monkeypatch.setattr(SH, "print_running", lambda rows, scope, errors=(): None)
     monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
     monkeypatch.setattr(sys, "argv",
-                        ["spot_hunter.py", "--list-running", "--regions", "us-west-2"])
+                        ["spot_scout.py", "--list-running", "--regions", "us-west-2"])
     SH.main()
     assert seen["scope"] == ["us-west-2"]
 
@@ -707,7 +707,7 @@ def test_the_hunt_still_defaults_to_the_two_cheap_regions(monkeypatch):
                         lambda r, t, p, kw, cpu_only=False: seen.setdefault(
                             "regions", []).append(r) or [])
     monkeypatch.setattr(SH, "resolve_session_kwargs", lambda p: {})
-    monkeypatch.setattr(sys, "argv", ["spot_hunter.py", "--cpu-only"])
+    monkeypatch.setattr(sys, "argv", ["spot_scout.py", "--cpu-only"])
     try:
         SH.main()
     except SystemExit:
@@ -812,3 +812,167 @@ def test_an_empty_but_complete_scan_still_reads_as_a_clean_bill(capsys):
     SH.print_running([], ["eu-north-1"], errors=[])
     out = capsys.readouterr().out
     assert "No instances" in out and "could not" not in out.lower()
+
+
+def test_every_gpu_family_declares_its_gpu():
+    """The GPU mirror of `test_every_cpu_family_declares_its_simd_tier`, which had no
+    counterpart -- so a GPU family could sit in the lineup and print `? / ? / ?` for GPU,
+    VRAM and compute capability, which is the column a reader picks a box on.
+
+    Caught `g7` doing exactly that (RTX PRO 4500, 32 GiB, Blackwell) while `g7e` was mapped.
+    """
+    missing = sorted({SH._family(t) for t in SH.DEFAULT_TYPES} - set(SH.GPU_INFO))
+    assert not missing, f"GPU families with no GPU_INFO entry: {missing}"
+
+
+#: Instance types AWS does not offer in any of this account's 18 opted-in regions, verified
+#: with `describe-instance-type-offerings` on 2026-10-09. They are well-formed `family.size`
+#: strings, so `test_every_instance_type_can_actually_match` passes them happily -- and a
+#: nonexistent type is a filter that returns no rows, i.e. it fails exactly as silently as the
+#: missing-comma trap that test exists to catch.
+#:
+#: `g7e.xlarge` is the cautionary one: a comment in the module cited it as a type the comma bug
+#: had LOST, so it was added back. It never existed. The smallest real Blackwell entry points
+#: are `g7.2xlarge` and `g7e.2xlarge`.
+NONEXISTENT_TYPES = ("g7.xlarge", "g7e.xlarge")
+
+
+def test_the_lineup_holds_no_types_aws_does_not_offer():
+    present = [t for t in SH.DEFAULT_TYPES if t in NONEXISTENT_TYPES]
+    assert not present, (
+        f"these are not offered in any opted-in region, so they can never return a price: "
+        f"{present}")
+
+
+def test_the_real_blackwell_sizes_are_all_present():
+    """g7 and g7e each ship six sizes; the lineup previously carried one nonexistent xlarge
+    for each and none of the real ones for g7, so no g7 row could ever appear."""
+    for fam in ("g7", "g7e"):
+        have = {t for t in SH.DEFAULT_TYPES if SH._family(t) == fam}
+        want = {f"{fam}.{s}xlarge" for s in ("2", "4", "8", "12", "24", "48")}
+        assert want <= have, f"{fam} is missing {sorted(want - have)}"
+
+
+# ---- regions ------------------------------------------------------------------------------
+
+def test_zurich_is_in_the_default_scan():
+    """eu-central-2 (Zurich) is a g7/g7e region worth pricing, and it is an OPT-IN region --
+    `describe-regions` reported it `not-opted-in` on this account on 2026-10-09, which is why
+    a scan of it returned `AuthFailure: AWS was not able to validate the provided access
+    credentials`. That message reads as broken credentials and is nothing of the kind.
+
+    Listing it here is only safe because the scan now filters not-opted-in regions and says so
+    (see `test_a_not_opted_in_region_is_reported_as_such`); it then starts pricing Zurich by
+    itself the moment the account is enabled, with no further edit."""
+    assert "eu-central-2" in SH.DEFAULT_REGIONS
+
+
+def test_a_not_opted_in_region_is_reported_as_such(monkeypatch):
+    """The failure mode this guards: `AuthFailure` for an opt-in region is indistinguishable
+    from real credential trouble, and a standing one trains a reader to ignore the error that
+    matters -- which is the reasoning `enabled_regions` already states for --list-running."""
+    monkeypatch.setattr(SH, "enabled_regions",
+                        lambda *a, **k: ["eu-north-1", "eu-south-2"])
+    keep, dropped = SH.partition_scannable(["eu-north-1", "eu-central-2"], {})
+    assert keep == ["eu-north-1"]
+    assert dropped == ["eu-central-2"]
+
+
+def test_the_partition_is_permissive_when_the_lookup_fails():
+    """Over-scanning is the safe direction -- the same choice `enabled_regions` makes. A
+    lookup failure must not silently drop every region and report an empty price table."""
+    def boom(*a, **k):
+        raise RuntimeError("no credentials")
+    orig, SH.enabled_regions = SH.enabled_regions, boom
+    try:
+        keep, dropped = SH.partition_scannable(["eu-north-1", "eu-central-2"], {})
+    finally:
+        SH.enabled_regions = orig
+    assert keep == ["eu-north-1", "eu-central-2"]
+    assert dropped == []
+
+
+def test_the_full_g6_size_ladder_is_present():
+    """g6 ships eight sizes and the lineup carried five, so three real L4 boxes could never be
+    priced. That is not academic: in eu-central-2b on 2026-10-09 the missing g6.4xlarge was
+    $0.4078 against $0.4356 for the g6.2xlarge the lineup does list -- the cheapest option was
+    the one it could not see. L4/24 GB is also GLQ's primary target card."""
+    have = {t for t in SH.DEFAULT_TYPES if SH._family(t) == "g6"}
+    want = {f"g6.{s}xlarge" for s in ("", "2", "4", "8", "12", "16", "24", "48")}
+    want = {w.replace("g6.xlarge", "g6.xlarge") for w in want}
+    assert want <= have, f"g6 is missing {sorted(want - have)}"
+
+
+def test_fractional_g6f_is_kept_out_of_the_lineup():
+    """g6f does not work on our AMI, and it is the CHEAPEST GPU family AWS offers — so listing
+    it would put a box that cannot run GLQ at the top of the price table. Measured on a
+    g6f.4xlarge (eu-north-1, 2026-10-10): the L4 is on the bus and the DKMS modules are built
+    for the running kernel, yet `modprobe nvidia` fails with "No such device" because
+
+        NVRM: The NVIDIA vGPU ... is not supported by open nvidia.ko.
+
+    g6f presents its fraction as a vGPU, which only the proprietary kernel module supports,
+    and the DLAMI ships the open one. Same treatment as g4dn: mapped in GPU_INFO so a
+    hand-passed `--instance-types g6f.4xlarge` still prints real columns, but absent from the
+    lineup so no hunt recommends one.
+
+    Re-add the four sizes (large/xlarge/2xlarge/4xlarge) once the proprietary driver is
+    installed by install.sh or the golden AMI AND a g6f box has actually served."""
+    listed = sorted(t for t in SH.DEFAULT_TYPES if SH._family(t) == "g6f")
+    assert not listed, (
+        f"g6f cannot serve on our AMI (vGPU needs the proprietary nvidia.ko), so these would "
+        f"be recommended and then fail to launch usefully: {listed}")
+    assert "g6f" in SH.GPU_INFO, "a hand-passed g6f type must still report real columns"
+
+
+def test_fractional_vram_is_never_rounded_up():
+    """`--vram N` is a MINIMUM filter, so a VRAM figure that overstates the card produces a
+    false positive in the one filter whose job is "does the model fit".
+
+    Fractional sizes are where that bites. AWS reports g6f.large as 2861 MiB; rounding to
+    nearest gives 3 GB, so `--vram 3` would match a card holding 2.79. Whole-GPU families are
+    unaffected either way (24576 MiB is 24.0 exactly), which is why this went unnoticed —
+    there was no fractional size in the lineup until now.
+
+    Understating by under a GiB is the safe direction; overstating is not."""
+    assert SH._gpu_vram_gb(2861) == 2          # g6f.large / g6f.xlarge — 1/8 L4
+    assert SH._gpu_vram_gb(5722) == 5          # g6f.2xlarge — 1/4 L4
+    assert SH._gpu_vram_gb(11444) == 11        # g6f.4xlarge — 1/2 L4
+    # whole cards are unchanged by the switch away from round()
+    assert SH._gpu_vram_gb(24576) == 24        # L4 / A10G
+    assert SH._gpu_vram_gb(49152) == 48        # L40S
+    assert SH._gpu_vram_gb(0) == 0
+
+
+def test_g6f_reports_an_l4_rather_than_a_question_mark():
+    """A family in DEFAULT_TYPES with no GPU_INFO entry prints "? / ? / ?" in the three
+    columns a reader picks a box on — the g7 bug. The VRAM label is a fallback only, since
+    AWS GpuInfo overrides it per size, and for a fractional family the per-size value is the
+    only one that can be right."""
+    chip, _, cap = SH._gpu_cols("g6f.2xlarge")
+    assert chip == "L4"
+    assert cap == "sm_89"
+
+
+def test_the_price_scan_actually_calls_the_partition(monkeypatch):
+    """Assert the WIRING, not just the helper. A `partition_scannable` nothing calls is a
+    tested no-op, and the opt-in region keeps producing AuthFailure -- which is precisely the
+    class of "the kernel/feature existed, only the wiring was missing" bug this project has
+    shipped before."""
+    import types as _t
+    called = {}
+
+    def spy(regions, session_kwargs):
+        called["regions"] = list(regions)
+        return [r for r in regions if r != "eu-central-2"], ["eu-central-2"]
+
+    monkeypatch.setattr(SH, "partition_scannable", spy)
+    monkeypatch.setattr(SH, "latest_prices", lambda *a, **k: [])
+    monkeypatch.setattr(SH, "resolve_session_kwargs", lambda _p: {})
+    fake = _t.ModuleType("boto3")
+    fake.Session = lambda **kw: _t.SimpleNamespace(client=lambda *a, **k: None)
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+    monkeypatch.setattr(sys, "argv",
+                        ["spot_scout", "--regions", "eu-north-1,eu-central-2"])
+    SH.main()
+    assert called["regions"] == ["eu-north-1", "eu-central-2"]

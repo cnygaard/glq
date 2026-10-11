@@ -1,0 +1,4781 @@
+{
+ "model": "xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4",
+ "n_keys": 297256,
+ "note": "safetensors header only - shapes and dtypes, no weight data",
+ "recorded": "2026-10-11",
+ "shapes": {
+  "lm_head.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    248320,
+    2560
+   ]
+  },
+  "model.language_model.embed_tokens.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    248320,
+    2560
+   ]
+  },
+  "model.language_model.hyper_connection_mixer.hc_norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    320,
+    10240
+   ]
+  },
+  "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    10240,
+    320
+   ]
+  },
+  "model.language_model.layers.{i}.attn_hyper_connection.block_inject_weight.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    4,
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.attn_hyper_connection.hc_norm.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.attn_hyper_connection.input_mix_weight_down.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    320,
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.attn_hyper_connection.input_mix_weight_up.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    10240,
+    320
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.A_log": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.conv1d.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    10240,
+    1,
+    4
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.dt_bias": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_a.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    48,
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_b.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    48,
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_qkv.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_qkv.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_qkv.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_qkv.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    102400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_z.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    6144
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_z.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_z.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.linear_attn.in_proj_z.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    61440,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.norm.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.out_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.out_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    6144
+   ]
+  },
+  "model.language_model.layers.{i}.linear_attn.out_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.linear_attn.out_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6
+    ],
+    [
+     8
+    ],
+    [
+     9
+    ],
+    [
+     10
+    ],
+    [
+     12
+    ],
+    [
+     13
+    ],
+    [
+     14
+    ],
+    [
+     16
+    ],
+    [
+     17
+    ],
+    [
+     18
+    ],
+    [
+     20
+    ],
+    [
+     21
+    ],
+    [
+     22
+    ],
+    [
+     24
+    ],
+    [
+     25
+    ],
+    [
+     26
+    ],
+    [
+     28
+    ],
+    [
+     29
+    ],
+    [
+     30
+    ],
+    [
+     32
+    ],
+    [
+     33
+    ],
+    [
+     34
+    ],
+    [
+     36
+    ],
+    [
+     37
+    ],
+    [
+     38
+    ],
+    [
+     40
+    ],
+    [
+     41
+    ],
+    [
+     42
+    ],
+    [
+     44
+    ],
+    [
+     45
+    ],
+    [
+     46
+    ]
+   ],
+   "n": 36,
+   "ranges": [
+    [
+     0,
+     46
+    ]
+   ],
+   "shape": [
+    61440,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.down_proj.SU": {
+   "dtype": "F16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.down_proj.SV": {
+   "dtype": "F16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    640
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.down_proj.Wscale": {
+   "dtype": "F32",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.down_proj.trellis_packed": {
+   "dtype": "I16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    6400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.gate_proj.SU": {
+   "dtype": "F16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    640
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.gate_proj.SV": {
+   "dtype": "F16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.gate_proj.Wscale": {
+   "dtype": "F32",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.gate_proj.trellis_packed": {
+   "dtype": "I16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    6400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.up_proj.SU": {
+   "dtype": "F16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    640
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.up_proj.SV": {
+   "dtype": "F16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.up_proj.Wscale": {
+   "dtype": "F32",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.mlp.experts.{i}.up_proj.trellis_packed": {
+   "dtype": "I16",
+   "n": 24576,
+   "ranges": [
+    [
+     0,
+     47
+    ],
+    [
+     0,
+     511
+    ]
+   ],
+   "shape": [
+    6400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.gate.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.down_proj.SU": {
+   "dtype": "F16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.down_proj.SV": {
+   "dtype": "F16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    640
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.down_proj.Wscale": {
+   "dtype": "F32",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.down_proj.trellis_packed": {
+   "dtype": "I16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    6400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.gate_proj.SU": {
+   "dtype": "F16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    640
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.gate_proj.SV": {
+   "dtype": "F16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.gate_proj.Wscale": {
+   "dtype": "F32",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.gate_proj.trellis_packed": {
+   "dtype": "I16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    6400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.up_proj.SU": {
+   "dtype": "F16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    640
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.up_proj.SV": {
+   "dtype": "F16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.up_proj.Wscale": {
+   "dtype": "F32",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert.up_proj.trellis_packed": {
+   "dtype": "I16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    6400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.mlp.shared_expert_gate.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    1,
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.mlp_hyper_connection.block_inject_weight.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    4,
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.mlp_hyper_connection.hc_norm.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.mlp_hyper_connection.input_mix_weight_down.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    320,
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.mlp_hyper_connection.input_mix_weight_up.weight": {
+   "dtype": "BF16",
+   "n": 48,
+   "ranges": [
+    [
+     0,
+     47
+    ]
+   ],
+   "shape": [
+    10240,
+    320
+   ]
+  },
+  "model.language_model.layers.{i}.ple.conv1d.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    10240,
+    1,
+    4
+   ]
+  },
+  "model.language_model.layers.{i}.ple.key_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.ple.key_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.ple.key_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.ple.key_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    102400,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.ple.norm_conv.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.ple.norm_key.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.ple.norm_query.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.layer_multipliers": {
+   "dtype": "I64",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    3
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    160
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding.Wscale": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    320001536
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding.rht_blocks": {
+   "dtype": "I32",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    2
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    320001536,
+    40
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.ngram_heads_offsets": {
+   "dtype": "I64",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    16
+   ]
+  },
+  "model.language_model.layers.{i}.ple.ple_embedding.ngram_heads_vocab_sizes": {
+   "dtype": "I64",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    16
+   ]
+  },
+  "model.language_model.layers.{i}.ple.value_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.ple.value_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.ple.value_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.ple.value_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     1
+    ]
+   ],
+   "n": 1,
+   "ranges": [
+    [
+     1,
+     1
+    ]
+   ],
+   "shape": [
+    25600,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.indexer.index_qk_proj.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    640,
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.indexer.k_layernorm.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.indexer.q_layernorm.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    256
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.k_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    512
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.k_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.k_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.self_attn.k_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    5120,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.o_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.o_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    6144
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.o_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.self_attn.o_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    61440,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    256
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.q_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    12288
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.q_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.q_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.self_attn.q_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    122880,
+    48
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.v_proj.SU": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    512
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.v_proj.SV": {
+   "dtype": "F16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.language_model.layers.{i}.self_attn.v_proj.Wscale": {
+   "dtype": "F32",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": []
+  },
+  "model.language_model.layers.{i}.self_attn.v_proj.trellis_packed": {
+   "dtype": "I16",
+   "index_tuples": [
+    [
+     3
+    ],
+    [
+     7
+    ],
+    [
+     11
+    ],
+    [
+     15
+    ],
+    [
+     19
+    ],
+    [
+     23
+    ],
+    [
+     27
+    ],
+    [
+     31
+    ],
+    [
+     35
+    ],
+    [
+     39
+    ],
+    [
+     43
+    ],
+    [
+     47
+    ]
+   ],
+   "n": 12,
+   "ranges": [
+    [
+     3,
+     47
+    ]
+   ],
+   "shape": [
+    5120,
+    48
+   ]
+  },
+  "model.visual.blocks.{i}.attn.proj.bias": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.attn.proj.weight": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152,
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.attn.qkv.bias": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    3456
+   ]
+  },
+  "model.visual.blocks.{i}.attn.qkv.weight": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    3456,
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.mlp.linear_fc1.bias": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    4304
+   ]
+  },
+  "model.visual.blocks.{i}.mlp.linear_fc1.weight": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    4304,
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.mlp.linear_fc2.bias": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.mlp.linear_fc2.weight": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152,
+    4304
+   ]
+  },
+  "model.visual.blocks.{i}.norm1.bias": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.norm1.weight": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.norm2.bias": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.blocks.{i}.norm2.weight": {
+   "dtype": "BF16",
+   "n": 27,
+   "ranges": [
+    [
+     0,
+     26
+    ]
+   ],
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.merger.linear_fc1.bias": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    4608
+   ]
+  },
+  "model.visual.merger.linear_fc1.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    4608,
+    4608
+   ]
+  },
+  "model.visual.merger.linear_fc2.bias": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2560
+   ]
+  },
+  "model.visual.merger.linear_fc2.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2560,
+    4608
+   ]
+  },
+  "model.visual.merger.norm.bias": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.merger.norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.patch_embed.proj.bias": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    1152
+   ]
+  },
+  "model.visual.patch_embed.proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    1152,
+    3,
+    2,
+    16,
+    16
+   ]
+  },
+  "model.visual.pos_embed.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2304,
+    1152
+   ]
+  },
+  "mtp.fc_embedding.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2560,
+    2560
+   ]
+  },
+  "mtp.fc_hidden.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2560,
+    2560
+   ]
+  },
+  "mtp.hyper_connection_mixer.hc_norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    10240
+   ]
+  },
+  "mtp.hyper_connection_mixer.input_mix_weight_down.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    320,
+    10240
+   ]
+  },
+  "mtp.hyper_connection_mixer.input_mix_weight_up.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    10240,
+    320
+   ]
+  },
+  "mtp.layers.{i}.attn_hyper_connection.block_inject_weight.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    4,
+    10240
+   ]
+  },
+  "mtp.layers.{i}.attn_hyper_connection.hc_norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "mtp.layers.{i}.attn_hyper_connection.input_mix_weight_down.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    320,
+    10240
+   ]
+  },
+  "mtp.layers.{i}.attn_hyper_connection.input_mix_weight_up.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    10240,
+    320
+   ]
+  },
+  "mtp.layers.{i}.mlp.experts.down_proj": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    512,
+    2560,
+    640
+   ]
+  },
+  "mtp.layers.{i}.mlp.experts.gate_up_proj": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    512,
+    1280,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.mlp.gate.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.mlp.shared_expert.down_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    2560,
+    640
+   ]
+  },
+  "mtp.layers.{i}.mlp.shared_expert.gate_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    640,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.mlp.shared_expert.up_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    640,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.mlp.shared_expert_gate.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    1,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.mlp_hyper_connection.block_inject_weight.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    4,
+    10240
+   ]
+  },
+  "mtp.layers.{i}.mlp_hyper_connection.hc_norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    10240
+   ]
+  },
+  "mtp.layers.{i}.mlp_hyper_connection.input_mix_weight_down.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    320,
+    10240
+   ]
+  },
+  "mtp.layers.{i}.mlp_hyper_connection.input_mix_weight_up.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    10240,
+    320
+   ]
+  },
+  "mtp.layers.{i}.self_attn.indexer.index_qk_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    640,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.self_attn.indexer.k_layernorm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "mtp.layers.{i}.self_attn.indexer.q_layernorm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "mtp.layers.{i}.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    256
+   ]
+  },
+  "mtp.layers.{i}.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    2560,
+    6144
+   ]
+  },
+  "mtp.layers.{i}.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    256
+   ]
+  },
+  "mtp.layers.{i}.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    12288,
+    2560
+   ]
+  },
+  "mtp.layers.{i}.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "ranges": [
+    [
+     0,
+     0
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "mtp.pre_fc_norm_embedding.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2560
+   ]
+  },
+  "mtp.pre_fc_norm_hidden.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    10240
+   ]
+  }
+ },
+ "source": "local:/opt/dlami/nvme/hf_cache/hub/models--xv0y5ncu--Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4/snapshots/cc48093a06f34b3306e7d74018cc4ec7bc5e6a8f/"
+}

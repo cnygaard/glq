@@ -1432,10 +1432,17 @@ def test_an_unquantized_moe_layer_is_not_claimed():
     cfg = GLQvLLMConfig.from_config({
         "bpw": 3, "codebook": "trellis", "variant": "3inst",
         "trellis_layout": "kernel",
-        # a real checkpoint enumerates only the layers it quantized; mtp.* is absent
-        "layer_bpw": {"model.layers.0.mlp.experts": 3},
+        # Per-expert entries, the shape quantize_model actually writes. A BARE
+        # "...mlp.experts" key was used here once and no checkpoint contains one, which
+        # made the positive case pass trivially and hid a regression declining every MoE.
+        "layer_bpw": {f"model.layers.0.mlp.experts.{e}.{p}": 3
+                      for e in range(2)
+                      for p in ("gate_proj", "up_proj", "down_proj")},
     })
     layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    # Set so a None result can ONLY mean the guard declined it: without this, the
+    # AttributeError on moe_config is swallowed and None arrives for the wrong reason.
+    layer.moe_config = object()
     assert cfg.get_quant_method(layer, "mtp.layers.48.mlp.experts") is None, (
         "glq_vllm claimed an MoE layer the checkpoint never quantized; vLLM will then look "
         "for GLQ buffers that do not exist")
@@ -1474,3 +1481,168 @@ def test_an_empty_layer_bpw_still_claims_moe_layers():
     layer.moe_config = object()
     assert isinstance(cfg.get_quant_method(layer, "anything.mlp.experts"),
                       GLQFusedMoEMethod)
+
+
+# ---------------------------------------------------------------------------
+# MoE container lookup. The earlier tests here used a BARE container key
+# ({"model.layers.0.mlp.experts": 3}), which no real checkpoint contains —
+# `quantize_model` writes one layer_bpw entry per expert per projection. That
+# fixture made the positive case pass trivially and hid a regression that
+# declined EVERY MoE layer, so vLLM built bf16 experts for all 48 decoder
+# layers and OOM'd ~20 in on a 96 GB card. Measured on the published
+# Qwen3.8-Flash-Next checkpoint, which had served before.
+#
+# These fixtures use the real key shape, read off that checkpoint.
+# ---------------------------------------------------------------------------
+
+def _real_moe_layer_bpw(n_experts=4, layer=0, pfx="model.language_model.layers"):
+    """`layer_bpw` as `quantize_model` actually writes it for a stacked-expert MoE:
+    one entry per expert per projection, and NO entry for the container itself."""
+    lb = {}
+    for e in range(n_experts):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lb[f"{pfx}.{layer}.mlp.experts.{e}.{proj}"] = 3
+    lb[f"{pfx}.{layer}.self_attn.q_proj"] = 3
+    return lb
+
+
+def test_a_moe_container_with_per_expert_entries_is_claimed():
+    """THE regression. vLLM asks about the container (`...mlp.experts`); the checkpoint
+    lists its children (`...mlp.experts.0.gate_proj`). Declining here makes vLLM install
+    its own unquantized MoE method, which allocates w13/w2 in bf16 — 4.69 GiB per layer on
+    Flash-Next, so the card is gone long before the model is loaded, and nothing says why."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel", "layer_bpw": _real_moe_layer_bpw(),
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()          # read only once the layer is claimed
+    for prefix in ("model.language_model.layers.0.mlp.experts",
+                   "language_model.model.layers.0.mlp.experts"):  # vLLM's rewritten form
+        assert cfg.get_quant_method(layer, prefix) is not None, (
+            f"declined {prefix!r}, whose per-expert entries ARE in layer_bpw")
+
+
+def test_an_mtp_moe_absent_from_layer_bpw_is_still_declined():
+    """The MTP case this guard was added for must keep working: a head left bf16 has no
+    layer_bpw entries at all, and claiming it makes vLLM look for GLQ buffers the
+    checkpoint does not carry."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel", "layer_bpw": _real_moe_layer_bpw(),
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    # Set so a None result can ONLY mean the guard declined it: without this, the
+    # AttributeError on moe_config is swallowed and None arrives for the wrong reason.
+    layer.moe_config = object()
+    assert cfg.get_quant_method(layer, "mtp.layers.48.mlp.experts") is None
+
+
+def test_a_quantized_mtp_moe_IS_claimed():
+    """And the new case: once `--mtp-bpw` quantizes the head, its per-expert entries are in
+    layer_bpw and the container must be claimed, or vLLM builds bf16 weights for a head
+    whose checkpoint only has trellis artifacts."""
+    from glq_vllm.config import GLQvLLMConfig
+    lb = _real_moe_layer_bpw()
+    lb.update(_real_moe_layer_bpw(layer=0, pfx="mtp.layers"))
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel", "layer_bpw": lb,
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()
+    assert cfg.get_quant_method(layer, "mtp.layers.0.mlp.experts") is not None
+
+
+def test_a_sibling_prefix_is_not_mistaken_for_a_container():
+    """`...mlp.expert` must not match `...mlp.experts.0.gate_proj` by string prefix — the
+    check is on dotted segments, not `startswith`."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel", "layer_bpw": _real_moe_layer_bpw(),
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()
+    assert cfg.get_quant_method(
+        layer, "model.language_model.layers.0.mlp.expert") is None
+
+
+# ---------------------------------------------------------------------------
+# vLLM RENUMBERS the MTP block. The checkpoint stores `mtp.layers.0.*`; vLLM
+# places the head after the decoder's 0..47 and asks about `mtp.layers.48.*`,
+# having already rewritten the weight names it loads. Measured:
+#
+#   AttributeError: Layer mtp.layers.48.mlp.experts has no parameter 'w2_SU'
+#                   for checkpoint weight 'mtp.layers.48.mlp.experts.0.down_proj.SU'
+#
+# So every MTP lookup misses on the index alone — the experts AND the plain
+# projections — GLQ declines them, vLLM builds bf16 weights, and the loader then
+# meets a GLQ artifact it has nowhere to put.
+# ---------------------------------------------------------------------------
+
+def _mtp_layer_bpw(n_experts=2, ckpt_layer=0):
+    """`layer_bpw` as `--mtp-bpw` writes it: the CHECKPOINT's index, which is 0."""
+    lb = {}
+    for e in range(n_experts):
+        for p in ("gate_proj", "up_proj", "down_proj"):
+            lb[f"mtp.layers.{ckpt_layer}.mlp.experts.{e}.{p}"] = 3
+    for p in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        lb[f"mtp.layers.{ckpt_layer}.self_attn.{p}"] = 3
+    lb["mtp.fc_hidden"] = 3
+    return lb
+
+
+def test_a_renumbered_mtp_moe_container_is_claimed():
+    """THE fix. vLLM asks about index 48; the checkpoint recorded index 0."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel", "layer_bpw": _mtp_layer_bpw(),
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()
+    assert cfg.get_quant_method(layer, "mtp.layers.48.mlp.experts") is not None, (
+        "declined the renumbered MTP container, so vLLM will build bf16 experts")
+
+
+def test_a_renumbered_mtp_linear_resolves_its_bpw():
+    """The same mismatch hits the head's plain projections. Without this they load as bf16
+    and then KeyError on their trellis artifacts."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst",
+        "trellis_layout": "kernel", "layer_bpw": _mtp_layer_bpw(),
+    })
+    assert cfg._lookup_bpw("mtp.layers.48.self_attn.q_proj") == 3
+    assert cfg._lookup_bpw("mtp.layers.48.self_attn.o_proj") == 3
+
+
+def test_renumbering_does_not_invent_entries_for_an_unquantized_head():
+    """The guard must still decline a head that was NOT quantized, at any index — otherwise
+    it claims bf16 weights and vLLM looks for artifacts the checkpoint lacks."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst", "trellis_layout": "kernel",
+        "layer_bpw": _real_moe_layer_bpw(),          # decoder only; no mtp.* at all
+    })
+    layer = _moe_layer_cls().__new__(_moe_layer_cls())
+    layer.moe_config = object()
+    for idx in (0, 48):
+        assert cfg.get_quant_method(layer, f"mtp.layers.{idx}.mlp.experts") is None
+    assert cfg._lookup_bpw("mtp.layers.48.self_attn.q_proj") is None
+
+
+def test_renumbering_is_confined_to_the_mtp_tree():
+    """A DECODER layer index must never be renumbered — layers differ from one another, so
+    matching layer 48 against layer 0's entry would hand a layer the wrong bpw and size its
+    buffers wrongly."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3, "codebook": "trellis", "variant": "3inst", "trellis_layout": "kernel",
+        "layer_bpw": {"model.layers.0.self_attn.q_proj": 3},
+    })
+    assert cfg._lookup_bpw("model.layers.0.self_attn.q_proj") == 3
+    assert cfg._lookup_bpw("model.layers.7.self_attn.q_proj") is None
