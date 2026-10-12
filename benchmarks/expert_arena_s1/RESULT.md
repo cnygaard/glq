@@ -145,3 +145,63 @@ to 40 ≤ 71 and leaves the extra VRAM to KV, which MTP needs.
 * **An 8 GiB arena plus MTP does not fit** at `--gpu-mem 0.85`: `Available KV cache memory:
   -0.31 GiB`. Only just — which is why the retry raises the budget to 0.90 and shrinks the
   arena rather than abandoning the pairing.
+
+## Arena + MTP: the best combination is arena + `num_spec=1`, at 3.060×
+
+6 GiB arena (71 slots/layer × 49), `GLQ_MOE_ARENA_MAX_TOKENS=4`, `--gpu-mem 0.90`, offload
+41.48 GiB. The no-spec arm at the same arena size and budget is the reference, so the
+speculation effect is not confounded with arena size or memory budget.
+
+| config | arena | tok/s | range | ms/token | mean acceptance | vs baseline |
+|---|---|--:|--|--:|--:|--:|
+| baseline | off | 6.436 | 6.436–6.436 | 155.4 | — | 1.00× |
+| mtp3 | off | 7.384 | 7.177–7.450 | 135.4 | 2.16 | 1.147× |
+| mtp1 | off | 7.743 | 7.743–7.929 | 129.1 | 1.62 | 1.203× |
+| arena | **on** | 16.816 | 16.795–17.065 | 59.5 | — | 2.613× |
+| arena + mtp3 | **on** | 18.569 | 17.556–18.598 | 53.9 | 2.16 | 2.886× |
+| **arena + mtp1** | **on** | **19.692** | 19.681–19.912 | **50.8** | 1.62 | **3.060×** |
+
+### ★ `num_spec=1` still wins, and that is a finding about where the time goes
+
+The hypothesis under test was that the optimum flipped to 1 *because* step cost was steeply
+linear in drafted positions, dominated by expert PCIe traffic — so removing that traffic
+should have made 3 affordable again. It did not: 19.692 vs 18.569, the same ranking as with
+the arena off (7.743 vs 7.384).
+
+**So the per-position cost that makes 1 win is not mostly expert paging.** The arena removes
+about two thirds of the step (155.4 → 59.5 ms) and the ranking is unchanged, which places the
+remaining per-position cost in the rest of the step: trellis decode for the routed experts,
+the GDN/linear-attention blocks, attention and the dense layers. That is where the next piece
+of work has to go, and it is the same conclusion the falsified ceiling pointed at from the
+other direction.
+
+### The two techniques overlap rather than compound
+
+Speculation is worth **less** once the arena is in place:
+
+| | arena off | arena on |
+|---|--:|--:|
+| mtp1 over its own no-spec | 1.203× | 1.171× |
+| mtp3 over its own no-spec | 1.147× | 1.104× |
+
+Part of what speculation buys is amortising one weight fetch across several tokens, and the
+arena has already removed most of that fetch. They still combine usefully — 3.060× together
+against 2.613× and 1.203× apart — but not multiplicatively.
+
+### ⚠ MTP is not byte-identical here; the arena is
+
+| arm | sample md5 |
+|---|---|
+| baseline, iso-VRAM control, arena 8 GiB, arena 6 GiB | `1e44e07f7d9a6c450a8d95492132dcdb` |
+| arena + mtp3 | `c5d54df0e516c283a5240fc591aa7c30` |
+| arena + mtp1 | `2f2be2fe8b4651fec5142572c6c15ed2` |
+
+**Every non-speculative arm agrees**, including both arena sizes — so the arena is
+byte-identical, confirmed a third time at 6 GiB. The speculative arms each differ, and they
+differ with the arena off too, so this is MTP's property rather than the arena's: a verify
+step computes logits for several positions in one forward, and a batched GEMM does not reduce
+in the same order as a single-position one, so greedy decode can diverge after enough steps.
+
+Worth stating because speculative decoding is often described as lossless at temperature 0.
+It is lossless in *distribution*; it is not bit-identical in this implementation. Any quality
+claim about an MTP arm therefore needs its own eval, not an appeal to exactness.
