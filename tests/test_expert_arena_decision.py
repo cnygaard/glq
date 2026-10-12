@@ -79,14 +79,17 @@ def test_a_trivial_amount_of_offload_is_also_refused():
 # ★ The simultaneity precondition
 # ---------------------------------------------------------------------------
 
-def test_a_budget_too_small_for_the_token_cap_is_REFUSED_with_the_arithmetic():
-    """★ Correctness, not tuning: all `max_tokens * top_k` routings of a step must be
-    resident at once, or the fill evicts a routing the matmul has not read yet. The refusal
-    must name the numbers so the fix is obvious."""
+def test_a_budget_too_small_for_even_ONE_token_is_REFUSED_with_the_arithmetic():
+    """★ Correctness, not tuning: every routing of a step must be resident at once, or the
+    fill evicts a routing the matmul has not read yet.
+
+    The *floor* is one token's `top_k` routings. Above that the cap is lowered rather than
+    refused (see the derivation tests below); below it there is no narrower arena to fall back
+    to. Either way the reason must name the numbers so the fix is obvious."""
     d = arena_decision(budget="0.5", offloaded_bytes=40 * 1024**3, max_tokens=8, **LAYER)
     assert not d.enabled
-    assert "simultaneous" in d.reason.lower()
-    assert "80" in d.reason          # 8 tokens x top_k 10
+    assert "top_k 10" in d.reason and "resident at once" in d.reason
+    assert "6 slots" in d.reason      # what 0.5 GiB actually bought
 
 
 def test_the_shipped_defaults_satisfy_the_precondition():
@@ -94,11 +97,22 @@ def test_the_shipped_defaults_satisfy_the_precondition():
     assert d.enabled and d.slots >= 8 * 10
 
 
-def test_raising_the_token_cap_past_the_budget_is_refused_rather_than_silently_capped():
-    """Silently clamping the cap would be worse than refusing: the run would serve larger
-    batches through the slow path while the log claimed a larger cap."""
+def test_raising_the_token_cap_past_the_budget_LOWERS_it_and_says_so():
+    """SUPERSEDED BEHAVIOUR, deliberately. This test previously asserted that a cap the budget
+    cannot meet is *refused*, on the reasoning that silently clamping it would serve larger
+    batches through the slow path while the log claimed a larger cap.
+
+    The refusal turned out to be the worse failure: it cost three measured arms, where a 6 GiB
+    budget declined entirely and the runs silently measured no arena at all — which is far
+    harder to notice than a narrower one. Lowering the cap is safe (steps above it take
+    today's exact path), so it is lowered.
+
+    The original concern is answered by reporting it rather than by refusing: the chosen cap is
+    in `reason` and in `max_tokens`, so nothing claims a cap it does not serve."""
     d = arena_decision(budget="10", offloaded_bytes=40 * 1024**3, max_tokens=32, **LAYER)
-    assert not d.enabled and "simultaneous" in d.reason.lower()
+    assert d.enabled
+    assert d.max_tokens == d.slots // 10 < 32
+    assert f"{d.max_tokens} token" in d.reason and "cap lowered from 32" in d.reason
 
 
 # ---------------------------------------------------------------------------
@@ -148,3 +162,48 @@ def test_the_decision_is_driven_by_the_offload_SIZE_not_by_tensor_state():
     assert on.enabled and not off.enabled
     # Nothing about the decision depends on a tensor; it is pure arithmetic over the config.
     assert on.slots == 120 and off.slots == 0
+
+
+# ---------------------------------------------------------------------------
+# ★ The token cap is DERIVED, not demanded
+# ---------------------------------------------------------------------------
+
+def test_a_budget_short_of_the_cap_DOWNGRADES_rather_than_refusing():
+    """★ Lowering the cap is always safe: fewer token counts take the arena path and the rest
+    take today's exact path. Refusing instead is what cost three measured arms — 6 GiB over 49
+    containers is 71 slots/layer, a cap of 8 demands 8 x top_k 10 = 80, so the arena declined
+    and three runs silently measured no arena at all while looking healthy.
+
+    So the cap is derived from what the budget affords, `min(requested, n_slots // top_k)`,
+    and only a budget that cannot serve a SINGLE token's routings is refused.
+    """
+    d = arena_decision(budget="6", offloaded_bytes=40 * 1024**3, max_tokens=8,
+                       n_layers=49, n_experts=512, top_k=10, **FN)
+    assert d.enabled, f"should downgrade the cap, not refuse: {d.reason}"
+    assert d.slots == 71
+    assert d.max_tokens == 7, f"71 // 10 = 7, got {d.max_tokens}"
+
+
+def test_the_derived_cap_never_exceeds_what_was_requested():
+    """A generous budget must not widen the arena path past the caller's ceiling: the caller
+    knows the real step width (max_num_seqs), and serving wider would be guessing."""
+    d = arena_decision(budget="16", offloaded_bytes=40 * 1024**3, max_tokens=4,
+                       n_layers=49, n_experts=512, top_k=10, **FN)
+    assert d.enabled and d.max_tokens == 4
+
+
+def test_the_chosen_cap_is_reported():
+    """The reason line is what makes a downgrade legible. Three arms were only recognisable as
+    no-arena runs because the refusal named its arithmetic."""
+    d = arena_decision(budget="6", offloaded_bytes=40 * 1024**3, max_tokens=8,
+                       n_layers=49, n_experts=512, top_k=10, **FN)
+    assert "7" in d.reason and "token" in d.reason.lower()
+
+
+def test_a_budget_too_small_for_ONE_token_is_still_refused():
+    """The floor stays a refusal: below top_k slots the arena cannot serve even a single
+    token's routings, and serving anyway would evict a routing before the matmul read it."""
+    d = arena_decision(budget="0.05", offloaded_bytes=40 * 1024**3, max_tokens=8,
+                       n_layers=49, n_experts=512, top_k=10, **FN)
+    assert not d.enabled
+    assert "top_k" in d.reason or "simultaneous" in d.reason.lower()

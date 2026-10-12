@@ -416,16 +416,6 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         return int(_os.environ.get("GLQ_MOE_ARENA_REPORT_EVERY", "0"))
 
     @staticmethod
-    def _arena_max_tokens() -> int:
-        """Token cap for the arena path, read per call so it is visible to every captured
-        shape. The cap is a *correctness* bound, not a preference — see
-        `expert_arena.slots_for_budget`."""
-        import os as _os
-
-        from .expert_arena import DEFAULT_MAX_TOKENS, MAX_TOKENS_ENV
-        return int(_os.environ.get(MAX_TOKENS_ENV, DEFAULT_MAX_TOKENS))
-
-    @staticmethod
     def _arena_sources(layer) -> dict:
         """The per-expert tensors the arena pages. One definition, used by both the
         allocation and the later source binding, so the two cannot disagree about the set."""
@@ -951,7 +941,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 # on the simultaneity precondition already asserted at build time.
                 arena = self._try_build_arena(layer)
                 ids, W = topk_ids, layer
-                if arena is not None and x.shape[0] <= self._arena_max_tokens():
+                if arena is not None and x.shape[0] <= arena.decision.max_tokens:
                     from .expert_arena import ArenaWeights as _ArenaWeights
                     from .expert_arena import plan_step as _plan_step
                     plan = _plan_step(arena.state, topk_ids)

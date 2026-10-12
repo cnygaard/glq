@@ -236,6 +236,109 @@ def plan_expert_offload_gib(*, weights_bytes, ple_offload_bytes, expert_offload_
     return max(0, gib)
 
 
+#: Floor the arena must leave for KV beyond what the chosen window needs. The window figure is
+#: already padded by `_KV_SAFETY_FACTOR`, but KV block granularity and a second request's
+#: partial blocks are not in it, and coming up short is not graceful — vLLM refuses at startup.
+#: Measured either side of this on an L4: an 8 GiB arena left 1.16 GiB of pool and served; 10
+#: GiB left -0.82 GiB and the engine declined to start.
+_ARENA_KV_SLACK_BYTES = 1024**3
+
+
+def plan_expert_arena_gib(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
+                          vram_bytes, offload_gib, nontext_bytes=0, kv_bytes=0) -> int:
+    """GiB of VRAM to give the routing-aware expert arena (`GLQ_MOE_EXPERT_CACHE`).
+
+    Measured on an L4 (`benchmarks/expert_arena_s1/RESULT.md`): a routing-aware arena takes
+    decode from 6.436 to **17.211 tok/s**, byte-identical, and **2.441x of that survives an
+    iso-VRAM control** at a matched 14.79 GiB footprint — so it is routing-awareness, not
+    simply more resident weight. `--cpu-offload-gb` chooses what to keep with no knowledge of
+    routing; its effective hit rate is the 2.7% that happens to be resident.
+
+    Returns **0 unless experts are actually offloaded**. With the model resident there is no
+    PCIe traffic to remove and the arena would be a second copy of weights the card already
+    holds, so a box that does not need this never pays for it. Also 0 when any input is
+    unknown, matching `plan_expert_offload_gib`: guessing is worse than serving as before.
+
+    **The window keeps priority.** `kv_bytes` — what the chosen window needs, via
+    `window_kv_bytes` — comes off first, so an arena is never bought with context the caller
+    asked for. On a 22.49 GiB L4 the tested 8 GiB arena plus a 262,144 window needs 23.07 GiB
+    against a 20.69 GiB budget, so the two genuinely do not fit; the window wins and the arena
+    takes ~5.6 GiB, which is ~66 slots/layer. That costs little, because the hit-rate curve has
+    flattened by there: 71 slots/layer measured 16.816 tok/s against 94 at 17.211, 2.4% apart.
+
+    The arena sizes its own slot count and derives its token cap from this budget
+    (`glq_vllm.expert_arena.arena_decision`), so this function answers only "how many GiB are
+    genuinely spare".
+    """
+    if not weights_bytes or not vram_bytes or not expert_offload_bytes:
+        return 0
+    if int(offload_gib or 0) <= 0:
+        return 0
+
+    resident = (int(weights_bytes) - int(ple_offload_bytes or 0) - int(nontext_bytes or 0)
+                - int(offload_gib) * 1024**3)
+    spare = (kv_headroom_bytes(max(0, resident), vram_bytes)
+             - int(kv_bytes or 0) - _ARENA_KV_SLACK_BYTES)
+    if spare < 1024**3:
+        return 0
+    # Whole GiB, matching the env var's units and `plan_expert_offload_gib`'s granularity.
+    gib = int(spare // 1024**3)
+    # Never more than the experts themselves: past full residency the slots cannot be filled.
+    return max(0, min(gib, int(int(expert_offload_bytes) // 1024**3)))
+
+
+def plan_arena_and_offload(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
+                           vram_bytes, base_offload_gib, ram_bytes=None, nontext_bytes=0,
+                           kv_bytes=0, forced: bool = False) -> tuple[int, int]:
+    """``(expert_offload_gib, expert_arena_gib)`` — deepen offload when that buys an arena.
+
+    **Why deepening is the right trade, measured.** `plan_expert_offload_gib` offloads the
+    *minimum* that fits the card and the window, which leaves no VRAM spare — so on the 22.49
+    GiB L4 this feature exists for, the arena would come out at 0 GiB and ship inert. Moving
+    the rest of the experts to host frees exactly the VRAM the arena needs, and the arena is
+    what makes that extra offload cheap:
+
+        offload 36, resident 7.67, no arena        ~6.8 tok/s   (the old plan)
+        offload 41.48 + 8 GiB arena, resident 14.79  17.211     (measured)
+
+    **It does not cost context.** Deeper offload *increases* KV headroom, so the window
+    chosen by `plan_max_model_len` is still affordable — `kv_bytes` is subtracted before the
+    arena is offered anything, and a test asserts the window still fits afterwards.
+
+    Returns the base plan untouched when:
+
+    * nothing was being offloaded — the model fits, there is no PCIe traffic for an arena to
+      remove, and creating some would be strictly worse than serving as before. This is the
+      whole meaning of "when offload is needed";
+    * the caller pinned `--cpu-offload-gb`, which is an instruction rather than a starting
+      point: moving more weight to host than they asked for changes the footprint they chose;
+    * deepening does not actually buy a usable arena, so the PCIe cost would be paid for
+      nothing.
+    """
+    if forced or int(base_offload_gib or 0) <= 0:
+        return int(base_offload_gib or 0), 0
+    if not weights_bytes or not vram_bytes or not expert_offload_bytes:
+        return int(base_offload_gib or 0), 0
+
+    full = int(int(expert_offload_bytes) // 1024**3)
+    if ram_bytes:
+        # Same cap `plan_expert_offload_gib` applies: pinned pages cannot be swapped, so
+        # overshooting fails to allocate or starves the OS rather than running slowly.
+        host_cap = (int(float(ram_bytes) * _PINNED_RAM_FRACTION / 1024**3)
+                    - math.ceil(int(ple_offload_bytes or 0) / 1024**3))
+        full = min(full, max(0, host_cap))
+    full = max(full, int(base_offload_gib))        # never shallower than the base plan
+
+    arena = plan_expert_arena_gib(
+        weights_bytes=weights_bytes, ple_offload_bytes=ple_offload_bytes,
+        expert_offload_bytes=expert_offload_bytes, vram_bytes=vram_bytes,
+        offload_gib=full, nontext_bytes=nontext_bytes, kv_bytes=kv_bytes)
+    if arena <= 0:
+        # Deepening bought nothing, so do not pay PCIe for it.
+        return int(base_offload_gib), 0
+    return full, arena
+
+
 #: Worst-case KV cost per token among the served families, used to price a window before
 #: vLLM exists to ask. Taken from **measured pools**, not from arithmetic: two
 #: Qwen3.8-Flash-Next serves on an RTX PRO 6000 (vLLM 0.30.0, PLE offload) report
@@ -584,7 +687,8 @@ def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None, available_bytes=None) ->
 
 
 def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
-              available_bytes=None, ple_offload: bool = False) -> dict:
+              available_bytes=None, ple_offload: bool = False,
+              expert_arena_gib: int = 0, max_num_seqs: int = 0) -> dict:
     """The environment `vllm serve` is started with.
 
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
@@ -626,6 +730,21 @@ def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
         # GLQ's own refusal message already documents the setting being flipped. setdefault, so
         # a user who deliberately exports 0 still gets their answer (and GLQ's clear refusal).
         env.setdefault("VLLM_PLE_CPU_OFFLOAD", "1")
+    if expert_arena_gib and int(expert_arena_gib) > 0:
+        # The routing-aware expert arena. Measured on an L4: decode 6.436 -> 17.211 tok/s,
+        # byte-identical, and 2.441x of that survives an iso-VRAM control — so it is
+        # routing-awareness rather than simply more resident weight. Planned only when experts
+        # are offloaded (`plan_expert_arena_gib`), so a card that fits the model is untouched.
+        #
+        # setdefault, following VLLM_PLE_CPU_OFFLOAD above: a user who exports a value keeps
+        # it, and `GLQ_MOE_EXPERT_CACHE=0` is how they opt out.
+        env.setdefault("GLQ_MOE_EXPERT_CACHE", str(int(expert_arena_gib)))
+        if max_num_seqs and int(max_num_seqs) > 0:
+            # The arena path's token cap. `max_num_seqs` is the real step width — a decode
+            # step carries at most one token per concurrent stream, and this supervisor never
+            # enables speculative decoding, so nothing widens it. The arena lowers this
+            # further when its slot count cannot cover it, so it is a ceiling, not a demand.
+            env.setdefault("GLQ_MOE_ARENA_MAX_TOKENS", str(int(max_num_seqs)))
     # After PATH, so the probe sees the tools the child will actually have.
     env.update(flashinfer_env())
     return env
@@ -768,6 +887,28 @@ class VllmSupervisor:
                                   and gpu_memory_utilization is not None)
         self.max_num_seqs = int(max_num_seqs) if max_num_seqs is not None else (
             DEFAULT_CPU_MAX_NUM_SEQS if self.device == "cpu" else DEFAULT_MAX_NUM_SEQS)
+        #: GiB for the routing-aware expert arena, planned after the window and the offload
+        #: budget so the window keeps priority — an arena is never bought with context the
+        #: caller asked for. 0 on CPU and whenever nothing is offloaded, so a box that does
+        #: not need it is untouched. See `plan_expert_arena_gib`.
+        self.expert_arena_gib = 0
+        self.expert_offload_base_gib = self.expert_offload_gib
+        if self.device != "cpu":
+            # One call, so the offload depth and the arena size cannot disagree: deepening
+            # offload is what frees the VRAM the arena needs, and an arena that did not
+            # materialise must not leave the deeper offload behind paying PCIe for nothing.
+            #: What the window search chose on its own — the SMALLEST offload reaching the
+            #: chosen tier. Kept separate from the final figure because deepening for the
+            #: arena makes the final one deliberately larger, and "smallest that reaches the
+            #: tier" is still a true and tested property of the search itself.
+            self.expert_offload_base_gib = self.expert_offload_gib
+            self.expert_offload_gib, self.expert_arena_gib = plan_arena_and_offload(
+                weights_bytes=weights_bytes, ple_offload_bytes=self.ple_offload_bytes,
+                expert_offload_bytes=self.expert_offload_bytes,
+                vram_bytes=self._vram_bytes, base_offload_gib=self.expert_offload_gib,
+                ram_bytes=ram_bytes, nontext_bytes=self.nontext_bytes,
+                kv_bytes=window_kv_bytes(self.max_model_len, self.window_concurrency),
+                forced=self._expert_offload_forced)
         self.fp8_kv = bool(fp8_kv)
         self.serve = serve
         self._spawn, self._probe = spawn, probe
@@ -956,6 +1097,17 @@ class VllmSupervisor:
             self._say(f"  reserving {self.gpu_memory_utilization:.0%} of VRAM for the weights "
                       f"and KV cache, with a {self.max_model_len} token context"
                       f"{self._window_note}")
+        if self.expert_arena_gib > 0:
+            # Say it out loud. A cache that is silently on or off produces correct output
+            # either way, so the only way a user can tell is if we tell them — the same
+            # reason `arena_decision` carries its reason instead of logging and dropping it.
+            self._say(f"  keeping the hottest experts in {self.expert_arena_gib} GiB of VRAM "
+                      f"(routing-aware cache; measured 2.7x decode on an L4). "
+                      f"GLQ_MOE_EXPERT_CACHE=0 turns it off")
+        elif self.expert_offload_gib > 0 and self.device != "cpu":
+            self._say(f"  no VRAM left for the expert cache after a {self.max_model_len} "
+                      f"token context — a shorter window or more host RAM would buy one "
+                      f"(GLQ_MOE_EXPERT_CACHE=<GiB> forces it)")
         # Say how long this takes *before* going quiet. Minutes of silence you were warned
         # about is patience; the same silence unannounced is indistinguishable from a hang,
         # and that is what a first run looks like today.
@@ -978,7 +1130,9 @@ class VllmSupervisor:
         env = child_env(device=self.device, ram_bytes=self._ram_bytes,
                         ple_offload=bool(self.ple_offload_bytes),
                         weights_bytes=self.weights_bytes,
-                        available_bytes=self._available_bytes)
+                        available_bytes=self._available_bytes,
+                        expert_arena_gib=self.expert_arena_gib,
+                        max_num_seqs=self.max_num_seqs)
         if self.device == "cpu" and self._ram_bytes and self.weights_bytes:
             # Say the arithmetic out loud. On CPU the weights, the pool, the runtime and the
             # page cache share one pool of RAM, and when it does not fit there is no swap to

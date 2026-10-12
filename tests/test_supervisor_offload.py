@@ -44,7 +44,7 @@ def test_no_offload_when_the_model_already_fits():
 
 
 def test_smaller_cards_get_a_bigger_budget():
-    assert _sup(45.0).expert_offload_gib < _sup(23.0).expert_offload_gib
+    assert _sup(45.0).expert_offload_base_gib < _sup(23.0).expert_offload_base_gib
 
 
 def test_the_budget_never_exceeds_the_declared_expert_bytes():
@@ -216,7 +216,7 @@ def test_the_window_grows_on_a_24gb_card_once_the_counts_are_right():
     after = _code_sup(23.0, **FN_CORRECTED)
     assert before.max_model_len == 16384
     assert after.max_model_len == 131072
-    assert after.expert_offload_gib < before.expert_offload_gib
+    assert after.expert_offload_base_gib < before.expert_offload_base_gib
 
 
 def test_the_same_fix_also_hands_back_utilization():
@@ -366,8 +366,8 @@ def test_a_pinned_window_is_not_subject_to_the_auto_cap():
         vram_bytes=int(23.0 * GIB), ram_bytes=int(192.0 * GIB),
         max_model_len=262144, window_offload_extra_gib=0, **FN_CORRECTED)
     baseline = _code_sup(23.0, ram_gib=192.0, window_offload_extra_gib=0,
-                         **FN_CORRECTED).expert_offload_gib
-    assert chat_shaped.expert_offload_gib > baseline
+                         **FN_CORRECTED).expert_offload_base_gib
+    assert chat_shaped.expert_offload_base_gib > baseline
 
 
 def test_an_unaffordable_pinned_window_is_served_anyway_and_reported():
@@ -393,7 +393,7 @@ def test_the_auto_window_tiers_up_within_the_budget():
     262144 is NOT reached here and that is correct -- it needs ~40 GiB, which 124 GiB of host
     RAM cannot pin beside the 23.84 GiB PLE table."""
     sup = _code_sup(23.0, **FN_CORRECTED)
-    assert sup.expert_offload_gib == 37
+    assert sup.expert_offload_base_gib == 37
     assert sup.max_model_len == 131072
 
 
@@ -401,7 +401,7 @@ def test_the_auto_window_reaches_the_full_context_on_a_32gb_card():
     """The g7, where the trade is bracketed by measurement rather than extrapolated: the
     chosen 32 GiB sits between the 27 GiB and 34 GiB arms that were benched."""
     sup = _code_sup(31.9, **FN_CORRECTED)
-    assert sup.expert_offload_gib == 32
+    assert sup.expert_offload_base_gib == 32
     assert sup.max_model_len == 262144
 
 
@@ -410,7 +410,7 @@ def test_it_picks_the_smallest_offload_that_reaches_the_tier():
     declared maximum. On the g7, 32 GiB and 38 GiB both serve 262144; every GiB beyond the
     first one that reaches the tier is decode speed spent for nothing."""
     sup = _code_sup(31.9, **FN_CORRECTED)
-    lower = _code_sup(31.9, expert_offload_gib=sup.expert_offload_gib - 1, **FN_CORRECTED)
+    lower = _code_sup(31.9, expert_offload_gib=sup.expert_offload_base_gib - 1, **FN_CORRECTED)
     assert lower.max_model_len < sup.max_model_len
 
 
@@ -490,3 +490,260 @@ def test_an_explicit_budget_still_beats_the_window_aware_plan():
     zero = _code_sup(23.0, expert_offload_gib=0, **FN_CORRECTED)
     assert zero.expert_offload_gib == 0
     assert "--cpu-offload-gb" not in " ".join(str(a) for a in zero.argv())
+
+
+# ---------------------------------------------------------------------------
+# ★ The expert arena: default ON when experts are offloaded, window keeps priority
+# ---------------------------------------------------------------------------
+#
+# Measured on an L4 (benchmarks/expert_arena_s1/RESULT.md): a routing-aware arena takes decode
+# from 6.436 to 17.211 tok/s, byte-identical, and 2.441x of that survives an iso-VRAM control
+# -- so it is not just "more weights resident". It is worth defaulting on, and it costs VRAM
+# the window also wants, so the two have to be planned together.
+
+_L4 = int(23034 * 1024**2)                 # as nvidia-smi reports the card
+_FLASHNEXT = int(72.2 * 1024**3)
+_PLE = int(23.84 * 1024**3)
+_EXPERTS = int(42.62 * 1024**3)
+_NONTEXT = int(4.69 * 1024**3)             # the bf16 MTP head, never loaded
+
+
+from glq.supervisor import _WINDOW_TIERS, plan_expert_arena_gib  # noqa: E402
+
+
+def _arena(**kw):
+    base = dict(weights_bytes=_FLASHNEXT, ple_offload_bytes=_PLE,
+                expert_offload_bytes=_EXPERTS, nontext_bytes=_NONTEXT,
+                vram_bytes=_L4, offload_gib=42, kv_bytes=0)
+    base.update(kw)
+    return plan_expert_arena_gib(**base)
+
+
+def test_no_arena_when_nothing_is_offloaded():
+    """★ The arena's whole job is to stop re-reading experts over PCIe. With the model
+    resident there is no traffic to remove, and the arena would be a second copy of weights
+    the card already holds — it would push the model back into offload to pay for itself.
+
+    `arena_decision` refuses this independently at load time; this is the earlier, cheaper
+    check, and it keeps a big card's plan byte-for-byte what it is today.
+    """
+    assert _arena(offload_gib=0) == 0
+
+
+def test_no_arena_when_an_input_is_unknown():
+    """Matches `plan_expert_offload_gib`: guessing is worse than serving as before."""
+    assert _arena(vram_bytes=None) == 0
+    assert _arena(weights_bytes=None) == 0
+
+
+def test_the_262144_window_keeps_its_KV_and_still_gets_an_arena():
+    """★ The case the whole policy is built on, and the regression test for it.
+
+    On a 22.49 GiB L4 the *tested* 8 GiB arena plus a 262,144 window needs 23.07 GiB against a
+    20.69 GiB budget — 2.37 GiB short — so both are not available and the window wins. What is
+    left is still a useful arena: ~5.6 GiB is ~66 slots/layer, and the hit-rate curve has
+    flattened by then (measured 71 slots -> 16.816 tok/s against 94 -> 17.211, 2.4% apart).
+
+    So the window is never shortened to buy decode, and the arena still arrives.
+    """
+    kv = window_kv_bytes(262144, 1)
+    gib = _arena(kv_bytes=kv)
+    assert gib > 0, "a 262k window should still leave room for an arena"
+    assert 4 <= gib <= 7, f"expected ~5-6 GiB on this card, got {gib}"
+
+
+def test_the_arena_never_eats_the_window_KV_at_any_tier():
+    """At every tier the plan must still afford the window it chose. An arena that left the
+    window short would turn a served window into a startup refusal, which is the failure
+    `plan_expert_offload_gib` was already hardened against."""
+    from glq.supervisor import _MIN_KV_BYTES, kv_headroom_bytes
+
+    for tier in _WINDOW_TIERS:
+        kv = window_kv_bytes(tier, 1)
+        gib = _arena(kv_bytes=kv)
+        resident = (_FLASHNEXT - _PLE - _NONTEXT - 42 * 1024**3) + gib * 1024**3
+        left = kv_headroom_bytes(max(0, resident), _L4)
+        assert left >= kv or gib == 0, (
+            f"tier {tier}: arena {gib} GiB leaves {left / 1024**3:.2f} GiB for a window "
+            f"needing {kv / 1024**3:.2f}")
+        assert left >= min(kv, _MIN_KV_BYTES) or gib == 0
+
+
+def test_a_bigger_card_gets_a_bigger_arena():
+    """Sizing follows genuinely spare VRAM, so a card with more of it gets more arena. Pins
+    that the planner is not returning a constant."""
+    small = _arena(kv_bytes=window_kv_bytes(262144, 1))
+    big = plan_expert_arena_gib(
+        weights_bytes=_FLASHNEXT, ple_offload_bytes=_PLE, expert_offload_bytes=_EXPERTS,
+        nontext_bytes=_NONTEXT, vram_bytes=int(48 * 1024**3), offload_gib=42,
+        kv_bytes=window_kv_bytes(262144, 1))
+    assert big > small
+
+
+# ---------------------------------------------------------------------------
+# child_env: the arena vars, and the user's last word
+# ---------------------------------------------------------------------------
+
+def test_child_env_sets_the_arena_vars_when_offload_is_planned():
+    from glq.supervisor import child_env
+
+    env = child_env(device="cuda", expert_arena_gib=6, max_num_seqs=1)
+    assert env["GLQ_MOE_EXPERT_CACHE"] == "6"
+    assert env["GLQ_MOE_ARENA_MAX_TOKENS"] == "1"
+
+
+def test_child_env_sets_NOTHING_when_no_arena_was_planned():
+    """A card that fits the model must be byte-for-byte unchanged, env included."""
+    from glq.supervisor import child_env
+
+    env = child_env(device="cuda", expert_arena_gib=0, max_num_seqs=8)
+    assert "GLQ_MOE_EXPERT_CACHE" not in env
+    assert "GLQ_MOE_ARENA_MAX_TOKENS" not in env
+
+
+def test_an_exported_arena_budget_WINS_including_zero(monkeypatch):
+    """★ `GLQ_MOE_EXPERT_CACHE=0` is how a user opts out, so it must survive the plan.
+    Follows the `VLLM_PLE_CPU_OFFLOAD` / `VLLM_CPU_KVCACHE_SPACE` precedent in `child_env`:
+    every value there is a setdefault precisely so an explicit export is the last word."""
+    from glq.supervisor import child_env
+
+    monkeypatch.setenv("GLQ_MOE_EXPERT_CACHE", "0")
+    monkeypatch.setenv("GLQ_MOE_ARENA_MAX_TOKENS", "3")
+    env = child_env(device="cuda", expert_arena_gib=6, max_num_seqs=1)
+    assert env["GLQ_MOE_EXPERT_CACHE"] == "0"
+    assert env["GLQ_MOE_ARENA_MAX_TOKENS"] == "3"
+
+
+def test_the_cpu_path_never_plans_an_arena():
+    """The arena is a VRAM structure served by a Triton kernel; on the CPU backend there is
+    no card to hold it and no PCIe hop to remove."""
+    from glq.supervisor import child_env
+
+    env = child_env(device="cpu", ram_bytes=64 * 1024**3, weights_bytes=10 * 1024**3,
+                    expert_arena_gib=6, max_num_seqs=1)
+    assert "GLQ_MOE_EXPERT_CACHE" not in env
+
+
+# ---------------------------------------------------------------------------
+# ★ MTP stays OFF, and the offload plan depends on it
+# ---------------------------------------------------------------------------
+
+def test_the_supervisor_never_enables_speculative_decoding():
+    """★ An absence that another plan depends on, so it is asserted rather than assumed.
+
+    `supervisor.py` subtracts `nontext_bytes` — the MTP head and vision tower — from the
+    weights it plans against, which closed a measured 5.62 GiB over-estimate (15.72 predicted
+    vs 10.1 reported), worth two window tiers on a 24 GB card. Its own comment states the
+    condition: *"Sound only because this supervisor never enables speculative decoding, which
+    WOULD load the MTP head."*
+
+    So defaulting MTP on would silently under-plan offload by ~5.6 GiB. The measurements agree
+    it should stay off: `num_spec=1` beats `num_spec=3` both with the arena and without
+    (19.692 vs 18.569 on; 7.743 vs 7.384 off), speculation and the arena overlap rather than
+    compound (1.203x -> 1.171x once the arena is in place), and MTP is not byte-identical here
+    whereas the arena is. See `benchmarks/expert_arena_s1/RESULT.md`.
+    """
+    sup = VllmSupervisor(model="m", device="cuda", vram_bytes=_L4,
+                         weights_bytes=_FLASHNEXT, ple_offload_bytes=_PLE,
+                         expert_offload_bytes=_EXPERTS, nontext_bytes=_NONTEXT,
+                         serve=False)
+    argv = " ".join(sup.argv())
+    assert "--speculative-config" not in argv
+    assert "speculative" not in argv
+    # and the subtraction that depends on it is still in force
+    assert sup.nontext_bytes == _NONTEXT
+
+
+# ---------------------------------------------------------------------------
+# ★ Deepening offload to buy the arena
+# ---------------------------------------------------------------------------
+
+def _pair(**kw):
+    from glq.supervisor import plan_arena_and_offload
+    base = dict(weights_bytes=_FLASHNEXT, ple_offload_bytes=_PLE,
+                expert_offload_bytes=_EXPERTS, nontext_bytes=_NONTEXT, vram_bytes=_L4,
+                ram_bytes=int(120 * 1024**3), kv_bytes=window_kv_bytes(262144, 1),
+                base_offload_gib=36)
+    base.update(kw)
+    return plan_arena_and_offload(**base)
+
+
+def test_a_model_that_FITS_is_left_completely_alone():
+    """★ "when offload is needed" is the whole condition. With nothing offloaded the model is
+    resident, there is no PCIe traffic for an arena to remove, and deepening offload to create
+    some would be strictly worse than serving as before."""
+    assert _pair(base_offload_gib=0) == (0, 0)
+
+
+def test_offload_is_deepened_so_the_arena_has_room():
+    """★ The minimum-offload plan leaves nothing spare, so the arena would be 0 GiB on the
+    card it was built for. Measured on an L4: all experts offloaded plus an 8 GiB arena is
+    17.211 tok/s; the shallower plan with no arena is ~6.8.
+
+    Deepening does not cost context — more offload means *more* KV headroom, not less.
+
+    The chat window (8192 at concurrency 8) is the case where it clearly pays: offload
+    deepens 29 -> 36 and a 5 GiB arena appears. 36 rather than the full 42 because the host
+    RAM cap binds first, which the test below pins.
+    """
+    off, arena = _pair(base_offload_gib=29, kv_bytes=window_kv_bytes(8192, 8))
+    assert off > 29, f"offload should deepen past the minimum, got {off}"
+    assert arena >= 4, f"expected a usable arena, got {arena} GiB"
+
+
+def test_a_host_with_RAM_to_spare_offloads_everything():
+    """With the pinned-RAM cap out of the way, deepening reaches the full expert set — which
+    is the configuration the 17.211 tok/s arm actually ran."""
+    off, arena = _pair(ram_bytes=int(192 * 1024**3))
+    assert off >= int(_EXPERTS // 1024**3) - 1, f"expected full offload, got {off}"
+    assert arena >= 5
+
+
+def test_a_262k_window_on_a_RAM_LIMITED_host_keeps_the_window_and_loses_the_arena():
+    """★ The approved policy playing out, and worth pinning because the answer is "no arena".
+
+    A 262,144 window needs 7.92 GiB of KV, and a 121 GiB host caps expert offload at 36 GiB
+    (121 x `_PINNED_RAM_FRACTION` minus the PLE table), so nothing is left. The window wins —
+    it is what `glq-code` exists to provide — and the arena declines rather than quietly
+    shortening the context.
+
+    The same case with 192 GiB of host RAM does get a 6 GiB arena, so this is a host-memory
+    limit and not a card limit. A user who prefers decode can set `GLQ_MOE_EXPERT_CACHE`
+    themselves; the plan will not override it.
+    """
+    off, arena = _pair(base_offload_gib=36, kv_bytes=window_kv_bytes(262144, 1),
+                       ram_bytes=int(121 * 1024**3))
+    assert arena == 0
+    assert off == 36, "a plan that buys no arena must not pay extra PCIe for one"
+
+
+def test_deepening_leaves_the_window_its_KV():
+    """Deeper offload frees VRAM, so this should hold by construction — assert it anyway,
+    because a window that is planned and then refused at startup is the failure mode
+    `plan_expert_offload_gib` was already hardened against."""
+    from glq.supervisor import kv_headroom_bytes
+
+    kv = window_kv_bytes(262144, 1)
+    off, arena = _pair(kv_bytes=kv)
+    resident = (_FLASHNEXT - _PLE - _NONTEXT - off * 1024**3) + arena * 1024**3
+    assert kv_headroom_bytes(max(0, resident), _L4) >= kv
+
+
+def test_a_host_without_RAM_for_the_experts_is_not_asked_to_hold_them():
+    """Pinned pages cannot be swapped, so overshooting here does not run slowly — it fails to
+    allocate or starves the OS. `_PINNED_RAM_FRACTION` already caps `plan_expert_offload_gib`;
+    deepening respects the same cap, and on a host with no room it does not deepen at all.
+
+    This cap is why the measured 17.211 arm is not simply the default: that run passed
+    `--cpu-offload-gb 44` explicitly, pinning 65.3 GiB against a 121 GiB host — 54%, past this
+    policy's 50% — and `free` showed about 1 GiB spare at peak.
+    """
+    off, _arena = _pair(ram_bytes=int(40 * 1024**3))
+    assert off == 36, "a host that cannot hold more must not be asked to"
+
+
+def test_a_user_forced_offload_is_never_deepened():
+    """An explicit --cpu-offload-gb is an instruction, not a starting point. Quietly moving
+    more weight to host than the user asked for would change the footprint they chose."""
+    off, _arena = _pair(base_offload_gib=20, forced=True)
+    assert off == 20

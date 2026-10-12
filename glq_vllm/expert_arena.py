@@ -56,6 +56,9 @@ class ArenaDecision:
     slots: int = 0
     bytes_per_slot: int = 0
     n_layers: int = 0
+    #: Token count the arena path serves, DERIVED from what the budget affords rather than
+    #: taken from the caller — see `arena_decision`. `apply` gates on this.
+    max_tokens: int = 0
     reason: str = ""
 
     @property
@@ -93,8 +96,15 @@ def arena_decision(*, budget: str, offloaded_bytes: int, n_layers: int, n_expert
     * the budget is unset (the default);
     * little or nothing is offloaded, so there is no PCIe traffic to remove and the arena
       would be a second copy of weights already on the card;
-    * the budget cannot hold ``max_tokens * top_k`` slots, which is a **correctness**
-      precondition rather than a tuning one (see `slots_for_budget`).
+    * the budget cannot hold even ``top_k`` slots — one token's routings — which is a
+      **correctness** precondition rather than a tuning one (see `slots_for_budget`).
+
+    ``max_tokens`` is a **ceiling, not a demand.** The cap the arena actually serves is
+    ``min(max_tokens, slots // top_k)``, because lowering it is always safe: fewer token
+    counts take the arena path and the rest take today's exact path. Refusing instead cost
+    three measured arms — 6 GiB over 49 containers is 71 slots/layer, a cap of 8 demands
+    8 x top_k 10 = 80, so the arena declined and three runs silently measured no arena while
+    looking entirely healthy.
     """
     gib = _parse_budget(budget)
     if gib is None or gib <= 0:
@@ -108,18 +118,28 @@ def arena_decision(*, budget: str, offloaded_bytes: int, n_layers: int, n_expert
                 f"second copy of resident weights. Expert arena disabled."))
 
     per = bytes_per_slot(hidden_size=hidden_size, inter=inter, w13_out=w13_out, bpw=bpw)
-    try:
-        slots = slots_for_budget(int(gib * 1024**3), n_layers=n_layers,
-                                 hidden_size=hidden_size, inter=inter, w13_out=w13_out,
-                                 bpw=bpw, n_experts=n_experts, max_tokens=max_tokens,
-                                 top_k=top_k)
-    except ValueError as e:
-        return ArenaDecision(False, reason=f"expert arena disabled: {e}")
+    # Size first with no cap demanded, then derive the cap from what the budget bought. Asking
+    # `slots_for_budget` to enforce `max_tokens` here would make a too-small budget a refusal
+    # instead of a narrower arena.
+    slots = slots_for_budget(int(gib * 1024**3), n_layers=n_layers, hidden_size=hidden_size,
+                             inter=inter, w13_out=w13_out, bpw=bpw, n_experts=n_experts)
+    cap = min(int(max_tokens), slots // max(int(top_k), 1))
+    if cap < 1:
+        return ArenaDecision(
+            False, reason=(
+                f"expert arena disabled: {gib:g} GiB buys {slots} slots/layer across "
+                f"{n_layers} layers, which cannot hold even ONE token's top_k {top_k} "
+                f"routings. Every expert routed in a step must be resident at once, so a "
+                f"narrower arena is not an option here — raise {BUDGET_ENV}."))
 
+    note = "" if cap >= int(max_tokens) else \
+        f" (cap lowered from {max_tokens}: {slots} slots / top_k {top_k})"
     return ArenaDecision(True, slots=slots, bytes_per_slot=per, n_layers=n_layers,
+                         max_tokens=cap,
                          reason=(f"expert arena: {slots} slots/layer x {n_layers} layers = "
                                  f"{slots * per * n_layers / 1024**3:.2f} GiB, "
-                                 f"{per / 1024**2:.3f} MiB/slot"))
+                                 f"{per / 1024**2:.3f} MiB/slot, serving steps up to "
+                                 f"{cap} token(s){note}"))
 
 
 def arena_decision_from_env(env, **kw) -> ArenaDecision:
