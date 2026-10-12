@@ -131,9 +131,20 @@ def main(argv=None) -> int:
 
     bw, floor = fit_bandwidth(arms)
     print()
+    offs = sorted(a[0] for a in arms)
     print(f"fitted effective PCIe bandwidth : {bw:6.2f} GB/s")
-    print(f"fitted step floor (zero traffic): {floor:6.2f} ms/token  "
+    print(f"EXTRAPOLATED intercept at zero traffic: {floor:6.2f} ms/token  "
           f"-> {1000.0 / floor:5.2f} tok/s")
+    print(f"  ** NOT a floor and NOT a ceiling. ** Fitted over offload "
+          f"{offs[0]:.2f}-{offs[-1]:.2f} GiB")
+    print(f"  ({offs[-1] - offs[0]:.1f} GiB wide); zero traffic is ~{offs[-1]:.0f} GiB "
+          f"outside that window.")
+    print("  Measured consequence: this intercept read 84.24 ms and called 1.82x a hard")
+    print("  ceiling; the arena then measured 58.1 ms and 2.674x. Locally verified linearity")
+    print("  (3 intervals within 4.0%) was treated as global, and it is not. The fitted")
+    print("  bandwidth is also the UNCOALESCED UVA one, while an arena miss is a bulk copy,")
+    print("  so both errors push the same way. Use the rows below to rank options, never as")
+    print("  a bound on what is achievable.")
     if len(arms) == 2:
         print("  (two arms = a slope with no residual; a third point is what tests whether")
         print("   it is a line rather than a tangent, and the extrapolation below needs it)")
@@ -162,7 +173,7 @@ def main(argv=None) -> int:
           f"{'tok/s':>7} {'vs baseline':>12}")
     print("  " + "-" * 64)
     rows = [(args.arena_gib, args.hit_rate, "measured"),
-            (args.arena_gib, 1.0, "PERFECT cache (the hard ceiling)")]
+            (args.arena_gib, 1.0, "PERFECT cache (extrapolated, NOT a bound)")]
     for gib, h, note in rows:
         ms = floor + (1.0 - h) * TOKEN_MIB * (MIB / (bw * 1e9)) * 1000.0
         print(f"  {gib:>6.1f}G {h:>9.4f} {(1 - h) * TOKEN_MIB:>13.1f} {ms:>9.2f} "

@@ -98,3 +98,50 @@ is gated at 8 tokens/step because every expert routed in a step must be resident
 (`n_slots >= max_tokens * top_k`), so this says nothing about concurrent serving. KV drops from
 81,920 to 10,581 tokens to pay for the arena, which does not matter at a 4,096 window and B=1
 but would at higher concurrency.
+
+## MTP speculation, arena OFF — the earlier finding reproduces
+
+Measured on the way to the arena+MTP arms, when a 6 GiB arena was **correctly refused** (see
+below) and all three arms therefore ran with no arena. `--gpu-mem 0.90`, offload 41.48 GiB:
+
+| arm | tok/s | range | mean acceptance length | vs no-spec |
+|---|--:|--|--|--:|
+| no speculation | 6.436 | 6.436–6.436 | — | 1.00× |
+| `num_speculative_tokens=3` | 7.384 | 7.177–7.450 | 1.91–2.70 | 1.147× |
+| **`num_speculative_tokens=1`** | **7.743** | 7.743–7.929 | 1.56–1.72 | **1.203×** |
+
+**1 still beats 3 under offload without the arena**, reproducing the earlier result: step cost
+is steeply linear in drafted positions, so the extra acceptance that 3 buys does not cover the
+extra positions. `num_spec=3` also costs more KV (34,474 vs 54,016 tokens) and more capture
+(0.91 vs 0.60 GiB).
+
+### ★ The arena refused this configuration, and was right to
+
+The 6 GiB budget over **49** MoE containers is 71 slots/layer, against a cap of 8 tokens ×
+top_k 10 = 80 simultaneous routings:
+
+```
+expert arena disabled: an arena of 71 slots/layer cannot serve 8 tokens x top_k 10 = 80
+SIMULTANEOUS routings. Every expert routed in a step must be resident at once...
+```
+
+Serving it anyway would have evicted a routing before the matmul read it. The refusal names
+its arithmetic, which is the only reason the arms were recognisable as no-arena runs at all —
+their rates and `weights_gib=6.85` would otherwise have looked like a plausible arena result.
+
+The fix is to match the cap to the step width rather than to enlarge the arena: an MTP verify
+step carries `1 + num_spec = 4` tokens, so `GLQ_MOE_ARENA_MAX_TOKENS=4` brings the requirement
+to 40 ≤ 71 and leaves the extra VRAM to KV, which MTP needs.
+
+### Two things that stopped arena+MTP before this
+
+* **`VLLM_LOGGING_LEVEL=DEBUG` breaks CUDA-graph capture on the speculator path.** vLLM's
+  DEBUG formatter stringifies a tensor (`vllm/ir/op.py` → `tensors_str_no_data` →
+  `Tensor.__repr__`), which needs a device→host copy and is illegal mid-capture:
+  `cudaErrorStreamCaptureUnsupported`. The *reported* failure was an unrelated `rms_norm` in
+  the draft head with no GLQ frame, because the message is "operation failed due to a
+  **previous** error during capture". The first error in the log, 300k lines earlier, named
+  the real one. DEBUG is therefore a cause, not just an observer, when chasing a capture bug.
+* **An 8 GiB arena plus MTP does not fit** at `--gpu-mem 0.85`: `Available KV cache memory:
+  -0.31 GiB`. Only just — which is why the retry raises the budget to 0.90 and shrinks the
+  arena rather than abandoning the pairing.
