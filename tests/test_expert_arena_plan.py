@@ -150,3 +150,62 @@ def test_a_hit_issues_no_fill_which_is_where_the_saving_comes_from():
     p = plan_step(st, torch.tensor([1, 2, 3, 4], dtype=torch.int32))
     assert int((p.fill_src >= 0).sum()) == 0
     assert int(st.hits) == 4 and int(st.fills) == 4           # 4 fills from the cold step
+
+
+# ---------------------------------------------------------------------------
+# ★ Out-of-range expert ids (vLLM captures graphs with dummy inputs)
+# ---------------------------------------------------------------------------
+
+def test_an_expert_id_past_the_end_does_not_index_out_of_bounds():
+    """★ vLLM captures CUDA graphs with DUMMY inputs, so the router can emit ids outside
+    [0, n_experts). Measured: this took down the graphed arena arm with
+    `RuntimeError: Triton Error [CUDA]: device-side assert triggered`, after the memory
+    accounting was already healthy (capture 0.15 GiB, KV 1.16 GiB).
+
+    `residency[ids]` is a gather, so an id past the end is an out-of-bounds read — an
+    IndexError on CPU and a device-side assert on CUDA.
+    """
+    st = ArenaState(n_experts=64, n_slots=16, device="cpu")
+    p = plan_step(st, torch.tensor([70, 1, 2], dtype=torch.int32))
+    assert all(0 <= int(s) < 16 for s in p.slot_of)
+
+
+def test_a_NEGATIVE_expert_id_is_not_served_from_an_unfilled_slot():
+    """★ The dangerous direction, because it does not raise.
+
+    A negative id reaches `residency[-1]` through Python's negative indexing — the scratch
+    element — reads -1, is treated as a miss, is "admitted" as expert -1, and emits
+    `fill_src = -1`, which the kernel reads as a hit and skips. The op would then read a slot
+    nothing ever filled: stale weights, no error, plausible output.
+
+    So every routing that is handed a slot must also be either resident or filled.
+    """
+    st = ArenaState(n_experts=64, n_slots=16, device="cpu")
+    p = plan_step(st, torch.tensor([-1, 5, 6], dtype=torch.int32))
+    for r in range(3):
+        slot, src = int(p.slot_of[r]), int(p.fill_src[r])
+        assert 0 <= slot < 16, f"routing {r} got slot {slot}"
+        # cold arena: every routing is a first touch, so each must carry a real fill
+        assert src >= 0, (f"routing {r} was given slot {slot} with no fill, so the op would "
+                          f"read a slot that was never written")
+
+
+def test_clamping_does_not_disturb_valid_ids():
+    """The guard must be a no-op on real routing, or it would change the policy the hit rate
+    was measured with."""
+    st_a = ArenaState(n_experts=64, n_slots=16, device="cpu")
+    st_b = ArenaState(n_experts=64, n_slots=16, device="cpu")
+    ids = torch.tensor([3, 17, 3, 40], dtype=torch.int32)
+    a = plan_step(st_a, ids)
+    b = plan_step(st_b, ids.to(torch.int64))
+    assert [int(v) for v in a.slot_of] == [int(v) for v in b.slot_of]
+
+
+def test_the_callers_topk_ids_tensor_is_not_mutated():
+    """`plan_step` receives vLLM's own topk_ids. Clamping it in place would corrupt the
+    tensor the fused op is about to read for its own routing."""
+    st = ArenaState(n_experts=64, n_slots=16, device="cpu")
+    ids = torch.tensor([70, -1, 5], dtype=torch.int64)
+    before = ids.clone()
+    plan_step(st, ids)
+    assert torch.equal(ids, before), "plan_step modified the caller's topk_ids"

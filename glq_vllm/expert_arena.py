@@ -287,7 +287,17 @@ def plan_step(state: ArenaState, expert_ids) -> StepPlan:
     """
     import torch
 
-    ids = expert_ids.to(torch.int64).reshape(-1)
+    # ★ Clamp into range before any gather. vLLM captures CUDA graphs with DUMMY inputs, so
+    # the router can emit ids outside [0, n_experts). `residency[ids]` is a gather, and both
+    # directions are hazards: an id past the end is an out-of-bounds read (device-side assert
+    # under Triton, which is what took down the first graphed arm), and a NEGATIVE id silently
+    # reaches the scratch element through Python negative indexing, is admitted as "expert
+    # -1", and emits fill_src = -1 — which the kernel reads as a hit and skips, leaving the op
+    # to read a slot nothing ever wrote.
+    #
+    # Not in place: `expert_ids` is vLLM's own topk_ids, which the fused op reads for its own
+    # routing, and `.to(int64).reshape(-1)` can be a view when it is already int64.
+    ids = expert_ids.to(torch.int64).reshape(-1).clamp(0, max(state.n_experts - 1, 0))
     n_routings = ids.numel()
     S, E = state.n_slots, state.n_experts
     if n_routings > S:
