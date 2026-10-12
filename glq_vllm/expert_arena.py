@@ -407,6 +407,39 @@ class ExpertArena:
                                              dtype=src.dtype, device=src.device)
             self.row_elems[name] = src[0].numel()
 
+    def rebind_sources(self, sources: dict) -> None:
+        """Point the fill at the tensors the op will actually read, without reallocating.
+
+        **Allocation and source binding have opposite timing constraints, so they are
+        separate calls.**
+
+        The buffers must be allocated *before* vLLM's memory profiling and graph capture.
+        Allocating them at first apply put a 9.97 GiB arena inside `cudaStreamCapture`:
+        vLLM reported *"Graph capturing finished in 3 secs, took 10.06 GiB"* against the usual
+        0.3, subtracted that as graph memory, and refused to start with *"Available KV cache
+        memory: -0.82 GiB"*. A persistent arena also has no business living in the graph's
+        private pool.
+
+        The sources can only be read *after* vLLM's UVA offload, which runs later than
+        `process_weights_after_loading` — read too early they are the still-resident tensors,
+        and the op would be fed an arena filled from storage it no longer uses.
+
+        Shapes and dtypes are identical either way, so allocating from the early tensors and
+        filling from the late ones is sound; this asserts that rather than trusting it.
+        """
+        for name, src in sources.items():
+            buf = self.buffers.get(name)
+            if buf is None:
+                raise KeyError(
+                    f"{name} has no arena buffer; the source set changed between allocation "
+                    f"and binding, so the fill would read a tensor the op does not.")
+            if tuple(src.shape[1:]) != tuple(buf.shape[1:]) or src.dtype != buf.dtype:
+                raise ValueError(
+                    f"{name} changed shape/dtype between allocation and binding: "
+                    f"{tuple(src.shape)}/{src.dtype} vs arena {tuple(buf.shape)}/{buf.dtype}. "
+                    f"The arena would not be layout-identical to its source.")
+        self.sources = sources
+
     # ---- the per-step path ------------------------------------------------
 
     def fill(self, plan: StepPlan) -> None:

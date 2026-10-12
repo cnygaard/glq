@@ -252,3 +252,47 @@ def test_a_captured_graph_REPLAYS_the_same_decisions_as_eager():
         torch.cuda.synchronize()
         got.append(plan.slot_of.tolist())
     assert got == want, f"captured replay diverged from eager: {got} != {want}"
+
+
+# ---------------------------------------------------------------------------
+# ★ Allocation and source binding have opposite timing constraints
+# ---------------------------------------------------------------------------
+
+def test_sources_can_be_REBOUND_without_reallocating():
+    """★ The buffers must exist before vLLM profiles memory and captures graphs; the sources
+    can only be read after vLLM's UVA offload, which happens later. So they are separate
+    steps, and rebinding must not touch the allocation.
+
+    Measured consequence of getting this wrong: allocating at first apply put a 9.97 GiB
+    arena inside cudaStreamCapture, vLLM reported "Graph capturing finished in 3 secs, took
+    10.06 GiB" against the usual 0.3, charged it against the KV pool, and refused to start
+    with "Available KV cache memory: -0.82 GiB".
+    """
+    early = _sources()
+    a = ExpertArena(_decision(8), early, n_experts=16)
+    ptrs = {k: v.data_ptr() for k, v in a.buffers.items()}
+
+    late = _sources()                      # same shapes/dtypes, different storage
+    a.rebind_sources(late)
+    assert {k: v.data_ptr() for k, v in a.buffers.items()} == ptrs, "buffers were reallocated"
+    for k in late:
+        assert a.sources[k] is late[k], f"{k} still points at the pre-offload tensor"
+
+
+def test_rebinding_a_CHANGED_shape_is_refused():
+    """Layout identity is what makes the arena readable by the unmodified kernel. If a source
+    came back a different shape, filling it into the arena would produce plausible bytes at
+    the wrong stride."""
+    a = ExpertArena(_decision(8), _sources(), n_experts=16)
+    bad = _sources()
+    bad["w13_SU"] = torch.ones(16, 7, dtype=torch.float16)      # was (16, 6)
+    with pytest.raises(ValueError, match="shape/dtype"):
+        a.rebind_sources(bad)
+
+
+def test_rebinding_an_UNKNOWN_tensor_is_refused():
+    a = ExpertArena(_decision(8), _sources(), n_experts=16)
+    extra = _sources()
+    extra["w2_trellis_packed"] = torch.zeros(16, 8, 4, dtype=torch.int16)
+    with pytest.raises(KeyError, match="no arena buffer"):
+        a.rebind_sources(extra)

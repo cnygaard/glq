@@ -406,6 +406,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 ok = ok and 1 <= r2 <= 4
         layer.glq_trellis_fused_ok = bool(ok)
         self._record_offload_facts(layer)
+        self._try_build_arena(layer)
 
     @staticmethod
     def _arena_report_every() -> int:
@@ -423,6 +424,15 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
         from .expert_arena import DEFAULT_MAX_TOKENS, MAX_TOKENS_ENV
         return int(_os.environ.get(MAX_TOKENS_ENV, DEFAULT_MAX_TOKENS))
+
+    @staticmethod
+    def _arena_sources(layer) -> dict:
+        """The per-expert tensors the arena pages. One definition, used by both the
+        allocation and the later source binding, so the two cannot disagree about the set."""
+        names = [f"{p}_{s}" for p in ("w13", "w2")
+                 for s in ("trellis_packed", "trellis_packed2", "SU", "Wscale",
+                           "inv_resid_scale2")]
+        return {n: getattr(layer, n) for n in names if hasattr(layer, n)}
 
     @staticmethod
     def _record_offload_facts(layer) -> None:
@@ -474,6 +484,17 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
         cached = getattr(layer, 'glq_arena', _ARENA_UNSET)
         if cached is not _ARENA_UNSET:
+            # Allocated at load time. Bind the sources once, on the first forward, because
+            # vLLM's UVA offload runs after weight processing and replaces what the op reads.
+            if cached is not None and not getattr(layer, 'glq_arena_bound', False):
+                layer.glq_arena_bound = True
+                try:
+                    cached.rebind_sources(self._arena_sources(layer))
+                except Exception as e:                # noqa: BLE001
+                    layer.glq_arena = None
+                    print(f"glq[{self.prefix}]: expert arena disabled, source binding failed "
+                          f"({type(e).__name__}: {e})", flush=True)
+                    return None
             return cached
         layer.glq_arena = None               # a refusal is recorded, never retried
 
@@ -486,10 +507,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
         if not _os.environ.get("GLQ_MOE_EXPERT_CACHE", "").strip():
             return None                      # off by default; stay silent on the hot path
 
-        names = [f"{p}_{s}" for p in ("w13", "w2")
-                 for s in ("trellis_packed", "trellis_packed2", "SU", "Wscale",
-                           "inv_resid_scale2")]
-        sources = {n: getattr(layer, n) for n in names if hasattr(layer, n)}
+        sources = self._arena_sources(layer)
         if not sources:
             return None
 
