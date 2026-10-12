@@ -23,10 +23,11 @@ import sys
 from pathlib import Path
 
 from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
-                      _server_port, _vram_bytes, checkpoint_offload_bytes,
+                      _ram_bytes, _server_port, _vram_bytes,
+                      checkpoint_offload_bytes,
                       default_model, positive_seconds, sizing_weights_bytes)
 from glq.installer.configure import pi_max_tokens, write_pi_models
-from glq.supervisor import (DEFAULT_MAX_NUM_SEQS, DEFAULT_READY_TIMEOUT,
+from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
 from glq.tooling import (ensure_gemma4_template, sampling_serve_args,
                          tool_serve_args)
@@ -202,6 +203,10 @@ def main(argv=None) -> int:
         extra_args=tool_args,
         weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
+        # Host RAM, so the pinnable-expert cap can bind. Without it this command planned a
+        # 42 GiB pinned offload for Flash-Next regardless of the host, which only a
+        # workstation can hold.
+        ram_bytes=_ram_bytes(),
         # Declared host-offloadable bytes, so the supervisor sizes the pool and the window
         # from what actually lands in VRAM and turns PLE offload on for a checkpoint that
         # cannot serve without it. 0/0 for everything that declares nothing, which is every

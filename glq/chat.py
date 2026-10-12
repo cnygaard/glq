@@ -263,6 +263,27 @@ def _server_port(base_url: str, default: int = 8000) -> int:
     return urlparse(base_url).port or default
 
 
+def _ram_bytes():
+    """Total host RAM, or None if it cannot be read.
+
+    The supervisor needs this because offloaded expert weights are **pinned**: pinned pages
+    cannot be swapped out, so planning more than the host can hold does not run slowly, it
+    fails to allocate. Without it `_PINNED_RAM_FRACTION` cannot bind — measured on a 121 GiB
+    box, `glq-code` planned `--cpu-offload-gb 42` for Flash-Next, which beside the 23.84 GiB
+    PLE table is 66 GiB of pinned memory and impossible on the 32-64 GiB a consumer has.
+
+    Same never-block contract as `_vram_bytes`: a failure means the caps simply do not bind,
+    which is the behaviour that existed before this was wired in.
+
+    Shared by glq-chat and glq-code, for the same reason `sizing_weights_bytes` is.
+    """
+    try:
+        from glq.installer.hardware import ram_bytes
+        return ram_bytes()
+    except Exception:                                       # noqa: BLE001 - never block
+        return None
+
+
 def _vram_bytes():
     """Total VRAM, or None where nvidia-smi cannot answer."""
     try:
@@ -454,6 +475,9 @@ def main(argv=None) -> int:
         # the weights and the page cache inside one RAM budget.
         weights_bytes=sizing_weights_bytes(args),
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
+        # Host RAM, so the pinnable-expert cap can bind: offloaded weights are pinned and
+        # cannot be swapped, so an offload larger than the host fails to allocate.
+        ram_bytes=_ram_bytes(),
         # Declared host-offloadable bytes, so the supervisor sizes the pool and the window
         # from what actually lands in VRAM and turns PLE offload on for a checkpoint that
         # cannot serve without it. 0/0 for everything that declares nothing, which is every

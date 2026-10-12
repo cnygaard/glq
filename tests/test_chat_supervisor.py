@@ -2057,3 +2057,54 @@ def test_chat_prices_its_window_for_a_single_stream():
     assert (seen.get("max_num_seqs") or 0) != 1 or seen.get("max_num_seqs") is None, (
         "max_num_seqs should not be pinned to 1 alongside it; over-subscription is "
         "deliberate so a second tab queues rather than being refused")
+
+
+# ---------------------------------------------------------------------------
+# ★ Both entry points must tell the supervisor how much host RAM there is
+# ---------------------------------------------------------------------------
+
+def _capture_kwargs(module, argv):
+    seen = {}
+
+    class _Spy:
+        def __init__(self, **kw):
+            seen.update(kw)
+            raise SystemExit(0)
+
+    orig = module.VllmSupervisor
+    module.VllmSupervisor = _Spy
+    try:
+        try:
+            module.main(argv)
+        except SystemExit:
+            pass
+    finally:
+        module.VllmSupervisor = orig
+    return seen
+
+
+def test_chat_and_code_pass_host_ram():
+    """★ Without `ram_bytes` the pinnable-RAM cap cannot bind, and offloaded expert weights
+    are PINNED — they cannot be swapped out, so overshooting does not run slowly, it fails to
+    allocate.
+
+    Measured on the box: `glq-code` planned `--cpu-offload-gb 42` for Flash-Next with
+    `ram_bytes` absent. Beside the 23.84 GiB PLE table that is 66 GiB of pinned memory, which
+    is fine on the 121 GiB host it was measured on and impossible on the 32-64 GiB a consumer
+    has. `_PINNED_RAM_FRACTION`, `_ARENA_PINNED_RAM_FRACTION` and the host-RAM shortfall note
+    were all unreachable from the real entry points.
+    """
+    import glq.chat as chat
+    import glq.code as code
+
+    # glq-code checks for pi and for a known tool parser BEFORE constructing the supervisor,
+    # deliberately: starting vLLM costs minutes of weight loading, wasted if the agent cannot
+    # run. Satisfy the pi guard so this test can reach the kwargs it is about.
+    code._find_pi = lambda: "/usr/bin/true"
+
+    for mod, name in ((chat, "glq-chat"), (code, "glq-code")):
+        seen = _capture_kwargs(mod, ["--no-serve", "--model", "xv0y5ncu/Qwen3-whatever"])
+        assert seen, f"{name}: no supervisor was constructed"
+        got = seen.get("ram_bytes")
+        assert got, f"{name} must pass ram_bytes so the pinnable cap can bind, got {got!r}"
+        assert got > 1024**3, f"{name}: ram_bytes looks wrong ({got})"
