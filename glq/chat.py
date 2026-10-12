@@ -461,6 +461,16 @@ def main(argv=None) -> int:
         ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
         nontext_bytes=_offload[2],
         expert_offload_gib=args.cpu_offload_gb,
+        # One stream, because this command serves one person: it starts vLLM, opens a chat
+        # UI, and stops the server on the way out. Without this it inherited
+        # `_WINDOW_CONCURRENCY = 8` and had to afford its window eight times over, which is a
+        # server's requirement. Measured on a 22.49 GiB card with Flash-Next: 8192 at
+        # concurrency 8 against 65536 at 1, same offload, slightly larger arena.
+        #
+        # `max_num_seqs` deliberately stays at its default rather than following suit. Beyond
+        # the pool vLLM queues rather than failing, so a second browser tab waits instead of
+        # being refused — the over-subscription `_WINDOW_CONCURRENCY` documents.
+        window_concurrency=1,
     )
 
     # Ctrl-C already unwinds through the context manager below, but `kill` and a closed

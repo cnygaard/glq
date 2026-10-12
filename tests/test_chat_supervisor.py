@@ -2007,3 +2007,53 @@ def test_a_23gib_l4_still_starts():
         need = win * concurrency * sup_mod._KV_BYTES_PER_TOKEN
         assert real_kv >= need, (
             f"c={concurrency}: {real_kv / GIB:.2f} GiB real KV against {need / GIB:.2f} needed")
+
+
+# ---------------------------------------------------------------------------
+# ★ glq-chat prices its window for one stream, because it serves one person
+# ---------------------------------------------------------------------------
+
+def test_chat_prices_its_window_for_a_single_stream():
+    """★ `glq-chat` is a single-user Gradio desktop UI — it starts vLLM, opens a chat for one
+    person, and stops the server on the way out. It was inheriting `_WINDOW_CONCURRENCY = 8`,
+    so its window had to be affordable **eight times over**, which is a server's requirement
+    and not this command's.
+
+    Measured on a 22.49 GiB card with Flash-Next: concurrency 8 lands on 8192 where
+    concurrency 1 reaches 65536 at the same offload and a slightly *larger* arena — four to
+    eight times the context for no trade at all.
+
+    `max_num_seqs` deliberately stays higher. `_WINDOW_CONCURRENCY`'s own note explains the
+    asymmetry: over-subscribing is fine because beyond the pool vLLM queues rather than
+    failing, and a second browser tab should wait rather than be refused.
+    """
+    import glq.chat as chat
+
+    seen = {}
+
+    class _Spy:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        def __enter__(self):
+            raise SystemExit(0)
+
+        def __exit__(self, *a):
+            return False
+
+    orig = chat.VllmSupervisor
+    chat.VllmSupervisor = _Spy
+    try:
+        try:
+            chat.main(["--no-serve", "--model", "m"])
+        except SystemExit:
+            pass
+    finally:
+        chat.VllmSupervisor = orig
+
+    assert seen.get("window_concurrency") == 1, (
+        f"chat should price its window for one stream, got "
+        f"{seen.get('window_concurrency')!r}")
+    assert (seen.get("max_num_seqs") or 0) != 1 or seen.get("max_num_seqs") is None, (
+        "max_num_seqs should not be pinned to 1 alongside it; over-subscription is "
+        "deliberate so a second tab queues rather than being refused")
