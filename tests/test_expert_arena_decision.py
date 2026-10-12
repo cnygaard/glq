@@ -117,3 +117,34 @@ def test_the_decision_reports_the_footprint_it_will_take():
 def test_a_refusal_never_reports_a_slot_count_that_would_be_used():
     d = arena_decision(budget="", offloaded_bytes=40 * 1024**3, **LAYER)
     assert isinstance(d, ArenaDecision) and d.slots == 0 and d.total_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# ★ The offload facts must be read where they are readable
+# ---------------------------------------------------------------------------
+
+def test_a_refusal_reason_names_the_offload_figure_it_saw():
+    """★ Both arena bugs on the L4 were SILENT declines that looked like healthy runs: the
+    two A/B arms landed within 0.4% of each other and only the per-layer decision line showed
+    why ("only 0.00 GiB of experts are offloaded" against vLLM's own "Total CPU offloaded
+    parameters: 41.48").
+
+    So the reason has to carry the number the decision was made on. A refusal that says only
+    "disabled" is indistinguishable from a feature that is working.
+    """
+    d = arena_decision(budget="10", offloaded_bytes=0, **LAYER)
+    assert not d.enabled
+    assert "0.00 GiB" in d.reason, f"reason does not name what it measured: {d.reason!r}"
+
+
+def test_the_decision_is_driven_by_the_offload_SIZE_not_by_tensor_state():
+    """A UVA view reports `is_cuda=True` with host storage behind it, so is_cuda/is_pinned
+    cannot tell an offloaded expert tensor from a resident one — which is why the decision
+    takes a byte count from vLLM's config rather than inspecting tensors. Pinning that here
+    keeps a future refactor from reaching for introspection again.
+    """
+    on = arena_decision(budget="10", offloaded_bytes=40 * 1024**3, **LAYER)
+    off = arena_decision(budget="10", offloaded_bytes=0, **LAYER)
+    assert on.enabled and not off.enabled
+    # Nothing about the decision depends on a tensor; it is pure arithmetic over the config.
+    assert on.slots == 120 and off.slots == 0
