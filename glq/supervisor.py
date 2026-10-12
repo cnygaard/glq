@@ -480,6 +480,36 @@ def window_kv_bytes(max_model_len, concurrency=_WINDOW_CONCURRENCY) -> int:
     return int(cost * _KV_SAFETY_FACTOR)
 
 
+#: Largest window the AUTO planner will choose, by card size. `--max-model-len` overrides it.
+#:
+#: Needed because the window is chosen before the expert arena exists, so left alone the
+#: planner tiers up to whatever the card can hold and the arena gets the remainder. Measured
+#: on a 24 GiB card: 262,144 leaves a 1 GiB arena, 11 slots/layer, decode hit rate ~0.33 —
+#: where 131,072 leaves 5 GiB, 59 slots, ~0.68. PCIe traffic scales as (1 - hit), so that is
+#: roughly 4x the traffic on a term measured at 45% of the un-arena'd step.
+#:
+#: The thresholds are deliberately generous about context rather than set where the arena
+#: saturates (~94 slots/layer): these are the windows a user of each card should get. Cards
+#: report a little under nominal — an L4 reads 22.49, a 24 GB 3090 ~23.6, a 32 GB 5090 ~31.4 —
+#: so the bands are set between the classes, not at them.
+_WINDOW_CEILING_BY_VRAM_GIB = ((20, 32_768), (28, 131_072))
+
+
+def window_ceiling_for_vram(vram_bytes) -> int:
+    """Largest window the auto planner may choose on a card this size.
+
+    Returns the model's own maximum when the card is unknown: the same stance as every other
+    planner here, which is to not invent a limit from an input it does not have.
+    """
+    if not vram_bytes:
+        return _WINDOW_TIERS[-1]
+    gib = float(vram_bytes) / 1024**3
+    for ceiling_gib, window in _WINDOW_CEILING_BY_VRAM_GIB:
+        if gib <= ceiling_gib:
+            return window
+    return _WINDOW_TIERS[-1]
+
+
 def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
                        floor=DEFAULT_MAX_MODEL_LEN,
                        concurrency=_WINDOW_CONCURRENCY):
@@ -507,7 +537,9 @@ def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
     for tier in _WINDOW_TIERS:
         if window_kv_bytes(tier, concurrency) <= headroom:
             chosen = max(chosen, tier)
-    return min(chosen, int(model_max_len))
+    # Card-indexed ceiling, so the window does not consume the VRAM the expert arena needs.
+    # Never below the floor: a small card still serves its minimum window.
+    return min(chosen, int(model_max_len), max(floor, window_ceiling_for_vram(vram_bytes)))
 
 
 def default_log_path():
@@ -861,6 +893,9 @@ class VllmSupervisor:
         # exactly on the old fixed default, so callers that never pass the lookups keep
         # today's behavior.
         self._window_note = ""
+        #: Whether the window was sized rather than pinned. The re-plan after deepening must
+        #: touch only the automatic choice; a pinned `--max-model-len` is an instruction.
+        max_model_len_was_auto = max_model_len is None
         if max_model_len is None:
             max_model_len = plan_max_model_len(
                 weights_bytes=resident_bytes, vram_bytes=vram_bytes,
@@ -872,6 +907,7 @@ class VllmSupervisor:
                     f"request{'' if self.window_concurrency == 1 else 's'}; "
                     f"--max-model-len overrides)")
         self.max_model_len = int(max_model_len)
+        self.max_model_len_base = self.max_model_len
         # An explicit flag always wins; otherwise size the pool from the checkpoint AND the
         # window just chosen, because a fixed fraction starves anything bigger than it and a
         # minimal KV reservation starves the window. A PINNED window is sized for too: that
@@ -929,6 +965,39 @@ class VllmSupervisor:
                 ram_bytes=ram_bytes, nontext_bytes=self.nontext_bytes,
                 kv_bytes=window_kv_bytes(self.max_model_len, self.window_concurrency),
                 forced=self._expert_offload_forced)
+            if (self.expert_offload_gib > self.expert_offload_base_gib
+                    and max_model_len_was_auto):
+                # Deepening freed VRAM the window could not claim, because the window was
+                # chosen from the BASE footprint. Measured across cards at 100-110 GiB of host
+                # RAM, that left the window at 8192 where the deepened footprint carries
+                # 65,536 to 262,144 — up to 16x the context, from VRAM already free. No extra
+                # PCIe is paid: the offload depth is settled by this point.
+                #
+                # Only ever an increase, and `window_ceiling_for_vram` bounds it so the window
+                # cannot take the arena's share. The arena is then re-sized against the window
+                # actually chosen.
+                deeper = plan_max_model_len(
+                    weights_bytes=max(0, int(weights_bytes) - self.ple_offload_bytes
+                                      - self.nontext_bytes
+                                      - self.expert_offload_gib * 1024**3),
+                    vram_bytes=self._vram_bytes, model_max_len=model_max_len,
+                    floor=max_model_len_floor, concurrency=self.window_concurrency)
+                if deeper > self.max_model_len:
+                    #: The window the base footprint could afford, before deepening freed any
+                    #: VRAM. Kept because it is the quantity that answers "did this context
+                    #: come from counting right or from spending more PCIe" — the re-plan does
+                    #: spend more, so a test asserting the former has to read this.
+                    self.max_model_len_base = self.max_model_len
+                    self.max_model_len = deeper
+                    self.expert_arena_gib = plan_expert_arena_gib(
+                        weights_bytes=weights_bytes,
+                        ple_offload_bytes=self.ple_offload_bytes,
+                        expert_offload_bytes=self.expert_offload_bytes,
+                        vram_bytes=self._vram_bytes,
+                        offload_gib=self.expert_offload_gib,
+                        nontext_bytes=self.nontext_bytes,
+                        kv_bytes=window_kv_bytes(self.max_model_len,
+                                                 self.window_concurrency))
         self.fp8_kv = bool(fp8_kv)
         self.serve = serve
         self._spawn, self._probe = spawn, probe
@@ -1063,11 +1132,44 @@ class VllmSupervisor:
         short = self._window_shortfall_bytes()
         if not short:
             return
+        # Is host RAM the binding constraint rather than the card? If so, "raise
+        # --cpu-offload-gb" is advice the user cannot take: the pinnable cap already holds it
+        # shut. Measured on a 23 GiB card, this checkpoint cannot serve at all on 60, 70, 80
+        # or 90 GiB of host RAM, and serves a 131072 window from 100 GiB up — so the figure
+        # that decides it is the host's, and naming the card instead sends the user nowhere.
+        want = self._uncapped_offload_gib()
+        if want > self.expert_offload_gib and self._ram_bytes:
+            ram_gib = self._ram_bytes / 1024**3
+            need_ram = ((want + math.ceil(self.ple_offload_bytes / 1024**3))
+                        / _ARENA_PINNED_RAM_FRACTION)
+            self._say(
+                f"  note: this checkpoint needs about {want} GiB of experts in host RAM to "
+                f"fit this card, but only {self.expert_offload_gib} GiB may be pinned on a "
+                f"{ram_gib:.0f} GiB host (pinned pages cannot be swapped out, so the share is "
+                f"capped). vLLM will likely refuse to start. Roughly {need_ram:.0f} GiB of "
+                f"RAM would carry it; adding swap makes a larger pinned set safe; otherwise "
+                f"serve a smaller checkpoint")
+            return
         self._say(f"  note: --max-model-len {self.max_model_len} needs roughly "
                   f"{short / 1024**3:.2f} GiB more KV than this card can hold alongside the "
                   f"weights, so vLLM may refuse to start. Raise --cpu-offload-gb (now "
                   f"{self.expert_offload_gib}) to move more experts to host RAM, or ask for a "
                   f"shorter window")
+
+    def _uncapped_offload_gib(self) -> int:
+        """Expert offload the plan would choose if host RAM were unlimited.
+
+        The difference against `expert_offload_gib` is exactly how far the pinnable cap is
+        holding the plan back, which is what decides whether a shortfall is the card's fault
+        or the host's.
+        """
+        if self._expert_offload_forced or not self.weights_bytes or not self._vram_bytes:
+            return self.expert_offload_gib
+        return plan_expert_offload_gib(
+            weights_bytes=self.weights_bytes, ple_offload_bytes=self.ple_offload_bytes,
+            expert_offload_bytes=self.expert_offload_bytes, vram_bytes=self._vram_bytes,
+            ram_bytes=None, nontext_bytes=self.nontext_bytes,
+            kv_bytes=window_kv_bytes(self.max_model_len, self.window_concurrency))
 
     def _offload_args(self) -> list[str]:
         """Expert-offload flags, or nothing at all when the model already fits.

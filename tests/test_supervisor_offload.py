@@ -212,10 +212,14 @@ def test_the_window_grows_on_a_24gb_card_once_the_counts_are_right():
     resident leaves under 1 GiB of KV headroom and no tier above the floor is affordable. The
     corrected counts reach 131072 while offloading one GiB LESS, which is the whole claim --
     the context came from counting right, not from spending more PCIe."""
+    # `max_model_len_base` rather than `max_model_len`: the window is now re-planned once
+    # deepening for the expert arena frees VRAM, and that re-plan DOES spend more PCIe, so it
+    # would rescue `before` too and dissolve the control. The base figure is the one this
+    # claim is about — the context the corrected counts afford without deepening.
     before = _code_sup(23.0, **FN_PUBLISHED)
     after = _code_sup(23.0, **FN_CORRECTED)
-    assert before.max_model_len == 16384
-    assert after.max_model_len == 131072
+    assert before.max_model_len_base == 16384
+    assert after.max_model_len_base == 131072
     assert after.expert_offload_base_gib < before.expert_offload_base_gib
 
 
@@ -285,8 +289,12 @@ def test_an_explicit_budget_is_used_verbatim():
 def test_the_explicit_budget_lengthens_the_window_it_was_asked_for():
     """The point of the flag -- the window is sized from the resident footprint the budget
     produces, so raising the budget is what buys the context."""
-    planned = _code_sup(23.0, **FN_CORRECTED)
-    forced = _code_sup(23.0, expert_offload_gib=42, **FN_CORRECTED)
+    # At 70 GiB of host RAM the pinnable cap holds the planned offload down, so the window
+    # the budget buys is visible. On a 124 GiB host both arms reach this card's 131072
+    # ceiling (`window_ceiling_for_vram`) and the property is masked by saturation rather
+    # than absent.
+    planned = _code_sup(23.0, ram_gib=70.0, **FN_CORRECTED)
+    forced = _code_sup(23.0, ram_gib=70.0, expert_offload_gib=42, **FN_CORRECTED)
     assert forced.max_model_len > planned.max_model_len
 
 
@@ -379,11 +387,12 @@ def test_an_unaffordable_pinned_window_is_served_anyway_and_reported():
     Same contract as `--cpu-offload-gb 999`: honored verbatim, never silently adjusted."""
     import io
     out = io.StringIO()
-    # 70 GiB of host RAM rather than 124: the card is unchanged, and only the host is too
-    # small to hold the experts this window needs moved off it. 124 GiB no longer qualifies —
-    # deepening offload for the arena now makes that case genuinely affordable, which is the
-    # improvement rather than a lost assertion.
-    sup = _code_sup(23.0, ram_gib=70.0, max_model_len=262144, out=out, **FN_CORRECTED)
+    # A 16 GiB card with ample (192 GiB) host RAM: every expert is already offloaded, so
+    # host RAM is NOT the binding constraint and the card genuinely cannot hold this window's
+    # KV. That separation matters — the same shortfall on a RAM-starved host is reported
+    # differently, by `_say_window_shortfall`'s host-RAM branch, because "raise
+    # --cpu-offload-gb" is not advice a capped host can act on.
+    sup = _code_sup(16.0, ram_gib=192.0, max_model_len=262144, out=out, **FN_CORRECTED)
     sup.argv()
     assert sup.max_model_len == 262144           # not clamped
     said = out.getvalue().lower()
@@ -435,10 +444,16 @@ def test_a_tier_the_caps_cannot_reach_is_refused_not_promised():
     pinnable-RAM and declared-expert caps can clip the budget BELOW what the tier needs, and
     accepting the clipped value would announce a context that does not fit.
 
-    Same card, same checkpoint, more host RAM -- and only the one with RAM to pin reaches
-    262144."""
-    assert _code_sup(23.0, ram_gib=124.0, **FN_CORRECTED).max_model_len == 131072
-    assert _code_sup(23.0, ram_gib=192.0, **FN_CORRECTED).max_model_len == 262144
+    Same card, same checkpoint, more host RAM -- and only the one with RAM to pin reaches the
+    tier. The pair is 90 vs 124 GiB rather than 124 vs 192: this card's auto window is now
+    capped at 131072 by `window_ceiling_for_vram`, so 124 and 192 both land there and the
+    distinction has to be drawn below the ceiling, where it is still real."""
+    from glq.supervisor import window_ceiling_for_vram
+
+    lean = _code_sup(23.0, ram_gib=90.0, **FN_CORRECTED).max_model_len
+    ample = _code_sup(23.0, ram_gib=124.0, **FN_CORRECTED).max_model_len
+    assert lean < ample, f"more host RAM should reach a higher tier: {lean} vs {ample}"
+    assert ample == window_ceiling_for_vram(int(23.0 * 1024**3))
 
 
 def test_the_extra_never_exceeds_the_declared_budget():
@@ -512,7 +527,8 @@ _EXPERTS = int(42.62 * 1024**3)
 _NONTEXT = int(4.69 * 1024**3)             # the bf16 MTP head, never loaded
 
 
-from glq.supervisor import _WINDOW_TIERS, plan_expert_arena_gib  # noqa: E402
+from glq.supervisor import (_WINDOW_TIERS, plan_expert_arena_gib,  # noqa: E402
+                            plan_max_model_len, window_ceiling_for_vram)
 
 
 def _arena(**kw):
@@ -809,3 +825,158 @@ def test_the_arena_fraction_still_scales_with_the_host():
         vram_bytes=_L4, base_offload_gib=35, ram_bytes=int(64 * 1024**3),
         nontext_bytes=_NONTEXT, kv_bytes=window_kv_bytes(8192, 8))
     assert off == 35, "a 64 GiB host cannot hold 66 GiB of pinned weights"
+
+
+# ---------------------------------------------------------------------------
+# ★ The auto window is capped by card size, so the arena stays useful
+# ---------------------------------------------------------------------------
+
+def test_the_window_ceiling_follows_the_card():
+    """★ The auto window is chosen BEFORE the arena exists, so left alone it tiers up to the
+    largest window the card can hold and leaves the arena whatever is over. Measured on a
+    24 GiB card: 262,144 leaves a 1 GiB arena at ~11 slots/layer (hit ~0.33) where 131,072
+    leaves 5 GiB at ~59 slots (~0.68). Traffic scales as (1 - hit), so that is roughly 4x the
+    PCIe traffic, against a term that was 45% of the un-arena'd step.
+
+    So the ceiling is indexed on VRAM. The thresholds are generous about context on purpose —
+    these are the windows a user of each card should get, not the largest the arena would
+    prefer:
+
+        <= 20 GiB ->  32,768     (16 GiB cards, which report ~15.6)
+        <= 28 GiB -> 131,072     (22.49 GiB L4 and 23.6 GiB 3090/4090-class)
+        >  28 GiB -> 262,144     (31.4 GiB 5090-class and up, where no trade is needed)
+
+    `--max-model-len` overrides it; this bounds only the automatic choice.
+    """
+    from glq.supervisor import window_ceiling_for_vram
+
+    G = 1024**3
+    assert window_ceiling_for_vram(int(15.6 * G)) == 32768
+    assert window_ceiling_for_vram(int(22.49 * G)) == 131072     # the L4
+    assert window_ceiling_for_vram(int(23.6 * G)) == 131072      # a 24 GB 3090/4090
+    assert window_ceiling_for_vram(int(31.4 * G)) == 262144      # a 32 GB 5090
+    assert window_ceiling_for_vram(int(95 * G)) == 262144
+
+
+def test_an_unknown_card_is_not_capped():
+    """Same stance as every other planner here: with the input unknown, do not invent a
+    limit — `plan_max_model_len` already returns the floor when it cannot size anything."""
+    from glq.supervisor import window_ceiling_for_vram
+
+    assert window_ceiling_for_vram(None) >= 262144
+    assert window_ceiling_for_vram(0) >= 262144
+
+
+def test_the_ceiling_leaves_a_useful_arena_on_each_target_card():
+    """★ The point of the ceiling, asserted as an outcome rather than as a threshold: on each
+    card the capped window must leave an arena that can actually serve a token."""
+    from glq.supervisor import plan_arena_and_offload, window_ceiling_for_vram
+    from glq_vllm.moe_shapes import bytes_per_slot
+
+    per = bytes_per_slot(hidden_size=2560, inter=640, w13_out=1280, bpw=3)
+    G = 1024**3
+    for vram, least_slots in ((22.49, 40), (24.0, 55), (31.4, 90)):
+        win = window_ceiling_for_vram(int(vram * G))
+        _off, arena = plan_arena_and_offload(
+            weights_bytes=_FN_TRUE, ple_offload_bytes=_PLE, expert_offload_bytes=_EXPERTS,
+            vram_bytes=int(vram * G), base_offload_gib=36, ram_bytes=int(121 * G),
+            nontext_bytes=_NONTEXT, kv_bytes=window_kv_bytes(win, 1))
+        slots = int(arena * G // (per * 49))
+        assert slots >= least_slots, (
+            f"{vram} GiB at window {win}: {arena} GiB is {slots} slots/layer, "
+            f"expected >= {least_slots}")
+
+
+def test_a_pinned_window_still_beats_the_ceiling():
+    """`--max-model-len` is an instruction. Same contract as `--cpu-offload-gb`: honoured
+    verbatim, never silently adjusted, and the shortfall reported if it does not fit."""
+    sup = VllmSupervisor(model="m", device="cuda", vram_bytes=int(22.49 * 1024**3),
+                         ram_bytes=int(121 * 1024**3), weights_bytes=_FN_TRUE,
+                         ple_offload_bytes=_PLE, expert_offload_bytes=_EXPERTS,
+                         nontext_bytes=_NONTEXT, max_model_len=262144,
+                         window_concurrency=1, max_num_seqs=1, serve=False)
+    assert sup.max_model_len == 262144
+
+
+# ---------------------------------------------------------------------------
+# ★ When host RAM is the binding constraint, say so
+# ---------------------------------------------------------------------------
+
+def test_a_host_too_small_to_pin_the_experts_is_diagnosed_as_such():
+    """★ The advice has to be followable. On a 23 GiB card with 90 GiB of host RAM this
+    checkpoint does not fit at all — the pinnable cap allows 21 GiB of experts, so ~28 GiB of
+    weights stay resident on a 23 GiB card — and the old note blamed KV and said "raise
+    --cpu-offload-gb", which host RAM makes impossible.
+
+    Measured across hosts on a 23 GiB card: 60, 70, 80 and 90 GiB of RAM all collapse to the
+    8192 floor and none of them can serve; 100 GiB and up serve a 131072 window. So the
+    message must name **host RAM** and the remedies that exist — more RAM, swap so a larger
+    pinned set is safe, or a smaller checkpoint — rather than a knob that is already at its
+    ceiling.
+    """
+    import io
+    out = io.StringIO()
+    sup = _code_sup(23.0, ram_gib=90.0, **FN_CORRECTED)
+    sup._out = out
+    sup.argv()
+    said = out.getvalue().lower()
+    assert "may be pinned on a" in said, f"should name the pinnable cap: {said!r}"
+    assert "90 gib host" in said, f"should name this host's size: {said!r}"
+    assert "swap" in said, f"should offer swap as a remedy: {said!r}"
+    # and it must NOT send the user at a knob the host cap has already pinned shut
+    assert "raise --cpu-offload-gb" not in said
+
+
+def test_a_host_with_room_says_nothing_about_RAM():
+    """The diagnosis is for the case that cannot serve. A 124 GiB host serves a 131072 window
+    on the same card, and must not be warned about anything."""
+    import io
+    out = io.StringIO()
+    sup = _code_sup(23.0, ram_gib=124.0, **FN_CORRECTED)
+    sup._out = out
+    sup.argv()
+    said = out.getvalue().lower()
+    assert "swap" not in said and "host ram" not in said
+
+
+# ---------------------------------------------------------------------------
+# ★ The window is re-planned after deepening, so freed VRAM is not left idle
+# ---------------------------------------------------------------------------
+
+def test_the_window_claims_the_VRAM_that_deepening_freed():
+    """★ An ordering gap. The window is chosen from the BASE offload's resident figure, then
+    deepening moves more experts to host and frees VRAM the window can no longer claim.
+
+    Measured across cards at 100-110 GiB of host RAM, the window came out at 8192 where the
+    deepened footprint could carry 65,536 to 262,144 — up to 16x the context, from VRAM that
+    was already free and otherwise sat idle. No extra PCIe is paid for it: the offload depth
+    is already decided by then.
+
+    `window_ceiling_for_vram` is what keeps this from eating the arena: the window rises only
+    to the card's ceiling, and the arena takes the remainder.
+    """
+    sup = _code_sup(23.0, ram_gib=110.0, **FN_CORRECTED)
+    from glq.supervisor import window_ceiling_for_vram
+
+    assert sup.expert_offload_gib > sup.expert_offload_base_gib, "this case should deepen"
+    assert sup.max_model_len == window_ceiling_for_vram(int(23.0 * 1024**3))
+    assert sup.expert_arena_gib > 0, "the ceiling should leave the arena its share"
+
+
+def test_replanning_never_SHORTENS_the_window():
+    """It may only claim idle VRAM. A window already chosen is a promise, and the re-plan is
+    an increase or nothing — otherwise a card would announce less context after an upgrade."""
+    for ram in (100.0, 110.0, 124.0, 192.0):
+        sup = _code_sup(23.0, ram_gib=ram, **FN_CORRECTED)
+        base_window = plan_max_model_len(
+            weights_bytes=int((77.52 - 23.84 - 4.69) * 1024**3)
+            - sup.expert_offload_base_gib * 1024**3,
+            vram_bytes=int(23.0 * 1024**3), model_max_len=262144, concurrency=1)
+        assert sup.max_model_len >= min(base_window,
+                                        window_ceiling_for_vram(int(23.0 * 1024**3)))
+
+
+def test_a_pinned_window_is_not_replanned():
+    """`--max-model-len` is an instruction; the re-plan touches only the automatic choice."""
+    sup = _code_sup(23.0, ram_gib=110.0, max_model_len=16384, **FN_CORRECTED)
+    assert sup.max_model_len == 16384
