@@ -379,7 +379,11 @@ def test_an_unaffordable_pinned_window_is_served_anyway_and_reported():
     Same contract as `--cpu-offload-gb 999`: honored verbatim, never silently adjusted."""
     import io
     out = io.StringIO()
-    sup = _code_sup(23.0, ram_gib=124.0, max_model_len=262144, out=out, **FN_CORRECTED)
+    # 70 GiB of host RAM rather than 124: the card is unchanged, and only the host is too
+    # small to hold the experts this window needs moved off it. 124 GiB no longer qualifies —
+    # deepening offload for the arena now makes that case genuinely affordable, which is the
+    # improvement rather than a lost assertion.
+    sup = _code_sup(23.0, ram_gib=70.0, max_model_len=262144, out=out, **FN_CORRECTED)
     sup.argv()
     assert sup.max_model_len == 262144           # not clamped
     said = out.getvalue().lower()
@@ -699,22 +703,26 @@ def test_a_host_with_RAM_to_spare_offloads_everything():
     assert arena >= 5
 
 
-def test_a_262k_window_on_a_RAM_LIMITED_host_keeps_the_window_and_loses_the_arena():
-    """★ The approved policy playing out, and worth pinning because the answer is "no arena".
+def test_the_window_still_wins_at_262k_but_every_shorter_one_gets_an_arena():
+    """★ Where the window/arena boundary actually falls, with the recorded 77.52 GiB
+    checkpoint size rather than a docstring figure.
 
-    A 262,144 window needs 7.92 GiB of KV, and a 121 GiB host caps expert offload at 36 GiB
-    (121 x `_PINNED_RAM_FRACTION` minus the PLE table), so nothing is left. The window wins —
-    it is what `glq-code` exists to provide — and the arena declines rather than quietly
-    shortening the context.
+    On a 22.49 GiB card a 262,144 window needs 7.92 GiB of KV against ~7.4 GiB of headroom
+    even with every expert offloaded, so the two genuinely do not fit and the window wins —
+    it is not shortened to buy decode, and the arena declines. One card size up (23.0 GiB) it
+    just fits, at 1 GiB.
 
-    The same case with 192 GiB of host RAM does get a 6 GiB arena, so this is a host-memory
-    limit and not a card limit. A user who prefers decode can set `GLQ_MOE_EXPERT_CACHE`
-    themselves; the plan will not override it.
+    Every shorter window does get one, and that is what deepening plus
+    `_ARENA_PINNED_RAM_FRACTION` bought: without them all four rows would be 0.
     """
-    off, arena = _pair(base_offload_gib=36, kv_bytes=window_kv_bytes(262144, 1),
-                       ram_bytes=int(121 * 1024**3))
-    assert arena == 0
-    assert off == 36, "a plan that buys no arena must not pay extra PCIe for one"
+    kw = dict(weights_bytes=_FN_TRUE, base_offload_gib=36, ram_bytes=int(121 * 1024**3))
+    off, arena = _pair(kv_bytes=window_kv_bytes(262144, 1), **kw)
+    assert (off, arena) == (36, 0), "262k on this card leaves nothing; the window wins"
+
+    for window, least in ((131072, 3), (65536, 5), (8192, 7)):
+        off, arena = _pair(kv_bytes=window_kv_bytes(window, 1), **kw)
+        assert off > 36, f"window {window}: should deepen, got {off}"
+        assert arena >= least, f"window {window}: expected >= {least} GiB, got {arena}"
 
 
 def test_deepening_leaves_the_window_its_KV():
@@ -747,3 +755,57 @@ def test_a_user_forced_offload_is_never_deepened():
     more weight to host than the user asked for would change the footprint they chose."""
     off, _arena = _pair(base_offload_gib=20, forced=True)
     assert off == 20
+
+
+# ---------------------------------------------------------------------------
+# ★ Pinning: a higher share, but only when it buys an arena
+# ---------------------------------------------------------------------------
+
+_FN_TRUE = int(77.52 * 1024**3)      # the recorded checkpoint total, not the 72.2 docstring
+
+
+def test_deepening_may_pin_more_than_the_base_plan_would():
+    """★ `_PINNED_RAM_FRACTION` 0.5 caps expert offload at ~35 GiB on a 121 GiB host, which
+    leaves ~14 GiB resident on a 22 GiB card and no VRAM for an arena at any window. The
+    measured 2.674x configuration pins 66.5 GiB — **54.9%** — so the default could never reach
+    it.
+
+    `_ARENA_PINNED_RAM_FRACTION` permits that, and only here: the arena is what makes the
+    deeper offload worth paying for. Evidence it is safe on the box it was measured on: that
+    run pinned 65.3 GiB with **no swap** and still had ~13 GiB available at peak, and 0.6 of a
+    121 GiB host leaves ~48 GiB unpinned.
+    """
+    from glq.supervisor import plan_arena_and_offload
+
+    off, arena = plan_arena_and_offload(
+        weights_bytes=_FN_TRUE, ple_offload_bytes=_PLE, expert_offload_bytes=_EXPERTS,
+        vram_bytes=_L4, base_offload_gib=35, ram_bytes=int(121 * 1024**3),
+        nontext_bytes=_NONTEXT, kv_bytes=window_kv_bytes(8192, 8))
+    assert off >= 41, f"should reach (nearly) full offload, got {off}"
+    assert arena > 0, "the whole point of deepening is that an arena results"
+
+
+def test_the_BASE_offload_planner_is_untouched_by_the_arena_fraction():
+    """★ The blast radius is the new path only. `plan_expert_offload_gib` keeps the 0.5 share,
+    so every existing plan — every card, every checkpoint, arena or not — is unchanged."""
+    from glq.supervisor import _PINNED_RAM_FRACTION, plan_expert_offload_gib
+
+    assert _PINNED_RAM_FRACTION == 0.5
+    gib = plan_expert_offload_gib(
+        weights_bytes=_FN_TRUE, ple_offload_bytes=_PLE, expert_offload_bytes=_EXPERTS,
+        vram_bytes=_L4, ram_bytes=int(121 * 1024**3), nontext_bytes=_NONTEXT,
+        kv_bytes=window_kv_bytes(8192, 8))
+    host_cap = int(121 * _PINNED_RAM_FRACTION) - 24       # minus the PLE table
+    assert gib <= host_cap, f"base plan pinned past its own share: {gib} > {host_cap}"
+
+
+def test_the_arena_fraction_still_scales_with_the_host():
+    """It is a share, not a licence. A host with little RAM is still not asked to hold the
+    experts — pinned pages cannot be swapped, and there is no swap on these boxes."""
+    from glq.supervisor import plan_arena_and_offload
+
+    off, _ = plan_arena_and_offload(
+        weights_bytes=_FN_TRUE, ple_offload_bytes=_PLE, expert_offload_bytes=_EXPERTS,
+        vram_bytes=_L4, base_offload_gib=35, ram_bytes=int(64 * 1024**3),
+        nontext_bytes=_NONTEXT, kv_bytes=window_kv_bytes(8192, 8))
+    assert off == 35, "a 64 GiB host cannot hold 66 GiB of pinned weights"

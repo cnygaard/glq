@@ -287,6 +287,25 @@ def plan_expert_arena_gib(*, weights_bytes, ple_offload_bytes, expert_offload_by
     return max(0, min(gib, int(int(expert_offload_bytes) // 1024**3)))
 
 
+#: Pinned-RAM share permitted when deepening offload specifically to buy an expert arena.
+#: Higher than `_PINNED_RAM_FRACTION`, and used ONLY by `plan_arena_and_offload`, so no
+#: existing plan changes: `plan_expert_offload_gib` keeps the 0.5 share for every card and
+#: checkpoint.
+#:
+#: Why it has to be higher at all. 0.5 caps expert offload at ~35 GiB on a 121 GiB host, which
+#: leaves ~14 GiB resident on a 22 GiB card — no VRAM for an arena at any window. The measured
+#: 2.674x configuration pins 42 GiB of experts beside the 23.84 GiB PLE table, i.e. 66.5 GiB,
+#: which is **54.9%** of that host. At 0.5 the default could never reach the thing that was
+#: measured.
+#:
+#: Why 0.6 and not more. That run pinned 65.3 GiB on a box with **no swap** and still had
+#: ~13 GiB available at peak, so it is demonstrated rather than assumed; 0.6 of 121 GiB leaves
+#: ~48 GiB unpinned for the OS, the page cache and the serving processes. Pinned pages cannot
+#: be swapped, so overshooting does not run slowly — it fails to allocate or starves the
+#: machine, and with no swap there is nothing to absorb it.
+_ARENA_PINNED_RAM_FRACTION = 0.6
+
+
 def plan_arena_and_offload(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
                            vram_bytes, base_offload_gib, ram_bytes=None, nontext_bytes=0,
                            kv_bytes=0, forced: bool = False) -> tuple[int, int]:
@@ -322,9 +341,10 @@ def plan_arena_and_offload(*, weights_bytes, ple_offload_bytes, expert_offload_b
 
     full = int(int(expert_offload_bytes) // 1024**3)
     if ram_bytes:
-        # Same cap `plan_expert_offload_gib` applies: pinned pages cannot be swapped, so
-        # overshooting fails to allocate or starves the OS rather than running slowly.
-        host_cap = (int(float(ram_bytes) * _PINNED_RAM_FRACTION / 1024**3)
+        # The arena's own share, not the base plan's — see `_ARENA_PINNED_RAM_FRACTION`.
+        # Still a share: pinned pages cannot be swapped, so a host without the room is not
+        # asked to hold them.
+        host_cap = (int(float(ram_bytes) * _ARENA_PINNED_RAM_FRACTION / 1024**3)
                     - math.ceil(int(ple_offload_bytes or 0) / 1024**3))
         full = min(full, max(0, host_cap))
     full = max(full, int(base_offload_gib))        # never shallower than the base plan
