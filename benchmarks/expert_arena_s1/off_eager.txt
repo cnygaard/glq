@@ -1,0 +1,3 @@
+FOOTPRINT load_s=290.7 weights_gib=6.85 kv_tokens=84992 capture_gib=0 (eager)
+SAMPLE 'We need to answer user: "Name three primary colors and give one short fact about each." Simple. Need final concise. Could mention red, blue, yellow (traditional primaries) or RGB? User likely expects primary colors. Give three and short fact each. Ensure not too long.\n</think>\n\n- **Red**: In traditional color mixing, it is a primary color used to create orange and purple.\n- **Blue**: It is a prima'
+RESULT label=arena_off_eager model=/opt/dlami/nvme/hf_cache/hub/models--xv0y5ncu--Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4-3mtp/snapshots/d068887c484a8aaea882a8d9d61c70410dff8ee9/ batch=1 total_decode_tokps=4.518 per_seq_tokps=4.518 ttft_ms=613 n_tokens=256
