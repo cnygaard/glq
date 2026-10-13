@@ -59,4 +59,9 @@ jobs:
           pip install pytest
 
       - name: Run tests
-        run: pytest tests/ -v
+        # -m "not slow" is the filter pyproject.toml's own marker definition asks
+        # for: "slow: marks tests that download models / take >30s (deselect with
+        # '-m \"not slow\"')". CI never applied it, so the end-to-end quantize test
+        # was pulling the wikitext train split and a 3B checkpoint over the network --
+        # in three parallel jobs -- in a CPU unit-test lane. Those run on the box.
+        run: pytest tests/ -v -m "not slow"

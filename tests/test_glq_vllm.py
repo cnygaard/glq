@@ -1014,6 +1014,7 @@ def test_lookup_bpw_resolves_the_ple_kv_proj_merge():
 
 # ── Test 3: Dequant correctness (CPU, no vLLM server) ──────────────────
 
+@pytest.mark.slow          # downloads MODEL_ID, a 3B checkpoint
 @pytest.mark.skipif(
     not _HAS_TRANSFORMERS, reason="transformers not installed"
 )
