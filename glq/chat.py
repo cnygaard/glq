@@ -420,9 +420,14 @@ def resolve_mtp_tokens(requested, mtp_layers: int, head_is_quantized: bool):
 
     Returns ``(tokens, error)`` — exactly one of them meaningful.
 
-    The default is **1 where the head is quantized**, which is the measured best configuration
-    (19.692 tok/s with the arena on an L4, 3.060x, beating `num_spec=3` at 18.569), and **0
-    where it is bf16**. That asymmetry is deliberate rather than tidy: loading a bf16 head
+    The default is **1 where the head is quantized** and **0 where it is bf16**.
+
+    1 rather than 3 is the conservative choice, not the universally faster one: `num_spec=1`
+    measured 19.692 tok/s against 18.569 for 3 on an L4 (PCIe-bound, where each extra drafted
+    position costs more than its acceptance returns), but on a 32 GiB Blackwell the ranking
+    REVERSED — 39.659 at 3 against 37.957 at 1. Mean accepted length rises with N (1.709 ->
+    2.417); whether that pays depends on the link. Neither value is right everywhere, so the
+    flag exists. That asymmetry is deliberate rather than tidy: loading a bf16 head
     stops `nontext_bytes` being subtracted, which the planner's own comment measures as two
     window tiers on a 24 GB card. Nearly free is a reasonable default; costing context without
     being asked is not. An explicit `--mtp N` overrides either way.
@@ -499,9 +504,9 @@ def main(argv=None) -> int:
                         "KV cache for a single request)")
     p.add_argument("--mtp", type=int, default=None, metavar="N",
                    help="speculate N draft tokens per step with the checkpoint's MTP draft "
-                        "head (default 1 where that head is quantized, 0 disables). Measured "
-                        "on an L4: with the expert arena, 1 reaches 3.060x and beats 3. "
-                        "Output is NOT byte-identical with speculation on.")
+                        "head (default 1 where that head is quantized, 0 disables). Which N "
+                        "wins is hardware-dependent: 1 beat 3 on an L4, 3 beat 1 on a 32 GiB "
+                        "Blackwell. Output is NOT byte-identical with speculation on.")
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help=f"concurrent sequences vLLM plans for (default "
                         f"{DEFAULT_MAX_NUM_SEQS} on GPU, 4 on the CPU backend; vLLM's own "
