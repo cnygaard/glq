@@ -1506,6 +1506,7 @@ def _real_moe_layer_bpw(n_experts=4, layer=0, pfx="model.language_model.layers")
     return lb
 
 
+@requires_vllm
 def test_a_moe_container_with_per_expert_entries_is_claimed():
     """THE regression. vLLM asks about the container (`...mlp.experts`); the checkpoint
     lists its children (`...mlp.experts.0.gate_proj`). Declining here makes vLLM install
@@ -1524,6 +1525,7 @@ def test_a_moe_container_with_per_expert_entries_is_claimed():
             f"declined {prefix!r}, whose per-expert entries ARE in layer_bpw")
 
 
+@requires_vllm
 def test_an_mtp_moe_absent_from_layer_bpw_is_still_declined():
     """The MTP case this guard was added for must keep working: a head left bf16 has no
     layer_bpw entries at all, and claiming it makes vLLM look for GLQ buffers the
@@ -1540,6 +1542,7 @@ def test_an_mtp_moe_absent_from_layer_bpw_is_still_declined():
     assert cfg.get_quant_method(layer, "mtp.layers.48.mlp.experts") is None
 
 
+@requires_vllm
 def test_a_quantized_mtp_moe_IS_claimed():
     """And the new case: once `--mtp-bpw` quantizes the head, its per-expert entries are in
     layer_bpw and the container must be claimed, or vLLM builds bf16 weights for a head
@@ -1556,6 +1559,7 @@ def test_a_quantized_mtp_moe_IS_claimed():
     assert cfg.get_quant_method(layer, "mtp.layers.0.mlp.experts") is not None
 
 
+@requires_vllm
 def test_a_sibling_prefix_is_not_mistaken_for_a_container():
     """`...mlp.expert` must not match `...mlp.experts.0.gate_proj` by string prefix — the
     check is on dotted segments, not `startswith`."""
@@ -1595,6 +1599,7 @@ def _mtp_layer_bpw(n_experts=2, ckpt_layer=0):
     return lb
 
 
+@requires_vllm
 def test_a_renumbered_mtp_moe_container_is_claimed():
     """THE fix. vLLM asks about index 48; the checkpoint recorded index 0."""
     from glq_vllm.config import GLQvLLMConfig
@@ -1608,6 +1613,7 @@ def test_a_renumbered_mtp_moe_container_is_claimed():
         "declined the renumbered MTP container, so vLLM will build bf16 experts")
 
 
+@requires_vllm
 def test_a_renumbered_mtp_linear_resolves_its_bpw():
     """The same mismatch hits the head's plain projections. Without this they load as bf16
     and then KeyError on their trellis artifacts."""
@@ -1620,6 +1626,7 @@ def test_a_renumbered_mtp_linear_resolves_its_bpw():
     assert cfg._lookup_bpw("mtp.layers.48.self_attn.o_proj") == 3
 
 
+@requires_vllm
 def test_renumbering_does_not_invent_entries_for_an_unquantized_head():
     """The guard must still decline a head that was NOT quantized, at any index — otherwise
     it claims bf16 weights and vLLM looks for artifacts the checkpoint lacks."""
@@ -1635,6 +1642,7 @@ def test_renumbering_does_not_invent_entries_for_an_unquantized_head():
     assert cfg._lookup_bpw("mtp.layers.48.self_attn.q_proj") is None
 
 
+@requires_vllm
 def test_renumbering_is_confined_to_the_mtp_tree():
     """A DECODER layer index must never be renumbered — layers differ from one another, so
     matching layer 48 against layer 0's entry would hand a layer the wrong bpw and size its

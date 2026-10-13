@@ -25,6 +25,13 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy
+          # safetensors is declared only in the `quantize` extra, which CI does not install
+          # (transformers + datasets + accelerate is far too heavy for a CPU job). But
+          # tests/test_resume_import.py writes real checkpoint shards, so without it 13 tests
+          # covering the resume-store rebuild fail on an import rather than being skipped.
+          # It is a ~1 MB wheel with no heavy dependencies, so install it directly instead of
+          # pulling the whole extra or guarding the tests into silence.
+          pip install safetensors
           # hub: jinja2 + huggingface_hub + pyyaml, the model-card feature's deps.
           # chat: gradio + openai. Not for the supervisor tests — those stub both, so they
           # run anywhere — but for tests/test_chat_ui.py, which is skipped without gradio
