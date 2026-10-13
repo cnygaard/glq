@@ -144,9 +144,17 @@ class TestE8ShellCodebook:
         assert mse_rvq < mse_1stage
 
     def test_quantize_large_batch(self, codebook):
-        """Large batch (> _batch_size=16384) should use batched loop."""
+        """Large batch (> _batch_size) should use batched loop.
+
+        `_batch_size` is the chunk width, not the batch: 20000 rows still go through the
+        chunked branch, in 40 chunks rather than 2. Deliberately NOT the production default of
+        16384, which makes `dots` [16384, 65536] fp16 and costs 8 GiB live once
+        `-2.0 * dots + cb_norms` adds two more full-size tensors — measured to take the
+        process from 6.14 to 12.27 GiB peak and OOM-kill this suite on a 40 GiB machine.
+        512 is 64 MiB per matrix.
+        """
         x = torch.randn(20000, 8) * codebook.opt_scale
-        decoded, indices = codebook._quantize_pytorch(x, _batch_size=16384)
+        decoded, indices = codebook._quantize_pytorch(x, _batch_size=512)
         assert decoded.shape == (20000, 8)
         assert indices.shape == (20000,)
         # All indices should be valid
