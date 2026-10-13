@@ -648,20 +648,19 @@ def test_the_cpu_path_never_plans_an_arena():
 # ★ MTP stays OFF, and the offload plan depends on it
 # ---------------------------------------------------------------------------
 
-def test_the_supervisor_never_enables_speculative_decoding():
-    """★ An absence that another plan depends on, so it is asserted rather than assumed.
+def test_speculation_is_OFF_unless_asked_for_and_the_subtraction_holds():
+    """★ A conditional that another plan depends on, so it is asserted rather than assumed.
 
     `supervisor.py` subtracts `nontext_bytes` — the MTP head and vision tower — from the
     weights it plans against, which closed a measured 5.62 GiB over-estimate (15.72 predicted
-    vs 10.1 reported), worth two window tiers on a 24 GB card. Its own comment states the
-    condition: *"Sound only because this supervisor never enables speculative decoding, which
-    WOULD load the MTP head."*
+    vs 10.1 reported), worth two window tiers on a 24 GB card. That is sound only while
+    speculation is off, because MTP loads the head.
 
-    So defaulting MTP on would silently under-plan offload by ~5.6 GiB. The measurements agree
-    it should stay off: `num_spec=1` beats `num_spec=3` both with the arena and without
-    (19.692 vs 18.569 on; 7.743 vs 7.384 off), speculation and the arena overlap rather than
-    compound (1.203x -> 1.171x once the arena is in place), and MTP is not byte-identical here
-    whereas the arena is. See `benchmarks/expert_arena_s1/RESULT.md`.
+    This used to assert the supervisor could NEVER speculate, which is how the condition was
+    kept true. `mtp_tokens` now makes it a conditional instead: the subtraction is withheld
+    exactly when the head is loaded (see `tests/test_mtp_planning.py`). What this test keeps
+    is the other half — that nothing speculates unless a caller asked, so the default plan is
+    unchanged.
     """
     sup = VllmSupervisor(model="m", device="cuda", vram_bytes=_L4,
                          weights_bytes=_FLASHNEXT, ple_offload_bytes=_PLE,
@@ -670,8 +669,10 @@ def test_the_supervisor_never_enables_speculative_decoding():
     argv = " ".join(sup.argv())
     assert "--speculative-config" not in argv
     assert "speculative" not in argv
-    # and the subtraction that depends on it is still in force
+    # and the subtraction that depends on it is in force
     assert sup.nontext_bytes == _NONTEXT
+    assert sup.step_tokens == sup.max_num_seqs, "a non-speculative step is one token/stream"
+    assert sup.min_step_tokens == 1
 
 
 # ---------------------------------------------------------------------------

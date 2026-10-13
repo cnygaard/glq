@@ -24,8 +24,9 @@ from pathlib import Path
 
 from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
                       _ram_bytes, _server_port, _vram_bytes,
-                      checkpoint_offload_bytes,
-                      default_model, positive_seconds, sizing_weights_bytes)
+                      checkpoint_mtp, checkpoint_offload_bytes,
+                      default_model, positive_seconds, resolve_mtp_tokens,
+                      sizing_weights_bytes)
 from glq.installer.configure import pi_max_tokens, write_pi_models
 from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
@@ -139,6 +140,11 @@ def main(argv=None) -> int:
                         f"file contents and diffs; pass a number to pin it)")
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help="concurrent sequences (default: 16 on GPU, 4 on the CPU backend)")
+    p.add_argument("--mtp", type=int, default=None, metavar="N",
+                   help="speculate N draft tokens per step with the checkpoint's MTP draft "
+                        "head (default 1 where that head is quantized, 0 disables). Measured "
+                        "on an L4: with the expert arena, 1 reaches 3.060x and beats 3. "
+                        "Output is NOT byte-identical with speculation on.")
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",
@@ -182,6 +188,14 @@ def main(argv=None) -> int:
     # what actually lands in VRAM, and turns PLE offload on for a checkpoint that
     # cannot serve without it. (0, 0) for everything that declares nothing.
     _offload = checkpoint_offload_bytes(args.model)
+    # Before the supervisor, with the pi and tool-parser guards above, and for the same
+    # reason: a `--speculative-config` this checkpoint cannot honour makes vLLM refuse
+    # minutes into a weight load.
+    _mtp_layers, _mtp_quantized, _decoder_layers = checkpoint_mtp(args.model)
+    _mtp, _mtp_err = resolve_mtp_tokens(args.mtp, _mtp_layers, _mtp_quantized)
+    if _mtp_err:
+        print(f"error: {_mtp_err}", file=sys.stderr)
+        return 2
     # One value for both knobs, so what the server admits and what the window was priced for
     # can never disagree. Letting them drift is how a pool sized for one request ends up
     # admitting eight.
@@ -213,6 +227,10 @@ def main(argv=None) -> int:
         # checkpoint today except Qwen3.8-Flash-Next.
         ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
         nontext_bytes=_offload[2],
+        # Speculation changes the budget three ways, all handled in the supervisor: the MTP
+        # head is loaded (so `nontext_bytes` stops being subtracted), its own MoE layer
+        # becomes offloadable, and every decode step widens to `1 + mtp` tokens per stream.
+        mtp_tokens=_mtp, mtp_layers=_mtp_layers, decoder_layers=_decoder_layers,
         expert_offload_gib=args.cpu_offload_gb,
         # glq-code opts into spending a bounded amount of extra offload on a longer window;
         # glq-chat does not. For a coding agent the window IS the product -- pi carries file

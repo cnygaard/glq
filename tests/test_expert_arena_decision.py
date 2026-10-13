@@ -207,3 +207,56 @@ def test_a_budget_too_small_for_ONE_token_is_still_refused():
                        n_layers=49, n_experts=512, top_k=10, **FN)
     assert not d.enabled
     assert "top_k" in d.reason or "simultaneous" in d.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# ★ The step-width floor, which MTP raises
+# ---------------------------------------------------------------------------
+
+def test_the_floor_is_ONE_token_by_default():
+    """Unchanged behaviour: without speculation every decode step is one token wide, so any
+    cap of 1 or more serves them and a small arena merely degrades."""
+    d = arena_decision(budget="0.5", offloaded_bytes=40 * 1024**3, max_tokens=8, **LAYER)
+    assert not d.enabled                      # 6 slots < top_k 10, so not even one token
+    d2 = arena_decision(budget="1", offloaded_bytes=40 * 1024**3, max_tokens=8, **LAYER)
+    assert d2.enabled and d2.max_tokens == 1
+
+
+def test_a_raised_floor_REFUSES_an_arena_that_could_not_serve_an_MTP_STEP():
+    """★ With MTP on, lowering the cap stops being a graceful degradation: every decode step
+    carries `1 + num_spec` tokens, so a cap below that serves NONE of them. The arena would
+    then hold VRAM that KV needs and never use it — which is how an 8 GiB arena plus MTP
+    once produced `Available KV cache memory: -0.31 GiB`.
+
+    12 slots/layer affords a cap of 1, which is fine without speculation and useless with it.
+    """
+    kw = dict(offloaded_bytes=40 * 1024**3, max_tokens=4, **LAYER)
+    assert arena_decision(budget="1", min_tokens=1, **kw).enabled
+    d = arena_decision(budget="1", min_tokens=4, **kw)
+    assert not d.enabled, "allocated an arena that cannot serve a single MTP step"
+    assert "4 x 10 = 40" in d.reason, f"reason does not name the arithmetic: {d.reason!r}"
+    assert "num_spec" in d.reason
+
+
+def test_a_cap_BETWEEN_the_floor_and_the_request_is_fine():
+    """★ The glq-chat case, and the reason the floor is `1 + num_spec` rather than
+    `max_num_seqs * (1 + num_spec)`. At 16 streams and one draft the widest step is 32 tokens,
+    which would need 320 slots/layer (~27 GiB); the cap simply lands lower and the arena still
+    serves the one- and two-stream steps a real session produces.
+    """
+    d = arena_decision(budget="10", offloaded_bytes=40 * 1024**3,
+                       max_tokens=32, min_tokens=2, **LAYER)
+    assert d.enabled
+    assert 2 <= d.max_tokens < 32
+
+
+def test_the_floor_travels_in_its_own_env_var():
+    from glq_vllm.expert_arena import MIN_TOKENS_ENV, arena_decision_from_env
+
+    env = {"GLQ_MOE_EXPERT_CACHE": "1", "GLQ_MOE_ARENA_MAX_TOKENS": "4",
+           MIN_TOKENS_ENV: "4"}
+    d = arena_decision_from_env(env, offloaded_bytes=40 * 1024**3, **LAYER)
+    assert not d.enabled and "num_spec" in d.reason
+    # ...and absent, it defaults to today's floor of 1.
+    del env[MIN_TOKENS_ENV]
+    assert arena_decision_from_env(env, offloaded_bytes=40 * 1024**3, **LAYER).enabled

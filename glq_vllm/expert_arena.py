@@ -39,6 +39,11 @@ BUDGET_ENV = "GLQ_MOE_EXPERT_CACHE"
 #: Token cap for the arena path. Static, so each captured CUDA graph takes one branch.
 MAX_TOKENS_ENV = "GLQ_MOE_ARENA_MAX_TOKENS"
 DEFAULT_MAX_TOKENS = 8
+#: Narrowest step the arena must serve to be worth allocating. 1 without speculation — every
+#: decode step is one token wide, so any cap serves them and a small arena merely degrades.
+#: MTP makes every step `1 + num_spec` wide, and a cap below that serves NONE of them, so the
+#: arena would hold VRAM that KV needs and never be used. Set by `glq.supervisor.child_env`.
+MIN_TOKENS_ENV = "GLQ_MOE_ARENA_MIN_TOKENS"
 
 #: Below this, offload is rounding rather than a workload and an arena cannot pay for itself.
 _MIN_OFFLOAD_BYTES = 1024**3
@@ -88,7 +93,8 @@ def _parse_budget(budget: str) -> float | None:
 
 def arena_decision(*, budget: str, offloaded_bytes: int, n_layers: int, n_experts: int,
                    top_k: int, hidden_size: int, inter: int, w13_out: int, bpw: int,
-                   max_tokens: int = DEFAULT_MAX_TOKENS) -> ArenaDecision:
+                   max_tokens: int = DEFAULT_MAX_TOKENS,
+                   min_tokens: int = 1) -> ArenaDecision:
     """Decide whether this layer gets an arena, and how many slots.
 
     Refuses — with a reason — when:
@@ -124,13 +130,24 @@ def arena_decision(*, budget: str, offloaded_bytes: int, n_layers: int, n_expert
     slots = slots_for_budget(int(gib * 1024**3), n_layers=n_layers, hidden_size=hidden_size,
                              inter=inter, w13_out=w13_out, bpw=bpw, n_experts=n_experts)
     cap = min(int(max_tokens), slots // max(int(top_k), 1))
-    if cap < 1:
+    floor = max(1, int(min_tokens))
+    if cap < floor:
+        # `floor` is 1 without speculation, so this is the original "cannot hold even one
+        # token's routings" refusal. With MTP on the caller raises it to `1 + num_spec`,
+        # because every decode step is then at least that wide: a cap below it would serve NO
+        # decode step, making the arena VRAM that KV needs and never gets. An 8 GiB arena
+        # plus MTP once left `Available KV cache memory: -0.31 GiB` exactly this way.
+        need = "ONE token's" if floor == 1 else f"a {floor}-token verify step's"
+        extra = "" if floor == 1 else (
+            f" Every MTP step carries 1 + num_spec = {floor} tokens, so a narrower cap would "
+            f"serve none of them.")
         return ArenaDecision(
             False, reason=(
                 f"expert arena disabled: {gib:g} GiB buys {slots} slots/layer across "
-                f"{n_layers} layers, which cannot hold even ONE token's top_k {top_k} "
-                f"routings. Every expert routed in a step must be resident at once, so a "
-                f"narrower arena is not an option here — raise {BUDGET_ENV}."))
+                f"{n_layers} layers, which cannot hold {need} top_k {top_k} routings "
+                f"({floor} x {top_k} = {floor * int(top_k)} > {slots}). Every expert routed "
+                f"in a step must be resident at once, so a narrower arena is not an option "
+                f"here — raise {BUDGET_ENV}.{extra}"))
 
     note = "" if cap >= int(max_tokens) else \
         f" (cap lowered from {max_tokens}: {slots} slots / top_k {top_k})"
@@ -143,10 +160,16 @@ def arena_decision(*, budget: str, offloaded_bytes: int, n_layers: int, n_expert
 
 
 def arena_decision_from_env(env, **kw) -> ArenaDecision:
-    """`arena_decision` with the two env vars read from a mapping (``os.environ``)."""
+    """`arena_decision` with the env vars read from a mapping (``os.environ``).
+
+    `MIN_TOKENS_ENV` defaults to 1, i.e. today's behaviour; `glq.supervisor.child_env` raises
+    it to `1 + num_spec` when it enables MTP, because that is the narrowest step speculation
+    produces and a cap below it would serve none of them.
+    """
     return arena_decision(
         budget=env.get(BUDGET_ENV, ""),
         max_tokens=int(env.get(MAX_TOKENS_ENV, DEFAULT_MAX_TOKENS)),
+        min_tokens=int(env.get(MIN_TOKENS_ENV, 1)),
         **kw)
 
 

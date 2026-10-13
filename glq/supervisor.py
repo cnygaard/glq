@@ -16,6 +16,7 @@ process factory, the health probe and the clock are all injected.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -740,7 +741,8 @@ def plan_cpu_kvcache_gib(ram_bytes, weights_bytes=None, available_bytes=None) ->
 
 def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
               available_bytes=None, ple_offload: bool = False,
-              expert_arena_gib: int = 0, max_num_seqs: int = 0) -> dict:
+              expert_arena_gib: int = 0, max_num_seqs: int = 0,
+              min_step_tokens: int = 0) -> dict:
     """The environment `vllm serve` is started with.
 
     PYTHONUNBUFFERED: without it the child block-buffers into the log file, so the lines
@@ -792,11 +794,21 @@ def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
         # it, and `GLQ_MOE_EXPERT_CACHE=0` is how they opt out.
         env.setdefault("GLQ_MOE_EXPERT_CACHE", str(int(expert_arena_gib)))
         if max_num_seqs and int(max_num_seqs) > 0:
-            # The arena path's token cap. `max_num_seqs` is the real step width — a decode
-            # step carries at most one token per concurrent stream, and this supervisor never
-            # enables speculative decoding, so nothing widens it. The arena lowers this
-            # further when its slot count cannot cover it, so it is a ceiling, not a demand.
+            # The arena path's token cap, which is the widest decode step it may be asked to
+            # serve: one token per concurrent stream, times `1 + num_spec` when MTP is on,
+            # because a verify step carries the draft tokens alongside the real one. Callers
+            # pass `VllmSupervisor.step_tokens`, which is that product.
+            #
+            # A ceiling, not a demand: the arena lowers it when its slots cannot cover it.
             env.setdefault("GLQ_MOE_ARENA_MAX_TOKENS", str(int(max_num_seqs)))
+        if min_step_tokens and int(min_step_tokens) > 1:
+            # The floor below which lowering the cap stops being safe. Without speculation
+            # every decode step is one token wide, so any cap >= 1 serves them and a narrow
+            # arena just degrades. With MTP on, every step is at least `1 + num_spec` wide, so
+            # a cap under that serves NO decode step and the arena is pure wasted VRAM —
+            # VRAM that KV needs, which is how an 8 GiB arena plus MTP once produced
+            # `Available KV cache memory: -0.31 GiB`. The arena refuses rather than allocate.
+            env.setdefault("GLQ_MOE_ARENA_MIN_TOKENS", str(int(min_step_tokens)))
     # After PATH, so the probe sees the tools the child will actually have.
     env.update(flashinfer_env())
     return env
@@ -841,22 +853,53 @@ class VllmSupervisor:
                  max_num_seqs=None, device=None, ram_bytes=None,
                  ple_offload_bytes=0, expert_offload_bytes=0, nontext_bytes=0,
                  window_concurrency=_WINDOW_CONCURRENCY, expert_offload_gib=None,
-                 window_offload_extra_gib=0):
+                 window_offload_extra_gib=0, mtp_tokens=0, decoder_layers=None,
+                 mtp_layers=0):
         self.model = model
         self.port = int(port)
         self.base_url = base_url or f"http://127.0.0.1:{self.port}/v1"
+        #: Draft tokens per step for MTP speculation, 0 = off. Set before anything it changes:
+        #: it decides whether the MTP head is loaded, which moves both of the figures below.
+        #: Measured on an L4 (`benchmarks/expert_arena_s1/RESULT.md`): with the arena,
+        #: `num_spec=1` reaches 19.692 tok/s (3.060x) and beats `num_spec=3` at 18.569 —
+        #: the step cost is steeply linear in drafted positions, so the extra acceptance 3
+        #: buys does not cover the extra positions.
+        self.mtp_tokens = max(0, int(mtp_tokens or 0))
         # Host offload is planned FIRST, because everything downstream is sized from what
         # actually lands in VRAM. Passing the file size to the pool and window planners is how
         # a PLE checkpoint ended up under-sized by ~24 GiB: the n-gram table was counted
         # against the card it never occupies.
         self.ple_offload_bytes = int(ple_offload_bytes or 0)
         self.expert_offload_bytes = int(expert_offload_bytes or 0)
+        #: The MTP block's own 512-expert MoE layer, which `quantize_model._offloadable_bytes`
+        #: drops from every total: it is "mutually exclusive, non-text first", so once the head
+        #: is quantized `mtp.layers.0.mlp.experts.*` is claimed by the non-text branch and then
+        #: discarded by `if not mtp_is_loaded`. The tell is that `expert_offload_bytes` is
+        #: byte-identical (45,770,637,312) for the bf16-head and quantized-head builds of
+        #: Flash-Next, though only one of them loads that layer.
+        #:
+        #: Only counted when speculation is on, because only then is the block loaded. Derived
+        #: from the two declared numbers rather than estimated, and 0 when the layer count is
+        #: unknown — the planner's standing rule that an unknown input means fall back.
+        #:
+        #: This omission is the measured shortfall that stopped arena+MTP before: an 8 GiB
+        #: arena plus MTP reported `Available KV cache memory: -0.31 GiB`.
+        self.mtp_expert_bytes = 0
+        if self.mtp_tokens and decoder_layers and self.expert_offload_bytes:
+            per_layer = self.expert_offload_bytes // int(decoder_layers)
+            self.mtp_expert_bytes = per_layer * max(0, int(mtp_layers or 0))
+            self.expert_offload_bytes += self.mtp_expert_bytes
         #: Bytes outside the text decoder (MTP head, vision tower). Not offloaded — never
         #: loaded, so they cost neither VRAM nor pinned host RAM. Subtracting them is what
         #: closed a measured 5.62 GiB over-estimate (15.72 predicted vs 10.1 reported), worth
-        #: two window tiers on a 24 GB card. Sound only because this supervisor never enables
-        #: speculative decoding, which WOULD load the MTP head.
-        self.nontext_bytes = int(nontext_bytes or 0)
+        #: two window tiers on a 24 GB card.
+        #:
+        #: Sound only while speculation is OFF, which is the condition this line now enforces
+        #: rather than assuming: MTP loads the head, so subtracting it would under-plan the
+        #: footprint by exactly that much. The declared figure is kept so the plan can explain
+        #: what turning MTP on cost.
+        self._nontext_declared = int(nontext_bytes or 0)
+        self.nontext_bytes = 0 if self.mtp_tokens else self._nontext_declared
         #: How many concurrent requests the window is priced for. 1 for an agent driving a
         #: single stream, `_WINDOW_CONCURRENCY` for a chat server. Set before the offload plan
         #: because that plan now prices a window, and a window priced at the wrong concurrency
@@ -943,6 +986,22 @@ class VllmSupervisor:
                                   and gpu_memory_utilization is not None)
         self.max_num_seqs = int(max_num_seqs) if max_num_seqs is not None else (
             DEFAULT_CPU_MAX_NUM_SEQS if self.device == "cpu" else DEFAULT_MAX_NUM_SEQS)
+        #: Widest decode step the arena may be asked to serve: one token per stream without
+        #: speculation, and `1 + mtp_tokens` per stream with it, because an MTP verify step
+        #: carries the draft tokens alongside the real one.
+        #:
+        #: This is the quantity the measured arena+MTP arms needed: "an MTP verify step carries
+        #: 1 + num_spec = 4 tokens, so GLQ_MOE_ARENA_MAX_TOKENS=4 brings the requirement to
+        #: 40 <= 71 slots". With `max_num_seqs` there instead, a 6 GiB arena over 49 containers
+        #: refused a cap of 8 (8 x top_k 10 = 80 > 71) and three arms silently measured no
+        #: arena at all while looking entirely healthy.
+        self.step_tokens = self.max_num_seqs * (1 + self.mtp_tokens)
+        #: The NARROWEST step speculation produces — one stream's verify step. The arena's cap
+        #: may safely land between this and `step_tokens`: wider steps simply take today's
+        #: exact path. Below it, though, the arena serves NO decode step at all, because with
+        #: MTP on every step is at least this wide — so a cap under this is not graceful
+        #: degradation but wasted VRAM, and the arena is dropped instead.
+        self.min_step_tokens = 1 + self.mtp_tokens
         #: GiB for the routing-aware expert arena, planned after the window and the offload
         #: budget so the window keeps priority — an arena is never bought with context the
         #: caller asked for. 0 on CPU and whenever nothing is offloaded, so a box that does
@@ -1054,7 +1113,24 @@ class VllmSupervisor:
                 "--max-num-seqs", str(self.max_num_seqs),
                 *self._offload_args(),
                 *kv_compression.serve_args(self.fp8_kv),
+                *self._speculative_args(),
                 *self.extra_args]
+
+    def _speculative_args(self) -> list[str]:
+        """`--speculative-config` for MTP, or nothing.
+
+        Before `extra_args` deliberately: vLLM takes the LAST occurrence, the same convention
+        `--dtype` relies on above, so a caller passing their own `--speculative-config` still
+        wins.
+
+        Nothing on the CPU backend. Speculation is unmeasured there, and that path decodes in
+        single digits where a wrong draft budget costs proportionally more; announcing a
+        configuration nobody has run is how a plausible-looking number gets published.
+        """
+        if not self.mtp_tokens or self.device == "cpu":
+            return []
+        return ["--speculative-config",
+                json.dumps({"method": "mtp", "num_speculative_tokens": self.mtp_tokens})]
 
     def _plan_offload(self, *, weights_bytes, vram_bytes, ram_bytes, max_model_len,
                       model_max_len, floor, extra_cap) -> int:
@@ -1230,6 +1306,21 @@ class VllmSupervisor:
             self._say(f"  no VRAM left for the expert cache after a {self.max_model_len} "
                       f"token context — a shorter window or more host RAM would buy one "
                       f"(GLQ_MOE_EXPERT_CACHE=<GiB> forces it)")
+        if self.mtp_tokens and self.device != "cpu":
+            # Say it out loud, for the same reason as the arena line above — but with one
+            # extra thing to disclose. Speculative decoding is often described as lossless at
+            # temperature 0, and here it is not: three L4 speculative arms produced three
+            # distinct digests while EVERY non-speculative arm agreed, so this is MTP's
+            # property rather than the arena's. A user comparing output between runs should
+            # know that before concluding something broke.
+            self._say(f"  speculating {self.mtp_tokens} draft token"
+                      f"{'' if self.mtp_tokens == 1 else 's'} per step with the MTP head "
+                      f"(--mtp 0 turns it off). Output is not byte-identical with "
+                      f"speculation on, even at temperature 0")
+            if self._nontext_declared:
+                self._say(f"  the draft head costs "
+                          f"{self._nontext_declared / 2**30:.2f} GiB of VRAM that a "
+                          f"text-only serve would not load")
         # Say how long this takes *before* going quiet. Minutes of silence you were warned
         # about is patience; the same silence unannounced is indistinguishable from a hang,
         # and that is what a first run looks like today.
@@ -1254,7 +1345,8 @@ class VllmSupervisor:
                         weights_bytes=self.weights_bytes,
                         available_bytes=self._available_bytes,
                         expert_arena_gib=self.expert_arena_gib,
-                        max_num_seqs=self.max_num_seqs)
+                        max_num_seqs=self.step_tokens,
+                        min_step_tokens=self.min_step_tokens)
         if self.device == "cpu" and self._ram_bytes and self.weights_bytes:
             # Say the arithmetic out loud. On CPU the weights, the pool, the runtime and the
             # page cache share one pool of RAM, and when it does not fit there is no swap to

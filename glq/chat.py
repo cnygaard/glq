@@ -370,6 +370,79 @@ def checkpoint_offload_bytes(repo_id: str) -> tuple[int, int, int]:
         return 0, 0, 0
 
 
+def checkpoint_mtp(repo_id: str) -> tuple[int, bool, int]:
+    """``(mtp_layers, head_is_quantized, decoder_layers)`` for this checkpoint, zeros if
+    unknown — what the planner needs to budget for speculative decoding.
+
+    `mtp_layers` drives whether `--mtp` is offerable at all. **Test the VALUE, not the key:**
+    `mtp`, `mtp_num_hidden_layers` and `mtp_use_dedicated_embeddings` are all present on
+    Flash-Next builds that have no usable head, with `null` values (measured on
+    `...-3bpw-ple4`, 2026-10-13).
+
+    `head_is_quantized` is whether `layer_bpw` carries MTP entries — 1,545 of them on
+    `...-ple4-3mtp`, 0 on `...-ple4`, whose head is bf16 and therefore costs the whole of
+    `nontext_bytes` (4.86 GiB) to load. Matched on dotted SEGMENTS, following the warning on
+    `quantize_model._is_nontext`: `model.layers.0.mtpool.weight` contains "mtp" and is an
+    ordinary text weight.
+
+    `decoder_layers` is what makes the MTP block's expert bytes derivable rather than guessed:
+    `_offloadable_bytes` drops that layer from every total, so the planner reconstructs it as
+    one layer's share of `expert_offload_bytes`.
+
+    Same never-block contract as `checkpoint_offload_bytes`, and shared by glq-chat and
+    glq-code so the two cannot drift apart on it.
+    """
+    if not repo_id:
+        return 0, False, 0
+    try:
+        cfg = _sizing_fetch(repo_id)(
+            f"https://huggingface.co/{repo_id}/resolve/main/config.json")
+        text = cfg.get("text_config") or {}
+
+        def _get(key):
+            return cfg.get(key) or text.get(key)
+
+        mtp = _get("mtp_num_hidden_layers") or _get("num_nextn_predict_layers")
+        if not mtp:
+            block = _get("mtp")
+            if isinstance(block, dict):
+                mtp = block.get("num_hidden_layers") or 1
+        layers = int(_get("num_hidden_layers") or 0)
+        lb = (cfg.get("quantization_config") or {}).get("layer_bpw") or {}
+        quantized = any(k.split(".")[0] == "mtp" for k in lb)
+        return int(mtp or 0), quantized, layers
+    except Exception:                                       # noqa: BLE001 - offline, 404, …
+        return 0, False, 0
+
+
+def resolve_mtp_tokens(requested, mtp_layers: int, head_is_quantized: bool):
+    """Draft tokens to speculate with, or a message explaining the refusal.
+
+    Returns ``(tokens, error)`` — exactly one of them meaningful.
+
+    The default is **1 where the head is quantized**, which is the measured best configuration
+    (19.692 tok/s with the arena on an L4, 3.060x, beating `num_spec=3` at 18.569), and **0
+    where it is bf16**. That asymmetry is deliberate rather than tidy: loading a bf16 head
+    stops `nontext_bytes` being subtracted, which the planner's own comment measures as two
+    window tiers on a 24 GB card. Nearly free is a reasonable default; costing context without
+    being asked is not. An explicit `--mtp N` overrides either way.
+
+    An explicit request on a checkpoint with no head is an error rather than a silent 0,
+    because the alternative is vLLM refusing the `--speculative-config` minutes into a weight
+    load — and because the user asked for something this checkpoint cannot do.
+    """
+    if requested is None:
+        return (1 if (mtp_layers and head_is_quantized) else 0), None
+    n = int(requested)
+    if n < 0:
+        return 0, f"--mtp must be 0 or more, not {n}"
+    if n and not mtp_layers:
+        return 0, ("this checkpoint declares no MTP draft head, so --mtp cannot speculate "
+                   "with it. Re-run without --mtp, or pick a checkpoint whose name carries "
+                   "an mtp suffix.")
+    return n, None
+
+
 def sizing_weights_bytes(args, device=None):
     """The checkpoint size the supervisor should size against, or None.
 
@@ -424,6 +497,11 @@ def main(argv=None) -> int:
                         "number to pin it — vLLM would otherwise take the model's "
                         "declared maximum, which for gemma-4 is 262144 and needs GiB of "
                         "KV cache for a single request)")
+    p.add_argument("--mtp", type=int, default=None, metavar="N",
+                   help="speculate N draft tokens per step with the checkpoint's MTP draft "
+                        "head (default 1 where that head is quantized, 0 disables). Measured "
+                        "on an L4: with the expert arena, 1 reaches 3.060x and beats 3. "
+                        "Output is NOT byte-identical with speculation on.")
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help=f"concurrent sequences vLLM plans for (default "
                         f"{DEFAULT_MAX_NUM_SEQS} on GPU, 4 on the CPU backend; vLLM's own "
@@ -482,6 +560,13 @@ def main(argv=None) -> int:
     # what actually lands in VRAM, and turns PLE offload on for a checkpoint that
     # cannot serve without it. (0, 0) for everything that declares nothing.
     _offload = checkpoint_offload_bytes(args.model)
+    # With the gradio guard above, and for the same reason: a `--speculative-config` this
+    # checkpoint cannot honour makes vLLM refuse minutes into a weight load.
+    _mtp_layers, _mtp_quantized, _decoder_layers = checkpoint_mtp(args.model)
+    _mtp, _mtp_err = resolve_mtp_tokens(args.mtp, _mtp_layers, _mtp_quantized)
+    if _mtp_err:
+        print(f"error: {_mtp_err}", file=sys.stderr)
+        return 2
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -510,6 +595,10 @@ def main(argv=None) -> int:
         # checkpoint today except Qwen3.8-Flash-Next.
         ple_offload_bytes=_offload[0], expert_offload_bytes=_offload[1],
         nontext_bytes=_offload[2],
+        # Speculation changes the budget three ways, all handled in the supervisor: the MTP
+        # head is loaded (so `nontext_bytes` stops being subtracted), its own MoE layer
+        # becomes offloadable, and every decode step widens to `1 + mtp` tokens per stream.
+        mtp_tokens=_mtp, mtp_layers=_mtp_layers, decoder_layers=_decoder_layers,
         expert_offload_gib=args.cpu_offload_gb,
         # One stream, because this command serves one person: it starts vLLM, opens a chat
         # UI, and stops the server on the way out. Without this it inherited
