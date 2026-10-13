@@ -101,6 +101,42 @@ def _fetch_json(url: str):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def local_fetcher(root):
+    """A `fetch` that answers this module's Hub URL shapes from a directory on disk.
+
+    For `--model /path/to/checkpoint` there is no repo to call: the id interpolates into the
+    URL and produces `https://huggingface.co//path/to/checkpoint/resolve/main/config.json`,
+    which 404s. Every caller treats that as "declares nothing", so a local checkpoint silently
+    lost its window, its PLE offload, its expert offload and its expert arena together —
+    measured on an L4 as 16384 instead of 131072 tokens and 6.4 instead of 15.2 tok/s.
+
+    A fetcher rather than a second sizing implementation, because `repo_size_bytes`,
+    `model_max_len`, `offload_bytes` and `repo_traits` all carry parsing rules worth exactly
+    one copy: the `.safetensors`-only sum (`usedStorage` is wrong, see the module docstring),
+    and `max_position_embeddings` falling back to `text_config` for multimodal wrappers.
+    Answering the transport means every one of those applies unchanged.
+
+    `stat()` and not `lstat()`: an `hf download` snapshot is a directory of symlinks into a
+    sibling `blobs/`, so link sizes would price a 77 GiB checkpoint at a few hundred bytes and
+    conclude it fits in VRAM. Raises on a URL shape it cannot serve, and on a file that is not
+    there — an empty answer here is indistinguishable from a checkpoint that declares nothing,
+    which is the failure this exists to remove.
+    """
+    root = Path(root)
+
+    def fetch(url: str):
+        if "/tree/" in url:
+            return [{"path": str(p.relative_to(root)), "size": p.stat().st_size}
+                    for p in sorted(root.rglob("*")) if p.is_file()]
+        if "/resolve/" in url:
+            # ".../resolve/<revision>/<path>", optionally with a query string.
+            name = url.split("/resolve/", 1)[1].split("/", 1)[1].split("?")[0]
+            return json.loads((root / name).read_text(encoding="utf-8"))
+        raise DiscoveryError(f"no local answer for {url}")
+
+    return fetch
+
+
 def collection_repo_ids(fetch=_fetch_json) -> list[str]:
     """Model ids from the collection, in the curator's order.
 

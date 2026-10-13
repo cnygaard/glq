@@ -293,15 +293,41 @@ def _vram_bytes():
         return None
 
 
+def _sizing_fetch(model: str):
+    """Where the sizing lookups should read from: a local checkpoint directory, or the Hub.
+
+    `--model` takes either a repo id or a path, and the three lookups below were HTTP-only.
+    A path interpolates into the URL, so it could never resolve — and because all three
+    swallow failure, the window, PLE offload, expert offload and the expert arena collapsed
+    together in silence. Measured on an L4: 16384 instead of 131072 tokens, and 6.4 instead
+    of 15.2 tok/s with no message explaining either.
+
+    A token does not fix that half; no authorization makes the URL valid. What does is
+    noticing the bytes are already on disk — `config.json` sits beside the weights in any
+    cached snapshot, so for a model that is present this never needed the network at all.
+    """
+    try:
+        if model and Path(model).is_dir():
+            from glq.installer.discovery import local_fetcher
+            return local_fetcher(model)
+    except OSError:                                         # unreadable path, or not a path
+        pass
+    # Read the attribute at call time, not as a default argument: every function here binds
+    # `fetch=_fetch_json` at import, which is why patching the module attribute cannot reach
+    # them. (The same default-argument trap hides `VllmSupervisor`'s `spawn` seam.)
+    from glq.installer import discovery
+    return discovery._fetch_json
+
+
 def _model_max_len(repo_id: str):
     """The model's declared context maximum, or None — sizes the auto window's clamp.
 
-    Same never-block contract as _checkpoint_bytes: one small HTTP call whose failure
-    must not stop the chat from starting at the conservative floor.
+    Same never-block contract as _checkpoint_bytes: one small lookup whose failure must not
+    stop the chat from starting at the conservative floor.
     """
     try:
         from glq.installer.discovery import model_max_len
-        return model_max_len(repo_id) or None
+        return model_max_len(repo_id, fetch=_sizing_fetch(repo_id)) or None
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return None
 
@@ -316,7 +342,7 @@ def _checkpoint_bytes(repo_id: str):
     """
     try:
         from glq.installer.discovery import repo_size_bytes
-        return repo_size_bytes(repo_id) or None
+        return repo_size_bytes(repo_id, fetch=_sizing_fetch(repo_id)) or None
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return None
 
@@ -337,9 +363,9 @@ def checkpoint_offload_bytes(repo_id: str) -> tuple[int, int, int]:
     if not repo_id:
         return 0, 0, 0
     try:
-        from glq.installer.discovery import _fetch_json, offload_bytes
-        return offload_bytes(
-            _fetch_json(f"https://huggingface.co/{repo_id}/resolve/main/config.json"))
+        from glq.installer.discovery import offload_bytes
+        return offload_bytes(_sizing_fetch(repo_id)(
+            f"https://huggingface.co/{repo_id}/resolve/main/config.json"))
     except Exception:                                       # noqa: BLE001 - offline, 404, …
         return 0, 0, 0
 
