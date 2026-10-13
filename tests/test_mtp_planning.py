@@ -293,8 +293,8 @@ def test_an_unreadable_checkpoint_declares_nothing(tmp_path):
 
 
 @pytest.mark.parametrize("requested,layers,quantized,expected", [
-    (None, 1, True, 1),      # the measured best configuration, and nearly free
-    (None, 1, False, 0),     # a bf16 head costs nontext_bytes; do not spend it unasked
+    (None, 1, True, 0),      # OFF by default even where the head is cheap to load:
+    (None, 1, False, 0),     # speculation changes output, so it is opt-in
     (None, 0, False, 0),
     (0, 1, True, 0),         # the documented off switch
     (3, 1, True, 3),

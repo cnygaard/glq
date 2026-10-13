@@ -142,9 +142,9 @@ def main(argv=None) -> int:
                    help="concurrent sequences (default: 16 on GPU, 4 on the CPU backend)")
     p.add_argument("--mtp", type=int, default=None, metavar="N",
                    help="speculate N draft tokens per step with the checkpoint's MTP draft "
-                        "head (default 1 where that head is quantized, 0 disables). Which N "
-                        "wins is hardware-dependent: 1 beat 3 on an L4, 3 beat 1 on a 32 GiB "
-                        "Blackwell. Output is NOT byte-identical with speculation on.")
+                        "head (default OFF). Which N wins is hardware-dependent: 1 beat 3 on "
+                        "an L4, 3 beat 1 on a 32 GiB Blackwell. Output is NOT byte-identical "
+                        "with speculation on, even at temperature 0.")
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",

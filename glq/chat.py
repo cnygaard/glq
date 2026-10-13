@@ -420,24 +420,33 @@ def resolve_mtp_tokens(requested, mtp_layers: int, head_is_quantized: bool):
 
     Returns ``(tokens, error)`` — exactly one of them meaningful.
 
-    The default is **1 where the head is quantized** and **0 where it is bf16**.
+    **The default is OFF.** Speculation is opt-in via `--mtp N`, for two reasons measured
+    rather than assumed:
 
-    1 rather than 3 is the conservative choice, not the universally faster one: `num_spec=1`
-    measured 19.692 tok/s against 18.569 for 3 on an L4 (PCIe-bound, where each extra drafted
-    position costs more than its acceptance returns), but on a 32 GiB Blackwell the ranking
-    REVERSED — 39.659 at 3 against 37.957 at 1. Mean accepted length rises with N (1.709 ->
-    2.417); whether that pays depends on the link. Neither value is right everywhere, so the
-    flag exists. That asymmetry is deliberate rather than tidy: loading a bf16 head
-    stops `nontext_bytes` being subtracted, which the planner's own comment measures as two
-    window tiers on a 24 GB card. Nearly free is a reasonable default; costing context without
-    being asked is not. An explicit `--mtp N` overrides either way.
+    * It changes output. Three speculative arms on an L4 produced three distinct digests
+      where every non-speculative arm agreed, so it is not lossless at temperature 0 and a
+      default-on would silently change what users get.
+    * It loads the draft head, which withholds the `nontext_bytes` subtraction and deepens
+      the expert offload — and host-memory accounting for this checkpoint is not yet
+      trustworthy: a glq-code session on a 120 GiB box held **102.8 GiB** of shared host
+      memory against a planned 65.3 GiB and was OOM-killed by the kernel. Until that is
+      understood, speculation does not get to raise the offload budget unasked.
+
+    Worth having behind the flag: with the expert arena it measured 19.692 tok/s on an L4
+    (3.060x a 6.436 baseline) and 37.957 on a 32 GiB Blackwell against 29.523 without. Which
+    N wins is hardware-dependent — 1 beat 3 on the L4, 3 beat 1 on the Blackwell — so neither
+    is a safe constant.
+
+    `head_is_quantized` is still reported by `checkpoint_mtp` and still worth knowing (a bf16
+    head costs the whole of `nontext_bytes` to load, two window tiers on a 24 GB card), but it
+    no longer selects a default now that there is none.
 
     An explicit request on a checkpoint with no head is an error rather than a silent 0,
     because the alternative is vLLM refusing the `--speculative-config` minutes into a weight
     load — and because the user asked for something this checkpoint cannot do.
     """
     if requested is None:
-        return (1 if (mtp_layers and head_is_quantized) else 0), None
+        return 0, None
     n = int(requested)
     if n < 0:
         return 0, f"--mtp must be 0 or more, not {n}"
@@ -504,9 +513,9 @@ def main(argv=None) -> int:
                         "KV cache for a single request)")
     p.add_argument("--mtp", type=int, default=None, metavar="N",
                    help="speculate N draft tokens per step with the checkpoint's MTP draft "
-                        "head (default 1 where that head is quantized, 0 disables). Which N "
-                        "wins is hardware-dependent: 1 beat 3 on an L4, 3 beat 1 on a 32 GiB "
-                        "Blackwell. Output is NOT byte-identical with speculation on.")
+                        "head (default OFF). Which N wins is hardware-dependent: 1 beat 3 on "
+                        "an L4, 3 beat 1 on a 32 GiB Blackwell. Output is NOT byte-identical "
+                        "with speculation on, even at temperature 0.")
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help=f"concurrent sequences vLLM plans for (default "
                         f"{DEFAULT_MAX_NUM_SEQS} on GPU, 4 on the CPU backend; vLLM's own "
