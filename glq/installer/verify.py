@@ -246,11 +246,27 @@ def run_checks(components, *, glq_importable=_glq_importable,
                 f"on the CPU. Reinstall for the GPU: glq-setup --components vllm",
                 warning_only=gpu_surprise))
         else:
+            # A DECLARED cuda target without a visible GPU is a warning, not a failure: the
+            # caller has said where this will run, and the commonest case is a container image
+            # built on a GPU-less runner and started with `--gpus all`. Hard-failing it is why
+            # `ghcr.io/cnygaard/glq-env` shipped no image for six releases — the Dockerfile
+            # installs with `--device cuda`, this row then could not see a GPU, and the
+            # installer exited 1 with "Install INCOMPLETE" *after* the kernels had built.
+            #
+            # Symmetric with the `+cpu`-wheel branch above, which is already `warning_only`
+            # when a GPU is visible. Auto-detected installs are unchanged: with no explicit
+            # device nobody has claimed a GPU is coming, and the hard failure is the whole
+            # value of the check.
+            declared_cuda = device == "cuda"
             checks.append(Check(
                 "vllm backend", bool(cuda),
                 f"vLLM {ver} — the CUDA backend" if cuda else
+                f"vLLM {ver} is the CUDA build and no GPU is visible here — expected when "
+                f"building an image to run with `--gpus all`, but serving cannot start on "
+                f"this machine" if declared_cuda else
                 f"vLLM {ver} is the CUDA build but no GPU is visible — serving cannot "
-                f"start. Fix: glq-setup --components vllm --device cpu"))
+                f"start. Fix: glq-setup --components vllm --device cpu",
+                warning_only=declared_cuda))
 
     return checks
 

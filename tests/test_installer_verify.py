@@ -322,3 +322,34 @@ def test_default_device_keeps_live_probing():
     checks = V.run_checks(("core", "vllm"), **probes)
     row = next(c for c in checks if "vllm backend" in c.name)
     assert row.warning_only          # +cpu wheel on a GPU box, no declared device
+
+
+def test_a_DECLARED_cuda_target_without_a_visible_gpu_is_a_WARNING():
+    """★ An image is built on a GPU-less runner and run with `--gpus all`, so "CUDA wheel,
+    no GPU visible" is a statement about the builder, not about the artifact.
+
+    This hard-failed, and it is why `ghcr.io/cnygaard/glq-env` had no image for six releases:
+    the Dockerfile installs with `--device cuda`, install.sh's self-check then could not see a
+    GPU, `all_ok` was False, the installer exited 1 and `docker build` stopped with
+    `Install INCOMPLETE` -- after the kernels had built successfully.
+
+    Declaring the device is the user saying they know. The mirror case already works this way:
+    a `+cpu` wheel on a GPU box is `warning_only` because it serves, just not as intended.
+    Auto-detection is untouched -- without an explicit `--device cuda` this stays a hard
+    failure, because then nobody has claimed a GPU is coming.
+    """
+    checks = V.run_checks(("core", "vllm"),
+                          **_cpu_probes(vllm_version="0.31.0"), device="cuda")
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert row.warning_only, "a declared cuda target must not hard-fail on a GPU-less builder"
+    assert V.all_ok(checks), "the install as a whole must succeed"
+    assert "--gpus all" in row.detail or "declared" in row.detail.lower()
+
+
+def test_an_UNDECLARED_cuda_wheel_without_a_gpu_still_HARD_FAILS():
+    """The failing control. Auto-detected installs keep today's behaviour: a CUDA wheel on a
+    machine with no GPU cannot serve, and saying so is the whole value of the check."""
+    checks = V.run_checks(("core", "vllm"), **_cpu_probes(vllm_version="0.31.0"))
+    row = next(c for c in checks if "vllm backend" in c.name)
+    assert not row.ok and not row.warning_only
+    assert not V.all_ok(checks)
