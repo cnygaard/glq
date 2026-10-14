@@ -7,13 +7,28 @@
 # toolchain and the pip ordering by hand, and went stale: it shipped glq 0.5.3 / vLLM 0.20.2
 # against a current 0.8.x, and nothing here would have noticed.
 #
-# Base: CUDA *runtime*, not devel. install.sh installs nvcc and the CCCL headers from pip
-# into the venv, which is the path a user's machine takes, so a ~4 GB devel base buys
-# nothing but a second, divergent toolchain. Note the runtime image still ships
-# /usr/local/cuda (include/ + lib64/, no compiler) — torch's `_find_cuda_home()` resolves
-# that directory on sight, so glq checks for `bin/nvcc` before believing it. Plain
-# `ubuntu:24.04` also works and is what tests/test_installer_distros.py exercises; the CUDA
-# runtime base is kept because the eval tooling below links against it.
+# Base: plain Ubuntu, NOT an nvidia/cuda image. install.sh installs nvcc and the CCCL headers
+# from pip into the venv (`cuda-toolkit[nvcc,cccl]` → `<site-packages>/nvidia/cu13/bin/nvcc`),
+# which is the path a user's machine takes, so the CUDA runtime and the compiler both arrive
+# as wheels. At `docker run --gpus all` the NVIDIA Container Toolkit injects the *driver*
+# (libcuda.so); the CUDA *runtime* (libcudart) comes from pip. Nothing here needs a system CUDA.
+#
+# This used to be `nvidia/cuda:12.9.1-runtime-ubuntu24.04`, and that pin broke the image for
+# **six consecutive releases** (v0.8.6 through v0.8.26, measured) with the build failing at the
+# kernel-assertion step below:
+#
+#   prebuilt glq._C did not load: ImportError: libcudart.so.13: cannot open shared object file
+#   OSError: CUDA_HOME environment variable is not set.
+#
+# The wheels link against CUDA **13** while the base supplied libcudart.so.**12**, so the
+# prebuilt extension could not load and the JIT fallback had no compiler to fall back to. Two
+# separately-pinned CUDA versions is the defect; a plain base removes the class rather than
+# re-pinning it, and `tests/test_installer_distros.py` already exercises `ubuntu:24.04`.
+#
+# 24.04 rather than 26.04 deliberately: nvcc caps the host gcc version, install.sh carries
+# per-distro compat-compiler logic for that (`MAX_NVCC_GCC`), and 24.04's gcc 13 sits under
+# CUDA 13's ceiling without needing it. Fedora 44 is blocked outright by gcc 16 vs CUDA 13 —
+# see the distro-matrix notes. Move to 26.04 once the matrix has a green source-mode run on it.
 #
 # Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.27 .
 #          docker build --build-arg GLQ_VERSION=0.8.27 .
@@ -21,10 +36,9 @@
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
 #              ghcr.io/cnygaard/glq-env:0.8.27
-ARG CUDA_VERSION=12.9.1
 ARG UBUNTU_VERSION=24.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+FROM ubuntu:${UBUNTU_VERSION}
 
 # Which glq to install. Everything else — torch, vLLM, transformers, the CUDA build
 # toolchain — is resolved by the installer, so there is exactly one pin to bump here.
@@ -86,8 +100,16 @@ COPY --chown=glq:glq install.sh /tmp/install.sh
 # No --mount=type=cache here: BuildKit's cache mounts are root-owned by default, and the
 # uid=/gid= options do not take build args, so the one thing that would make them writable
 # by this user cannot be expressed. Layer caching still covers the common rebuild.
+# `picode` adds the pi coding agent, and node via nvm into /home/glq/.nvm, so `glq-code`
+# runs in the container instead of exiting on a missing agent. It works here without nvm
+# being sourced: `glq-code._find_pi()` globs `~/.nvm/versions/node/*/bin/pi` rather than
+# trusting PATH, deliberately, because a bare `which pi` can resolve the unrelated
+# Raspberry-Pi `pi` from apt. `chat` adds gradio for `glq-chat`.
+#
+# Both components were verified non-interactively under `--yes` on a fresh Ubuntu 24.04 box:
+# pi landed at ~/.nvm/versions/node/v24.21.0/bin/pi and `glq-setup --verify` reported 7/7.
 RUN bash /tmp/install.sh --yes \
-        --components core,vllm \
+        --components core,vllm,chat,picode \
         --glq-version "${GLQ_VERSION}"
 
 # Bake the fused CUDA kernels for every architecture we support, so the first request in a

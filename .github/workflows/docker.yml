@@ -116,6 +116,11 @@ jobs:
           echo "Publish-to-PyPI reported success, so check the upload rather than this build."
           exit 1
 
+      # No CUDA/torch versions in the labels: both are resolved by install.sh at build
+      # time, so a hardcoded pair goes stale silently. The description claimed
+      # "CUDA 12.8, torch 2.11" while the image shipped a CUDA 13 pip toolchain and
+      # torch 2.13. (Comments cannot live inside the `labels: |` block scalar -- every
+      # line there is a literal label, not a comment.)
       - name: Extract image tags & labels
         id: meta
         uses: docker/metadata-action@v5
@@ -128,7 +133,7 @@ jobs:
             type=sha,prefix=sha-,format=short
           labels: |
             org.opencontainers.image.title=glq-env
-            org.opencontainers.image.description=GLQ runtime + dev environment (CUDA 12.8, torch 2.11, vLLM, transformers, lm-eval)
+            org.opencontainers.image.description=GLQ runtime + dev environment (vLLM, transformers, lm-eval, pi agent; torch/CUDA resolved by install.sh)
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
 
