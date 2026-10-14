@@ -349,6 +349,43 @@ Limits and caveats, all measured or explicitly untested:
 - **Quality under offload is unmeasured.** Output was checked for coherence, not accuracy.
 - n=1 per row, B=1 only.
 
+### Routing-aware expert cache (new in 0.8.27)
+
+Weight offload makes a model fit, and then every routed expert is re-read over PCIe. `glq-chat`
+and `glq-code` now keep the hottest experts in a per-layer VRAM arena with LRU residency, so a
+repeat routing is a local read instead of a bus transfer. **On by default whenever experts are
+offloaded**, and off otherwise — with the model resident there is no PCIe traffic to remove.
+
+| card | arena | decode | vs no arena |
+|---|--:|--:|--:|
+| L4, 22.49 GiB, sm_89 | 8 GiB | **17.211** tok/s | **2.674×** (6.436) |
+| RTX PRO 4500 Blackwell, 32 GiB, sm_120 | 8.95 GiB | **28.795** tok/s | **2.20×** (13.067) |
+
+Both B=1, `Qwen3.8-Flash-Next` 3 bpw, one checkpoint per row, same checkpoint in both arms.
+**Output is byte-identical** with the cache on or off (md5 matched across the baseline, an
+iso-VRAM control and two arena sizes). On the L4 an iso-VRAM control at a matched 14.79 GiB
+footprint reached 7.052 tok/s, so **2.441× of the gain is routing-awareness** rather than
+simply more resident weight.
+
+Two things to know:
+
+- **It needs CUDA graphs.** The same configuration measured 2.674× graphed and only 1.247×
+  eager, so `--enforce-eager` gives most of it back.
+- **VRAM is spent on it**, taken from what is left after the context window is paid for. The
+  hit-rate curve is flat near the top — 71 slots/layer measured 16.816 tok/s against 94 at
+  17.211 — so a smaller arena costs little.
+
+Driving vLLM yourself, set the budget in GiB and the step width:
+
+```bash
+GLQ_MOE_EXPERT_CACHE=8 GLQ_MOE_ARENA_MAX_TOKENS=1 vllm serve … \
+    --cpu-offload-gb 42 --cpu-offload-params experts --offload-backend uva
+```
+
+`GLQ_MOE_EXPERT_CACHE=0` disables it. `GLQ_MOE_ARENA_MAX_TOKENS` is the widest decode step the
+arena serves — one token per concurrent stream, times `1 + num_speculative_tokens` if you
+enable MTP; steps wider than the cap take the ordinary path.
+
 ### Quantize your own model
 
 ```bash
@@ -838,8 +875,10 @@ On 24-31B models budget ~100-200 MB per shape. Capture time is
 ### PLE table in host memory (Qwen4Exp, vLLM ≥ 0.30.0)
 
 Qwen3.8-Flash-Next's n-gram PLE table is the bulk of the checkpoint. vLLM ≥ 0.30.0
-can hold it in pinned host memory and read rows over UVA, controlled by
-`VLLM_PLE_CPU_OFFLOAD` (**vLLM defaults it ON**). GLQ ≥ 0.8.23 supports that for a
+can hold it in pinned host memory and read rows over UVA. **The control moved in vLLM
+0.31.0:** it is now `--engram-config '{"cpu_offload": true}'`, which defaults to `true`;
+`VLLM_PLE_CPU_OFFLOAD` was the switch on 0.30.x and 0.31.0 no longer reads it at all
+(it logs `Unknown vLLM environment variable detected`). GLQ ≥ 0.8.23 supports that for a
 **trellis-coded** table: the packed rows stay on the host and the gather, decode and
 inverse RHT run on the GPU, so nothing but the row bytes crosses PCIe — 80 B per row
 at 4 bpw against 320 B for a dense bf16 row.
