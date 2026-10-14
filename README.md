@@ -838,13 +838,18 @@ extra kwargs). For 24B models the matmul is compute-bound at B=1, so
 graphs don't help (Devstral-24B GLQ 4 bpw: 6.6 tok/s eager vs 6.4
 graphed).
 
-### Tuning vLLM CUDA-graph capture sizes (v0.3.4+)
+### Tuning vLLM CUDA-graph capture sizes
 
-vLLM 0.20 captures both **FULL** model-forward graphs (single replay
-per fixed shape) and **PIECEWISE** subgraphs split at attention. The
-default capture set is derived from `max_num_seqs * 2`, so a
-single-sequence harness only gets FULL captures for `[1, 2]`. For
-batched serving, raise the list explicitly:
+vLLM captures both **FULL** model-forward graphs (single replay per fixed
+shape) and **PIECEWISE** subgraphs split at attention. It derives the
+capture set from the serving configuration, so a single-sequence harness
+gets a short list and batched serving may fall back to PIECEWISE-only at
+widths it never captured. **Read the list vLLM prints at startup rather
+than predicting it** — the derivation has changed across releases. On
+0.20 it was `max_num_seqs * 2`, giving `[1, 2]` for one sequence; on
+0.31.0 with `--max-num-seqs 1` and one speculative token it chose
+`[1, 2, 4]` with `max_cudagraph_capture_size: 4`, having accounted for
+the wider verify step. For batched serving, raise the list explicitly:
 
 ```python
 from vllm import LLM
@@ -855,7 +860,7 @@ llm = LLM(model="xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw",
 ```
 
 Measured impact on Gemma-4-E4B-it-GLQ-4bpw, RTX PRO 6000 Blackwell,
-256-token decode:
+256-token decode, **vLLM 0.20** (where the default was `[1, 2]`):
 
 | Mode | B=1 tok/s | B=4 tok/s (total) |
 |---|---:|---:|
