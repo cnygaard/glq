@@ -506,13 +506,13 @@ docker run --rm --gpus all ghcr.io/cnygaard/glq-env:latest nvidia-smi
 If that prints your GPU table, you're set. (No toolkit → `--gpus`
 errors with "could not select device driver".)
 
-**Produce output.** Mount a host directory for the model cache (the
-image's `HF_HOME` is `/cache/hf`, so models persist across runs
-instead of re-downloading), then generate:
+**Produce output.** Give the model cache a **named volume** (the image's
+`HF_HOME` is `/cache/hf`, so models persist across runs instead of
+re-downloading), then generate:
 
 ```bash
 docker run --rm --gpus all \
-    -v "$HOME/.cache/huggingface:/cache/hf" \
+    -v glq-hf:/cache/hf \
     ghcr.io/cnygaard/glq-env:latest \
     python -c '
 import glq.hf_integration, torch                      # registers GLQ with HF
@@ -525,6 +525,33 @@ ids = tok("The capital of France is", return_tensors="pt").to("cuda")
 print(tok.decode(model.generate(**ids, max_new_tokens=20)[0],
                  skip_special_tokens=True))
 '
+```
+
+A **named volume** rather than a bind mount, deliberately. The image runs as
+an unprivileged user (uid 10001, high enough not to collide with `ubuntu`'s
+1000) and `/cache/hf` is owned by that user *inside the image*. Docker
+initialises a named volume from the image's contents **and ownership**, so it
+is writable; a bind mount instead replaces the directory with the host's,
+carrying the host uid, and the container cannot write to it:
+
+```
+OSError: PermissionError at /cache/hf/hub/models--… when downloading …
+         Check cache directory permissions.
+```
+
+Mounting the host cache somewhere else (`-v "$HOME/.cache/huggingface:/tmp/hf"`)
+silences that, but only because `HF_HOME` still points at the image's own
+`/cache/hf` — the download then happens inside the container and `--rm`
+discards it, so nothing is shared or persisted.
+
+**To share an existing host cache**, run as yourself so the uids match:
+
+```bash
+docker run --rm --gpus all \
+    --user "$(id -u):$(id -g)" \
+    -e HF_HOME=/cache/hf \
+    -v "$HOME/.cache/huggingface:/cache/hf" \
+    ghcr.io/cnygaard/glq-env:latest …
 ```
 
 Expected output:
@@ -542,7 +569,7 @@ reuse it. Swap `mid` for any GLQ checkpoint (see
 | Flag | Why |
 |---|---|
 | `--gpus all` | binds **all** host GPUs into the container (needs the NVIDIA Container Toolkit). Use `--gpus '"device=0"'` to pick one. |
-| `-v "$HOME/.cache/huggingface:/cache/hf"` | persists downloaded weights on the host (`HF_HOME=/cache/hf` inside) so they survive `--rm`. |
+| `-v glq-hf:/cache/hf` | persists downloaded weights in a named volume (`HF_HOME=/cache/hf` inside) so they survive `--rm`. A **bind** mount here fails: the image runs as uid 10001 and a host directory arrives owned by the host uid — see above for sharing an existing host cache. |
 | `--rm` | remove the container when it exits (drop it to keep the container around). |
 
 **Serving (vLLM) & an interactive shell.** The image bundles vLLM, so
@@ -552,7 +579,7 @@ mount the cache:
 ```bash
 # Plain chat — the model ships its own chat template, so nothing extra needed:
 docker run --rm --gpus all -p 8000:8000 \
-    -v "$HOME/.cache/huggingface:/cache/hf" \
+    -v glq-hf:/cache/hf \
     ghcr.io/cnygaard/glq-env:latest \
     vllm serve xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw --max-model-len 64000
 ```
@@ -566,7 +593,7 @@ curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm/v0.20.2/examples/
     -o tool_chat_template_gemma4.jinja
 
 docker run --rm --gpus all -p 8000:8000 \
-    -v "$HOME/.cache/huggingface:/cache/hf" \
+    -v glq-hf:/cache/hf \
     -v "$PWD/tool_chat_template_gemma4.jinja:/work/tool.jinja:ro" \
     ghcr.io/cnygaard/glq-env:latest \
     vllm serve xv0y5ncu/Gemma-4-E4B-it-GLQ-4bpw \
