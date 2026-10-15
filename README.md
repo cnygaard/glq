@@ -475,12 +475,24 @@ for details.
 
 ## Docker image (NVIDIA GPU)
 
-A prebuilt CUDA image ships everything needed to run GLQ models —
-`glq`, PyTorch, vLLM, transformers, and lm-eval on CUDA 12.8:
+A prebuilt image ships everything needed to run GLQ models — `glq`, PyTorch,
+vLLM, transformers and lm-eval, plus `glq-chat` and the pi coding agent for
+`glq-code`:
 
 ```
-ghcr.io/cnygaard/glq-env:latest     # CUDA 12.8 bundle: glq + vLLM + transformers + lm-eval
+ghcr.io/cnygaard/glq-env:latest     # glq + vLLM + transformers + lm-eval + chat + pi
 ```
+
+The image is built on plain `ubuntu:24.04` and gets its CUDA toolchain from pip
+(the same path `install.sh` takes on your own machine), so there is no system
+CUDA version to match — `--gpus all` supplies the driver at run time. Versions
+are not pinned here because the installer resolves them; the image records what
+it actually got at `/home/glq/glq-image-versions`.
+
+> **Tags before 0.8.28 are stale.** The image build failed from v0.8.6 through
+> v0.8.27 — `docker build` has no GPU, so the installer correctly chose the CPU
+> stack while the Dockerfile asserted the CUDA one. `:latest` therefore pointed
+> at a v0.8.6-era build for seven releases. Pin `:0.8.28` or newer.
 
 **Prerequisite — GPU access in Docker.** You need an NVIDIA GPU plus
 the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)

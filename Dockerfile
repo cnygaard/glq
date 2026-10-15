@@ -30,19 +30,19 @@
 # CUDA 13's ceiling without needing it. Fedora 44 is blocked outright by gcc 16 vs CUDA 13 —
 # see the distro-matrix notes. Move to 26.04 once the matrix has a green source-mode run on it.
 #
-# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.27 .
-#          docker build --build-arg GLQ_VERSION=0.8.27 .
+# Build:   docker build -t ghcr.io/cnygaard/glq-env:0.8.28 .
+#          docker build --build-arg GLQ_VERSION=0.8.28 .
 # Run:     docker run --gpus all -it --rm \
 #              -v $HOME/.cache/huggingface:/cache/hf \
 #              -e HF_TOKEN=$HF_TOKEN \
-#              ghcr.io/cnygaard/glq-env:0.8.27
+#              ghcr.io/cnygaard/glq-env:0.8.28
 ARG UBUNTU_VERSION=24.04
 
 FROM ubuntu:${UBUNTU_VERSION}
 
 # Which glq to install. Everything else — torch, vLLM, transformers, the CUDA build
 # toolchain — is resolved by the installer, so there is exactly one pin to bump here.
-ARG GLQ_VERSION=0.8.27
+ARG GLQ_VERSION=0.8.28
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
