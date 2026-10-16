@@ -25,6 +25,7 @@ read programmatically and copied around.
 |---|---|---|
 | `qwen3_8_flash_next_glq_3bpw.json` | [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE) |
 | `gemma_4_26b_a4b_it.json` | [`google/gemma-4-26B-A4B-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | [apache-2.0](https://ai.google.dev/gemma/docs/gemma_4_license) |
+| `kolibri_1_bf16.json` | [`Aleph-Alpha/Kolibri-1-BF16`](https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16) | [apache-2.0](https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16/blob/main/LICENSE) |
 
 **The licences differ, and the Qwen one is not Apache 2.0.** It is a custom licence with its
 own notice requirement and a restriction on operating model-as-a-service businesses. Assuming

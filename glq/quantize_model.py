@@ -606,6 +606,42 @@ _MODEL_PROFILES = {
         # shared expert stay split and use vLLM's per-shard merged-linear path.
         'fuse_expert_gate_up': True,
     },
+    'Kolibri1ForCausalLM': {
+        # Kolibri-1 (Aleph Alpha, model_type `kolibri1`, transformers >= 5.20.0): a
+        # text-only MoE, 78B total / 3.46B active. 50 layers, 384 routed experts of
+        # intermediate size 512 with sigmoid top-6 routing, plus one shared expert.
+        # Standard `model.layers.*`; all three attribute paths verified on a
+        # meta-instantiated Kolibri1ForCausalLM rather than assumed.
+        #
+        # 96.7% of the parameters are routed experts, which makes every silent
+        # under-quantization failure mode maximally expensive here: a run that misses them
+        # produces a "3 bpw" checkpoint still weighing ~146 GiB of 145.48.
+        'layers_attr': 'model.layers',
+        'embed_attr': 'model.embed_tokens',
+        'rotary_attr': 'model.rotary_emb',
+        'sd_prefix': 'model.layers',
+        'trust_remote_code': False,
+        # The decoder layer takes exactly the default branch's kwargs, and needs no
+        # per-layer-type rotary: Kolibri1Attention applies RoPE only when its own
+        # `is_sliding` is set (RoPE lives in the sliding-window layers only) and passes
+        # `sliding_window` to the attention interface itself, keyed on layer_idx.
+        'forward_kwargs': 'default',
+        # 40 of the 50 layers are sliding-window (513), and the model's attention passes
+        # `sliding_window=` to the attention interface — which `sdpa`, the default, ignores
+        # in favour of the mask. With no mask those layers calibrate against the whole
+        # sequence instead of a 513-token window, and the MoE block downstream inherits the
+        # error. `_causal_mask_for` picks the sliding builder per layer_idx.
+        'causal_mask': True,
+        # Experts are 3-D nn.Parameters (`experts.gate_up_proj` [384,1024,2560],
+        # `experts.down_proj` [384,2560,512]) that the nn.Linear walk cannot see. Also
+        # required for serving, not just for coverage: vLLM's FusedMoE gives the stacked
+        # gate+up a SINGLE per-expert Wscale, so the two must be quantized jointly.
+        'stacked_experts': True,
+        # ...but the CHECKPOINT stores them one tensor per expert, and spells three keys
+        # differently from transformers, which declares no conversion for them. See
+        # `_convert_state_kolibri1`.
+        'convert_state': 'kolibri1',
+    },
 }
 
 _DEFAULT_PROFILE = {
@@ -1184,7 +1220,18 @@ def _apply_hc_expansion(hidden_states, cfg):
     return hidden_states.repeat(1, 1, hc)
 
 
-def _causal_mask_for(h, cfg, position_ids):
+def _is_sliding_layer(cfg, layer_idx):
+    """True when `layer_idx` uses sliding-window attention, per the config's layer_types."""
+    if layer_idx is None:
+        return False
+    inner = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    types = getattr(inner, "layer_types", None) or ()
+    return (layer_idx < len(types)
+            and types[layer_idx] == "sliding_attention"
+            and getattr(inner, "sliding_window", None))
+
+
+def _causal_mask_for(h, cfg, position_ids, layer_idx=None):
     """A 4-D causal mask shaped as the sparse-attention indexer expects.
 
     Uses transformers' ``create_causal_mask`` with ``allow_is_causal_skip=False``, which is
@@ -1192,16 +1239,30 @@ def _causal_mask_for(h, cfg, position_ids):
     "due to the indexer", and a skipped (None) mask is what crashes it. Falls back to an
     explicit lower-triangular bool mask if that helper is unavailable, which is the same
     thing the sdpa branch consumes.
+
+    **Sliding-window layers get a sliding mask.** On a hybrid architecture the mask is not
+    a per-model constant: Kolibri-1 is 4 sliding layers to 1 full, and its attention module
+    forwards `sliding_window=` to the attention interface, which `sdpa` ignores — it honours
+    the mask instead. Calibrating those layers without one shows them the whole sequence
+    where inference shows them `sliding_window` tokens, and since the MoE block sits
+    downstream of attention, every routed-expert Hessian inherits the error. Measured on a
+    tiny model with window 4 and T=16: max |calibration - model's own forward| was 3.3 on a
+    sliding layer, and 0 once this mask is supplied.
     """
     inner = getattr(cfg, "text_config", cfg) if cfg is not None else None
     # The mask builder wants the 2-D text positions, not the 3-D mRoPE stack.
     pos = position_ids[0] if position_ids is not None and position_ids.dim() == 3 \
         else position_ids
     try:
-        from transformers.masking_utils import create_causal_mask
-        m = create_causal_mask(config=inner, inputs_embeds=h, attention_mask=None,
-                               past_key_values=None, position_ids=pos,
-                               allow_is_causal_skip=False)
+        if _is_sliding_layer(cfg, layer_idx):
+            from transformers.masking_utils import create_sliding_window_causal_mask
+            build = create_sliding_window_causal_mask
+        else:
+            from transformers.masking_utils import create_causal_mask
+            build = create_causal_mask
+        m = build(config=inner, inputs_embeds=h, attention_mask=None,
+                  past_key_values=None, position_ids=pos,
+                  allow_is_causal_skip=False)
     except Exception:                                        # noqa: BLE001
         m = None
     if m is not None:
@@ -1291,7 +1352,7 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
     # indexer select future tokens, so every downstream Hessian would be fitted to
     # activations the model never produces at inference.
     if profile and profile.get('causal_mask'):
-        kwargs['attention_mask'] = _causal_mask_for(h, cfg, position_ids)
+        kwargs['attention_mask'] = _causal_mask_for(h, cfg, position_ids, layer_idx)
     # Token-lookup layers need the ids, not just the hidden states: Qwen4Exp's PLE layer
     # does `self.ple_embedding(ple_input_ids, ...)` -> `.long()`, an AttributeError on None.
     # The decoder layer's parameter is `ple_input_ids`; passing `input_ids` is silently
@@ -2059,6 +2120,183 @@ def _should_load_for_quantize(key: str) -> bool:
     return not any(marker in key for marker in _UNQUANTIZED_BULK)
 
 
+def _module_has_path(module, dotted):
+    """True when `dotted` names a real attribute of `module` (param, buffer or submodule).
+
+    Used to tell a genuinely homeless checkpoint tensor from one the module owns but does
+    not persist — `rotary_emb.inv_freq` is the standard example: transformers registers it
+    non-persistent and recomputes it from config, so checkpoints that still carry it report
+    it as "unexpected" while nothing has actually been lost.
+    """
+    obj = module
+    for part in dotted.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _assert_load_coverage(layer_idx, incompatible, *, n_loaded, module=None):
+    """Fail when a checkpoint tensor found no home in the module it was loaded into.
+
+    The streaming path must call `load_state_dict(strict=False)` — bulk tensors are held out
+    of `layer_state` on purpose (`_UNQUANTIZED_BULK`) and streamed in afterwards — and that
+    tolerance is what makes a missing key-conversion *silent*. `_materialize_meta_params`
+    then hands the orphaned parameter `torch.empty` storage, so calibration runs against
+    uninitialized memory, every SQNR is computed against noise, and the run reports success.
+
+    This repo has paid for that class of bug repeatedly: Qwen4Exp's 3-D experts were walked
+    past for want of an opt-in and produced a "4 bpw" checkpoint still weighing ~290 GiB of
+    335; its PLE table came back from the resume store undecodable because a hand-kept
+    whitelist omitted `rht_blocks`. In both cases nothing raised.
+
+    An **unexpected** key is always a defect: the checkpoint supplied a tensor and the module
+    has nowhere to put it, which means a conversion or rename is missing. That is fatal here.
+    **Missing** keys are only reported: a meta-constructed block legitimately lacks tensors no
+    checkpoint supplies, and turning those into errors would break architectures that work
+    today. The asymmetry is deliberate — the unexpected side is sufficient to catch a dropped
+    conversion, because a tensor that fails to land is a tensor the module did not want.
+    """
+    unexpected = list(getattr(incompatible, "unexpected_keys", ()) or ())
+    missing = list(getattr(incompatible, "missing_keys", ()) or ())
+
+    # A key the module genuinely owns but does not persist (non-persistent buffers such as
+    # `rotary_emb.inv_freq`, recomputed from config) is reported as unexpected while nothing
+    # has been lost. Keep those out of the fatal set, or this guard would reject real
+    # checkpoints for architectures that work today.
+    if module is not None and unexpected:
+        non_persistent = [k for k in unexpected if _module_has_path(module, k)]
+        if non_persistent:
+            unexpected = [k for k in unexpected if k not in set(non_persistent)]
+            print(f"  layer {layer_idx}: {len(non_persistent)} checkpoint tensor(s) are "
+                  f"non-persistent in the module and were not adopted: "
+                  f"{', '.join(non_persistent[:4])}"
+                  f"{', ...' if len(non_persistent) > 4 else ''}")
+
+    if missing:
+        head = ", ".join(missing[:4])
+        print(f"  layer {layer_idx}: {len(missing)} module tensor(s) not in the checkpoint "
+              f"(will be materialized empty): {head}"
+              f"{', ...' if len(missing) > 4 else ''}")
+
+    if unexpected:
+        head = "\n    ".join(unexpected[:8])
+        raise ValueError(
+            f"layer {layer_idx}: {len(unexpected)} of {n_loaded} checkpoint tensors did not "
+            f"load — the module has no parameter of that name, so they were silently "
+            f"dropped and the corresponding weights would be quantized from uninitialized "
+            f"memory.\n  First few:\n    {head}"
+            f"{chr(10) + '    ...' if len(unexpected) > 8 else ''}\n"
+            f"  This means a key conversion is missing for this architecture (stacked "
+            f"experts, a renamed norm, a fused projection). Add it to the profile's "
+            f"`convert_state` rather than relaxing this check.")
+
+
+#: Kolibri-1: checkpoint name -> the name transformers' `Kolibri1DecoderLayer` uses.
+#: Both sides are recorded fact, not inference: the left from the shape manifest
+#: `tests/models/kolibri_1_bf16.json` (safetensors headers), the right from a
+#: meta-instantiated layer. transformers declares NO conversion mapping for any of these.
+_KOLIBRI1_RENAMES = {
+    "post_attn_norm.weight": "post_self_attn_layernorm.weight",
+    "post_ffn_norm.weight": "post_mlp_layernorm.weight",
+    # The sigmoid router's load-balancing bias. This is the damaging one to lose: it is
+    # added to the router logits before top-k, so dropping it changes WHICH experts each
+    # token selects, and therefore every per-expert Hessian, while leaving the expert
+    # weights themselves perfectly intact. Nothing downstream would look wrong.
+    "moe.router.expert_bias": "mlp.gate.e_score_correction_bias",
+}
+
+_KOLIBRI1_EXPERT = re.compile(
+    r"^(?P<pre>.*experts)\.(?P<idx>\d+)\.(?P<leaf>gate_proj|up_proj|down_proj)\.weight$")
+
+
+def _convert_state_kolibri1(state):
+    """Stack Kolibri-1's per-expert tensors and apply its three renames.
+
+    The checkpoint stores experts one tensor per expert per projection — 1,152 of them per
+    layer — while transformers stores them as two 3-D parameters:
+
+        mlp.experts.{e}.gate_proj.weight  \\
+        mlp.experts.{e}.up_proj.weight     -> mlp.experts.gate_up_proj  [E, 2I, H]
+        mlp.experts.{e}.down_proj.weight   -> mlp.experts.down_proj     [E, H, I]
+
+    `from_pretrained` reconciles that with its own conversion ops; the streaming path does
+    its own `load_state_dict` and does not, so without this every expert key is dropped
+    silently and 96.7% of this model would be quantized from uninitialized memory.
+
+    Row order within `gate_up_proj` is gate-then-up, from the module's own forward:
+    `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` yields `(gate, up)`.
+
+    Experts are moved out of `state` as they are consumed rather than stacked with
+    `torch.stack`, which would hold the 1,152 source tensors and the 3 GiB result at the
+    same time — the same reason transformers' own `MergeModulelist` pre-allocates.
+    """
+    out, experts = {}, {}
+    for key, val in state.items():
+        m = _KOLIBRI1_EXPERT.match(key)
+        if m:
+            experts.setdefault(m.group("pre"), {}) \
+                   .setdefault(int(m.group("idx")), {})[m.group("leaf")] = val
+        else:
+            out[_KOLIBRI1_RENAMES.get(key, key)] = val
+
+    for prefix, per_idx in experts.items():
+        idxs = sorted(per_idx)
+        if idxs != list(range(len(idxs))):
+            missing = sorted(set(range(max(idxs) + 1)) - set(idxs))
+            raise ValueError(
+                f"{prefix}: expert indices are not contiguous from 0 — missing "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''}. Stacking would put "
+                f"weights at the wrong expert index, which routing cannot detect.")
+        for e in idxs:
+            have = set(per_idx[e])
+            if have != {"gate_proj", "up_proj", "down_proj"}:
+                raise ValueError(
+                    f"{prefix}.{e}: expected gate_proj/up_proj/down_proj, got "
+                    f"{sorted(have)}")
+
+        g0, u0, d0 = (per_idx[0][k] for k in ("gate_proj", "up_proj", "down_proj"))
+        n_gate = g0.shape[0]
+        gate_up = torch.empty((len(idxs), n_gate + u0.shape[0], g0.shape[1]),
+                              dtype=g0.dtype, device=g0.device)
+        down = torch.empty((len(idxs), *d0.shape), dtype=d0.dtype, device=d0.device)
+        for e in idxs:
+            leaves = per_idx.pop(e)
+            gate_up[e, :n_gate] = leaves.pop("gate_proj")
+            gate_up[e, n_gate:] = leaves.pop("up_proj")
+            down[e] = leaves.pop("down_proj")
+        out[f"{prefix}.gate_up_proj"] = gate_up
+        out[f"{prefix}.down_proj"] = down
+
+    # The model declares this buffer fp32-strict (`_keep_in_fp32_modules_strict`), and
+    # `assign=True` would otherwise adopt the checkpoint's bf16 and quietly lower the
+    # precision of a comparison that decides expert selection.
+    bias_key = _KOLIBRI1_RENAMES["moe.router.expert_bias"]
+    if bias_key in out:
+        out[bias_key] = out[bias_key].float()
+    return out
+
+
+#: Profiles select a converter by name, the way `forward_kwargs` selects a kwargs branch.
+_STATE_CONVERTERS = {
+    "kolibri1": _convert_state_kolibri1,
+}
+
+
+def _convert_layer_state(state, profile):
+    """Apply the profile's declared checkpoint->module key conversion, if any."""
+    name = (profile or {}).get("convert_state")
+    if not name:
+        return state
+    try:
+        convert = _STATE_CONVERTERS[name]
+    except KeyError:
+        raise ValueError(
+            f"profile declares convert_state={name!r}, which is not registered in "
+            f"_STATE_CONVERTERS (have: {sorted(_STATE_CONVERTERS)})") from None
+    return convert(state)
+
+
 def _load_layer_state(weight_map, shard_paths, layer_idx, sd_prefix):
     """Load all tensors for a single layer from sharded safetensors.
 
@@ -2295,6 +2533,137 @@ def _restore_source_layer_types(config_dict, model_name):
             holder["layer_types"] = list(source)
 
 
+#: The historical calibration corpus. It is the default and must stay byte-identical:
+#: every published checkpoint was calibrated with it, and the `_ckpt_bytecmp.py` exactness
+#: gate only means something if the default path does not move. New corpora are opt-in.
+DEFAULT_CALIB_CORPUS = "wikitext"
+
+
+def _calib_segments_wikitext(_tokens_needed):
+    """English WikiText-2 — the shipped default, one segment."""
+    from datasets import load_dataset
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
+    return [("wikitext-en", "\n\n".join(ds["text"]))]
+
+
+def _stream_wikipedia(config, target_chars):
+    """Concatenate streamed Wikipedia articles until `target_chars` is reached.
+
+    Streaming: the German dump alone is tens of GB and the calibration set needs a few MB.
+    """
+    from datasets import load_dataset
+    ds = load_dataset("wikimedia/wikipedia", config, split="train", streaming=True)
+    parts, total = [], 0
+    for row in ds:
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        parts.append(text)
+        total += len(text) + 2
+        if total >= target_chars:
+            break
+    return "\n\n".join(parts)
+
+
+def _calib_segments_wikipedia_de_en(tokens_needed):
+    """German + English Wikipedia, an equal share of the token budget each.
+
+    For a bilingual model with fine-grained expert routing, the calibration corpus does not
+    merely shift the Hessians — it decides which experts get a Hessian at all. With top-6 of
+    384 routing, a monolingual corpus leaves any language-specialised expert at the identity
+    fallback, which prints one line and is otherwise invisible. Both halves are requested
+    with a generous character budget (~8 chars/token; German compounds run long) and the
+    shortfall is raised rather than silently under-filling.
+    """
+    per_lang = max(1, tokens_needed // 2)
+    return [("wikipedia-de", _stream_wikipedia("20231101.de", per_lang * 8)),
+            ("wikipedia-en", _stream_wikipedia("20231101.en", per_lang * 8))]
+
+
+_CALIB_CORPORA = {
+    "wikitext": _calib_segments_wikitext,
+    "wikipedia-de-en": _calib_segments_wikipedia_de_en,
+}
+
+
+def _load_calib_ids(corpus, tokenizer, nsamples, seqlen):
+    """``(calib_ids [n, seqlen], {segment: n_chunks})``.
+
+    A single-segment corpus takes exactly the historical path — concatenate, tokenize, slice
+    the first ``nsamples * seqlen`` tokens — so `wikitext` stays byte-identical. Multiple
+    segments split the chunk budget evenly and then **interleave**, so a run that is cut
+    short still saw every language rather than all of the first one.
+    """
+    try:
+        build = _CALIB_CORPORA[corpus]
+    except KeyError:
+        raise ValueError(
+            f"unknown --calib-corpus {corpus!r}; choose from "
+            f"{sorted(_CALIB_CORPORA)}") from None
+
+    segments = build(nsamples * seqlen)
+
+    if len(segments) == 1:
+        label, text = segments[0]
+        input_ids = tokenizer(text, return_tensors="pt").input_ids[0]
+        n_chunks = min(nsamples, input_ids.shape[0] // seqlen)
+        return input_ids[:n_chunks * seqlen].reshape(n_chunks, seqlen), {label: n_chunks}
+
+    want = nsamples // len(segments)
+    per_segment, counts = [], {}
+    for label, text in segments:
+        ids = tokenizer(text, return_tensors="pt").input_ids[0]
+        got = min(want, ids.shape[0] // seqlen)
+        if got < want:
+            raise ValueError(
+                f"calibration segment {label!r} yielded {got} chunks of {seqlen} tokens, "
+                f"wanted {want}. Raise the character budget in the corpus builder rather "
+                f"than accepting an unbalanced mix — an under-filled language is the exact "
+                f"failure this corpus exists to avoid.")
+        per_segment.append(ids[:got * seqlen].reshape(got, seqlen))
+        counts[label] = got
+
+    interleaved = torch.stack(
+        [per_segment[s][i] for i in range(want) for s in range(len(per_segment))])
+    return interleaved, counts
+
+
+def _report_expert_routing(token_counts, expert_modules):
+    """One line per MoE container: how many calibration token-rows each expert really saw.
+
+    A routed expert's Hessian is only as good as its slice of the corpus, and with top-k of
+    several hundred experts that slice is thin. Kolibri-1's top-6 of 384 gives each expert
+    ~1.6% of the tokens, so the house `nsamples 128 / seqlen 2048` leaves ~4096 rows against
+    a 2560-wide Hessian: 1.6x over-determined *on average*, with the tail of any
+    language-specialised expert below that. An expert that sees nothing at all falls back to
+    an identity Hessian — plain nearest-neighbour, no error feedback.
+
+    None of this was observable before. The identity-fallback notice is printed per expert
+    *before* quantizing, which reads like progress rather than a warning, and nothing
+    reported the distribution — so a corpus that starved a whole family of experts looked
+    exactly like a healthy run. Reported rather than enforced: what counts as too thin
+    depends on the model, and a hard floor here would block legitimate runs.
+    """
+    if not token_counts:
+        return
+    for name, emod in expert_modules:
+        counts = sorted(v for (mn, _e), v in token_counts.items() if mn == name)
+        if not counts:
+            continue
+        width = emod.gate_up_proj.shape[-1]          # the gate/up Hessian's dimension
+        zeros = sum(1 for c in counts if c == 0)
+        median = counts[len(counts) // 2]
+        p01 = counts[max(0, len(counts) // 100)]
+        print(f"  {name}: routed rows/expert over {len(counts)} experts — "
+              f"min {counts[0]}, p1 {p01}, median {median}, max {counts[-1]}; "
+              f"median/width {median / width:.2f}x (Hessian is {width} wide)"
+              + (f"; {zeros} expert(s) saw NOTHING -> identity Hessian" if zeros else ""))
+        if median < width:
+            print(f"    note: the median expert is under-determined "
+                  f"({median} rows < {width}); consider a larger --nsamples or a corpus "
+                  f"that matches this model's languages")
+
+
 def quantize(
     model_name: str,
     output_dir: str,
@@ -2315,6 +2684,7 @@ def quantize(
     resume_bucket: str = None,
     resume_prefix: str = None,
     mtp_bpw: int = None,
+    calib_corpus: str = DEFAULT_CALIB_CORPUS,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -2527,15 +2897,13 @@ def quantize(
         print(f"  {n_params_f:.2f}B params in {time.perf_counter() - t0:.1f}s")
 
     # ---- Calibration data ----
-    print(f"\nLoading calibration data ...")
-    from datasets import load_dataset
-    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-    text = "\n\n".join(ds["text"])
-    enc = tokenizer(text, return_tensors="pt")
-    input_ids = enc.input_ids[0]
-    n_chunks = min(nsamples, input_ids.shape[0] // seqlen)
-    calib_ids = input_ids[:n_chunks * seqlen].reshape(n_chunks, seqlen)
+    print(f"\nLoading calibration data ({calib_corpus}) ...")
+    calib_ids, calib_counts = _load_calib_ids(
+        calib_corpus, tokenizer, nsamples, seqlen)
+    n_chunks = calib_ids.shape[0]
     print(f"  {n_chunks} sequences of length {seqlen}")
+    if len(calib_counts) > 1:
+        print("  " + ", ".join(f"{k}: {v}" for k, v in calib_counts.items()))
 
     # ---- Build codebook ----
     print(f"\nBuilding {codebook_type} codebook ...")
@@ -2865,9 +3233,16 @@ def quantize(
             # module build, not the weight load, is what --streaming does not cover. The
             # same pattern is used for whole-model construction above. `assign=True` then
             # adopts the loaded tensors rather than copying into (meta) storage.
+            # Checkpoint names do not always match the module's: an architecture may store
+            # experts per-expert where transformers stores them stacked, or spell a norm
+            # differently. `from_pretrained` reconciles that with its own conversion ops;
+            # this path must do it explicitly, and then prove it worked.
+            layer_state = _convert_layer_state(layer_state, profile)
             with torch.device("meta"):
                 layer = BlockClass(layer_cfg, layer_idx)
-            layer.load_state_dict(layer_state, strict=False, assign=True)
+            _incompat = layer.load_state_dict(layer_state, strict=False, assign=True)
+            _assert_load_coverage(layer_idx, _incompat, n_loaded=len(layer_state),
+                                  module=layer)
             # Anything still on meta was deliberately not loaded (see _UNQUANTIZED_BULK) or
             # is absent from this checkpoint; give it real storage so the forward does not
             # trip over a meta tensor.
@@ -2935,6 +3310,7 @@ def quantize(
         # negligible in size, so we keep it bf16.
         gemma4_experts = []        # list of (module_name, experts_module)
         moe_expert_hessians = {}   # virtual_name -> accumulated input Gram (GPU)
+        moe_expert_tokens = {}     # (module_name, expert) -> routed token-row count
         moe_hooks = []
         # Capability, not a name: architectures with stacked experts opt in through the
         # profile (see _stacked_experts_enabled). Gated on `is_gemma4` alone, Qwen4Exp
@@ -2957,7 +3333,13 @@ def quantize(
                     ti = ti.reshape(-1, ti.shape[-1])
                     for e in range(n_exp):
                         sel = (ti == e).any(dim=-1)
-                        if not bool(sel.any()):
+                        n_sel = int(sel.sum())
+                        # Counted even when zero: a never-routed expert is the single most
+                        # useful thing to know about a calibration run, and the identity
+                        # fallback that handles it is otherwise reported only in passing.
+                        moe_expert_tokens[(mn, e)] = \
+                            moe_expert_tokens.get((mn, e), 0) + n_sel
+                        if not n_sel:
                             continue
                         xs = hs[sel]
                         xf = xs.float()
@@ -3013,6 +3395,7 @@ def quantize(
         # dropped from the save.
         for h in moe_hooks:
             h.remove()
+        _report_expert_routing(moe_expert_tokens, gemma4_experts)
         for k, H in moe_expert_hessians.items():
             hessians[k] = H.cpu()
         del moe_expert_hessians
@@ -4036,6 +4419,12 @@ def build_parser():
                         help="Number of calibration samples (default 128; <64 may degrade quality)")
     parser.add_argument("--seqlen", type=int, default=2048,
                         help="Calibration sequence length")
+    parser.add_argument("--calib-corpus", type=str, default=DEFAULT_CALIB_CORPUS,
+                        choices=sorted(_CALIB_CORPORA),
+                        help="Calibration corpus (default %(default)s, English). "
+                             "'wikipedia-de-en' splits the budget evenly between German "
+                             "and English — for a bilingual MoE, the corpus decides which "
+                             "experts get a real Hessian at all")
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu"])
     parser.add_argument("--trust-remote-code", action="store_true",
@@ -4118,6 +4507,7 @@ def main():
         resume_bucket=args.resume_bucket,
         resume_prefix=args.resume_prefix,
         mtp_bpw=args.mtp_bpw,
+        calib_corpus=args.calib_corpus,
     )
 
 

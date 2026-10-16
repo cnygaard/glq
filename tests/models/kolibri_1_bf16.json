@@ -1,0 +1,292 @@
+{
+ "base_model": "Aleph-Alpha/Kolibri-1-BF16",
+ "license": "apache-2.0",
+ "license_url": "https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16/blob/main/LICENSE",
+ "model": "Aleph-Alpha/Kolibri-1-BF16",
+ "n_keys": 58353,
+ "note": "safetensors header only - shapes and dtypes, no weight data",
+ "recorded": "2026-10-16",
+ "shapes": {
+  "lm_head.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    128000,
+    2560
+   ]
+  },
+  "model.embed_tokens.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    128000,
+    2560
+   ]
+  },
+  "model.layers.{i}.input_layernorm.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.layers.{i}.mlp.experts.{i}.down_proj.weight": {
+   "dtype": "BF16",
+   "n": 19200,
+   "ranges": [
+    [
+     0,
+     49
+    ],
+    [
+     0,
+     383
+    ]
+   ],
+   "shape": [
+    2560,
+    512
+   ]
+  },
+  "model.layers.{i}.mlp.experts.{i}.gate_proj.weight": {
+   "dtype": "BF16",
+   "n": 19200,
+   "ranges": [
+    [
+     0,
+     49
+    ],
+    [
+     0,
+     383
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.layers.{i}.mlp.experts.{i}.up_proj.weight": {
+   "dtype": "BF16",
+   "n": 19200,
+   "ranges": [
+    [
+     0,
+     49
+    ],
+    [
+     0,
+     383
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.layers.{i}.mlp.gate.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    384,
+    2560
+   ]
+  },
+  "model.layers.{i}.mlp.shared_experts.down_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    2560,
+    512
+   ]
+  },
+  "model.layers.{i}.mlp.shared_experts.gate_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.layers.{i}.mlp.shared_experts.up_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.layers.{i}.moe.router.expert_bias": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    384
+   ]
+  },
+  "model.layers.{i}.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.layers.{i}.post_attn_norm.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.layers.{i}.post_ffn_norm.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    2560
+   ]
+  },
+  "model.layers.{i}.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "model.layers.{i}.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.layers.{i}.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    2560,
+    6144
+   ]
+  },
+  "model.layers.{i}.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    128
+   ]
+  },
+  "model.layers.{i}.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    6144,
+    2560
+   ]
+  },
+  "model.layers.{i}.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "n": 50,
+   "ranges": [
+    [
+     0,
+     49
+    ]
+   ],
+   "shape": [
+    512,
+    2560
+   ]
+  },
+  "model.norm.weight": {
+   "dtype": "BF16",
+   "n": 1,
+   "shape": [
+    2560
+   ]
+  }
+ },
+ "source": "hub:Aleph-Alpha/Kolibri-1-BF16"
+}
