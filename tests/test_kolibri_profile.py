@@ -352,6 +352,91 @@ def test_a_model_without_layer_types_is_never_sliding():
     assert not qm._is_sliding_layer(None, 0)
 
 
+# ------------------------- HF load path: transformers resolves the renames itself
+
+def _tiny_cfg():
+    Kolibri1Config, _ = _kolibri_layer_cls()
+    return Kolibri1Config(
+        hidden_size=32, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=16, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=8,
+        shared_expert_intermediate_size=8, vocab_size=64, sliding_window=8,
+        layer_types=["sliding_attention", "full_attention"])
+
+
+def _write_checkpoint_spelled_model(tmp_path, cfg):
+    """Save a tiny Kolibri whose three keys use the RELEASED checkpoint's spellings.
+
+    Returns the values written, so "loaded" can be told apart from "left at init" — the
+    whole failure mode here is that init looks plausible (norms all-ones, bias zeros).
+    """
+    import json
+    from safetensors.torch import save_file
+    from transformers.models.kolibri1.modeling_kolibri1 import Kolibri1ForCausalLM as K
+
+    torch.manual_seed(0)
+    model = K(cfg).to(torch.float32)
+    sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+    written = {}
+    for layer in range(cfg.num_hidden_layers):
+        for module_name, ckpt_name in (
+                ("post_self_attn_layernorm.weight", "post_attn_norm.weight"),
+                ("post_mlp_layernorm.weight", "post_ffn_norm.weight"),
+                ("mlp.gate.e_score_correction_bias", "moe.router.expert_bias")):
+            src = f"model.layers.{layer}.{module_name}"
+            val = torch.full_like(sd[src], 0.5 + layer)      # never the init value
+            sd.pop(src)
+            sd[f"model.layers.{layer}.{ckpt_name}"] = val
+            written[src] = val
+    save_file({k: v.contiguous() for k, v in sd.items()},
+              str(tmp_path / "model.safetensors"))
+    d = cfg.to_dict()
+    d["architectures"] = ["Kolibri1ForCausalLM"]
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(d, f)
+    return written
+
+
+def test_from_pretrained_resolves_the_checkpoint_spellings_unaided(tmp_path):
+    """`from_pretrained` loads all three differently-spelled keys with NO help from GLQ.
+
+    This is a canary, and it exists because the static evidence says the opposite:
+    `Kolibri1ForCausalLM` has no `_checkpoint_conversion_mapping` (nor `_conversion_mapping`
+    or `weight_converters`), and `transformers.core_model_loading` never mentions
+    `post_attn_norm`, `post_ffn_norm` or `expert_bias`. Reading the source, loading the
+    released checkpoint under HF looks broken. Measured, it is fine: zero missing, zero
+    unexpected, and the written values arrive.
+
+    So the conversion lives somewhere in the `from_pretrained` pipeline rather than on the
+    class — which is exactly the distinction that matters for GLQ:
+
+      * `from_pretrained`      -> conversion applied   -> HF serving needs nothing from us
+      * `nn.Module.load_state_dict` -> no conversion   -> the quantize path DOES need
+        `_convert_state_kolibri1`, as the streaming loader calls the latter directly
+        (see `test_without_the_conversion_the_drop_is_caught_not_silent`).
+
+    If upstream ever stops doing this, HF loading of a GLQ Kolibri checkpoint goes quietly
+    wrong — both norms at all-ones, the router bias at zero — so the failure is worth a
+    standing check rather than an assumption.
+    """
+    from transformers.models.kolibri1.modeling_kolibri1 import Kolibri1ForCausalLM as K
+
+    cfg = _tiny_cfg()
+    written = _write_checkpoint_spelled_model(tmp_path, cfg)
+
+    model, info = K.from_pretrained(
+        str(tmp_path), dtype=torch.float32, output_loading_info=True)
+    assert not list(info.get("missing_keys", [])), info.get("missing_keys")
+    assert not list(info.get("unexpected_keys", [])), info.get("unexpected_keys")
+
+    sd = model.state_dict()
+    for name, want in written.items():
+        got = sd[name].float()
+        assert torch.allclose(got, want.float()), (
+            f"{name} was not populated from its checkpoint spelling: mean {got.mean():.4f} "
+            f"vs {want.float().mean():.4f} (all-ones/all-zeros means it stayed at init)")
+
+
 # ------------------------------------ the generic guard, independent of any architecture
 
 class _Incompatible:

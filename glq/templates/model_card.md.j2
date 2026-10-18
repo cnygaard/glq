@@ -64,7 +64,7 @@ def main():
         model="{{ repo_id }}",
         quantization="glq",
         dtype="bfloat16",
-        max_model_len=4096,
+        max_model_len={{ max_ctx }},
 {% if multimodal %}
         limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},  # text-only serving
 {% endif %}
