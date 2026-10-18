@@ -82,6 +82,10 @@ class ServingMeta:
     gpu_memory_utilization: float | None = None
     max_model_len: int | None = None
     load_gpu_mem_gib: float | None = None     # weights+ctx resident right after load
+    #: GiB of WEIGHTS mapped into host memory (vLLM `--cpu-offload-gb`), distinct from the
+    #: KV offload above. Non-None marks a run whose model did not fit the card — so
+    #: `load_gpu_mem_gib` is the RESIDENT share, not the model's footprint.
+    cpu_offload_gb: float | None = None
 
 
 @dataclass

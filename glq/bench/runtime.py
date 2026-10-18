@@ -59,7 +59,8 @@ def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bflo
                      multimodal: bool = False, cudagraph: bool = True,
                      max_num_seqs: int = 64,
                      kv_cache_dtype: str | None = None,
-                     kv_transfer_config: dict | None = None) -> dict:
+                     kv_transfer_config: dict | None = None,
+                     cpu_offload_gb: float = 0) -> dict:
     # vLLM's max_num_seqs default is 1024 — a batch-server number. On hybrid-GDN models
     # every decode sequence reserves a Mamba cache block before a single request exists,
     # and the bf16 Qwen3.8-27B arm refused to start at 0.75 util on a 96 GiB card:
@@ -90,6 +91,20 @@ def build_llm_kwargs(model: str, *, quant: str | None = None, dtype: str = "bflo
     # rather than aliased so a caller mutating its dict afterwards cannot rewrite the record.
     if kv_transfer_config:
         kw["kv_transfer_config"] = json.loads(json.dumps(kv_transfer_config))
+    # WEIGHT offload, which is a different mechanism from the KV offload above: vLLM maps
+    # this many GiB of parameters into host memory through a UVA view, so a model larger
+    # than the card can be measured at all.
+    #
+    # This exists for exactly one job: a bf16 BASELINE of a model that does not fit. Kolibri-1
+    # is 145.49 GiB against a 96 GiB card, so without it the GLQ perplexity number has nothing
+    # to be compared against and cannot be interpreted. Perplexity is the right workload for
+    # it — prefill-bound, so it trades bandwidth for capacity where that trade is cheapest;
+    # a DECODE number measured under offload is about PCIe, not about the quantization.
+    #
+    # Note `gpu_memory_utilization` is a share of the WHOLE card, not of what offload left
+    # free, so the KV pool expands to absorb the freed VRAM. Size the two together.
+    if cpu_offload_gb and cpu_offload_gb > 0:
+        kw["cpu_offload_gb"] = float(cpu_offload_gb)
     return kw
 
 
@@ -114,6 +129,10 @@ def serving_command(model: str, kw: dict) -> str:
     # exactly what `vllm serve --kv-transfer-config` takes.
     if kw.get("kv_transfer_config"):
         parts += ["--kv-transfer-config", json.dumps(kw["kv_transfer_config"])]
+    # Weight offload belongs in the command string for the same reason: a run with 75 GiB of
+    # parameters in host memory is not the same run, and the record is what a reader has.
+    if kw.get("cpu_offload_gb"):
+        parts += ["--cpu-offload-gb", str(kw["cpu_offload_gb"])]
     if kw.get("trust_remote_code"):
         parts += ["--trust-remote-code"]
     if kw.get("limit_mm_per_prompt"):
@@ -212,7 +231,8 @@ def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
          arch: str | None = None, multimodal: bool | None = None,
          max_num_seqs: int = 64,
          kv_cache_dtype: str | None = None,
-         kv_transfer_config: dict | None = None) -> LoadedModel:
+         kv_transfer_config: dict | None = None,
+         cpu_offload_gb: float = 0) -> LoadedModel:
     """Construct the vLLM engine and capture load footprint + serving command.
 
     ``max_num_seqs`` is exposed because on a hybrid-GDN model it is the only knob that
@@ -226,7 +246,8 @@ def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
                           gpu_mem_util=gpu_mem_util, multimodal=multimodal,
                           max_num_seqs=max_num_seqs,
                           kv_cache_dtype=kv_cache_dtype,
-                          kv_transfer_config=kv_transfer_config)
+                          kv_transfer_config=kv_transfer_config,
+                          cpu_offload_gb=cpu_offload_gb)
 
     # The engine wants a KVTransferConfig; the record wants a dict (see build_llm_kwargs).
     # Convert into a SEPARATE mapping for LLM() so `kw` — which is what serving_command
@@ -266,6 +287,10 @@ def load(model: str, *, quant: str | None = None, dtype: str = "bfloat16",
         # regardless of what was served.
         kv_cache_dtype=kv_cache_dtype,
         kv_transfer_config=kw.get("kv_transfer_config"),
+        # Promoted to its own field for the same reason as those two: a baseline measured
+        # with 75 GiB of weights in host memory must be distinguishable from a resident one
+        # when the records are compared later, without digging through llm_kwargs.
+        cpu_offload_gb=kw.get("cpu_offload_gb"),
     )
     try:
         tok = llm.get_tokenizer()

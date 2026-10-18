@@ -54,6 +54,7 @@ def _cmd_run(args) -> int:
         max_num_seqs=args.max_num_seqs, dtype=args.dtype,
         max_model_len=args.max_model_len, kv_cache_dtype=args.kv_cache_dtype,
         kv_transfer_config=args.kv_transfer_config,
+        cpu_offload_gb=args.cpu_offload_gb,
         hf_token=None, task_config=task_config,
     )
     from .record import write_jsonl
@@ -189,6 +190,17 @@ def build_parser() -> argparse.ArgumentParser:
     # runs bf16 and reports it as a KV-quantization result.
     r.add_argument("--kv-cache-dtype", dest="kv_cache_dtype", default=None,
                    help="fp8 | turboquant_4bit_nc | ... (default: engine default)")
+    # WEIGHT offload, not the KV offload below. This exists so a model larger than the
+    # card can still be measured: Kolibri-1 bf16 is 145.5 GiB against 96 GiB, so without
+    # it the GLQ perplexity number has no baseline and cannot be interpreted. Use it for
+    # prefill-bound tasks (perplexity); a DECODE rate measured under offload describes
+    # PCIe, not the quantization.
+    r.add_argument("--cpu-offload-gb", dest="cpu_offload_gb", type=float, default=0,
+                   help="GiB of WEIGHTS to map into host RAM so an oversized model "
+                        "fits (vLLM --cpu-offload-gb). Needed for a bf16 baseline of a "
+                        "model bigger than the card. Note --gpu-mem-util is a share of "
+                        "the WHOLE card, so the KV pool grows into the VRAM this frees; "
+                        "size the two together. Recorded in ServingMeta.")
     # Parsed by argparse, not by the runner: a typo in a long JSON blob should fail here and
     # not four minutes into an engine start. vLLM's own recipes configure CPU/disk KV offload
     # through this, e.g. the OffloadingConnector config published for Qwen3.8-Flash-Next.
