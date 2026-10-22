@@ -44,6 +44,15 @@ class Ranked:
     #: True/False when VRAM is known, None when it could not be detected.
     fits: bool | None
     recommended: bool
+    #: WHY `fits` is False: "vram", "host", "both", or "" when unexplained.
+    #:
+    #: Defaulted, because `rank()` does not set it and every three-argument construction in
+    #: the installer must keep working. It exists for the richer verdict in `glq.fit`, which
+    #: prices host RAM as well as the card — and because a menu that renders every non-fit as
+    #: "too large for this GPU" is wrong half the time once host memory can bind. That
+    #: mislabelling is not cosmetic: it sends a user to price graphics cards for a problem
+    #: that more RAM, or any swap at all, would fix.
+    reason: str = ""
 
 
 def usable_weight_bytes(vram_bytes: int, weight_fraction: float = WEIGHT_FRACTION) -> int:

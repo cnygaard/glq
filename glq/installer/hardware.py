@@ -82,6 +82,39 @@ def available_ram_bytes(read=_read_meminfo) -> int | None:
     return None
 
 
+def _meminfo_bytes(key: str, read) -> int | None:
+    """One `/proc/meminfo` field in bytes, or None if absent or unreadable.
+
+    `available_ram_bytes` and `ram_bytes` predate this and keep their own loops — they differ
+    in which exceptions they catch, and both are pinned by tests — so this is deliberately
+    not a refactor of them. It exists so a third field does not become a third copy.
+    """
+    try:
+        for line in read().splitlines():
+            if line.startswith(f"{key}:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1]) * 1024          # meminfo reports kB
+                return None
+    except Exception:                                    # noqa: BLE001 - any failure = unknown
+        return None
+    return None
+
+
+def swap_bytes(read=_read_meminfo) -> int | None:
+    """Total swap, or None if it can't be determined. **0 is a known answer, not unknown.**
+
+    Needed because pinned host memory and swap interact: the serve planners pin MoE experts
+    in host RAM, pinned pages cannot be swapped out, and the overshoot around them can be.
+    So a box with swap survives a host-memory budget that a swapless box does not — and the
+    two measured data points behind that budget are both swapless, which is exactly why the
+    distinction has to be visible rather than assumed.
+
+    Same never-raise contract as `ram_bytes` and `vram_bytes`: no answer beats a wrong one.
+    """
+    return _meminfo_bytes("SwapTotal", read)
+
+
 def ram_bytes(read=_read_meminfo) -> int | None:
     """Total system RAM, or None if it can't be determined.
 

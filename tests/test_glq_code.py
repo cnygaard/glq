@@ -11,6 +11,7 @@ these tests need neither node, nor a GPU, nor the network.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import types
@@ -22,18 +23,34 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import glq.code as code  # noqa: E402
 from glq.installer import configure  # noqa: E402
+from glq.installer.discovery import Checkpoint, DiscoveryError  # noqa: E402
+from glq.supervisor import VllmSupervisor  # noqa: E402
 
 
-class _FakeSup:
+class _FakeSup(VllmSupervisor):
+    """The REAL supervisor, with only its lifecycle stubbed out.
+
+    `VllmSupervisor.__init__` is pure planning — it spawns nothing, writes nothing, and
+    `default_log_path()` only builds a Path — so there is no reason to fake the part under
+    test. Subclassing means the pre-flight fit check here runs against the real planners and
+    the real `resident_bytes` / `pinned_host_bytes` / `vram_bytes` properties.
+
+    A hand-written stand-in would have to re-declare that surface, and a stand-in that
+    re-declares what it stands in for is how three tests in this project came to pass against
+    a state no real object can be in. `device="cuda"` is injected by `_run_code` because the
+    only I/O `__init__` can do is `detect_device()`, which shells out to nvidia-smi.
+    """
+
     def __init__(self, events, **kw):
+        # popped BEFORE the real __init__, which rejects unknown kwargs
+        self._attached = kw.pop("_attached", False)
+        super().__init__(**kw)
         self.events, self.kw = events, kw
-        # the real supervisor resolves None to a planned window; the floor stands in
-        self.max_model_len = kw.get("max_model_len") or kw.get("max_model_len_floor", 8192)
-        self.proc = None
 
     def __enter__(self):
         self.events.append("start")
-        self.proc = object()             # we "spawned" it; attach tests override
+        # we "spawned" it; the attach tests want proc None
+        self.proc = None if self._attached else object()
         return self
 
     def __exit__(self, *_exc):
@@ -41,25 +58,84 @@ class _FakeSup:
         return False
 
 
+class _Tty(io.StringIO):
+    """Stands in for /dev/tty: feeds keystrokes, records what the user would see."""
+
+    def __init__(self, keystrokes=""):
+        super().__init__(keystrokes)
+        self.shown = []
+
+    def write(self, s):
+        self.shown.append(s)
+        return len(s)
+
+    @property
+    def screen(self):
+        return "".join(self.shown)
+
+
 def _run_code(monkeypatch, tmp_path, *, cfg=None, pi_exit=0, pi_missing=False,
-              attach=False):
+              attach=False, vram_gib=None, ram_gib=None, swap_gib=0,
+              weights_gib=None, offload=None, collection=None, keystrokes=None,
+              discovery_error=False):
+    """Inject every process, probe, file-write, hardware reading AND checkpoint lookup.
+
+    The hardware defaults are all "unknown" on purpose: `glq.fit.check_fit` returns
+    `fits is None` when it cannot size the box, so every test written before the pre-flight
+    check existed keeps its original behaviour, and no test's result depends on the card in
+    whatever machine is running pytest. A test that wants a verdict asks for one by passing
+    `vram_gib` / `ram_gib` / `weights_gib`.
+
+    `weights_gib` and `offload` are stubbed for the same reason, and they close a hole that
+    predates this: `sizing_weights_bytes` and `checkpoint_offload_bytes` reach HuggingFace
+    over HTTP, so without stubs the suite's results depend on network reachability and on
+    what the live repos happen to declare. They default to None/zeros — the values those
+    helpers already return offline, since both have a never-raise broad except.
+    """
     events, made, ran, wrote = [], [], [], []
+
+    monkeypatch.setattr(code, "sizing_weights_bytes",
+                        lambda args, **kw: (None if weights_gib is None
+                                            else int(weights_gib * (2 ** 30))))
+    monkeypatch.setattr(code, "checkpoint_offload_bytes",
+                        lambda repo: tuple(offload or (0, 0, 0)))
 
     monkeypatch.setattr(code, "_installed_config", lambda: dict(cfg or {}))
 
     def sup(**kw):
         made.append(kw)
-        s = _FakeSup(events, **kw)
-        if attach:
-            class _Attached(_FakeSup):
-                def __enter__(self):
-                    self.events.append("start")
-                    self.proc = None     # attached: we did not spawn it
-                    return self
-            s = _Attached(events, **kw)
-        return s
+        # device is pinned so the real __init__ never probes for a GPU.
+        return _FakeSup(events, **{"device": "cuda", "_attached": attach, **kw})
 
     monkeypatch.setattr(code, "VllmSupervisor", sup)
+
+    _gib = lambda v: None if v is None else int(v * (2 ** 30))      # noqa: E731
+    monkeypatch.setattr(code, "_vram_bytes", lambda: _gib(vram_gib))
+    monkeypatch.setattr(code, "_ram_bytes", lambda: _gib(ram_gib))
+    monkeypatch.setattr(code, "_swap_bytes", lambda: _gib(swap_gib))
+    monkeypatch.setattr(code, "_available_ram_bytes", lambda: _gib(ram_gib))
+    # Only read on the refusal path, but it shells out to nvidia-smi, so it is injected for
+    # the same reason as the rest: no test result may depend on the host running pytest.
+    monkeypatch.setattr(code, "_gpu_name",
+                        lambda: None if vram_gib is None else "Test GPU")
+
+    # The picker's two seams. `collection` is a list of (repo_id, GiB) pairs; the default of
+    # None means "discovery finds nothing", which keeps every pre-picker test on the path it
+    # was written for. `keystrokes=None` means NO TERMINAL — `select_model` then answers
+    # without prompting, which is the CI contract and must stay the default.
+    def _discover(*_a, **_kw):
+        if discovery_error:
+            raise DiscoveryError("no network (test)")
+        return [Checkpoint(rid, int(g * (2 ** 30)), True, False, 0, 0, 0)
+                for rid, g in (collection or [])]
+
+    monkeypatch.setattr(code, "cached_discover", _discover)
+    tty = _Tty(keystrokes) if keystrokes is not None else None
+    monkeypatch.setattr(code, "open_tty", lambda: tty)
+    # `device` is pinned for the same reason the supervisor's is: detect_device() would
+    # otherwise answer for whatever machine runs pytest, and on a GPU-less one every
+    # checkpoint is unjudged and nothing is ever recommended.
+    monkeypatch.setattr(code, "_fit_device", lambda: "cuda")
 
     pi_bin = tmp_path / "node" / "bin" / "pi"
     if not pi_missing:
@@ -478,3 +554,247 @@ def test_plain_glq_code_passes_pi_nothing_extra(monkeypatch, tmp_path):
     code.main(["--model", SMOL])
     cmd, _env = ran[0]
     assert cmd[1:] == ["--provider", "glq", "--model", SMOL], cmd
+
+
+# ---- the pre-flight fit check -----------------------------------------------------------
+#
+# A checkpoint larger than the machine used to reach vLLM and fail with a CUDA
+# out-of-memory several minutes into the weight load, with nothing naming the cause. These
+# pin the refusal, and — more importantly — pin that it happens BEFORE the supervisor is
+# entered, since the whole value is not paying for the download first.
+#
+# The motivating case: Kolibri-1 at 3 bpw (28.70 GiB, 26.77 GiB of it offloadable experts) on
+# an RTX PRO 4500 Blackwell with 31.86 GiB of VRAM and 30 GiB of host RAM and no swap. The
+# non-obvious part, measured, is that the CARD is fine once the offload is planned and HOST
+# RAM is what binds — so a refusal that blamed the GPU would send the user shopping for
+# hardware that fixes nothing.
+
+GIB = 2 ** 30
+KOLIBRI = dict(weights_gib=28.70, offload=(0, int(26.77 * GIB), 0),
+               vram_gib=31.86, ram_gib=30.0, swap_gib=0)
+
+
+def test_an_oversized_model_is_refused_before_the_supervisor_starts(monkeypatch, tmp_path,
+                                                                    capsys):
+    events, made, _, _ = _run_code(monkeypatch, tmp_path, **KOLIBRI)
+    rc = code.main(["--model", SMOL])
+    assert rc == 2
+    assert events == [], "the refusal must precede the weight load, not follow it"
+    err = capsys.readouterr().err
+    assert "does not fit" in err
+    assert "--force" in err
+
+
+def test_the_refusal_names_host_ram_when_that_is_what_binds(monkeypatch, tmp_path, capsys):
+    """Blaming the card here would be wrong AND expensive to act on. Also: it must not
+    advise raising --cpu-offload-gb, which is advice the user cannot take — pinned pages
+    cannot be swapped out, so deeper offload makes a host shortfall worse."""
+    _run_code(monkeypatch, tmp_path, **KOLIBRI)
+    code.main(["--model", SMOL])
+    err = capsys.readouterr().err
+    assert "Host RAM is the binding constraint" in err, err
+    assert "--cpu-offload-gb" not in err
+
+
+def test_force_serves_an_oversized_model_anyway(monkeypatch, tmp_path):
+    """The user may know something the planner does not; --force must still work."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, **KOLIBRI)
+    rc = code.main(["--model", SMOL, "--force"])
+    assert rc == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_a_fitting_model_is_not_refused(monkeypatch, tmp_path):
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, weights_gib=1.8,
+                                vram_gib=31.86, ram_gib=30.0)
+    assert code.main(["--model", SMOL]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_an_unsizeable_checkpoint_is_never_refused(monkeypatch, tmp_path):
+    """Offline, or a repo whose size cannot be read. The check must never be the thing that
+    stops a setup that works today."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, weights_gib=None,
+                                vram_gib=31.86, ram_gib=30.0)
+    assert code.main(["--model", SMOL]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_a_box_with_no_detectable_gpu_is_never_refused(monkeypatch, tmp_path):
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, **{**KOLIBRI, "vram_gib": None})
+    assert code.main(["--model", SMOL]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_no_serve_is_never_refused(monkeypatch, tmp_path):
+    """Attaching to a server somebody else started allocates nothing here, so there is
+    nothing to refuse."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, attach=True, **KOLIBRI)
+    assert code.main(["--model", SMOL, "--no-serve"]) == 0
+    assert "start" in events
+
+
+def test_an_explicit_gpu_memory_utilization_suppresses_the_refusal(monkeypatch, tmp_path):
+    """That flag IS the answer the sizing would have produced, so `vram_bytes` is passed as
+    None deliberately and there is nothing left to judge against."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, **KOLIBRI)
+    assert code.main(["--model", SMOL, "--gpu-memory-utilization", "0.9"]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_swap_saves_the_same_configuration(monkeypatch, tmp_path):
+    """Swap absorbs the overshoot around the pinned pages, so the predicted failure cannot
+    occur. The failing control for the host gate, at the CLI level."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, **{**KOLIBRI, "swap_gib": 64.0})
+    assert code.main(["--model", SMOL]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_a_refused_gemma4_invocation_does_not_fetch_the_tool_template(monkeypatch,
+                                                                      tmp_path):
+    """`ensure_gemma4_template` downloads a file the refused serve will never read. The
+    mechanism, not the exit code: assert the call did not happen."""
+    calls = []
+    _run_code(monkeypatch, tmp_path, **KOLIBRI)
+    monkeypatch.setattr(code, "ensure_gemma4_template",
+                        lambda: calls.append("fetched") or tmp_path / "t.jinja")
+    assert code.main(["--model", GEMMA]) == 2
+    assert calls == [], "a refused invocation must not download the tool template"
+
+
+def test_a_served_gemma4_invocation_still_fetches_the_template(monkeypatch, tmp_path):
+    """The failing control for the move: reordering must not make it stop happening."""
+    calls = []
+    _run_code(monkeypatch, tmp_path, weights_gib=1.8, vram_gib=31.86, ram_gib=30.0)
+    monkeypatch.setattr(code, "ensure_gemma4_template",
+                        lambda: calls.append("fetched") or tmp_path / "t.jinja")
+    assert code.main(["--model", GEMMA]) == 0
+    assert calls == ["fetched"]
+
+
+# ---- the interactive picker ------------------------------------------------------------
+#
+# Bare `glq-code` used to print "error: no model to serve" and exit 2. It now offers the
+# curated collection, sized against this machine, with the best fit preselected.
+#
+# Two properties carry the value and neither is visible in an exit code:
+#
+# * the offered list is FAMILY-FILTERED, because glq-code refuses any model whose tool
+#   parser it does not know — an unfiltered menu offers models it then rejects, and the two
+#   smallest, most inviting entries in the real collection are exactly those;
+# * the filter runs BEFORE ranking. `rank` marks one entry of the list it is handed as
+#   recommended, so filtering afterwards leaves every survivor unrecommended and
+#   `select_model` falls back to index 1 — the LARGEST entry, the worst possible default.
+
+#: SmolLM2 has no tool parser, so glq-code exits 2 on it: the realistic unsupported family.
+NO_PARSER = "xv0y5ncu/SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw"
+FITS = [(SMOL, 1.8), (GEMMA, 13.9), ("xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw", 17.8)]
+
+
+def test_bare_glq_code_offers_a_menu_and_enter_takes_the_recommendation(monkeypatch,
+                                                                        tmp_path):
+    events, made, _, _ = _run_code(monkeypatch, tmp_path, collection=FITS,
+                                   keystrokes="", vram_gib=31.86, ram_gib=64.0)
+    assert code.main([]) == 0
+    assert events == ["start", "pi", "stop"]
+    # largest that fits, which is the Qwen entry — and `prefer_family="qwen"` for this
+    # command, so the two agree here
+    assert made[0]["model"].endswith("Qwen3.8-27B-GLQ-trellis-3inst-4bpw"), made[0]["model"]
+
+
+def test_a_number_picks_that_entry(monkeypatch, tmp_path):
+    events, made, _, _ = _run_code(monkeypatch, tmp_path, collection=FITS,
+                                   keystrokes="3", vram_gib=31.86, ram_gib=64.0)
+    assert code.main([]) == 0
+    # largest-first ordering, so 3 is the smallest of the three
+    assert made[0]["model"] == SMOL, made[0]["model"]
+
+
+def test_with_no_terminal_it_auto_picks_and_never_prompts(monkeypatch, tmp_path):
+    """The CI contract. `keystrokes=None` means open_tty() returns None."""
+    events, made, _, _ = _run_code(monkeypatch, tmp_path, collection=FITS,
+                                   vram_gib=31.86, ram_gib=64.0)
+    assert code.main([]) == 0
+    assert events == ["start", "pi", "stop"]
+    assert made[0]["model"]
+
+
+def test_the_offered_list_excludes_families_glq_code_cannot_serve(monkeypatch, tmp_path):
+    """The mechanism: inspect the list handed to select_model, not the model chosen."""
+    seen = {}
+    _run_code(monkeypatch, tmp_path, collection=[(NO_PARSER, 0.1)] + FITS,
+              keystrokes="", vram_gib=31.86, ram_gib=64.0)
+    real = code.select_model
+    monkeypatch.setattr(code, "select_model",
+                        lambda ranked, tty=None: seen.setdefault("ranked", ranked)
+                        and None or real(ranked, tty=tty))
+    code.main([])
+    offered = [r.checkpoint.repo_id for r in seen["ranked"]]
+    assert NO_PARSER not in offered, offered
+    assert len(offered) == len(FITS)
+
+
+def test_the_family_filter_runs_before_ranking(monkeypatch, tmp_path):
+    """If it ran after, every survivor would be `recommended=False` and the menu's default
+    would silently become the largest entry. Pins that exactly one survivor is recommended."""
+    seen = {}
+    # the LARGEST entry is the unsupported one, which is what makes the ordering matter
+    _run_code(monkeypatch, tmp_path, collection=[(NO_PARSER, 400.0)] + FITS,
+              keystrokes="", vram_gib=31.86, ram_gib=64.0)
+    real = code.select_model
+    monkeypatch.setattr(code, "select_model",
+                        lambda ranked, tty=None: seen.setdefault("ranked", ranked)
+                        and None or real(ranked, tty=tty))
+    code.main([])
+    assert sum(r.recommended for r in seen["ranked"]) == 1, seen["ranked"]
+
+
+def test_an_explicit_model_never_consults_discovery(monkeypatch, tmp_path):
+    """No new network cost and no behaviour change for scripted use."""
+    def boom(*_a, **_kw):
+        raise AssertionError("discovery must not be consulted for an explicit --model")
+
+    _run_code(monkeypatch, tmp_path, vram_gib=31.86, ram_gib=64.0, weights_gib=1.8)
+    monkeypatch.setattr(code, "cached_discover", boom)
+    assert code.main(["--model", SMOL]) == 0
+
+
+def test_a_fitting_config_default_is_served_without_prompting(monkeypatch, tmp_path):
+    """The installer's per-command pick must not start nagging."""
+    asked = []
+    _run_code(monkeypatch, tmp_path, cfg={"code_model": SMOL}, collection=FITS,
+              keystrokes="", vram_gib=31.86, ram_gib=64.0, weights_gib=1.8)
+    monkeypatch.setattr(code, "select_model",
+                        lambda *a, **k: asked.append(1) or SMOL)
+    assert code.main([]) == 0
+    assert asked == [], "a config default that fits must be served as-is"
+
+
+def test_a_menu_pick_that_does_not_fit_is_not_then_refused(monkeypatch, tmp_path):
+    """The picker warns and obeys. If the fit check then refused the choice, the menu would
+    be a liar — the two features have to agree about who decides."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path,
+                                collection=[(SMOL, 28.70)], keystrokes="",
+                                vram_gib=31.86, ram_gib=30.0, swap_gib=0,
+                                weights_gib=28.70)
+    assert code.main([]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_discovery_failure_falls_back_to_the_config_default(monkeypatch, tmp_path):
+    events, made, _, _ = _run_code(monkeypatch, tmp_path, cfg={"code_model": SMOL},
+                                   discovery_error=True, keystrokes="",
+                                   vram_gib=31.86, ram_gib=64.0, weights_gib=1.8)
+    assert code.main([]) == 0
+    assert made[0]["model"] == SMOL
+
+
+def test_discovery_failure_with_nothing_to_fall_back_on_is_an_error(monkeypatch, tmp_path,
+                                                                    capsys):
+    events, _, _, _ = _run_code(monkeypatch, tmp_path, discovery_error=True,
+                                keystrokes="", vram_gib=31.86, ram_gib=64.0)
+    assert code.main([]) == 2
+    assert events == []
+    err = capsys.readouterr().err
+    assert "--model" in err, "the original hint must survive"
+    assert "no network" in err, "and it should say why the menu could not be shown"

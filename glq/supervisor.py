@@ -1078,6 +1078,47 @@ class VllmSupervisor:
         self._tail = deque(maxlen=40)
         self._last_output_at = None      #: when the child last said anything
 
+    # ------------------------------------------------------------------ what was planned
+
+    @property
+    def resident_bytes(self) -> int:
+        """Weight bytes that will actually occupy VRAM, after everything that leaves.
+
+        The same subtraction the planners do (`:924`, `:1039`), exposed because the pre-flight
+        fit check in `glq.fit` has to judge the footprint that will be served and a third copy
+        of this formula is a third thing to keep in step.
+
+        Reads `self.expert_offload_gib` as it stands *after* `plan_arena_and_offload` may have
+        deepened it, so this is the final figure rather than the base one the window was first
+        chosen from — which is the number a fit verdict needs. Only meaningful once `__init__`
+        has finished, since `self.weights_bytes` is assigned near the end of it.
+        """
+        if not self.weights_bytes:
+            return 0
+        return max(0, int(self.weights_bytes) - self.ple_offload_bytes - self.nontext_bytes
+                   - self.expert_offload_gib * 1024 ** 3)
+
+    @property
+    def vram_bytes(self) -> int | None:
+        """The card the plan was sized against, or None when it could not be detected.
+
+        Public because `glq.fit` has to judge against the same figure the plan used, and
+        reaching into `_vram_bytes` from another module would make that a private contract.
+        None is meaningful rather than missing: no nvidia-smi, a container started without
+        `--gpus`, or an explicit `--gpu-memory-utilization`, which deliberately passes None
+        because that flag already IS the answer sizing would have produced.
+        """
+        return self._vram_bytes
+
+    @property
+    def pinned_host_bytes(self) -> int:
+        """Host memory the plan will pin: the PLE table plus the offloaded experts.
+
+        Pinned, so it cannot be swapped out and cannot be reclaimed under pressure — which is
+        why it is budgeted against total RAM rather than against what is momentarily free.
+        """
+        return self.ple_offload_bytes + self.expert_offload_gib * 1024 ** 3
+
     # ------------------------------------------------------------------ lifecycle
 
     def argv(self) -> list[str]:

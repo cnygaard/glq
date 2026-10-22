@@ -233,14 +233,20 @@ def test_a_child_that_exits_early_is_not_waited_on():
 
 
 
-class _FakeSup:
+class _FakeSup(VllmSupervisor):
     """Records lifecycle order, because "UI built before the server answered" is the exact
-    bug this replaces: it produced a chat window with an empty model dropdown."""
+    bug this replaces: it produced a chat window with an empty model dropdown.
+
+    Subclasses the REAL supervisor and overrides only the lifecycle. `__init__` is pure
+    planning — nothing spawned, nothing written — so the pre-flight fit check here runs
+    against the real planners and the real `resident_bytes` / `pinned_host_bytes` properties
+    rather than against a stand-in that would have to re-declare them. `device` is injected
+    by `_run_chat` because the only I/O `__init__` can do is `detect_device()`.
+    """
 
     def __init__(self, events, **kw):
+        super().__init__(**kw)
         self.events, self.kw = events, kw
-        # the real supervisor resolves None to a planned window; 8192 stands in for it
-        self.max_model_len = kw.get("max_model_len") or 8192
 
     def __enter__(self):
         self.events.append("start")
@@ -251,13 +257,32 @@ class _FakeSup:
         return False
 
 
-def _run_chat(monkeypatch, argv, *, display=None, cfg=None, launch=None, models=("m",)):
+def _run_chat(monkeypatch, argv, *, display=None, cfg=None, launch=None, models=("m",),
+              vram_gib=None, ram_gib=None, swap_gib=0, weights_gib=None, offload=None):
     import glq.chat as chat
 
     events, made, launched = [], [], []
 
     monkeypatch.setattr(chat, "_installed_config", lambda: dict(cfg or {}))
     monkeypatch.setattr(chat, "_served_models", lambda _c: list(models))
+
+    # Hardware and checkpoint lookups, all injected and all defaulting to "unknown".
+    # `glq.fit.check_fit` returns `fits is None` when it cannot size the box, so every test
+    # written before the pre-flight check keeps its original behaviour and no result depends
+    # on the machine running pytest. The two checkpoint lookups also reach HuggingFace over
+    # HTTP, which this suite was paying for silently.
+    _gib = lambda v: None if v is None else int(v * (2 ** 30))      # noqa: E731
+    monkeypatch.setattr(chat, "_vram_bytes", lambda: _gib(vram_gib))
+    monkeypatch.setattr(chat, "_ram_bytes", lambda: _gib(ram_gib))
+    monkeypatch.setattr(chat, "_swap_bytes", lambda: _gib(swap_gib))
+    monkeypatch.setattr(chat, "_available_ram_bytes", lambda: _gib(ram_gib))
+    monkeypatch.setattr(chat, "_gpu_name", lambda: None if vram_gib is None else "Test GPU")
+    # `_checkpoint_bytes`, not `sizing_weights_bytes`: the lower seam, so
+    # `sizing_weights_bytes`'s own logic — notably the `--gpu-memory-utilization`
+    # short-circuit — stays under test, and a test that patches this seam itself still wins.
+    monkeypatch.setattr(chat, "_checkpoint_bytes", lambda repo: _gib(weights_gib))
+    monkeypatch.setattr(chat, "checkpoint_offload_bytes",
+                        lambda repo: tuple(offload or (0, 0, 0)))
     # These tests are about the supervisor's process lifetime, not about HTTP. Both of the
     # `chat` extra's packages are stubbed out so the suite runs on an install that has
     # neither — which is exactly what CI has (`pip install .[hub]`), and what made twenty of
@@ -267,7 +292,8 @@ def _run_chat(monkeypatch, argv, *, display=None, cfg=None, launch=None, models=
 
     def sup(**kw):
         made.append(kw)
-        return _FakeSup(events, **kw)
+        # device pinned so the real __init__ never probes for a GPU
+        return _FakeSup(events, **{"device": "cuda", **kw})
 
     monkeypatch.setattr(chat, "VllmSupervisor", sup)
 
@@ -2108,3 +2134,81 @@ def test_chat_and_code_pass_host_ram():
         got = seen.get("ram_bytes")
         assert got, f"{name} must pass ram_bytes so the pinnable cap can bind, got {got!r}"
         assert got > 1024**3, f"{name}: ram_bytes looks wrong ({got})"
+
+
+# ---- the pre-flight fit check ----------------------------------------------------------
+#
+# The same gate glq-code got, for the same reason and through the same code: a checkpoint
+# larger than the machine reached vLLM and failed with a CUDA out-of-memory several minutes
+# into the weight load. `glq.fit` is shared between the two commands deliberately — every
+# other sizing helper already is, and letting the two drift on this one is how the fix ends
+# up applying to whichever command the author happened to be using.
+#
+# No picker here: glq-chat chooses its model in the gradio dropdown, not at a terminal.
+
+#: Kolibri-1 at 3 bpw on the box that prompted all this: 31.86 GiB card, 30 GiB host RAM,
+#: no swap. The card is fine once the offload is planned; HOST RAM is what binds.
+_KOLIBRI = dict(weights_gib=28.70, offload=(0, int(26.77 * GIB), 0),
+                vram_gib=31.86, ram_gib=30.0, swap_gib=0)
+
+
+def test_an_oversized_model_is_refused_before_the_server_starts(monkeypatch, capsys):
+    chat, events, _, _ = _run_chat(monkeypatch, [], **_KOLIBRI)
+    rc = chat.main(["--model", "org/kolibri"])
+    assert rc == 2
+    assert events == [], "the refusal must precede the weight load"
+    err = capsys.readouterr().err
+    assert "does not fit" in err
+    assert "--force" in err
+
+
+def test_the_chat_refusal_names_host_ram_and_not_the_card(monkeypatch, capsys):
+    chat, _, _, _ = _run_chat(monkeypatch, [], **_KOLIBRI)
+    chat.main(["--model", "org/kolibri"])
+    err = capsys.readouterr().err
+    assert "Host RAM is the binding constraint" in err, err
+    assert "--cpu-offload-gb" not in err
+
+
+def test_the_chat_refusal_says_glq_chat_not_glq_code(monkeypatch, capsys):
+    """Shared renderer, so the command name has to be threaded through rather than baked in
+    — otherwise glq-chat tells the user to re-run glq-code."""
+    chat, _, _, _ = _run_chat(monkeypatch, [], **_KOLIBRI)
+    chat.main(["--model", "org/kolibri"])
+    err = capsys.readouterr().err
+    assert "glq-chat" in err
+    assert "glq-code" not in err
+
+
+def test_force_serves_an_oversized_model_anyway(monkeypatch):
+    chat, events, _, _ = _run_chat(monkeypatch, [], **_KOLIBRI)
+    assert chat.main(["--model", "org/kolibri", "--force"]) == 0
+    assert events == ["start", "build_ui", "launch", "stop"]
+
+
+def test_a_fitting_model_is_not_refused(monkeypatch):
+    chat, events, _, _ = _run_chat(monkeypatch, [], weights_gib=1.8,
+                                   vram_gib=31.86, ram_gib=30.0)
+    assert chat.main(["--model", "org/small"]) == 0
+    assert events == ["start", "build_ui", "launch", "stop"]
+
+
+def test_an_unsizeable_checkpoint_is_never_refused(monkeypatch):
+    chat, events, _, _ = _run_chat(monkeypatch, [], weights_gib=None,
+                                   vram_gib=31.86, ram_gib=30.0)
+    assert chat.main(["--model", "org/unknown"]) == 0
+    assert events == ["start", "build_ui", "launch", "stop"]
+
+
+def test_attaching_is_never_refused(monkeypatch):
+    """--no-serve allocates nothing here, so there is nothing to refuse."""
+    chat, events, _, _ = _run_chat(monkeypatch, [], **_KOLIBRI)
+    assert chat.main(["--model", "org/kolibri", "--no-serve"]) == 0
+    assert "start" in events
+
+
+def test_swap_saves_the_same_configuration(monkeypatch):
+    """The failing control for the host gate, at the glq-chat CLI."""
+    chat, events, _, _ = _run_chat(monkeypatch, [], **{**_KOLIBRI, "swap_gib": 64.0})
+    assert chat.main(["--model", "org/kolibri"]) == 0
+    assert events == ["start", "build_ui", "launch", "stop"]

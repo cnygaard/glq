@@ -114,12 +114,21 @@ def select_components(default=DEFAULT_COMPONENTS, tty=None) -> tuple[str, ...]:
     return tuple(n for n in names if n in chosen)
 
 
+#: What a non-fit is blamed on. The bare "too large for this GPU" is kept for the
+#: unexplained case, because `rank()` sets no reason and its menu must read as it always did.
+_WHY = {"host": "too large for this host's memory",
+        "vram": "too large for this GPU",
+        "both": "too large for this GPU and this host's memory"}
+
+
 def _fit_label(ranked) -> str:
     if ranked.recommended:
         return "recommended"
     if ranked.fits is None:
         return "size unknown for this GPU"
-    return "fits" if ranked.fits else "too large for this GPU"
+    if ranked.fits:
+        return "fits"
+    return _WHY.get(getattr(ranked, "reason", ""), "too large for this GPU")
 
 
 def select_model(ranked, tty=None):
@@ -160,8 +169,14 @@ def select_model(ranked, tty=None):
         question = f"  please enter a number 1-{len(ranked)}: "
 
     if picked.fits is False:
+        # Warn and obey: the user may know something the sizing does not, and this menu has
+        # always let them through. Which resource is named matters though — "may not fit this
+        # GPU" for a host-memory shortfall sends them to fix the wrong thing.
+        where = {"host": "may not fit this host's memory",
+                 "both": "may not fit this GPU or this host's memory"}.get(
+                     getattr(picked, "reason", ""), "may not fit this GPU")
         tty.write(f"\n  warning: {picked.checkpoint.short_name} "
-                  f"({picked.checkpoint.size_gib:.1f} GiB) may not fit this GPU; "
+                  f"({picked.checkpoint.size_gib:.1f} GiB) {where}; "
                   f"serving it can fail with an out-of-memory error.\n")
 
     return picked.checkpoint

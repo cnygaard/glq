@@ -22,12 +22,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from glq.chat import (DEFAULT_BASE_URL, _installed_config, _model_max_len,
-                      _ram_bytes, _server_port, _vram_bytes,
-                      checkpoint_mtp, checkpoint_offload_bytes,
-                      default_model, positive_seconds, resolve_mtp_tokens,
-                      sizing_weights_bytes)
+from glq import fit
+from glq.chat import (DEFAULT_BASE_URL, _available_ram_bytes, _gpu_name,
+                      _installed_config, _model_max_len, _ram_bytes,
+                      _server_port, _swap_bytes, _vram_bytes, checkpoint_mtp,
+                      checkpoint_offload_bytes, default_model, positive_seconds,
+                      resolve_mtp_tokens, sizing_weights_bytes)
 from glq.installer.configure import pi_max_tokens, write_pi_models
+from glq.installer.discovery import DiscoveryError, cached_discover
+from glq.installer.prompt import open_tty, select_model
+from glq.installer.recommend import PREFERRED_FAMILIES
 from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
 from glq.tooling import (ensure_gemma4_template, sampling_serve_args,
@@ -106,6 +110,66 @@ class _PiAwareParser(argparse.ArgumentParser):
         super().error(message)
 
 
+def _fit_device():
+    """The backend to judge checkpoints against, resolved ONCE per invocation.
+
+    Separate function so `fit_ranked` is not asked to probe per checkpoint: `detect_device`
+    reads wheel metadata and can shell out to nvidia-smi, and paying that for each entry in
+    the menu is a slow start nobody would attribute to the picker.
+    """
+    from glq.supervisor import detect_device
+    return detect_device()
+
+
+def _pick_model(cfg, *, current=None):
+    """`(repo_id, chosen_by_a_human)`, or `(None, why_not)` when nothing can be offered.
+
+    The curated collection, filtered to families this command can actually serve, ranked
+    against this machine with the serve-time math, and offered through the installer's own
+    `select_model` — which with no terminal answers without prompting, so CI and
+    `curl | bash` need no separate path.
+    """
+    try:
+        checkpoints = cached_discover()
+    except DiscoveryError as exc:
+        return None, str(exc)
+
+    # BEFORE ranking, not after. `fit_ranked` marks one entry of the list it is handed as
+    # recommended; filtering afterwards would strip that mark whenever the recommendation
+    # happened to be an unsupported family, and `select_model` then defaults to index 1 —
+    # the largest entry. A wrong default that still looks like a considered one.
+    #
+    # The filter itself is not optional: `tool_serve_args` is what decides, and glq-code
+    # exits 2 on anything it does not know. In the live collection the two entries it
+    # removes are the SmolLM2 pair, which are also the smallest and most inviting.
+    offerable = [c for c in checkpoints if tool_serve_args(c.repo_id) is not None]
+    if not offerable:
+        return None, ("the published collection has nothing this command can serve "
+                      "(no known tool-calling setup for any entry)")
+
+    ranked = fit.fit_ranked(
+        offerable, vram_bytes=_vram_bytes(), ram_bytes=_ram_bytes(),
+        swap_bytes=_swap_bytes(), prefer_family=PREFERRED_FAMILIES.get("code"),
+        concurrency=DEFAULT_CODE_MAX_NUM_SEQS, floor=DEFAULT_CODE_MAX_MODEL_LEN,
+        window_extra_gib=WINDOW_OFFLOAD_MAX_EXTRA_GIB, device=_fit_device())
+
+    tty = open_tty()
+    try:
+        picked = select_model(ranked, tty=tty)
+    finally:
+        if tty is not None:
+            try:
+                tty.close()
+            except Exception:                   # noqa: BLE001 - closing is best-effort
+                pass
+    # A pick made at a prompt is CONSENT: `select_model` deliberately warns and obeys on an
+    # entry that may not fit, so a fit check that then refused the choice would make the menu
+    # a liar. Only an unattended auto-pick stays subject to the gate.
+    #
+    # `select_model` returns a Checkpoint, not an id.
+    return picked.repo_id, tty is not None
+
+
 def main(argv=None) -> int:
     cfg = _installed_config()
     # allow_abbrev=False because prefix matching SILENTLY redirects abbreviated pi flags into
@@ -120,9 +184,13 @@ def main(argv=None) -> int:
     p = _PiAwareParser(description=__doc__.splitlines()[0], epilog=_EPILOG,
                        allow_abbrev=False,
                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default=default_model(cfg, "code"),
-                   help="checkpoint to serve (default: the installer's code pick, "
-                        "then its generic one)")
+    # default=None, resolved after parsing, because "the user named a model" and "the
+    # installer's config named one" must behave differently: an explicit --model is honoured
+    # and fit-checked, a config default that no longer fits falls through to the picker.
+    # Sharing one default made the two indistinguishable.
+    p.add_argument("--model", default=None,
+                   help="checkpoint to serve (default: the installer's code pick, then its "
+                        "generic one, then an interactive picker)")
     p.add_argument("--base-url", default=cfg.get("base_url", DEFAULT_BASE_URL))
     p.add_argument("--gpu-memory-utilization", type=float, default=None,
                    help="fraction of VRAM vLLM may reserve (default: sized from the "
@@ -149,15 +217,27 @@ def main(argv=None) -> int:
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",
                    help="do not start vLLM; attach to a server you started yourself")
+    p.add_argument("--force", action="store_true",
+                   help="serve a checkpoint this machine was measured too small for "
+                        "(vLLM will most likely fail during the weight load)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("pi_args", nargs=argparse.REMAINDER,
                    help="everything after `--` goes to pi verbatim")
     args = p.parse_args(argv)
 
-    if not args.model:
-        print("error: no model to serve — pass --model <repo-id> or run the installer",
-              file=sys.stderr)
-        return 2
+    explicit_model = args.model is not None
+    picked_interactively = False
+    if not explicit_model:
+        args.model = default_model(cfg, "code")
+        if not args.model:
+            # No flag and no config: offer the collection instead of refusing. With no
+            # terminal this still answers — `select_model` returns the recommendation — so
+            # a scripted or `curl | bash` invocation never blocks on a prompt.
+            args.model, picked_interactively = _pick_model(cfg)
+            if not args.model:
+                print("error: no model to serve — pass --model <repo-id> or run the "
+                      f"installer\n  ({picked_interactively})", file=sys.stderr)
+                return 2
 
     # Both guards run BEFORE the supervisor: starting vLLM costs minutes of weight
     # loading, all wasted if the agent cannot run or the parser would be wrong.
@@ -174,11 +254,6 @@ def main(argv=None) -> int:
               f"fails silently\n(tool calls that never parse), so glq-code refuses to "
               f"guess. Supported families:\ngemma-4, SmolLM3, Qwen.", file=sys.stderr)
         return 2
-    if "gemma4" in tool_args:
-        # The template is in neither the checkpoint nor the vLLM wheel; the installer
-        # downloads it, but this install may predate that or have skipped picode.
-        ensure_gemma4_template()
-
     # The model card's sampling, pinned server-side because pi cannot send `top_k` at all
     # (not an OpenAI field, and the pi config has no slot for it). Appended, not substituted:
     # correct sampling with no tool parser is a useless coding session.
@@ -239,6 +314,39 @@ def main(argv=None) -> int:
         # 5 GiB of offload, about 3% of decode. See WINDOW_OFFLOAD_MAX_EXTRA_GIB.
         window_offload_extra_gib=WINDOW_OFFLOAD_MAX_EXTRA_GIB,
     )
+
+    # The last guard, and the most expensive failure it prevents: a checkpoint larger than
+    # this machine used to reach vLLM and die with a CUDA out-of-memory several minutes into
+    # the weight load, after the download, with nothing in the message naming the cause.
+    #
+    # Asked of the supervisor rather than of the arguments, because the supervisor has already
+    # planned the offload, the window and the arena, and it is THAT footprint which either
+    # fits or does not. Construction is pure planning — no process, no files — so there is
+    # nothing to undo if the answer is no.
+    #
+    # `fits is None` whenever the box or the checkpoint could not be sized, and proceeds: a
+    # check that blocks a working setup because it could not reach HuggingFace would be worse
+    # than no check. See `glq.fit`.
+    if args.serve and not args.force and not picked_interactively:
+        _verdict = fit.check_fit(supervisor, ram_bytes=_ram_bytes(),
+                                 swap_bytes=_swap_bytes(),
+                                 available_ram_bytes=_available_ram_bytes(),
+                                 floor=DEFAULT_CODE_MAX_MODEL_LEN)
+        if _verdict.fits is False:
+            print(*fit.refusal_lines(_verdict, command="glq-code",
+                                     gpu_name=_gpu_name()),
+                  sep="\n", file=sys.stderr)
+            return 2
+
+    if "gemma4" in tool_args:
+        # The template is in neither the checkpoint nor the vLLM wheel; the installer
+        # downloads it, but this install may predate that or have skipped picode.
+        #
+        # AFTER the fit check on purpose: `tool_serve_args` already put the template's PATH
+        # into tool_args, so this call only has to make the file exist — which a refused
+        # invocation never needs. Fetching it first would download for a serve that is about
+        # to be declined.
+        ensure_gemma4_template()
 
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
     # provider always points at the server this process is about to own (merge-safe:

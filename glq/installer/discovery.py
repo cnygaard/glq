@@ -10,8 +10,10 @@ card. Sizes therefore come from the file tree, summing `.safetensors` entries.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -263,6 +265,86 @@ def offload_bytes(cfg) -> tuple[int, int, int]:
         return int(v) if isinstance(v, (int, float)) and v > 0 else 0
 
     return _n("ple_offload_bytes"), _n("expert_offload_bytes"), _n("nontext_bytes")
+
+
+#: Bump when the cached document's shape changes, so an older glq's file is discarded
+#: rather than misread.
+CACHE_VERSION = 1
+
+#: A day. The collection changes when a checkpoint is published — rare, and never urgent
+#: enough to justify 2N+1 HTTP calls on every `glq-code` launch. `glq-setup` is the command
+#: that must always see the curator's latest, and it deliberately does not use this.
+CACHE_TTL_SECONDS = 24 * 3600
+
+
+def cache_path() -> Path:
+    """Where the discovered list is cached. Read fresh each call, not at import, so
+    `GLQ_HOME` can be pointed somewhere else by a test or a user."""
+    return Path(os.environ.get("GLQ_HOME", Path.home() / ".glq")) / "checkpoints.json"
+
+
+def _read_cache(path: Path, now) -> tuple[list[Checkpoint], bool]:
+    """`(checkpoints, fresh)`. `([], False)` when there is nothing usable.
+
+    Returns stale entries rather than dropping them: an expired cache that cannot be
+    refreshed is the best answer an offline `glq-code` can get, so expiry has to mean
+    "try again" rather than "discard".
+    """
+    try:
+        doc = json.loads(path.read_text())
+        if (doc.get("version") != CACHE_VERSION
+                or doc.get("collection") != COLLECTION_SLUG):
+            return [], False
+        fields = {f.name for f in dataclasses.fields(Checkpoint)}
+        # Unknown keys dropped and missing keys defaulted, so a document written by a
+        # different glq still loads as far as it can.
+        out = [Checkpoint(**{k: v for k, v in c.items() if k in fields})
+               for c in doc.get("checkpoints", [])]
+        fresh = (now() - float(doc.get("fetched_at", 0))) < CACHE_TTL_SECONDS
+        return out, bool(out) and fresh
+    except Exception:                                      # noqa: BLE001 - absent, corrupt, …
+        return [], False
+
+
+def _write_cache(path: Path, checkpoints, now) -> None:
+    """Atomically, and 0644: this is public collection metadata, not token-adjacent."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
+        "version": CACHE_VERSION, "collection": COLLECTION_SLUG,
+        "fetched_at": now(),
+        "checkpoints": [dataclasses.asdict(c) for c in checkpoints],
+    }, indent=2))
+    os.replace(tmp, path)
+
+
+def cached_discover(fetch=_fetch_json, *, path=None, now=time.time) -> list[Checkpoint]:
+    """`discover()`, memoised on disk for `CACHE_TTL_SECONDS`.
+
+    For the commands that show a picker on every launch. `discover()` costs one HTTP call for
+    the collection plus two per repo, each with a 20 s timeout and no retry, which is a long
+    time to stare at nothing before a menu appears.
+
+    Degrades in one direction only: a cache that cannot be read is ignored, a cache that
+    cannot be written is shrugged off, and a refresh that fails falls back to whatever stale
+    entries exist. Only a first run with no network raises — and then the caller genuinely has
+    nothing to offer, so `DiscoveryError` is the honest answer.
+    """
+    path = Path(path) if path else cache_path()
+    cached, fresh = _read_cache(path, now)
+    if fresh:
+        return cached
+    try:
+        found = discover(fetch=fetch)
+    except Exception:                                      # noqa: BLE001 - offline, 500, …
+        if cached:
+            return cached                                  # stale beats nothing
+        raise
+    try:
+        _write_cache(path, found, now)
+    except Exception:                                      # noqa: BLE001 - an optimisation
+        pass
+    return found
 
 
 def discover(fetch=_fetch_json) -> list[Checkpoint]:

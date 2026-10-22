@@ -124,6 +124,19 @@ glq-code --max-model-len 65536 -- -c   # glq-code's flags, then pi's
 The separator is required: without it argparse claims the flag for `glq-code` and the run
 stops rather than reaching pi. `pi --help` lists the rest.
 
+With no `--model` and no installer pick, `glq-code` offers the published collection sized
+against your hardware, best fit preselected, and filtered to the families it can actually
+serve. With no terminal — CI, a pipe, `curl | bash` — it takes the recommendation without
+prompting instead.
+
+A checkpoint too large for the machine is **refused before the download** rather than failing
+with an out-of-memory several minutes into the weight load. The check prices weights, runtime
+overhead, the KV floor and the expert arena against the card, **and the pinned expert budget
+against host RAM** — which is the limit that binds first on a small-RAM box, and the one no
+amount of extra offload can relieve, because pinned pages cannot be swapped out. It never
+refuses on a number it could not read (offline, no `nvidia-smi`, `--gpu-memory-utilization`),
+and `--force` overrides it. `glq-chat` carries the same check.
+
 CPU-only serving on a machine that has a GPU you don't want used (no flag needed on a
 machine without one — the installer detects it):
 

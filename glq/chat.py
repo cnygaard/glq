@@ -34,6 +34,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+from glq import fit
 from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
                             DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS,
                             DEFAULT_READY_TIMEOUT,
@@ -293,6 +294,47 @@ def _vram_bytes():
         return None
 
 
+def _swap_bytes():
+    """Total swap, or None if it cannot be read. **0 is an answer, not an unknown.**
+
+    Read for the pre-flight fit check rather than for planning. Pinned expert pages cannot be
+    swapped out, but the allocations *around* them can, so a box with swap survives a pinned
+    budget that a swapless box does not — and both measured data points behind that budget are
+    swapless, which is why the distinction has to be visible. See `glq.fit`.
+    """
+    try:
+        from glq.installer.hardware import swap_bytes
+        return swap_bytes()
+    except Exception:                                       # noqa: BLE001 - never block
+        return None
+
+
+def _gpu_name():
+    """The card's marketing name, or None. Cosmetic — it only labels a row in a message.
+
+    Worth having there: "this card 31.86 GiB" tells a user less than "RTX PRO 4500 Blackwell
+    31.86 GiB", which they can match against what they think they bought.
+    """
+    try:
+        from glq.installer.hardware import gpu_name
+        return gpu_name()
+    except Exception:                                       # noqa: BLE001 - never block
+        return None
+
+
+def _available_ram_bytes():
+    """RAM a new process can have without swapping, or None. Advisory only.
+
+    Reported in a refusal, never gated on: a refusal must be a statement about the machine,
+    so the gate uses MemTotal. Refusing because a browser happens to be open would be wrong.
+    """
+    try:
+        from glq.installer.hardware import available_ram_bytes
+        return available_ram_bytes()
+    except Exception:                                       # noqa: BLE001 - never block
+        return None
+
+
 def _sizing_fetch(model: str):
     """Where the sizing lookups should read from: a local checkpoint directory, or the Hub.
 
@@ -541,6 +583,9 @@ def main(argv=None) -> int:
                    help="do not start vLLM; attach to a server you started yourself")
     p.add_argument("--no-browser", dest="browser", action="store_false",
                    help="print the URL instead of opening a browser")
+    p.add_argument("--force", action="store_true",
+                   help="serve a checkpoint this machine was measured too small for "
+                        "(vLLM will most likely fail during the weight load)")
     p.add_argument("--verbose", action="store_true",
                    help="stream vLLM's own output instead of a one-line summary")
     # On by default: a *.gradio.live tunnel is what makes the chat reachable from a phone or
@@ -625,6 +670,30 @@ def main(argv=None) -> int:
         # being refused — the over-subscription `_WINDOW_CONCURRENCY` documents.
         window_concurrency=1,
     )
+
+    # The last guard, and the most expensive failure it prevents: a checkpoint larger than
+    # this machine used to reach vLLM and die with a CUDA out-of-memory several minutes into
+    # the weight load, after the download, with nothing naming the cause.
+    #
+    # Asked of the supervisor, not of the arguments, because by here the offload, the window
+    # and the arena are planned and it is THAT footprint which either fits. Construction is
+    # pure planning, so there is nothing to undo when the answer is no.
+    #
+    # The same function glq-code calls, deliberately: every other sizing helper is already
+    # shared between the two commands, and a gate that lived in only one of them would mean
+    # the fix applied to whichever command the author happened to be using. `command=` is
+    # threaded through so the shared renderer does not tell a glq-chat user to re-run
+    # glq-code.
+    if args.serve and not args.force:
+        _verdict = fit.check_fit(supervisor, ram_bytes=_ram_bytes(),
+                                 swap_bytes=_swap_bytes(),
+                                 available_ram_bytes=_available_ram_bytes(),
+                                 floor=DEFAULT_MAX_MODEL_LEN)
+        if _verdict.fits is False:
+            print(*fit.refusal_lines(_verdict, command="glq-chat",
+                                     gpu_name=_gpu_name()),
+                  sep="\n", file=sys.stderr)
+            return 2
 
     # Ctrl-C already unwinds through the context manager below, but `kill` and a closed
     # terminal do not: the default disposition for SIGTERM/SIGHUP ends the process without

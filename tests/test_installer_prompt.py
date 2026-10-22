@@ -227,3 +227,48 @@ def test_quantize_is_offered_but_not_default():
     serving-only default stays lean."""
     assert "quantize" in P.COMPONENTS
     assert "quantize" not in P.DEFAULT_COMPONENTS
+
+
+# ---- why a checkpoint does not fit, not just that it does not ---------------------------
+#
+# `_fit_label` said "too large for this GPU" for every non-fitting entry. Once host RAM
+# became a verdict axis (see `glq.fit`) that is a lie half the time: the pinned expert
+# budget can exceed what the host can hold while the card has room to spare — which is
+# exactly the case that sent a user looking at GPU prices for a host-memory problem.
+#
+# `Ranked.reason` is DEFAULTED, so every existing three-argument construction in the
+# installer and in these suites keeps working untouched.
+
+def test_ranked_still_takes_three_positional_arguments():
+    """The compatibility guarantee that makes this change small."""
+    r = Ranked(Checkpoint("org/a", GIB), True, False)
+    assert r.reason == ""
+
+
+def test_a_host_bound_entry_does_not_blame_the_gpu():
+    r = Ranked(Checkpoint("org/a", GIB), False, False, "host")
+    label = P._fit_label(r)
+    assert "GPU" not in label, label
+    assert "host" in label.lower(), label
+
+
+def test_a_vram_bound_entry_still_blames_the_gpu():
+    r = Ranked(Checkpoint("org/a", GIB), False, False, "vram")
+    assert "GPU" in P._fit_label(r)
+
+
+def test_an_unexplained_non_fit_keeps_the_original_wording():
+    """`rank` does not set a reason, and must keep rendering as it always did."""
+    assert P._fit_label(Ranked(Checkpoint("org/a", GIB), False, False)) \
+        == "too large for this GPU"
+
+
+def test_the_warning_after_a_host_bound_pick_names_host_memory():
+    """Picking it is allowed — the menu warns and obeys — but the warning has to be about
+    the right resource, or it sends the user to fix the wrong thing."""
+    ranked = [Ranked(Checkpoint("org/big", int(30 * GIB)), False, False, "host")]
+    tty = _Tty("")                      # EOF -> takes the default, which is this entry
+    P.select_model(ranked, tty=tty)
+    warning = tty.screen.split("warning:", 1)[-1]
+    assert "host" in warning, warning
+    assert "GPU" not in warning, "a host-memory shortfall must not be blamed on the card"
