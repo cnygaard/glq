@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 import os
 import shutil
 import signal
@@ -34,8 +35,8 @@ from glq.installer.prompt import open_tty, select_model
 from glq.installer.recommend import PREFERRED_FAMILIES
 from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
-from glq.tooling import (ensure_gemma4_template, sampling_serve_args,
-                         tool_serve_args)
+from glq.tooling import (ensure_gemma4_template, required_plugin,
+                         sampling_serve_args, tool_serve_args)
 
 #: The window a coding session falls back to when the card cannot be sized — a CPU box, or
 #: a `--model` whose config we could not read. A coding agent carries file contents, diffs
@@ -110,6 +111,33 @@ class _PiAwareParser(argparse.ArgumentParser):
         super().error(message)
 
 
+def _plugin_installed(module: str) -> bool:
+    """Is this plugin importable? Asked WITHOUT importing it.
+
+    Importing `aleph_alpha_inference` runs its registration side effects —
+    `ModelRegistry.register_model`, `AutoConfig.register`, and two parser registrations —
+    which is not something a *check* gets to do, least of all one that may be followed by a
+    refusal. `find_spec` answers presence from the module finders alone.
+
+    Reached through `importlib.util` rather than a `from` import so tests can patch the
+    lookup on this module without touching every other import in the process.
+    """
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):       # a broken or namespace-shadowed install
+        return False
+
+
+def _installed_vllm():
+    """The installed vLLM version string, or None. Cosmetic — it only makes a pin mismatch
+    self-evident in the plugin-guard message."""
+    try:
+        from importlib.metadata import version
+        return version("vllm")
+    except Exception:                       # noqa: BLE001 - absent, or metadata unreadable
+        return None
+
+
 def _fit_device():
     """The backend to judge checkpoints against, resolved ONCE per invocation.
 
@@ -142,10 +170,21 @@ def _pick_model(cfg, *, current=None):
     # The filter itself is not optional: `tool_serve_args` is what decides, and glq-code
     # exits 2 on anything it does not know. In the live collection the two entries it
     # removes are the SmolLM2 pair, which are also the smallest and most inviting.
-    offerable = [c for c in checkpoints if tool_serve_args(c.repo_id) is not None]
+    # Both halves of "can this command actually serve it": a known tool parser, AND any
+    # plugin that family needs. Offering an entry the guard below would immediately refuse
+    # is the same inconsistency this filter exists to prevent — a menu that lies. Latent
+    # rather than active today, since no Kolibri build is in the start-here collection.
+    def _servable(rid):
+        if tool_serve_args(rid) is None:
+            return False
+        plug = required_plugin(rid)
+        return plug is None or _plugin_installed(plug[0])
+
+    offerable = [c for c in checkpoints if _servable(c.repo_id)]
     if not offerable:
         return None, ("the published collection has nothing this command can serve "
-                      "(no known tool-calling setup for any entry)")
+                      "(no known tool-calling setup, or a missing vLLM plugin, for "
+                      "every entry)")
 
     ranked = fit.fit_ranked(
         offerable, vram_bytes=_vram_bytes(), ram_bytes=_ram_bytes(),
@@ -252,7 +291,31 @@ def main(argv=None) -> int:
     if tool_args is None:
         print(f"error: no known tool-calling setup for {args.model}. A wrong parser "
               f"fails silently\n(tool calls that never parse), so glq-code refuses to "
-              f"guess. Supported families:\ngemma-4, SmolLM3, Qwen.", file=sys.stderr)
+              f"guess. Supported families:\ngemma-4, SmolLM3, Qwen, Kolibri 1.",
+              file=sys.stderr)
+        return 2
+
+    # Some families need a third-party vLLM plugin as well as glq. Guarded here, with the
+    # other pre-supervisor guards, for the same reason: without it vLLM fails at startup
+    # with an unknown-architecture or unknown-parser error — minutes into a multi-GiB weight
+    # load, naming neither the plugin nor how to get it.
+    _plugin = required_plugin(args.model)
+    if _plugin is not None and not _plugin_installed(_plugin[0]):
+        _mod, _pip = _plugin
+        # Comment column derived from the longer command, so the two lines stay aligned
+        # whatever the pip string is — a hardcoded pad drifts the moment it changes.
+        _cmds = [(_pip, "also installs the vLLM it supports (0.29.x)"),
+                 ("pip install glq", "kernels only; does not move vLLM")]
+        _w = max(len(c) for c, _ in _cmds)
+        _lines = "\n".join(f"  {c.ljust(_w)}   # {note}" for c, note in _cmds)
+        print(f"error: {args.model} needs a vLLM plugin that is not installed.\n"
+              f"       vLLM has no built-in Kolibri1ForCausalLM, and the kolibri1 tool and\n"
+              f"       reasoning parsers are registered by the plugin rather than by vLLM.\n"
+              f"\n{_lines}\n\n"
+              f"       That order matters: the `glq[vllm]` extra would pull a vLLM newer\n"
+              f"       than the plugin's >=0.29.0,<0.30.0 pin allows.\n"
+              f"       Installed now: vllm {_installed_vllm() or 'not found'}.",
+              file=sys.stderr)
         return 2
     # The model card's sampling, pinned server-side because pi cannot send `top_k` at all
     # (not an OpenAI field, and the pi config has no slot for it). Appended, not substituted:
