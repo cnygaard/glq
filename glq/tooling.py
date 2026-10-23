@@ -94,6 +94,67 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
         # reasoning parser is the pairing the Terminal-Bench integration validated end
         # to end — don't drift it as a side effect of Qwen changes.
         return ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
+    if "kolibri" in name:
+        # Both names are registered by the `aleph-alpha-inference` PLUGIN, not by vLLM —
+        # see `required_plugin` below for the consequence. A vanilla vLLM has neither
+        # parser, and cannot load `Kolibri1ForCausalLM` natively either (upstream
+        # `registry.py` routes it to the transformers backend).
+        #
+        # The two are NOT symmetric. The reasoning parser is genuinely the plugin's
+        # (`Kolibri1ParserReasoningAdapter`, which reads `reasoning_effort`); the tool
+        # parser is a lazy ALIAS to vLLM's own `Hermes2ProToolParser`, with the plugin's
+        # comment "Kolibri 1 currently shares the Hermes <tool_call>...</tool_call>
+        # format". So `hermes` would behave identically today — and is still the wrong
+        # thing to write here, because that alias is exactly where Aleph Alpha would
+        # change it if the markup diverges, and `kolibri1` is what the plugin's README
+        # and the published model card both document.
+        #
+        # No `--default-chat-template-kwargs`, unlike gemma-4: the plugin has thinking ON
+        # by default and it is turned OFF per request (`reasoning_effort: "none"`), so a
+        # server-side default would assert something the model already does. No
+        # `--chat-template` either — Kolibri's ships with the plugin rather than living in
+        # vLLM's examples directory.
+        return ["--enable-auto-tool-choice",
+                "--tool-call-parser", "kolibri1",
+                "--reasoning-parser", "kolibri1"]
+    return None
+
+
+#: Families that need a third-party vLLM plugin on top of glq + vLLM, as
+#: `{substring: (importable module, pip command)}`.
+#:
+#: Data rather than a check, and data *here* rather than a second family test in
+#: `glq/code.py`: this module is the one place that knows what a repo id implies, and the
+#: repo already carries one stranded family test outside it (`installer/__main__.py`'s
+#: `is_gemma4`) which is a wart worth not duplicating.
+#:
+#: The module name is the IMPORTABLE one (underscores), not the distribution name
+#: (hyphens) — `importlib.util.find_spec` only accepts the former, and a hyphen here could
+#: never be found, so the guard would refuse a perfectly good install.
+_FAMILY_PLUGIN = {
+    "kolibri": ("aleph_alpha_inference", "pip install 'aleph-alpha-inference>=1'"),
+}
+
+
+def required_plugin(model_id: str) -> tuple[str, str] | None:
+    """`(importable module, pip command)` this family needs beyond glq + vLLM, or None.
+
+    Only Kolibri 1 today. vLLM has no native `Kolibri1ForCausalLM` and no `kolibri1`
+    parsers, so without the plugin a serve fails at vLLM startup — minutes into a weight
+    load, with an unknown-architecture or unknown-parser error that names neither the
+    plugin nor the install command.
+
+    Callers should test presence with `importlib.util.find_spec`, **never by importing**:
+    importing the plugin runs its registration side effects (`ModelRegistry.register_model`,
+    `AutoConfig.register`, two parser registrations), which is not something a check should
+    do. Note the plugin pins `vllm>=0.29.0,<0.30.0` and each of its releases supports
+    exactly one vLLM minor, so `glq[vllm]` would move vLLM out of range — plain `glq`
+    installed *after* the plugin is the order that works.
+    """
+    name = (model_id or "").lower()
+    for family, spec in _FAMILY_PLUGIN.items():
+        if family in name:
+            return spec
     return None
 
 
@@ -112,6 +173,9 @@ _FAMILY_SAMPLING = {
     # key out is not the same as sending 0: it keeps whatever the checkpoint's own
     # generation_config.json says, which is the thing we have no reason to overrule.
     "smollm3": {"temperature": 0.6, "top_p": 0.95},
+    # Kolibri 1's card: 1.0 / 0.97 / 128. The 128 is again the point of the table — pi
+    # cannot send top_k at all, so an unpinned one silently becomes vLLM's default.
+    "kolibri": {"temperature": 1.0, "top_p": 0.97, "top_k": 128},
 }
 
 #: Neutral values for a family we have no card for — usable on a slider, opinionated about

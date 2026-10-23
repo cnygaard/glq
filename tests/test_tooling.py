@@ -235,3 +235,88 @@ def test_an_unknown_model_still_gets_usable_slider_values():
     cfg = recommended_sampling("some-org/unheard-of-model")
     assert set(cfg) == {"temperature", "top_p", "top_k"}
     assert all(v is not None for v in cfg.values())
+
+
+# ---- Kolibri 1 -------------------------------------------------------------------------
+#
+# `glq-code --model xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw` refused outright: the family
+# chain knew gemma-4, Qwen and SmolLM3 and nothing else. Kolibri serves fine — the published
+# model card and the Aleph Alpha plugin's README both document the recipe — glq simply had no
+# entry for it.
+#
+# The two parser names are NOT symmetric, which is why both are pinned here:
+#   kolibri1 reasoning -> Kolibri1ParserReasoningAdapter   (genuinely plugin-specific)
+#   kolibri1 tool      -> vllm...hermes_tool_parser:Hermes2ProToolParser   (an alias)
+# so `hermes` would work identically *today*. It is still wrong to write: the alias is where
+# Aleph Alpha will diverge if Kolibri's markup changes, and the plugin, its README and the
+# published card all say `kolibri1`.
+
+KOLIBRI = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
+
+
+def test_kolibri_gets_the_plugin_s_own_parsers():
+    args = T.tool_serve_args(KOLIBRI)
+    assert args is not None, "the reported failure: this returned None"
+    assert "--enable-auto-tool-choice" in args
+    assert args[args.index("--tool-call-parser") + 1] == "kolibri1"
+    assert args[args.index("--reasoning-parser") + 1] == "kolibri1"
+
+
+def test_kolibri_does_not_use_hermes():
+    """The plugin currently ALIASES kolibri1 to Hermes2ProToolParser, so this passes either
+    way at runtime. Pinned anyway: a future 'simplify to hermes' has to argue with a test
+    rather than quietly diverge from the plugin and the model card."""
+    assert "hermes" not in " ".join(T.tool_serve_args(KOLIBRI))
+
+
+def test_kolibri_needs_no_chat_template_or_thinking_default():
+    """gemma-4's template fetch and enable_thinking default must not leak across. Kolibri's
+    template ships with the plugin, and the plugin has thinking ON by default — it is turned
+    off per request via reasoning_effort, so a server-side default would be redundant."""
+    joined = " ".join(T.tool_serve_args(KOLIBRI))
+    assert "--chat-template" not in joined
+    assert "--default-chat-template-kwargs" not in joined
+    assert "--language-model-only" not in joined          # qwen-only
+
+
+def test_kolibri_sampling_is_the_cards_numbers():
+    """1.0 / 0.97 / 128, and top_k present — the contrast with SmolLM3, which deliberately
+    emits none. top_k is the reason this table exists: pi cannot send it."""
+    import json
+    args = T.sampling_serve_args(KOLIBRI)
+    params = json.loads(args[args.index("--override-generation-config") + 1])
+    assert params["temperature"] == 1.0
+    assert params["top_p"] == 0.97
+    assert params["top_k"] == 128
+
+
+def test_kolibri_substring_does_not_collide_with_another_family():
+    """The chain is ordered substring matching, so a new key could shadow an existing one."""
+    for other in ("google/gemma-4-26B-A4B-it", "Qwen/Qwen3.8-27B",
+                  "HuggingFaceTB/SmolLM3-3B"):
+        joined = " ".join(T.tool_serve_args(other) or [])
+        assert "kolibri1" not in joined, other
+
+
+# ---- the plugin a family needs beyond glq + vLLM ---------------------------------------
+
+def test_kolibri_declares_its_required_plugin():
+    """vLLM has no native Kolibri1ForCausalLM and no kolibri1 parsers: both come from
+    `aleph-alpha-inference`. Declared as DATA here so `code.py` needs no second family
+    check — the repo already has one stranded in installer/__main__.py and it is a wart."""
+    mod, pip = T.required_plugin(KOLIBRI)
+    assert mod == "aleph_alpha_inference"
+    assert "aleph-alpha-inference>=1" in pip
+
+
+def test_families_that_need_no_plugin_say_so():
+    for m in ("google/gemma-4-26B-A4B-it", "Qwen/Qwen3.8-27B",
+              "HuggingFaceTB/SmolLM3-3B", "mistralai/Devstral-Small-2-24B"):
+        assert T.required_plugin(m) is None, m
+
+
+def test_required_plugin_names_an_importable_module_not_the_pip_name():
+    """The two differ (underscore vs hyphen) and `find_spec` needs the importable one; a
+    hyphen there can never be found, so the guard would refuse a working install."""
+    mod, _pip = T.required_plugin(KOLIBRI)
+    assert "-" not in mod

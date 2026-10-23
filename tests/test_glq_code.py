@@ -14,8 +14,6 @@ from __future__ import annotations
 import io
 import os
 import sys
-import types
-from pathlib import Path
 
 import pytest
 
@@ -798,3 +796,90 @@ def test_discovery_failure_with_nothing_to_fall_back_on_is_an_error(monkeypatch,
     err = capsys.readouterr().err
     assert "--model" in err, "the original hint must survive"
     assert "no network" in err, "and it should say why the menu could not be shown"
+
+
+# ---- Kolibri 1, and the plugin it needs ------------------------------------------------
+#
+# `glq-code --model xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw` used to exit 2 with "no known
+# tool-calling setup". The family now maps — but the `kolibri1` parsers and the model
+# implementation both come from `aleph-alpha-inference`, which pins vllm>=0.29.0,<0.30.0. On
+# a standard GLQ box (vLLM 0.32) correct flags alone still fail at vLLM startup, minutes into
+# a 28.68 GiB load. So the plugin is guarded up front, like every other guard here.
+#
+# `find_spec` is patched in every case below, so no result depends on whether the plugin
+# happens to be installed on the machine running pytest.
+
+KOLIBRI_ID = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
+
+
+def _plugin(monkeypatch, present: bool):
+    """Patch only the plugin's own spec lookup, leaving every other import alone."""
+    import importlib.util as iu
+    real = iu.find_spec
+
+    def fake(name, *a, **kw):
+        if name == "aleph_alpha_inference":
+            return object() if present else None
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(code.importlib.util, "find_spec", fake)
+
+
+def test_kolibri_serves_with_the_plugin_parsers(monkeypatch, tmp_path):
+    events, made, _, _ = _run_code(monkeypatch, tmp_path)
+    _plugin(monkeypatch, True)
+    assert code.main(["--model", KOLIBRI_ID]) == 0
+    assert events == ["start", "pi", "stop"]
+    extra = made[0]["extra_args"]
+    assert extra[extra.index("--tool-call-parser") + 1] == "kolibri1"
+    assert extra[extra.index("--reasoning-parser") + 1] == "kolibri1"
+
+
+def test_kolibri_without_the_plugin_is_refused_before_the_server(monkeypatch, tmp_path,
+                                                                 capsys):
+    events, made, _, _ = _run_code(monkeypatch, tmp_path)
+    _plugin(monkeypatch, False)
+    assert code.main(["--model", KOLIBRI_ID]) == 2
+    assert made == [] and events == [], "nothing may start before the plugin is present"
+    err = capsys.readouterr().err
+    assert "aleph-alpha-inference>=1" in err, err
+    # the install ORDER matters: glq[vllm] would move vLLM past the plugin's <0.30.0 pin
+    assert err.index("aleph-alpha-inference") < err.index("pip install glq")
+
+
+def test_the_plugin_guard_is_family_scoped(monkeypatch, tmp_path):
+    """A missing Aleph Alpha plugin must not gate a model that never needed it."""
+    events, _, _, _ = _run_code(monkeypatch, tmp_path)
+    _plugin(monkeypatch, False)
+    assert code.main(["--model", SMOL]) == 0
+    assert events == ["start", "pi", "stop"]
+
+
+def test_the_picker_hides_a_family_whose_plugin_is_missing(monkeypatch, tmp_path):
+    """The menu must not offer what the guard will immediately refuse — the same
+    inconsistency the tool-parser filter exists to prevent."""
+    seen = {}
+    _run_code(monkeypatch, tmp_path, collection=[(KOLIBRI_ID, 28.7)] + FITS,
+              keystrokes="", vram_gib=31.86, ram_gib=120.0)
+    _plugin(monkeypatch, False)
+    real = code.select_model
+    monkeypatch.setattr(code, "select_model",
+                        lambda ranked, tty=None: seen.setdefault("ranked", ranked)
+                        and None or real(ranked, tty=tty))
+    code.main([])
+    offered = [r.checkpoint.repo_id for r in seen["ranked"]]
+    assert KOLIBRI_ID not in offered, offered
+
+
+def test_the_picker_offers_kolibri_when_the_plugin_is_there(monkeypatch, tmp_path):
+    """The failing control: the filter must key on the plugin, not on the family."""
+    seen = {}
+    _run_code(monkeypatch, tmp_path, collection=[(KOLIBRI_ID, 28.7)] + FITS,
+              keystrokes="", vram_gib=31.86, ram_gib=120.0)
+    _plugin(monkeypatch, True)
+    real = code.select_model
+    monkeypatch.setattr(code, "select_model",
+                        lambda ranked, tty=None: seen.setdefault("ranked", ranked)
+                        and None or real(ranked, tty=tty))
+    code.main([])
+    assert KOLIBRI_ID in [r.checkpoint.repo_id for r in seen["ranked"]]
