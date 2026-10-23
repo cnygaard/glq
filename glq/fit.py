@@ -127,7 +127,12 @@ def check_fit(sup, *, ram_bytes=None, swap_bytes=None, available_ram_bytes=None,
     weights = getattr(sup, "weights_bytes", None)
     window = int(getattr(sup, "max_model_len", 0) or 0)
     conc = max(1, int(getattr(sup, "window_concurrency", 1) or 1))
-    offload_gib = int(getattr(sup, "expert_offload_gib", 0) or 0)
+    # The ACHIEVABLE figure, not the request. This only feeds message text, never a verdict
+    # — but a refusal that says "80 GiB pinned in host memory" beside a `pinned_bytes` of
+    # 66.47 GiB is two numbers in one message disagreeing, and the reader cannot tell which
+    # to believe. `getattr` keeps the existing tolerance for a stand-in object.
+    offload_gib = int(getattr(sup, "effective_expert_offload_gib", None)
+                      or getattr(sup, "expert_offload_gib", 0) or 0)
     arena_gib = int(getattr(sup, "expert_arena_gib", 0) or 0)
     resident = int(getattr(sup, "resident_bytes", 0) or 0)
     pinned = int(getattr(sup, "pinned_host_bytes", 0) or 0)

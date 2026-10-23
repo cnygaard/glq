@@ -307,3 +307,32 @@ def test_fit_ranked_resolves_the_device_once_not_once_per_checkpoint(monkeypatch
     assert len(got) == 6, "the ranking must still have happened"
     assert calls, "the probe must have been reached at all — else this proves nothing"
     assert len(calls) == 1, f"detect_device called {len(calls)}x for 6 checkpoints"
+
+
+# ---- a forced offload budget is not the same as pinned bytes ---------------------------
+#
+# Found from a real report: a user on a 94.27 GiB host served Flash-Next with
+# `--cpu-offload-gb 60`. The checkpoint declares 42.63 GiB of offloadable experts, so vLLM
+# cannot pin 60 — there is not that much to pin. Counting the REQUEST rather than what is
+# achievable over-stated pinned memory by 17.37 GiB and flipped the verdict to a refusal, and
+# over-counting is the dangerous direction: it refuses a configuration that works.
+
+def test_a_forced_budget_is_capped_by_the_declared_expert_bytes():
+    s = _sup(KOLIBRI, ram_gib=120.0, expert_offload_gib=80)
+    # 80 GiB requested, 26.77 GiB of experts exist -> at most 26.77 can be pinned
+    assert s.pinned_host_bytes <= KOLIBRI["expert_offload_bytes"] + 0
+
+
+def test_an_over_large_budget_does_not_manufacture_a_host_refusal():
+    """The real-report case, scaled down: the request exceeds what the checkpoint has, so
+    the host gate must judge the achievable figure."""
+    r = _check(_sup(KOLIBRI, ram_gib=60.0, expert_offload_gib=200), ram_gib=60.0)
+    assert r.pinned_bytes <= KOLIBRI["expert_offload_bytes"]
+    assert r.fits is not False, f"refused on a budget that cannot be spent: {r.reason}"
+
+
+def test_an_undeclared_offload_still_trusts_the_request():
+    """A checkpoint declaring no offloadable experts has no figure to clamp to, so a forced
+    budget must be taken at face value rather than silently becoming zero."""
+    s = _sup(DENSE, ram_gib=120.0, expert_offload_gib=20)
+    assert s.pinned_host_bytes == 20 * GIB

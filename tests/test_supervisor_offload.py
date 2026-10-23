@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from glq.supervisor import (WINDOW_OFFLOAD_MAX_EXTRA_GIB,  # noqa: E402
@@ -981,3 +983,114 @@ def test_a_pinned_window_is_not_replanned():
     """`--max-model-len` is an instruction; the re-plan touches only the automatic choice."""
     sup = _code_sup(23.0, ram_gib=110.0, max_model_len=16384, **FN_CORRECTED)
     assert sup.max_model_len == 16384
+
+
+# ---- a forced budget is a budget, not an amount -----------------------------------------
+#
+# `--cpu-offload-gb` is a ceiling: vLLM saturates at the experts the checkpoint declares.
+# The planners already cap (`plan_expert_offload_gib`, `plan_arena_and_offload`), but a
+# FORCED value returns early before reaching them — so the accounting derived from it was
+# computed against a number that cannot happen.
+#
+# Both derived figures were wrong, in OPPOSITE directions, and the VRAM one is the dangerous
+# half: `resident_bytes` returned 0 where 7.19 GiB is really resident (the `max(0, ...)`
+# swallowed a negative), making `kv_headroom_bytes` claim +25.31 GiB against a true +17.91.
+# Under-stating VRAM says things fit that do not.
+#
+# Real figures, from the HF report this came out of: Flash-Next declares 23.84 GiB of PLE and
+# 42.63 GiB of experts out of 73.66 GiB total, so everything offloadable leaving puts exactly
+# 7.19 GiB on the card.
+
+FN_REAL = dict(weights_bytes=int(73.66 * GIB), ple_offload_bytes=int(23.84 * GIB),
+               expert_offload_bytes=int(42.63 * GIB), model_max_len=262144)
+#: Resident once the clamp applies. The cap floors to whole GiB (42, not 42.63), like every
+#: other clamp in the module, so this is 7.82 rather than the 7.19 that the exact byte figure
+#: would give. Flooring errs toward reporting MORE resident than reality, which is the safe
+#: direction for VRAM: it under-promises KV headroom rather than over-promising it.
+_CLAMPED_RESIDENT = int((73.66 - 23.84 - 42) * GIB)      # 7.82 GiB
+
+
+def _fn(vram_gib=31.86, ram_gib=94.27, **kw):
+    return VllmSupervisor(model="org/flash-next", device="cuda",
+                          vram_bytes=int(vram_gib * GIB), ram_bytes=int(ram_gib * GIB),
+                          **{**FN_REAL, **kw})
+
+
+@pytest.mark.parametrize("forced", [60, 80, 120])
+def test_a_forced_budget_does_not_understate_vram(forced):
+    """The dangerous half. Before the clamp this returned 0.00 GiB for every one of these."""
+    got = _fn(expert_offload_gib=forced).resident_bytes
+    assert abs(got - _CLAMPED_RESIDENT) < GIB // 50, (
+        f"forced {forced}: resident {got/GIB:.2f} GiB, expected "
+        f"{_CLAMPED_RESIDENT/GIB:.2f}")
+    assert got > 0, "the bug this guards: max(0, ...) swallowed a negative and returned 0"
+
+
+def test_the_kv_headroom_derived_from_it_is_not_optimistic():
+    """`check_fit` prices the card from `resident_bytes`, so an understated resident becomes
+    an overstated KV headroom — the number a fit verdict must never inflate."""
+    sup = _fn(expert_offload_gib=120)
+    assert (kv_headroom_bytes(sup.resident_bytes, sup.vram_bytes)
+            == kv_headroom_bytes(_CLAMPED_RESIDENT, sup.vram_bytes))
+    # and it must be LOWER than what the unclamped request claimed (+25.31 GiB), because
+    # the whole point is to stop over-promising the card
+    assert (kv_headroom_bytes(sup.resident_bytes, sup.vram_bytes)
+            < kv_headroom_bytes(0, sup.vram_bytes))
+
+
+@pytest.mark.parametrize("forced", [60, 80])
+def test_a_forced_budget_does_not_overstate_pinned_host_memory(forced):
+    """The other half: counting the request refused configurations that run."""
+    sup = _fn(expert_offload_gib=forced)
+    assert sup.pinned_host_bytes == FN_REAL["ple_offload_bytes"] + int(42 * GIB)
+
+
+def test_a_budget_within_the_declared_experts_is_untouched():
+    """The fix must reach only the forced-and-over case. 40 < 42.63, so it is achievable and
+    every figure stays exactly what it was."""
+    sup = _fn(expert_offload_gib=40)
+    assert sup.effective_expert_offload_gib == 40
+    assert sup.pinned_host_bytes == FN_REAL["ple_offload_bytes"] + 40 * GIB
+
+
+def test_a_planned_offload_is_untouched():
+    """The planners already capped, so an auto plan must be bit-identical to before — this
+    is the guard that the change cannot move any working configuration."""
+    sup = _fn()
+    assert sup.effective_expert_offload_gib == sup.expert_offload_gib
+    assert sup.pinned_host_bytes == (FN_REAL["ple_offload_bytes"]
+                                     + sup.expert_offload_gib * GIB)
+
+
+def test_an_undeclared_offload_still_trusts_the_request():
+    """0 declared bytes means UNDECLARED, not "no experts". There is nothing to cap against,
+    so a forced budget is taken at face value rather than collapsing to zero."""
+    sup = _fn(expert_offload_bytes=0, ple_offload_bytes=0, expert_offload_gib=20)
+    assert sup.effective_expert_offload_gib == 20
+    assert sup.pinned_host_bytes == 20 * GIB
+
+
+# ---- the two things that must keep seeing the RAW request -------------------------------
+#
+# Clamping `self.expert_offload_gib` at assignment is the tempting one-liner. These are the
+# failing controls for it: both of these break silently if the attribute is clamped.
+
+def test_the_request_itself_is_still_honored_verbatim():
+    """`--cpu-offload-gb 999` is a documented contract — honored, never silently adjusted."""
+    sup = _fn(expert_offload_gib=999)
+    assert sup.expert_offload_gib == 999
+    argv = sup.argv()
+    assert argv[argv.index("--cpu-offload-gb") + 1] == "999"
+    assert sup.effective_expert_offload_gib == 42, "but the ACCOUNTING is capped"
+
+
+def test_the_over_large_budget_warning_still_fires():
+    """`_offload_args` compares the request against the declared bytes to warn about the
+    VRAM side. A clamped attribute makes that condition unreachable and the warning dies
+    without a trace."""
+    import io
+    out = io.StringIO()
+    sup = _fn(expert_offload_gib=80, out=out)
+    sup.argv()
+    said = out.getvalue()
+    assert "80" in said and "42" in said, said
