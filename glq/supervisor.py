@@ -1095,8 +1095,11 @@ class VllmSupervisor:
         """
         if not self.weights_bytes:
             return 0
+        # `effective_expert_offload_gib`, not the request: a forced budget larger than the
+        # checkpoint's experts drove this to 0 where 7.19 GiB was really resident, and an
+        # understated resident becomes an overstated KV headroom. See that property.
         return max(0, int(self.weights_bytes) - self.ple_offload_bytes - self.nontext_bytes
-                   - self.expert_offload_gib * 1024 ** 3)
+                   - self.effective_expert_offload_gib * 1024 ** 3)
 
     @property
     def vram_bytes(self) -> int | None:
@@ -1111,13 +1114,61 @@ class VllmSupervisor:
         return self._vram_bytes
 
     @property
+    def effective_expert_offload_gib(self) -> int:
+        """GiB of experts that can ACTUALLY be pinned: the request, capped by what exists.
+
+        `--cpu-offload-gb` is a **budget**, not an amount — vLLM saturates at the experts the
+        checkpoint declares. Every planner here already caps for that reason
+        (`plan_expert_offload_gib`, `plan_expert_arena_gib`, `plan_arena_and_offload`), but a
+        **forced** value returns early before reaching any of them, so only that path needs
+        this. An auto plan is unchanged by it, by construction.
+
+        Measured on the configuration that found this (Flash-Next: 23.84 GiB of PLE and
+        42.63 GiB of experts out of 73.66 GiB, on a 94.27 GiB host), accounting from the
+        request rather than from this was wrong **in both directions at once**:
+
+            --cpu-offload-gb 60   pinned +17.37 GiB over   resident -7.19 GiB under
+            --cpu-offload-gb 80   pinned +37.37 GiB over   resident -7.19 GiB under
+
+        The over-count refused a configuration that runs — 66.47 GiB pinned leaves 27.80 GiB
+        unpinned, well clear of `fit.HOST_UNPINNED_FLOOR_BYTES`. The under-count is worse: a
+        resident of 0 where 7.19 GiB is really on the card (the `max(0, …)` in
+        `resident_bytes` swallowed a negative) made `kv_headroom_bytes` claim +25.31 GiB
+        against a true +17.91, and over-promising VRAM is how a check says yes to something
+        that cannot load.
+
+        Deliberately **not** a clamp on `self.expert_offload_gib` itself. Two things need the
+        raw request and would break silently: `_offload_args`' warning compares it against
+        the declared bytes (a clamped attribute makes that condition unreachable), and the
+        emitted `--cpu-offload-gb` is the user's own number — honored verbatim, never
+        silently adjusted. The window re-plan and the arena re-size also stay on the request;
+        moving those is a *sizing* change for configurations that work today, so it belongs
+        in its own measured change rather than riding along with this one.
+
+        Floored whole GiB, like every other clamp in this module — which is not free, and the
+        two sides of it point opposite ways. Against 42.63 GiB of declared experts the cap is
+        42, so `resident_bytes` reports 7.82 GiB where 7.19 is real (conservative: it
+        under-promises KV headroom) while `pinned_host_bytes` reports 65.84 where 66.47 is
+        real (optimistic by 0.63 GiB). The host error is immaterial against
+        `fit.HOST_UNPINNED_FLOOR_BYTES`, a 16 GiB constant derived from one measured pass and
+        one measured failure — 0.63 GiB sits far inside that envelope — and one consistent
+        clamp is worth more than two clamps rounding different ways.
+        """
+        gib = self.expert_offload_gib
+        if self.expert_offload_bytes:
+            gib = min(gib, int(self.expert_offload_bytes // 1024 ** 3))
+        return max(0, gib)
+
+    @property
     def pinned_host_bytes(self) -> int:
         """Host memory the plan will pin: the PLE table plus the offloaded experts.
 
         Pinned, so it cannot be swapped out and cannot be reclaimed under pressure — which is
         why it is budgeted against total RAM rather than against what is momentarily free.
+
+        Counted from `effective_expert_offload_gib`, not the request; see there for why.
         """
-        return self.ple_offload_bytes + self.expert_offload_gib * 1024 ** 3
+        return self.ple_offload_bytes + self.effective_expert_offload_gib * 1024 ** 3
 
     # ------------------------------------------------------------------ lifecycle
 
