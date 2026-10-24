@@ -248,6 +248,10 @@ class GLQEmbeddingMethod(QuantizeMethodBase):
     #: matches what vLLM's own FP8 and unquantized PLE methods declare. Harmless on 0.29.0.
     requires_device_loading: bool = False
 
+    def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
+        """Decoded row dtype used by vLLM's pinned-host prefetch buffer."""
+        return layer.glq_out_dtype
+
     def dequantize(self, layer: nn.Module, embeddings: torch.Tensor,
                    output_dtype: torch.dtype) -> torch.Tensor:
         """Required by vLLM >= 0.30.0, which SPLIT the PLE lookup into two calls.
