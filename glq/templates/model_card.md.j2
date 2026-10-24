@@ -20,6 +20,34 @@
 - **Calibration:** {{ nsamples }} samples × {{ seqlen }} tokens (WikiText-2)
 
 ## Install
+{% if required_plugin %}
+
+**This model needs a vLLM plugin as well as GLQ**, and that changes the install. vLLM has no
+built-in support for this architecture, so the plugin supplies both the model and its
+parsers — and it supports exactly one vLLM minor version:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+{{ required_plugin[1] }}   # also installs the vLLM it supports
+pip install glq{{ ' ' * (required_plugin[1]|length - 15) }}   # GLQ's kernels only; does not move vLLM
+```
+
+The order matters, and so does the absence of the `[vllm]` extra: that extra would pull a
+vLLM newer than the plugin allows, and plain `glq` installs torch and numpy only, so it
+leaves the plugin's vLLM in place.
+
+**The project's `install.sh` one-liner is deliberately not shown here** — it installs the
+latest vLLM, which this plugin does not support.
+{% else %}
+
+```bash
+{{ install_one_liner }}
+```
+
+That builds a venv, installs GLQ with its CUDA kernels and vLLM, and adds the `glq-chat` and
+`glq-code` wrappers used below. Or do it by hand:
 
 ```bash
 python -m venv .venv
@@ -31,6 +59,7 @@ pip install 'glq[vllm]'
 every snippet below fails. The `[vllm]` extra pulls the server in the **same** pip
 transaction, which matters: installing them separately lets the second resolve its own torch
 over the first one's. The venv is what puts `vllm` on `PATH`.
+{% endif %}
 
 For the Transformers path instead of vLLM, `pip install 'glq[hf]'` — that extra adds
 `transformers` and `accelerate`, which `import glq.hf_integration` and `device_map="auto"`
@@ -168,11 +197,35 @@ print(tok.decode(model.generate(ids, max_new_tokens=64)[0][ids.shape[1]:], skip_
 
 ## Use with coding agents (pi-code, opencode)
 
-Serve an OpenAI-compatible endpoint, then point your agent at it:
+```bash
+glq-code --model {{ repo_id }}
+```
+
+That starts a correctly-configured vLLM and runs the pi agent against it. It is the
+recommended path rather than a convenience: tool calling needs a **tool-call parser matched
+to this model's markup**, and a wrong or missing one fails *silently* — the agent emits calls
+that never parse, which reads as a bad model rather than a bad flag. `glq-code` also pins the
+sampling from this card server-side (`top_k` is not an OpenAI field, so an agent cannot send
+it), sizes the context window and any host offload for your card, and refuses **before** the
+download if the checkpoint cannot fit{% if required_plugin %} or the required plugin is
+missing{% endif %}.
+
+{% if tool_parsers %}
+To serve it yourself instead, the parser flags are not optional:
 
 ```bash
-vllm serve {{ repo_id }} --port 8000
+vllm serve {{ repo_id }} \
+    --quantization glq \
+    --port 8000 \
+    --enable-auto-tool-choice \
+    --tool-call-parser {{ tool_parsers.tool }}{% if tool_parsers.reasoning %} \
+    --reasoning-parser {{ tool_parsers.reasoning }}{% endif %}
 ```
+{% if tool_parsers.needs_template %}
+This family also needs a tool-aware chat template that is not in the checkpoint — one more
+reason to prefer `glq-code`, which fetches it to `$GLQ_HOME/templates` and passes
+`--chat-template` for you.
+{% endif %}{% endif %}
 
 **pi-code** — `~/.pi/agent/models.json`:
 ```json

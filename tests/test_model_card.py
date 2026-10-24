@@ -280,3 +280,124 @@ def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path):
     assert created and activated, block
     assert created.group(1) == activated.group(1), (
         f"creates {created.group(1)} but activates {activated.group(1)}")
+
+
+# ---- the easy install path, and a command that actually serves tool calling -------------
+#
+# Two gaps and one defect, all verified across the published fleet before this change:
+#
+# * No card mentioned the project's own advertised install path (`curl … install.sh`), or
+#   `glq-code` / `glq-chat` / `glq-setup`. The template had never emitted them.
+# * The "Use with coding agents" section said `vllm serve <repo> --port 8000` — with no
+#   tool-call parser and no reasoning parser. pi and opencode then emit tool calls that
+#   never parse, which is the exact silent failure `glq.tooling` exists to prevent.
+# * For a model needing a vLLM plugin the one-liner is WORSE than nothing: `install.sh`
+#   pip-installs unpinned latest vLLM, and Kolibri's plugin pins >=0.29,<0.30, so following
+#   it builds a stack that cannot load the model.
+
+KOLIBRI_REPO = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
+
+
+def _card_for(tmp_path, repo_id, **kw):
+    out = _write_quant_dir(tmp_path, **kw)
+    return build_card(out, "google/gemma-4-e4b-it", repo_id=repo_id, write=False)
+
+
+def test_a_plugin_free_model_gets_the_installer_one_liner(tmp_path):
+    block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    assert "install.sh" in block, block
+    assert "--components" in block
+
+
+def test_the_one_liner_installs_picode_because_glq_code_needs_it(tmp_path):
+    """`glq-code` exits 3 without the pi agent, and the card now features `glq-code`. A
+    component list that omits picode would hand the reader a command that cannot run."""
+    block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    line = next(ln for ln in block.splitlines() if "--components" in ln)
+    assert "picode" in line, line
+
+
+def test_the_manual_pip_path_survives(tmp_path):
+    """The one-liner is added BESIDE `glq[vllm]`, not instead of it — the extra is what
+    installs vLLM in one pip transaction, which the tests above this one pin."""
+    block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    assert "glq[vllm]" in block
+
+
+def test_a_model_needing_a_plugin_does_not_get_the_one_liner(tmp_path):
+    """The whole reason this branch exists: install.sh takes latest vLLM, and the plugin
+    pins <0.30, so the one-liner would build a stack that cannot load the model."""
+    block = _install_block(_card_for(tmp_path, KOLIBRI_REPO))
+    # The runnable parts must be absent. The words "install.sh" may still appear — the block
+    # says the one-liner is deliberately not shown and why, which is the useful thing to tell
+    # a reader who has seen it in the README.
+    assert "--components" not in block, block
+    assert "| bash" not in block, block
+    assert "aleph-alpha-inference" in block, block
+
+
+def test_the_plugin_branch_does_not_offer_the_vllm_extra(tmp_path):
+    """`glq[vllm]` is precisely the thing that moves vLLM past the plugin's pin, so the
+    plugin branch must not show it even as an alternative."""
+    assert "glq[vllm]" not in _install_block(_card_for(tmp_path, KOLIBRI_REPO))
+
+
+def test_the_coding_agent_section_features_glq_code(tmp_path):
+    body = _card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw")
+    section = body.split("## Use with coding agents", 1)[1].split("\n## ", 1)[0]
+    assert "glq-code --model xv0y5ncu/Test-GLQ-4bpw" in section, section
+
+
+def test_no_card_tells_you_to_serve_an_agent_without_a_tool_parser(tmp_path):
+    """The pre-existing defect. Any `vllm serve` the card shows for AGENT use must carry a
+    tool-call parser, or the agent's calls never parse and it reads as a bad model."""
+    for repo in ("xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO):
+        body = _card_for(tmp_path, repo)
+        section = body.split("## Use with coding agents", 1)[1].split("\n## ", 1)[0]
+        for line in section.splitlines():
+            if line.strip().startswith("vllm serve"):
+                assert "--tool-call-parser" in section, (
+                    f"{repo}: agent section serves without a parser:\n{section}")
+
+
+def test_required_plugin_reaches_the_render_context(tmp_path):
+    """Derived from `tooling.required_plugin`, the same function glq-code guards on, so a
+    card and the CLI cannot disagree about what a model needs."""
+    from glq.tooling import required_plugin
+    assert required_plugin(KOLIBRI_REPO) is not None
+    assert required_plugin("xv0y5ncu/Test-GLQ-4bpw") is None
+    # and the template must actually branch on it
+    assert "required_plugin" in Path("glq/templates/model_card.md.j2").read_text()
+
+
+def test_the_manual_recipe_shows_the_real_parser_not_a_placeholder(tmp_path):
+    for repo, parser in (("xv0y5ncu/gemma-4-26B-A4B-it-GLQ-4bpw", "gemma4"),
+                         ("xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw", "hermes"),
+                         (KOLIBRI_REPO, "kolibri1")):
+        body = _card_for(tmp_path, repo)
+        section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
+        assert f"--tool-call-parser {parser}" in section, f"{repo}:\n{section}"
+
+
+def test_a_local_chat_template_path_is_never_baked_into_a_card(tmp_path):
+    """`tool_serve_args` returns gemma-4's `--chat-template` as an ABSOLUTE path under
+    $GLQ_HOME on whichever machine rendered the card. Publishing that would be wrong for
+    every reader and would leak the builder's filesystem layout."""
+    body = _card_for(tmp_path, "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-4bpw")
+    # The flag may be NAMED in prose ("glq-code passes --chat-template for you"); what must
+    # never appear is the flag followed by a path, or the builder's home directory.
+    assert "--chat-template /" not in body, "an absolute template path reached the card"
+    assert str(Path.home()) not in body, "the builder's home directory reached the card"
+    assert ".glq/templates/tool_chat_template" not in body
+    # ...but the reader is still told the template is needed
+    section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
+    assert "chat template" in section.lower(), section
+
+
+def test_an_unsupported_family_gets_no_hand_rolled_recipe(tmp_path):
+    """`tool_serve_args` returns None for a family with no known parser. The card must then
+    show no serve recipe rather than one with a guessed parser in it."""
+    body = _card_for(tmp_path, "xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw")
+    section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
+    assert "--tool-call-parser" not in section, section
+    assert "glq-code --model" in section, "the wrapper is still the recommendation"
