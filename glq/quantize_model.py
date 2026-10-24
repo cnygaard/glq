@@ -414,6 +414,72 @@ _MODEL_PROFILES = {
         'trust_remote_code': True,
         'forward_kwargs': 'nemotron_h',
     },
+    'NemotronH_Omni_Reasoning_V3': {
+        # NVIDIA-Nemotron-3.5-Super-VL-120B-A12B (model_type `nemotron_h_omni`): a RADIO
+        # vision tower + projector wrapped around an ordinary `NemotronHForCausalLM`, which
+        # the wrapper builds itself from `config.text_config`. 88 blocks, measured from the
+        # tensors and from the config: **40 linear_attention (Mamba-2) + 40 moe + 8
+        # full_attention**. No audio tower in this checkpoint (`sound_config: null`) despite
+        # the "omni" name. 231.8 GiB over 43,079 tensors in 63 shards.
+        #
+        # Every path below was read off a meta-instantiated model on transformers 5.20.1,
+        # because the CHECKPOINT and the MODULE disagree by design and only one of them is
+        # right for each field. transformers' own conversion mapping for `nemotron_h`
+        # (conversion_mapping.py) renames `backbone.` -> `model.` and merges the per-expert
+        # tensors, so:
+        #   layers_attr / embed_attr  are MODULE paths   -> language_model.model.*
+        #   sd_prefix                 is the CHECKPOINT prefix -> language_model.backbone.*
+        # Using `backbone.layers` as layers_attr (as the older NemotronHForCausalLM entry
+        # still does) resolves nothing on tf 5.20; using `model.layers` as sd_prefix matches
+        # zero tensors, which is an empty quantize rather than an error.
+        'layers_attr': 'language_model.model.layers',
+        'embed_attr': 'language_model.model.embeddings',   # NOT embed_tokens
+        # NemotronHAttention applies no rotary at all (NoPE), like the text-only entry below.
+        'rotary_attr': None,
+        'sd_prefix': 'language_model.backbone.layers',
+        # Native since transformers 5.18, so no remote code is needed and none is fetched;
+        # 5.14-5.17 have `nemotron_h` but not the wrapper and do need `--trust-remote-code`.
+        # The text tower is the same class either way. One serving-side caveat, irrelevant to
+        # quantization: the native port names the projector `multi_modal_projector` while the
+        # checkpoint spells it `mlp1.*`. Streaming copies those bytes by checkpoint key and
+        # never builds the module, so the saved spelling is preserved.
+        'trust_remote_code': False,
+        # NOT 'nemotron_h'. That branch supplies `cache_params=None`, and NemotronHBlock.forward
+        # does not take `cache_params` — it passes `cache_params=past_key_values` to the mixer
+        # itself and forwards **kwargs, so the two collide with "got multiple values for
+        # keyword argument 'cache_params'" on every one of the 40 Mamba blocks. The branch also
+        # forces `_attn_implementation = "eager"`, and this model's eager path applies causality
+        # only through a mask that the per-layer calibration forward does not pass — measured,
+        # perturbing later tokens moved earlier outputs under eager/no-mask and not at all
+        # under sdpa/no-mask, so the 8 attention layers would calibrate bidirectionally.
+        # `default` keeps sdpa, which is causal with no mask.
+        'forward_kwargs': 'default',
+        # No `causal_mask`: a 4-D mask reaches the Mamba mixer's padding-state helper and
+        # raises on the sequence dimension. sdpa with no mask already matches the model.
+        #
+        # No `skip_linears`: every quantizable matrix clears the gates. The nn.Linear walk
+        # sees only mamba in_proj [18560,4096] / out_proj [4096,8192]; MoE
+        # shared_experts.up/down_proj [5376,4096]/[4096,5376] and fc1/fc2_latent_proj
+        # [1024,4096]/[4096,1024]; attention q/o [4096,4096] and k/v [256,4096]. All out-dims
+        # are 32-divisible. The router needs no entry because `NemotronHTopkRouter` holds a
+        # bare nn.Parameter plus an fp32 buffer rather than an nn.Linear, so the walk never
+        # sees it — structurally excluded, like sarvam's gate.
+        'multimodal_text': True,
+        # Mandatory, and it earns its place twice: it forces --streaming, and the wrapper
+        # declares `_keys_to_ignore_on_load_unexpected = [r"mtp\."]` and builds no MTP module
+        # at all, so a non-streaming save would silently drop the 5.40 GiB head — the Qwen3.5
+        # failure. It also makes the streaming path derive sd_prefix from the real keys.
+        #
+        # Declared but NOT yet actionable: `NemotronHExperts` holds two 3-D nn.Parameters,
+        # `up_proj` [512,2688,1024] and `down_proj` [512,1024,2688], with **no gate** — the
+        # forward is up -> relu**2 -> down. Every stacked-expert site in this module is
+        # written against a gated `gate_up_proj`, so `_require_supported_expert_layout`
+        # refuses this architecture during meta discovery rather than letting a run skip
+        # 210.0 of 231.8 GiB (90.6%) and report success. Lifting that refusal also needs a
+        # `convert_state` converter, since the checkpoint stores experts one 2-D tensor per
+        # expert while the module wants them stacked.
+        'stacked_experts': True,
+    },
     'Gemma4ForConditionalGeneration': {
         # Multimodal — language decoder lives at model.language_model. The
         # streaming branch in `quantize()` drives the right block class
@@ -674,6 +740,66 @@ def _is_multimodal_text(arch, profile=None):
     if "Mistral3" in arch:
         return True
     return "Gemma4" in arch and "ForConditionalGeneration" in arch
+
+
+def _has_segment(key: str, segment: str) -> bool:
+    """Is ``segment`` a whole dotted component of ``key``?
+
+    Substring and prefix matching are each wrong in one direction here:
+    ``model.layers.0.mtpool.weight`` *contains* "mtp" and is an ordinary text weight, while
+    Nemotron's MTP keys are spelled ``language_model.mtp.layers.…`` and so do not *start*
+    with it. Same rule as `_is_nontext`, applied at any depth.
+    """
+    return segment in key.split(".")
+
+
+#: Checkpoint spellings of a text decoder's input embedding. ``embed_tokens`` is the
+#: transformers convention; NemotronH calls its own ``embeddings``, so a multimodal wrapper
+#: around one spells the key ``language_model.backbone.embeddings.weight`` and a lookup for
+#: ``embed_tokens.weight`` alone finds nothing.
+_EMBED_KEY_SUFFIXES = ("embed_tokens.weight", "embeddings.weight")
+
+
+def _streaming_wrapper_keys(weight_map, is_gemma4=False):
+    """``(embed_key, sd_prefix)`` for a multimodal wrapper, derived from the real keys.
+
+    Derived rather than taken from the profile because the checkpoint layout moves under us:
+    transformers <5.10 saved the Mistral3 text decoder under ``language_model.model.*`` and
+    >=5.10 (with gemma-4) uses ``model.language_model.*``. ``sd_prefix`` is ``None`` when
+    nothing matched, leaving the caller's profile value in place.
+
+    Two things this must not do, both measured against
+    NVIDIA-Nemotron-3.5-Super-VL-120B-A12B:
+
+    * **pick the MTP head.** A speculative-decoding head is its own ``.layers.N.*`` stack
+      under the same ``language_model`` namespace — 8 matching keys against the backbone's 9 —
+      so the bare match is decided by shard ordering. It happens to land on the backbone in
+      that model's index today; a re-sharded or resumed checkpoint flips it, and quantizing a
+      1-layer stack as if it were an 88-layer decoder is the kind of wrong that finishes.
+    * **miss the embedding.** That model's is ``…backbone.embeddings.weight``, which matches
+      no ``embed_tokens`` lookup, and the old fallback was a hardcoded guess.
+
+    Ambiguity raises. Several distinct non-MTP decoder stacks in one checkpoint is not
+    something to resolve by iteration order.
+    """
+    embed_key = next(
+        (k for k in weight_map
+         if k.endswith(_EMBED_KEY_SUFFIXES)
+         and "vision" not in k and "per_layer" not in k
+         and not _has_segment(k, "mtp")), None)
+    if embed_key is None:
+        embed_key = ("model.language_model.embed_tokens.weight" if is_gemma4
+                     else "language_model.model.embed_tokens.weight")
+
+    prefixes = sorted({k.split(".layers.")[0] + ".layers" for k in weight_map
+                       if ".layers.0." in k and "language_model" in k
+                       and not _has_segment(k, "mtp")})
+    if len(prefixes) > 1:
+        raise ValueError(
+            f"ambiguous text-decoder prefix: {prefixes} all look like language-model layer "
+            f"stacks. Picking one by iteration order would quantize whichever the shards "
+            f"happen to list first; declare the right one in the profile's sd_prefix.")
+    return embed_key, (prefixes[0] if prefixes else None)
 
 
 def _text_config(cfg, is_multimodal):
@@ -946,6 +1072,10 @@ def _collect_stacked_experts(layer):
 
     Detected by structure — a 3-D ``gate_up_proj`` Parameter — not by name, so it covers
     Gemma4TextExperts and Qwen4Exp's container without knowing either.
+
+    Gated containers only. A container whose experts have no gate projection carries a 3-D
+    ``up_proj`` instead and is invisible here, which is what `_require_supported_expert_layout`
+    exists to refuse rather than silently skip.
     """
     out = []
     for mn, mod in layer.named_modules():
@@ -953,6 +1083,68 @@ def _collect_stacked_experts(layer):
         if isinstance(gup, nn.Parameter) and gup.dim() == 3:
             out.append((mn, mod))
     return out
+
+
+def _collect_nongated_stacked_experts(layer):
+    """[(module_name, module, param_name, shape)] for 3-D expert containers with NO gate.
+
+    The mirror of `_collect_stacked_experts`, and structural for the same reason. NemotronH's
+    `NemotronHExperts` holds two bare 3-D Parameters — ``up_proj`` [E, I, H] and ``down_proj``
+    [E, H, I] — and runs ``up -> relu**2 -> down`` with no gate projection at all. A container
+    is non-gated when it has the 3-D ``up_proj`` and lacks the 3-D ``gate_up_proj`` the rest of
+    the stacked-expert path is written against.
+
+    Both projections are required, so an unrelated module that happens to own a 3-D parameter
+    named ``up_proj`` is not reported. This feeds a refusal, and a refusal's false positives
+    block architectures that would otherwise quantize correctly.
+    """
+    out = []
+    for mn, mod in layer.named_modules():
+        up = getattr(mod, 'up_proj', None)
+        dwn = getattr(mod, 'down_proj', None)
+        gup = getattr(mod, 'gate_up_proj', None)
+        if not (isinstance(up, nn.Parameter) and up.dim() == 3):
+            continue
+        if not (isinstance(dwn, nn.Parameter) and dwn.dim() == 3):
+            continue
+        if isinstance(gup, nn.Parameter) and gup.dim() == 3:
+            continue                       # gated: the supported layout
+        out.append((mn, mod, 'up_proj', tuple(up.shape)))
+    return out
+
+
+def _require_supported_expert_layout(layers, arch):
+    """Refuse an architecture whose routed experts the quantize path cannot read.
+
+    Every stacked-expert site in this module — the collector, the per-expert Hessian hooks,
+    the quantize loop, the replay restore, the save-side split and the routing report — is
+    written against a gated 3-D ``gate_up_proj``. A non-gated container (NemotronH's
+    `NemotronHExperts`) matches none of them, so the nn.Linear walk and the stacked walk BOTH
+    miss it and the run reports success.
+
+    On NVIDIA-Nemotron-3.5-Super-VL-120B-A12B that is 40,960 tensors and **210.0 of 231.8
+    GiB, 90.6% of the checkpoint** — a "3 bpw" output weighing more than the bf16 input it
+    came from. Nothing downstream would look wrong: `layer_metrics.json` would list the
+    sublayers that were quantized, and the resulting checkpoint would load.
+
+    So this raises, and it is called during meta discovery — before the weights are
+    downloaded — because the alternative is finding out after a 232 GiB pull.
+
+    Scans every layer, not just the first: a hybrid tower interleaves block types, and
+    Nemotron's layer 0 is a Mamba block with no experts in it at all.
+    """
+    for layer_idx, layer in enumerate(layers):
+        found = _collect_nongated_stacked_experts(layer)
+        if not found:
+            continue
+        mn, _mod, pname, shape = found[0]
+        raise ValueError(
+            f"{arch}: routed experts at layers.{layer_idx}.{mn} are stacked but NOT gated "
+            f"({pname} is a 3-D {list(shape)} Parameter with no gate_up_proj), and GLQ's "
+            f"stacked-expert path reads only the gated layout. Quantizing now would skip "
+            f"every routed expert in the model — the overwhelming majority of its weights — "
+            f"and still report success. Refusing instead; non-gated stacked experts are not "
+            f"implemented yet.")
 
 
 def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
@@ -2855,6 +3047,10 @@ def quantize(
             _rotary_cls = _discover_rotary_cls(_model, profile)
         BlockClass = type(_layers[0])
         n_layers = len(_layers)
+        # Here, not after the download: the meta model is the first and cheapest place the
+        # real expert layout is visible, and the alternative is a 232 GiB pull followed by a
+        # run that skips 90% of the weights without saying so.
+        _require_supported_expert_layout(_layers, arch)
         del _model, _layers
 
         # Download model (if needed) and build weight map
@@ -2943,24 +3139,17 @@ def quantize(
         # ``model.language_model.*``. Deriving embed_key + sd_prefix from the
         # actual keys keeps streaming robust across both layouts.
         if is_mm_text:
-            _ek = next((k for k in weight_map
-                        if k.endswith("embed_tokens.weight")
-                        and "vision" not in k and "per_layer" not in k
-                        and not k.startswith("mtp")), None)
-            embed_key = _ek or (
-                "model.language_model.embed_tokens.weight" if is_gemma4
-                else "language_model.model.embed_tokens.weight")
             # Target the LANGUAGE-MODEL decoder layers specifically. Multimodal
             # Gemma-4 / Mistral3 also expose ``*_tower.layers.0.*`` (vision AND
             # audio encoders), so matching a bare ``.layers.0.`` would pick a
             # tower prefix (e.g. ``model.audio_tower.layers``) and quantize the
             # wrong stack. The text decoder key always contains "language_model"
             # (``model.language_model.layers.*`` on tf>=5.10, ``language_model.
-            # model.layers.*`` on tf<5.10), so key on that.
-            _lk = next((k for k in weight_map
-                        if ".layers.0." in k and "language_model" in k), None)
-            if _lk:
-                sd_prefix = _lk.split(".layers.")[0] + ".layers"
+            # model.layers.*`` on tf<5.10), so key on that — and exclude the MTP
+            # head, which is a second such stack. See `_streaming_wrapper_keys`.
+            embed_key, _derived = _streaming_wrapper_keys(weight_map, is_gemma4=is_gemma4)
+            if _derived:
+                sd_prefix = _derived
         else:
             embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
             embed_key = f"{embed_attr}.weight"
@@ -3006,6 +3195,11 @@ def quantize(
         embed = get_embed(text_model, profile)
         rotary_emb = get_rotary_emb(text_model, profile)
         n_layers = len(decoder_layers)
+        # The same refusal as the streaming branch. Later here than there — this path has
+        # already loaded the weights to CPU, and there is no earlier point at which the real
+        # module tree exists — but a gate on one of two paths is a gate that the next person
+        # routes around by dropping a flag.
+        _require_supported_expert_layout(decoder_layers, arch)
         if use_gpu:
             embed.to(device)
             if rotary_emb is not None:

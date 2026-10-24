@@ -101,13 +101,23 @@ class ModelShapes:
     def _expanded(self) -> tuple[str, ...]:
         out = []
         for pat, rec in self._shapes.items():
+            # Three index forms, most precise first. `index_tuples` is the literal set.
+            # `values` is the per-position value lists of a set that is their exact
+            # cross-product — a hybrid tower's non-contiguous MoE layers crossed with its
+            # experts. `ranges` is the inclusive span, valid only when the set fills it; it
+            # is recorded alongside `values` for readability, so it must lose to it here or
+            # a "layers 1..87" entry would expand to 87 layers instead of the 40 real ones.
             tuples = rec.get("index_tuples")
             if tuples is None:
-                ranges = rec.get("ranges")
-                if not ranges:
-                    out.append(pat)
-                    continue
-                tuples = itertools.product(*(range(lo, hi + 1) for lo, hi in ranges))
+                values = rec.get("values")
+                if values is not None:
+                    tuples = itertools.product(*values)
+                else:
+                    ranges = rec.get("ranges")
+                    if not ranges:
+                        out.append(pat)
+                        continue
+                    tuples = itertools.product(*(range(lo, hi + 1) for lo, hi in ranges))
             for idx in tuples:
                 parts = pat.split("{i}")
                 out.append("".join(p + (str(i) if k < len(idx) else "")

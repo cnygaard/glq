@@ -18,9 +18,14 @@ A recorded manifest removes the guesswork: the test asks the real architecture.
 ## Format
 
 Numeric path segments are collapsed to ``{i}`` and the index ranges recorded, so a 295,000-key
-checkpoint becomes ~100 patterns and a few KB. Expansion is exact: the recorder asserts each
-index set is contiguous ``0..max`` and stores the explicit set when it is not, rather than
-quietly misrepresenting it.
+checkpoint becomes ~100 patterns and a few KB. Expansion is exact — the recorder never
+describes an index set it does not have — so there are three forms, cheapest first:
+
+* ``ranges`` alone, when each position runs contiguously ``0..max``;
+* ``values``, the per-position value lists, when the set is their exact cross-product but the
+  positions are not contiguous. A hybrid tower interleaves mamba / MoE / attention blocks, so
+  its MoE layer indices have holes while every (layer, expert) combination still exists;
+* ``index_tuples``, the literal set, when it is neither.
 
 ## Usage
 
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import itertools
 import json
 import os
 import re
@@ -112,15 +118,26 @@ def build_manifest(shapes, *, model, source, base_model=None, license_id=None,
             entry["conflicts"] = rec["conflicts"]
         if idxs and idxs != [()]:
             n_pos = len(idxs[0])
-            ranges, explicit = [], False
+            ranges, per_pos, explicit = [], [], False
             for pos in range(n_pos):
                 vals = sorted({t[pos] for t in idxs})
                 if vals != list(range(len(vals))):
                     explicit = True          # not contiguous 0..max; do not fake it
                 ranges.append([vals[0], vals[-1]])
+                per_pos.append(vals)
             entry["ranges"] = ranges
             if explicit or len(idxs) != _product(ranges):
-                entry["index_tuples"] = [list(t) for t in idxs]
+                # `ranges` would over-claim, so record something exact. Two forms, and the
+                # cheaper one is usually available: a hybrid tower (mamba/MoE/attention
+                # interleaved) puts its MoE layers at non-contiguous indices, yet the index
+                # set is still every combination of {those layers} x {those experts}. The
+                # per-position value lists describe that in 40 + 512 numbers where the pairs
+                # take 20,480 — measured on Nemotron-3.5-Super-VL, the difference between a
+                # 1,280.6 KiB manifest and a 25 KiB one.
+                if set(itertools.product(*per_pos)) == set(idxs):
+                    entry["values"] = per_pos
+                else:
+                    entry["index_tuples"] = [list(t) for t in idxs]
         out[pat] = entry
     return {
         "model": model,
