@@ -8,7 +8,7 @@ client works. Two are set up here.
 ```bash
 pip install glq vllm 'glq[chat]'
 vllm serve xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel --quantization glq   # terminal 1
-python examples/chat/app.py                                                   # terminal 2
+python3 examples/chat/app.py                                                  # terminal 2
 ```
 
 Then open http://localhost:7860. The dropdown is populated from the server's

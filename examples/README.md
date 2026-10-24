@@ -16,11 +16,11 @@ Example scripts for quantizing and running GLQ models.
 
 ```bash
 # Small 3B model
-python inference_hf.py --model xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
+python3 inference_hf.py --model xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw
 
 # 24B Devstral (needs the PreTrainedTokenizerFast workaround, handled
 # automatically by load_tokenizer() in inference_hf.py on transformers 5.x)
-python inference_hf.py \
+python3 inference_hf.py \
     --model xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw \
     --prompt "Write a Python function that computes the Fibonacci sequence" \
     --max-tokens 100

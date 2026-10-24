@@ -10,11 +10,17 @@ assert the structure + frontmatter merge.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 jinja2 = pytest.importorskip("jinja2")
+
+#: A repo id whose family needs a vLLM plugin, so the card renders the OTHER
+#: Install branch. Defined up here because a parametrize decorator is evaluated
+#: at import time, before the tests further down that also use it.
+KOLIBRI_REPO = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
 
 from glq.model_card import (  # noqa: E402
     _merged_frontmatter, _split_frontmatter, _bpw_label, build_card,
@@ -248,7 +254,7 @@ def test_the_install_block_creates_a_virtual_environment(tmp_path):
     """`vllm` has to land on PATH for `vllm serve` to resolve, and a venv is what makes the
     console scripts reachable without touching the system interpreter."""
     block = _install_block(_split_frontmatter(_card(tmp_path))[1])
-    assert "python -m venv" in block
+    assert re.search(r"python3? -m venv", block), block
     assert "activate" in block
 
 
@@ -270,13 +276,173 @@ def test_the_transformers_path_gets_its_extra(tmp_path):
     assert "glq[hf]" in block, f"transformers path shown but its extra never named:\n{block}"
 
 
-def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path):
+@pytest.mark.parametrize("repo", ["xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO])
+def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path, repo):
     """A card that creates `env` and activates `venv` leaves the reader in the system
-    interpreter, which is the failure this whole block exists to prevent."""
-    import re
-    block = _install_block(_split_frontmatter(_card(tmp_path))[1])
-    created = re.search(r"python -m venv (\S+)", block)
+    interpreter, which is the failure this whole block exists to prevent.
+
+    Parametrized over both Install branches. It used to render only the plugin-free one, so
+    sabotaging the plugin branch's activate path left this GREEN — found by doing exactly
+    that. Two branches need two renders.
+    """
+    block = _install_block(_card_for(tmp_path, repo))
+    created = re.search(r"python3? -m venv (\S+)", block)
     activated = re.search(r"source (\S+)/bin/activate", block)
     assert created and activated, block
     assert created.group(1) == activated.group(1), (
         f"creates {created.group(1)} but activates {activated.group(1)}")
+
+
+# ---- the easy install path, and a command that actually serves tool calling -------------
+#
+# Two gaps and one defect, all verified across the published fleet before this change:
+#
+# * No card mentioned the project's own advertised install path (`curl … install.sh`), or
+#   `glq-code` / `glq-chat` / `glq-setup`. The template had never emitted them.
+# * The "Use with coding agents" section said `vllm serve <repo> --port 8000` — with no
+#   tool-call parser and no reasoning parser. pi and opencode then emit tool calls that
+#   never parse, which is the exact silent failure `glq.tooling` exists to prevent.
+# * For a model needing a vLLM plugin the one-liner is WORSE than nothing: `install.sh`
+#   pip-installs unpinned latest vLLM, and Kolibri's plugin pins >=0.29,<0.30, so following
+#   it builds a stack that cannot load the model.
+
+
+def _card_for(tmp_path, repo_id, **kw):
+    out = _write_quant_dir(tmp_path, **kw)
+    return build_card(out, "google/gemma-4-e4b-it", repo_id=repo_id, write=False)
+
+
+def test_a_plugin_free_model_gets_the_installer_one_liner(tmp_path):
+    block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    assert "install.sh" in block, block
+    assert "--components" in block
+
+
+def test_the_one_liner_installs_picode_because_glq_code_needs_it(tmp_path):
+    """`glq-code` exits 3 without the pi agent, and the card now features `glq-code`. A
+    component list that omits picode would hand the reader a command that cannot run."""
+    block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    line = next(ln for ln in block.splitlines() if "--components" in ln)
+    assert "picode" in line, line
+
+
+def test_the_manual_pip_path_survives(tmp_path):
+    """The one-liner is added BESIDE `glq[vllm]`, not instead of it — the extra is what
+    installs vLLM in one pip transaction, which the tests above this one pin."""
+    block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    assert "glq[vllm]" in block
+
+
+def test_a_model_needing_a_plugin_does_not_get_the_one_liner(tmp_path):
+    """The whole reason this branch exists: install.sh takes latest vLLM, and the plugin
+    pins <0.30, so the one-liner would build a stack that cannot load the model."""
+    block = _install_block(_card_for(tmp_path, KOLIBRI_REPO))
+    # The runnable parts must be absent. The words "install.sh" may still appear — the block
+    # says the one-liner is deliberately not shown and why, which is the useful thing to tell
+    # a reader who has seen it in the README.
+    assert "--components" not in block, block
+    assert "| bash" not in block, block
+    assert "aleph-alpha-inference" in block, block
+
+
+def test_the_plugin_branch_does_not_offer_the_vllm_extra(tmp_path):
+    """`glq[vllm]` is precisely the thing that moves vLLM past the plugin's pin, so the
+    plugin branch must not show it even as an alternative."""
+    assert "glq[vllm]" not in _install_block(_card_for(tmp_path, KOLIBRI_REPO))
+
+
+def test_the_coding_agent_section_features_glq_code(tmp_path):
+    body = _card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw")
+    section = body.split("## Use with coding agents", 1)[1].split("\n## ", 1)[0]
+    assert "glq-code --model xv0y5ncu/Test-GLQ-4bpw" in section, section
+
+
+def test_no_card_tells_you_to_serve_an_agent_without_a_tool_parser(tmp_path):
+    """The pre-existing defect. Any `vllm serve` the card shows for AGENT use must carry a
+    tool-call parser, or the agent's calls never parse and it reads as a bad model."""
+    for repo in ("xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO):
+        body = _card_for(tmp_path, repo)
+        section = body.split("## Use with coding agents", 1)[1].split("\n## ", 1)[0]
+        for line in section.splitlines():
+            if line.strip().startswith("vllm serve"):
+                assert "--tool-call-parser" in section, (
+                    f"{repo}: agent section serves without a parser:\n{section}")
+
+
+def test_required_plugin_reaches_the_render_context(tmp_path):
+    """Derived from `tooling.required_plugin`, the same function glq-code guards on, so a
+    card and the CLI cannot disagree about what a model needs."""
+    from glq.tooling import required_plugin
+    assert required_plugin(KOLIBRI_REPO) is not None
+    assert required_plugin("xv0y5ncu/Test-GLQ-4bpw") is None
+
+    # That the key REACHES the context is only observable through the render, so assert on
+    # behaviour: the two repos must produce different Install blocks, and specifically must
+    # differ on the one-liner, which is the thing the branch exists to withhold.
+    #
+    # An earlier version read the template source through `Path("glq/templates/...")` — a
+    # CWD-relative path, which passed locally and raised FileNotFoundError in CI for that
+    # reason alone. `model_card.py` itself resolves the template package-relative
+    # (`Path(__file__).parent / "templates"`), and no test should be more fragile than the
+    # code it covers. Rendering needs no path at all.
+    plain = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    plugin = _install_block(_card_for(tmp_path, KOLIBRI_REPO))
+    assert plain != plugin, "the context key is present but the template does not branch"
+    assert "--components" in plain and "--components" not in plugin
+
+
+def test_the_manual_recipe_shows_the_real_parser_not_a_placeholder(tmp_path):
+    for repo, parser in (("xv0y5ncu/gemma-4-26B-A4B-it-GLQ-4bpw", "gemma4"),
+                         ("xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw", "hermes"),
+                         (KOLIBRI_REPO, "kolibri1")):
+        body = _card_for(tmp_path, repo)
+        section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
+        assert f"--tool-call-parser {parser}" in section, f"{repo}:\n{section}"
+
+
+def test_a_local_chat_template_path_is_never_baked_into_a_card(tmp_path):
+    """`tool_serve_args` returns gemma-4's `--chat-template` as an ABSOLUTE path under
+    $GLQ_HOME on whichever machine rendered the card. Publishing that would be wrong for
+    every reader and would leak the builder's filesystem layout."""
+    body = _card_for(tmp_path, "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-4bpw")
+    # The flag may be NAMED in prose ("glq-code passes --chat-template for you"); what must
+    # never appear is the flag followed by a path, or the builder's home directory.
+    assert "--chat-template /" not in body, "an absolute template path reached the card"
+    assert str(Path.home()) not in body, "the builder's home directory reached the card"
+    assert ".glq/templates/tool_chat_template" not in body
+    # ...but the reader is still told the template is needed
+    section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
+    assert "chat template" in section.lower(), section
+
+
+def test_an_unsupported_family_gets_no_hand_rolled_recipe(tmp_path):
+    """`tool_serve_args` returns None for a family with no known parser. The card must then
+    show no serve recipe rather than one with a guessed parser in it."""
+    body = _card_for(tmp_path, "xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw")
+    section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
+    assert "--tool-call-parser" not in section, section
+    assert "glq-code --model" in section, "the wrapper is still the recommendation"
+
+
+def test_no_rendered_card_tells_a_reader_to_run_bare_python(tmp_path):
+    """`python` is not a command everywhere, and a card is the first thing a reader copies.
+
+    Debian and Ubuntu ship no `python` binary at all by default — only `python3` — so
+    `python -m venv .venv` is `command not found` there unless `python-is-python3` is
+    installed. Fedora 44 does have one, but as `/usr/bin/python -> ./python3` owned by
+    `python-unversioned-command`, a *separate optional* package, so a minimal install has
+    none either. `install.sh` has always agreed: it probes python3.14/3.13/3.12/python3 and
+    never bare `python`.
+
+    `startswith` on the stripped line, not a substring search, for two reasons: "Python"
+    appears legitimately in prose, and `.venv/bin/python` must keep passing. `lstrip('> ')`
+    because the Kolibri quickstart lives inside a blockquote.
+
+    Scoped to the GLQ-authored part: the appended base card is somebody else's text.
+    """
+    for repo in ("xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO):
+        ours = _card_for(tmp_path, repo).split("<details>")[0]
+        for line in ours.splitlines():
+            stripped = line.strip().lstrip("> ").strip()
+            assert not stripped.startswith("python "), (
+                f"{repo}: a reader is told to run bare `python`: {line!r}")

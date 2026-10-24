@@ -24,7 +24,43 @@ import json
 import os
 from pathlib import Path
 
+from glq import tooling
+
 GLQ_REPO = "https://github.com/cnygaard/glq"
+
+#: The published one-liner, kept here rather than inlined in the template so the component
+#: list has one definition. `picode` is in it because the card features `glq-code`, which
+#: exits without the pi agent; `chat` because `glq-chat` is the other wrapper a reader may
+#: reach for. Not pinned to a version: `install.sh` with no `GLQ_VERSION` takes the latest
+#: release from PyPI, which is what makes the one-liner work without an edit per release.
+INSTALL_ONE_LINER = (
+    "curl -fsSL https://raw.githubusercontent.com/cnygaard/glq/main/install.sh"
+    " | bash -s -- --components core,vllm,chat,picode"
+)
+
+
+def _tool_parsers(repo_id: str) -> dict:
+    """The parser NAMES for this family, and whether it also needs a chat-template file.
+
+    Deliberately not the whole of `tool_serve_args`. That returns a `--chat-template` with an
+    **absolute path on the machine that rendered the card** (gemma-4's template lives under
+    `$GLQ_HOME`), and baking a local path into a public card would be both wrong for every
+    reader and a small leak of the builder's filesystem. Parser names are machine-independent,
+    so those are safe to show; the template says `glq-code` fetches the rest.
+
+    `{}` for a family with no known setup, which is the same thing `tool_serve_args` means by
+    None — the card then shows no hand-rolled serve recipe at all rather than a guess.
+    """
+    args = tooling.tool_serve_args(repo_id)
+    if not args:
+        return {}
+    out = {}
+    for flag, key in (("--tool-call-parser", "tool"),
+                      ("--reasoning-parser", "reasoning")):
+        if flag in args:
+            out[key] = args[args.index(flag) + 1]
+    out["needs_template"] = "--chat-template" in args
+    return out
 _TEMPLATE = "model_card.md.j2"
 
 # Frontmatter keys carried over verbatim from the base model's card.
@@ -231,6 +267,18 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
         "is_trellis": codebook == "trellis",
         "variant": variant,
         "stages_blurb": _stages_blurb(avg_bpw),
+        # `(importable module, pip command)` when this family needs a vLLM plugin as well as
+        # glq, else None. Derived from the same function `glq-code` guards on, so the card
+        # and the CLI cannot disagree about what a model needs — and so a new family is
+        # declared in one place rather than two.
+        #
+        # The Install section branches on it because the `curl … install.sh` one-liner is
+        # WORSE than nothing for such a model: the installer pip-installs unpinned latest
+        # vLLM, while the plugin supports exactly one minor, so following the one-liner
+        # builds a stack that cannot load the checkpoint.
+        "required_plugin": tooling.required_plugin(repo_id or ""),
+        "install_one_liner": INSTALL_ONE_LINER,
+        "tool_parsers": _tool_parsers(repo_id or ""),
         "pi_config": _pi_config(repo_id),
         "opencode_config": _opencode_config(repo_id),
         "orig_body": orig_body,
