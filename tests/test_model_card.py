@@ -10,11 +10,17 @@ assert the structure + frontmatter merge.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 jinja2 = pytest.importorskip("jinja2")
+
+#: A repo id whose family needs a vLLM plugin, so the card renders the OTHER
+#: Install branch. Defined up here because a parametrize decorator is evaluated
+#: at import time, before the tests further down that also use it.
+KOLIBRI_REPO = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
 
 from glq.model_card import (  # noqa: E402
     _merged_frontmatter, _split_frontmatter, _bpw_label, build_card,
@@ -248,7 +254,7 @@ def test_the_install_block_creates_a_virtual_environment(tmp_path):
     """`vllm` has to land on PATH for `vllm serve` to resolve, and a venv is what makes the
     console scripts reachable without touching the system interpreter."""
     block = _install_block(_split_frontmatter(_card(tmp_path))[1])
-    assert "python -m venv" in block
+    assert re.search(r"python3? -m venv", block), block
     assert "activate" in block
 
 
@@ -270,12 +276,17 @@ def test_the_transformers_path_gets_its_extra(tmp_path):
     assert "glq[hf]" in block, f"transformers path shown but its extra never named:\n{block}"
 
 
-def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path):
+@pytest.mark.parametrize("repo", ["xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO])
+def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path, repo):
     """A card that creates `env` and activates `venv` leaves the reader in the system
-    interpreter, which is the failure this whole block exists to prevent."""
-    import re
-    block = _install_block(_split_frontmatter(_card(tmp_path))[1])
-    created = re.search(r"python -m venv (\S+)", block)
+    interpreter, which is the failure this whole block exists to prevent.
+
+    Parametrized over both Install branches. It used to render only the plugin-free one, so
+    sabotaging the plugin branch's activate path left this GREEN — found by doing exactly
+    that. Two branches need two renders.
+    """
+    block = _install_block(_card_for(tmp_path, repo))
+    created = re.search(r"python3? -m venv (\S+)", block)
     activated = re.search(r"source (\S+)/bin/activate", block)
     assert created and activated, block
     assert created.group(1) == activated.group(1), (
@@ -294,8 +305,6 @@ def test_the_venv_path_is_consistent_between_create_and_activate(tmp_path):
 # * For a model needing a vLLM plugin the one-liner is WORSE than nothing: `install.sh`
 #   pip-installs unpinned latest vLLM, and Kolibri's plugin pins >=0.29,<0.30, so following
 #   it builds a stack that cannot load the model.
-
-KOLIBRI_REPO = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
 
 
 def _card_for(tmp_path, repo_id, **kw):
@@ -401,3 +410,27 @@ def test_an_unsupported_family_gets_no_hand_rolled_recipe(tmp_path):
     section = body.split("## Use with coding agents", 1)[1].split("\n**pi-code**", 1)[0]
     assert "--tool-call-parser" not in section, section
     assert "glq-code --model" in section, "the wrapper is still the recommendation"
+
+
+def test_no_rendered_card_tells_a_reader_to_run_bare_python(tmp_path):
+    """`python` is not a command everywhere, and a card is the first thing a reader copies.
+
+    Debian and Ubuntu ship no `python` binary at all by default — only `python3` — so
+    `python -m venv .venv` is `command not found` there unless `python-is-python3` is
+    installed. Fedora 44 does have one, but as `/usr/bin/python -> ./python3` owned by
+    `python-unversioned-command`, a *separate optional* package, so a minimal install has
+    none either. `install.sh` has always agreed: it probes python3.14/3.13/3.12/python3 and
+    never bare `python`.
+
+    `startswith` on the stripped line, not a substring search, for two reasons: "Python"
+    appears legitimately in prose, and `.venv/bin/python` must keep passing. `lstrip('> ')`
+    because the Kolibri quickstart lives inside a blockquote.
+
+    Scoped to the GLQ-authored part: the appended base card is somebody else's text.
+    """
+    for repo in ("xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO):
+        ours = _card_for(tmp_path, repo).split("<details>")[0]
+        for line in ours.splitlines():
+            stripped = line.strip().lstrip("> ").strip()
+            assert not stripped.startswith("python "), (
+                f"{repo}: a reader is told to run bare `python`: {line!r}")

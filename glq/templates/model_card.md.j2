@@ -27,7 +27,7 @@ built-in support for this architecture, so the plugin supplies both the model an
 parsers — and it supports exactly one vLLM minor version:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
 {{ required_plugin[1] }}   # also installs the vLLM it supports
@@ -50,7 +50,7 @@ That builds a venv, installs GLQ with its CUDA kernels and vLLM, and adds the `g
 `glq-code` wrappers used below. Or do it by hand:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install 'glq[vllm]'
 ```
