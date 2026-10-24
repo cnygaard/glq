@@ -146,3 +146,96 @@ def test_shapes_is_not_an_empty_shell():
         assert isinstance(m, ModelShapes)
         assert m.n_keys > 100, f"{slug}: only {m.n_keys} keys recorded"
         assert len(m.patterns()) > 10
+
+
+# ---- the index form: ranges, per-position values, explicit tuples -----------------
+#
+# A hybrid tower (mamba/MoE/attention interleaved) puts its MoE layers at NON-contiguous
+# indices, so `ranges` alone cannot describe `layers.{i}.…experts.{i}.…` and the recorder
+# falls back to writing every (layer, expert) pair. Measured on Nemotron-3.5-Super-VL —
+# 40 MoE layers of 88, 512 experts each — that is 20,480 pairs per pattern and a 1,280.6 KiB
+# manifest, against 47 KiB for the largest recorded before it. The index set is nonetheless
+# an exact cross-product of the two positions' values, which 40 + 512 numbers describe.
+
+
+def _record_module():
+    """`tests/models/record.py` loaded by path — it is a script, not an importable package."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "models", "record.py")
+    spec = importlib.util.spec_from_file_location("glq_record_py", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _manifest_of(shapes):
+    return _record_module().build_manifest(
+        shapes, model="m", source="test", base_model="b", license_id="l",
+        license_url="http://example.invalid/license")
+
+
+def test_a_noncontiguous_cross_product_records_per_position_VALUES():
+    """3 MoE layers out of 8, 4 experts each — the hybrid layout, in miniature.
+
+    `ranges` would claim layers 1..5 inclusive and so expand to 20 keys for 12 real ones,
+    which is why the recorder refuses ranges here. But the set IS every combination of
+    {1,3,5} with {0,1,2,3}, so the two value lists are lossless and 7 numbers long.
+    """
+    shapes = {f"backbone.layers.{L}.mixer.experts.{e}.up_proj.weight": ("BF16", (8, 4))
+              for L in (1, 3, 5) for e in range(4)}
+    entry = next(iter(_manifest_of(shapes)["shapes"].values()))
+
+    assert entry["n"] == 12
+    assert entry.get("values") == [[1, 3, 5], [0, 1, 2, 3]]
+    assert "index_tuples" not in entry, (
+        "recorded 12 explicit tuples where 7 per-position values describe the same set")
+
+
+def test_an_index_set_that_is_NOT_a_cross_product_still_records_every_tuple():
+    """The guard on the above. Drop one expert from one layer and the value lists would
+    over-claim a key the checkpoint does not have, so the explicit form must come back —
+    `record.py`'s whole premise is that it never fakes an index set."""
+    shapes = {f"backbone.layers.{L}.mixer.experts.{e}.up_proj.weight": ("BF16", (8, 4))
+              for L in (1, 3) for e in range(4) if not (L == 3 and e == 2)}
+    entry = next(iter(_manifest_of(shapes)["shapes"].values()))
+
+    assert entry["n"] == 7
+    assert "values" not in entry, "claimed a cross-product over an incomplete set"
+    assert entry["index_tuples"] == [[1, 0], [1, 1], [1, 2], [1, 3], [3, 0], [3, 1], [3, 3]]
+
+
+def test_a_contiguous_set_still_records_only_ranges():
+    """Back-compatibility in the other direction: the cheapest form stays the cheapest.
+    Every manifest recorded before this change leans on it."""
+    shapes = {f"model.layers.{L}.mlp.up_proj.weight": ("BF16", (8, 4)) for L in range(4)}
+    entry = next(iter(_manifest_of(shapes)["shapes"].values()))
+
+    assert entry["ranges"] == [[0, 3]]
+    assert "values" not in entry and "index_tuples" not in entry
+
+
+def test_the_loader_expands_the_values_form_exactly():
+    """Written against `ModelShapes` directly rather than through a recorded file, so the
+    expansion is tested even before any manifest uses the new form."""
+    m = ModelShapes({
+        "model": "m", "recorded": "2026-10-24", "n_keys": 6,
+        "shapes": {"a.{i}.b.{i}.w": {"dtype": "BF16", "shape": [8, 4], "n": 6,
+                                     "ranges": [[1, 5], [0, 1]],
+                                     "values": [[1, 3, 5], [0, 1]]}},
+    })
+    assert sorted(m.keys()) == sorted([
+        "a.1.b.0.w", "a.1.b.1.w", "a.3.b.0.w", "a.3.b.1.w", "a.5.b.0.w", "a.5.b.1.w"])
+    assert len(m.keys()) == m.n_keys
+    assert m.shape_of("a.3.b.1.w") == (8, 4)
+
+
+def test_values_beats_ranges_when_both_are_present():
+    """`ranges` is recorded alongside `values` for human readability — an entry says
+    "layers 1..87" at a glance. Expansion must take the precise one, or it would invent 174
+    keys for the 6 that exist."""
+    m = ModelShapes({
+        "model": "m", "recorded": "2026-10-24", "n_keys": 2,
+        "shapes": {"a.{i}.w": {"dtype": "BF16", "shape": [1], "n": 2,
+                               "ranges": [[1, 87]], "values": [[1, 87]]}},
+    })
+    assert sorted(m.keys()) == ["a.1.w", "a.87.w"]
