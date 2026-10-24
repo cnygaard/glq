@@ -375,8 +375,20 @@ def test_required_plugin_reaches_the_render_context(tmp_path):
     from glq.tooling import required_plugin
     assert required_plugin(KOLIBRI_REPO) is not None
     assert required_plugin("xv0y5ncu/Test-GLQ-4bpw") is None
-    # and the template must actually branch on it
-    assert "required_plugin" in Path("glq/templates/model_card.md.j2").read_text()
+
+    # That the key REACHES the context is only observable through the render, so assert on
+    # behaviour: the two repos must produce different Install blocks, and specifically must
+    # differ on the one-liner, which is the thing the branch exists to withhold.
+    #
+    # An earlier version read the template source through `Path("glq/templates/...")` — a
+    # CWD-relative path, which passed locally and raised FileNotFoundError in CI for that
+    # reason alone. `model_card.py` itself resolves the template package-relative
+    # (`Path(__file__).parent / "templates"`), and no test should be more fragile than the
+    # code it covers. Rendering needs no path at all.
+    plain = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
+    plugin = _install_block(_card_for(tmp_path, KOLIBRI_REPO))
+    assert plain != plugin, "the context key is present but the template does not branch"
+    assert "--components" in plain and "--components" not in plugin
 
 
 def test_the_manual_recipe_shows_the_real_parser_not_a_placeholder(tmp_path):
