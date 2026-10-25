@@ -539,3 +539,56 @@ def test_the_text_only_profile_opts_into_the_stacked_walk_and_the_converter():
     assert prof.get("stacked_experts") is True
     assert prof.get("convert_state") == "nemotron_h"
     qm._require_supported_expert_layout(layers, TEXT_ARCH, profile=prof)
+
+
+# ---- the streaming embedding key --------------------------------------------------
+#
+# `sd_prefix` is the checkpoint spelling while `layers_attr` is the module's. The embedding
+# needed the same split and did not have it: the text-only streaming branch just concatenated
+# `profile['embed_attr'] + ".weight"`, which is a MODULE path. For every arch before this one
+# the two coincided; NemotronH renames `backbone.` -> `model.` on load, so they do not.
+# Measured on the real Lightning-30B checkpoint: 6,242 keys under `backbone.`, **zero** under
+# `model.`, and the embedding at `backbone.embeddings.weight`.
+
+
+def test_the_profile_declares_the_checkpoint_side_embedding_key():
+    for arch in (TEXT_ARCH, "NemotronH_Omni_Reasoning_V3"):
+        prof = qm._MODEL_PROFILES[arch]
+        assert prof["embed_key"].endswith("embeddings.weight"), arch
+        # ...and it is NOT the module path, which is what the old code used.
+        assert prof["embed_key"] != f"{prof['embed_attr']}.weight", arch
+
+
+def test_the_declared_key_is_used_when_the_checkpoint_has_it():
+    wm = {"backbone.embeddings.weight": "s", "backbone.layers.0.mixer.A_log": "s"}
+    assert qm._streaming_embed_key(wm, qm._MODEL_PROFILES[TEXT_ARCH]) == \
+        "backbone.embeddings.weight"
+
+
+def test_the_embed_attr_fallback_still_serves_every_other_architecture():
+    """Kolibri-1, sarvam and the default profile all have module == checkpoint spelling and
+    no `embed_key`; they must keep working off `embed_attr`."""
+    for arch in ("Kolibri1ForCausalLM", "SarvamMoEForCausalLM"):
+        prof = qm._MODEL_PROFILES[arch]
+        assert "embed_key" not in prof, f"{arch} gained an embed_key; update this test"
+        key = f"{prof['embed_attr']}.weight"
+        assert qm._streaming_embed_key({key: "s"}, prof) == key
+
+
+def test_a_declared_key_absent_from_the_checkpoint_falls_back_rather_than_failing():
+    """The declaration is a hint, not a contract: a re-sharded or converted checkpoint may
+    use the module spelling instead, and that should still load."""
+    prof = dict(qm._MODEL_PROFILES[TEXT_ARCH])
+    wm = {"model.embeddings.weight": "s"}
+    assert qm._streaming_embed_key(wm, prof) == "model.embeddings.weight"
+
+
+def test_neither_key_present_names_what_it_looked_for():
+    """The old path raised `KeyError: 'model.embeddings.weight'` from inside the shard loader,
+    four frames down, with no hint that the profile was the problem."""
+    with pytest.raises(ValueError) as exc:
+        qm._streaming_embed_key({"backbone.layers.0.mixer.A_log": "s"},
+                                qm._MODEL_PROFILES[TEXT_ARCH])
+    msg = str(exc.value)
+    assert "backbone.embeddings.weight" in msg and "model.embeddings.weight" in msg, msg
+    assert "embed_key" in msg, msg

@@ -423,6 +423,9 @@ _MODEL_PROFILES = {
         'rotary_attr': None,       # NemotronHAttention applies no rotary (NoPE)
         # ...and this one IS the checkpoint spelling, which is why it does not change.
         'sd_prefix': 'backbone.layers',
+        # CHECKPOINT spelling again, for the same reason sd_prefix is: the module is
+        # `model.embeddings` but the file says `backbone.embeddings.weight`.
+        'embed_key': 'backbone.embeddings.weight',
         'trust_remote_code': False,   # native since transformers 5.3; 5.18+ for the VL wrapper
         # NOT 'nemotron_h'. That branch passes `cache_params=None`, and NemotronHBlock.forward
         # has no such parameter — it passes `cache_params=past_key_values` to the mixer itself
@@ -460,6 +463,7 @@ _MODEL_PROFILES = {
         # NemotronHAttention applies no rotary at all (NoPE), like the text-only entry below.
         'rotary_attr': None,
         'sd_prefix': 'language_model.backbone.layers',
+        'embed_key': 'language_model.backbone.embeddings.weight',
         # Native since transformers 5.18, so no remote code is needed and none is fetched;
         # 5.14-5.17 have `nemotron_h` but not the wrapper and do need `--trust-remote-code`.
         # The text tower is the same class either way. One serving-side caveat, irrelevant to
@@ -828,6 +832,44 @@ def _streaming_wrapper_keys(weight_map, is_gemma4=False):
             f"stacks. Picking one by iteration order would quantize whichever the shards "
             f"happen to list first; declare the right one in the profile's sd_prefix.")
     return embed_key, (prefixes[0] if prefixes else None)
+
+
+def _streaming_embed_key(weight_map, profile, derived=None):
+    """The CHECKPOINT key holding the text decoder's input embedding.
+
+    A third spelling problem of the same family as ``sd_prefix`` vs ``layers_attr``. The
+    streaming path used ``profile['embed_attr'] + ".weight"`` — a MODULE path — which was
+    fine while every architecture spelled the two the same. NemotronH does not:
+    transformers renames ``backbone.`` to ``model.`` on load, so the module is
+    ``model.embeddings`` while the checkpoint keeps ``backbone.embeddings.weight``. Measured
+    on Nemotron-3.5-Lightning-30B: 6,242 keys under ``backbone.``, **zero** under
+    ``model.``. The old code therefore raised ``KeyError: 'model.embeddings.weight'`` four
+    frames down inside the shard loader, naming neither the profile nor the real key.
+
+    Resolution order, most specific first:
+
+    1. the profile's declared ``embed_key``, when the checkpoint actually has it;
+    2. ``derived`` — what the multimodal branch found by scanning the real keys;
+    3. ``embed_attr + ".weight"``, which is still right for every architecture whose module
+       and checkpoint spellings agree (Kolibri-1, sarvam, the default profile).
+
+    A declared key that is absent is a miss, not an error: a re-sharded or already-converted
+    checkpoint may legitimately use the module spelling. Only exhausting all three raises,
+    and it names what it looked for.
+    """
+    declared = (profile or {}).get('embed_key')
+    attr = (profile or {}).get('embed_attr') or 'model.embed_tokens'
+    fallback = f"{attr}.weight"
+    for cand in (declared, derived, fallback):
+        if cand and cand in weight_map:
+            return cand
+    tried = [c for c in (declared, derived, fallback) if c]
+    nearby = sorted(k for k in weight_map if 'embed' in k)[:5]
+    raise ValueError(
+        f"no embedding tensor in the checkpoint. Tried {tried}; keys containing 'embed' "
+        f"are {nearby or '(none)'}. Set the profile's `embed_key` to the CHECKPOINT "
+        f"spelling — it is not always `embed_attr` + '.weight', because transformers may "
+        f"rename the module path on load.")
 
 
 def _text_config(cfg, is_multimodal):
@@ -3363,12 +3405,12 @@ def quantize(
             # (``model.language_model.layers.*`` on tf>=5.10, ``language_model.
             # model.layers.*`` on tf<5.10), so key on that — and exclude the MTP
             # head, which is a second such stack. See `_streaming_wrapper_keys`.
-            embed_key, _derived = _streaming_wrapper_keys(weight_map, is_gemma4=is_gemma4)
+            _mm_embed, _derived = _streaming_wrapper_keys(weight_map, is_gemma4=is_gemma4)
             if _derived:
                 sd_prefix = _derived
+            embed_key = _streaming_embed_key(weight_map, profile, derived=_mm_embed)
         else:
-            embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
-            embed_key = f"{embed_attr}.weight"
+            embed_key = _streaming_embed_key(weight_map, profile)
         embed_weight = _load_tensor_from_shards(weight_map, shard_paths, embed_key)
         vocab_size = embed_weight.shape[0]
         hidden_size = embed_weight.shape[1]
