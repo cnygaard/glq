@@ -219,7 +219,7 @@ vllm serve {{ repo_id }} \
     --port 8000 \
     --enable-auto-tool-choice \
     --tool-call-parser {{ tool_parsers.tool }}{% if tool_parsers.reasoning %} \
-    --reasoning-parser {{ tool_parsers.reasoning }}{% endif %}
+    --reasoning-parser {{ tool_parsers.reasoning }}{% endif +%}
 ```
 {% if tool_parsers.needs_template %}
 This family also needs a tool-aware chat template that is not in the checkpoint — one more

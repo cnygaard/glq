@@ -446,3 +446,31 @@ def test_no_rendered_card_tells_a_reader_to_run_bare_python(tmp_path):
             stripped = line.strip().lstrip("> ").strip()
             assert not stripped.startswith("python "), (
                 f"{repo}: a reader is told to run bare `python`: {line!r}")
+
+
+def test_every_rendered_code_fence_is_closed_on_its_own_line(tmp_path):
+    """A `{% endif %}` immediately before a closing fence loses its newline.
+
+    The template env sets `trim_blocks=True`, which strips the newline that follows a block
+    tag. The parser-flag block ends with a conditional `--reasoning-parser` line, so the
+    ``` that should close it was pulled onto the end of that line:
+
+        --reasoning-parser kolibri1```
+
+    Markdown then reads the fence as part of the command and leaves the block open, which
+    swallows the formatting of everything after it. `{% endif +%}` keeps the newline.
+
+    Asserted by counting fences rather than by matching that one string: any future
+    conditional ending a fenced block fails the same way, and an odd count is the signal
+    regardless of which block it came from.
+    """
+    for repo in ("xv0y5ncu/Test-GLQ-4bpw", KOLIBRI_REPO):
+        glq = _card_for(tmp_path, repo).partition("<details>")[0]
+        fences = [ln for ln in glq.splitlines() if ln.strip().startswith("```")]
+        assert len(fences) % 2 == 0, f"{repo}: {len(fences)} fence lines, so one is unclosed"
+        for ln in fences:
+            stripped = ln.strip()
+            # An opening fence may name a language; a closing one is bare. Either way the
+            # fence must be the whole line, not glued to the end of a command.
+            assert stripped.startswith("```") and "```" not in stripped[3:], (
+                f"{repo}: fence is not alone on its line: {ln!r}")
