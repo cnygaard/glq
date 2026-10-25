@@ -222,3 +222,112 @@ class TestReplaceHelper:
         assert isinstance(m.experts, E8RHTFusedExperts)
         # ModuleList __len__ over the 2 per-expert pairs.
         assert len(m.experts) == 2
+
+
+class TestNestedConfigResolution:
+    """`_replace_nemotron_h_experts` on a multimodal wrapper.
+
+    Every other test in this file hands `E8RHTFusedExperts` a flat `SimpleNamespace`, which
+    is why this went unnoticed: on a vision-language wrapper the MoE geometry lives on
+    `config.text_config`, not at the top level. Measured on transformers 5.20.1 with
+    `NemotronH_Omni_Reasoning_V3_Config`: `hasattr(cfg, "n_routed_experts")` is **False**, so
+    `int(config.n_routed_experts)` raises AttributeError and the substitution never happens —
+    which the loader reports only as "the model will load DENSE in its original dtype".
+    """
+
+    @staticmethod
+    def _nested(n_exp=4, hidden=32, inter=16, latent=8):
+        """A wrapper config shaped like the real one: geometry only on `.text_config`."""
+        import types as _t
+        inner = _t.SimpleNamespace(
+            n_routed_experts=n_exp, hidden_size=hidden, moe_intermediate_size=inter,
+            moe_latent_size=latent, mlp_hidden_act="relu2", model_type="nemotron_h")
+        outer = _t.SimpleNamespace(model_type="nemotron_h_omni", text_config=inner)
+        outer.get_text_config = lambda: inner
+        return outer, inner
+
+    def test_the_wrapper_config_really_lacks_the_geometry(self):
+        """Guards the test below: if the wrapper ever exposed these at the top level, the
+        fix would be unnecessary and this class would be testing nothing."""
+        outer, _ = self._nested()
+        for attr in ("n_routed_experts", "moe_intermediate_size", "moe_latent_size"):
+            assert not hasattr(outer, attr), f"wrapper exposes {attr}; premise is stale"
+
+    def test_experts_are_built_from_the_text_config(self):
+        from glq.fused_experts import E8RHTFusedExperts, _replace_nemotron_h_experts
+        nh = pytest.importorskip(
+            "transformers.models.nemotron_h.modeling_nemotron_h",
+            reason="needs transformers' native nemotron_h")
+
+        outer, inner = self._nested()
+        experts = nh.NemotronHExperts.__new__(nh.NemotronHExperts)
+        torch.nn.Module.__init__(experts)
+
+        model = torch.nn.Module()
+        model.config = outer
+        model.mixer = torch.nn.Module()
+        model.mixer.experts = experts
+
+        assert _replace_nemotron_h_experts(model) == 1
+        built = model.get_submodule("mixer.experts")
+        assert isinstance(built, E8RHTFusedExperts)
+        # Sized from the INNER config, and the latent is the expert input width.
+        assert built.num_experts == inner.n_routed_experts == 4
+        assert built.input_dim == inner.moe_latent_size == 8
+        assert built.intermediate_dim == inner.moe_intermediate_size == 16
+
+    def test_a_flat_config_still_works(self):
+        """The text-only path, which is what every existing checkpoint uses."""
+        from glq.fused_experts import E8RHTFusedExperts
+        cfg = _make_stub_config(num_experts=4, hidden=32, intermediate=16)
+        assert not hasattr(cfg, "get_text_config")
+        built = E8RHTFusedExperts(cfg)
+        assert built.num_experts == 4 and built.input_dim == 32
+        assert isinstance(built, E8RHTFusedExperts)
+
+
+class TestActivationDispatchSafety:
+    """The fused non-gated kernel must not be handed a non-relu² activation.
+
+    `glq_cuda.cu`'s id table is 0/1/2 = silu / gelu-tanh / relu² **gated**, and 3/4/5 the
+    same three **non-gated**. `activation_type = 5 if _is_relu2(act) else 0` therefore asked
+    a *gated* kernel to evaluate this non-gated module — the wrong function, computed without
+    error. `E8RHTFusedExperts` has only ever run relu², so anything else declines the fused
+    path and takes the Python loop, which applies `act_fn` itself and is right for all of them.
+    """
+
+    def test_relu2_is_still_recognised(self):
+        from transformers.activations import ACT2FN
+        from glq.fused_experts import _is_relu2
+        assert _is_relu2(ACT2FN["relu2"]), "relu2 must keep taking the fused path"
+
+    def test_relu2_maps_to_the_non_gated_id(self):
+        from transformers.activations import ACT2FN
+
+        from glq.fused_experts import _nongated_activation_type
+        assert _nongated_activation_type(ACT2FN["relu2"]) == 5
+
+    def test_any_other_activation_declines_rather_than_falling_through_to_zero(self):
+        """id 0 is **gated** silu, so the old `else 0` evaluated the wrong function on this
+        non-gated module's weights.
+
+        Tested on `_nongated_activation_type` rather than through `_try_fused_forward`: that
+        method returns None on a CPU tensor (`if not hidden_states.is_cuda`) long before
+        reaching this decision, so an end-to-end assertion here passes for the wrong reason
+        on any machine without a GPU — which is every machine that runs this suite.
+        """
+        from transformers.activations import ACT2FN
+
+        from glq.fused_experts import _nongated_activation_type
+        for name in ("silu", "gelu", "gelu_pytorch_tanh", "relu"):
+            assert _nongated_activation_type(ACT2FN[name]) is None, name
+
+    def test_declining_leaves_the_caller_its_existing_fallback(self):
+        """`_try_fused_forward`'s contract is documented as "``None`` on any unsupported
+        case (caller falls back to Python loop)", and that loop applies `self.act_fn`
+        directly — so declining routes a silu module to code that is correct for silu. This
+        pins the contract rather than re-testing the loop, which the construction tests above
+        already cover: a populated module needs loaded codebooks, and building one here would
+        test the decode path instead of the dispatch decision."""
+        from glq.fused_experts import E8RHTFusedExperts
+        assert "falls back to Python loop" in E8RHTFusedExperts._try_fused_forward.__doc__

@@ -137,6 +137,26 @@ def _is_relu2(act_fn) -> bool:
     return "relu2" in name or "relusquared" in name
 
 
+def _nongated_activation_type(act_fn):
+    """The fused kernel's activation id for this NON-GATED module, or ``None`` to decline.
+
+    `glq_cuda.cu`'s table is 0/1/2 = silu / gelu-tanh / relu² **gated**, and 3/4/5 the same
+    three **non-gated**. The dispatch used to read `5 if _is_relu2(act) else 0`, so any
+    activation this helper did not recognise asked a *gated* kernel to evaluate a non-gated
+    module — not a crash, just a different function computed with confidence.
+
+    Declining instead sends the caller to its Python loop, which applies ``act_fn`` itself
+    and is correct for every activation. Only relu² is mapped because only relu² has ever
+    been run through the kernel; ids 3 and 4 exist but are unexercised, and guessing them
+    here would re-create the same class of silent error one step along.
+
+    Separate from `_try_fused_forward` so it can be tested without a GPU: that method
+    returns ``None`` on a CPU tensor long before reaching this decision, which makes an
+    end-to-end assertion on it pass for the wrong reason.
+    """
+    return 5 if _is_relu2(act_fn) else None
+
+
 #: Names that mean exactly the activation the fused op implements. Matched EXACTLY, never
 #: as substrings: ``nn.Tanh`` contains "tanh" and would otherwise read as gelu-tanh.
 _SILU_NAMES = frozenset({"silu", "swish", "siluactivation"})
@@ -351,8 +371,9 @@ class E8RHTFusedExperts(nn.Module):
         if not hasattr(glq_cuda, "glq_fused_moe_block_diag_cuda"):
             return None
 
-        # NemotronH uses non-gated relu² → activation_type=5.
-        activation_type = 5 if _is_relu2(self.act_fn) else 0
+        activation_type = _nongated_activation_type(self.act_fn)
+        if activation_type is None:
+            return None
 
         # Codebook tensors — reuse shared E8 codebook for stages 1 & 3
         # (same convention as glq_fused_linear_cuda's stage-3 path).
@@ -457,8 +478,17 @@ def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True) -
     # Walk a snapshot since we'll mutate during iteration.
     targets = [(name, m) for name, m in model.named_modules()
                if isinstance(m, NemotronHExperts)]
+    # The TEXT config, not the top-level one. On a vision-language wrapper
+    # (`nemotron_h_omni`) the MoE geometry lives on `config.text_config` and the wrapper
+    # exposes none of it: measured on transformers 5.20.1,
+    # `hasattr(cfg, "n_routed_experts")` is False, so `E8RHTFusedExperts.__init__` raised
+    # AttributeError and no substitution happened — surfacing only as the loader's "the
+    # model will load DENSE in its original dtype". `get_text_config()` returns the config
+    # itself for a text-only model, so the flat case is unchanged.
+    cfg = model.config
+    if hasattr(cfg, "get_text_config"):
+        cfg = cfg.get_text_config()
     for name, _ in targets:
-        cfg = model.config
         new_mod = E8RHTFusedExperts(cfg, block_diagonal=block_diagonal)
         new_mod.requires_grad_(False)
         model.set_submodule(name, new_mod)
