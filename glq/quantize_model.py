@@ -407,12 +407,35 @@ def _e8p_rvq_recipe(bpw, e8p_cb, dev):
 
 _MODEL_PROFILES = {
     'NemotronHForCausalLM': {
-        'layers_attr': 'backbone.layers',
-        'embed_attr': 'backbone.embeddings',
-        'rotary_attr': None,       # no global rotary embedding
+        # The whole Nemotron-3 / 3.5 TEXT family: Lightning-30B-A3B, Super-120B-A12B,
+        # Nano-30B-A3B. Hybrid tower — Mamba-2 / MoE / attention interleaved per
+        # `layers_block_type` — with the same non-gated `NemotronHExperts` the VL wrapper
+        # nests. Verified on a meta `NemotronHForCausalLM` (transformers 5.19.0), against
+        # the real Lightning-30B config: 52 blocks = 23 mamba + 23 moe + 6 attention,
+        # experts `up_proj` [128, 1856, 2688] / `down_proj` [128, 2688, 1856].
+        #
+        # MODULE path, not the checkpoint's. transformers' own conversion mapping renames
+        # `backbone.` -> `model.` on load (`conversion_mapping.py`, the `nemotron_h` entry),
+        # so these two were written for the pre-native trust-remote-code tree and resolved
+        # nothing on 5.17+ — which is an empty quantize, not an error.
+        'layers_attr': 'model.layers',
+        'embed_attr': 'model.embeddings',       # not embed_tokens
+        'rotary_attr': None,       # NemotronHAttention applies no rotary (NoPE)
+        # ...and this one IS the checkpoint spelling, which is why it does not change.
         'sd_prefix': 'backbone.layers',
-        'trust_remote_code': True,
-        'forward_kwargs': 'nemotron_h',
+        'trust_remote_code': False,   # native since transformers 5.3; 5.18+ for the VL wrapper
+        # NOT 'nemotron_h'. That branch passes `cache_params=None`, and NemotronHBlock.forward
+        # has no such parameter — it passes `cache_params=past_key_values` to the mixer itself
+        # and forwards `**kwargs`, so they collide on every Mamba block. It also forces eager
+        # attention, whose causality here comes only from a mask the per-layer calibration
+        # forward does not pass. See the Omni entry below for the same reasoning.
+        'forward_kwargs': 'default',
+        # `NemotronHExperts` holds two bare 3-D nn.Parameters with no nn.Linear children, so
+        # nothing walks them without this: 54.7 of 61.3 GiB (89.2%) on Lightning-30B.
+        'stacked_experts': True,
+        # ...and the checkpoint stores them one 2-D tensor per expert, which the streaming
+        # path's own `load_state_dict` does not reconcile. See `_convert_state_nemotron_h`.
+        'convert_state': 'nemotron_h',
     },
     'NemotronH_Omni_Reasoning_V3': {
         # NVIDIA-Nemotron-3.5-Super-VL-120B-A12B (model_type `nemotron_h_omni`): a RADIO

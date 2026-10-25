@@ -471,3 +471,71 @@ def test_the_hook_runs_under_a_real_forward_of_the_real_block():
     for k in routed:
         assert hess[k].shape == (16, 16)
         assert hess[k.replace(".up_proj", ".down_proj")].shape == (32, 32)
+
+
+# ---- the text-only NemotronH profile ----------------------------------------------
+#
+# `NemotronHForCausalLM` is the architecture of the whole Nemotron-3/3.5 text family
+# (Lightning-30B-A3B, Super-120B-A12B, Nano-30B-A3B), and it is the same non-gated
+# `NemotronHExperts` the VL wrapper nests. Its profile predates transformers' native port and
+# still describes the old trust-remote-code module tree.
+
+
+def _text_model(**kw):
+    """A real meta `NemotronHForCausalLM`. No weights, no download."""
+    pytest.importorskip("transformers", minversion="5.18.0")
+    from transformers.models.nemotron_h import NemotronHForCausalLM
+    cfg = _nemotron_cfg(latent=None, block_types=("mamba", "moe", "attention"), **kw)
+    with torch.device("meta"):
+        return NemotronHForCausalLM(cfg), cfg
+
+
+TEXT_ARCH = "NemotronHForCausalLM"
+
+
+def test_the_text_only_profile_resolves_on_the_real_module_tree():
+    """It did not. transformers renames the checkpoint's `backbone.` to `model.` on load
+    (`conversion_mapping.py`, the `nemotron_h` entry), so the MODULE is `model.*` while the
+    CHECKPOINT stays `backbone.*` — and the profile had `backbone.*` for both. `layers_attr`
+    resolving to nothing is not an error; it is an empty quantize.
+    """
+    model, _ = _text_model()
+    prof = qm._MODEL_PROFILES[TEXT_ARCH]
+
+    layers = qm._resolve_attr(model, prof["layers_attr"])
+    assert isinstance(layers, nn.ModuleList) and len(layers) == 3
+    assert isinstance(qm._resolve_attr(model, prof["embed_attr"]), nn.Embedding)
+
+    # sd_prefix is the CHECKPOINT spelling and must NOT be renamed to match the module.
+    assert prof["sd_prefix"] == "backbone.layers"
+    with pytest.raises(AttributeError):
+        qm._resolve_attr(model, "backbone.layers")
+
+
+def test_the_text_only_profile_does_not_use_the_nemotron_h_forward_kwargs():
+    """`forward_kwargs: 'nemotron_h'` supplies `cache_params=None`, and NemotronHBlock has no
+    such parameter — it passes `cache_params=past_key_values` to the mixer itself and
+    forwards `**kwargs`, so the two collide on every Mamba block. The branch also forces
+    eager attention, whose causality here comes only from a mask the per-layer calibration
+    forward never passes."""
+    import inspect
+
+    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHBlock
+    params = inspect.signature(NemotronHBlock.forward).parameters
+    assert "cache_params" not in params
+    assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    assert qm._MODEL_PROFILES[TEXT_ARCH]["forward_kwargs"] == "default"
+
+
+def test_the_text_only_profile_opts_into_the_stacked_walk_and_the_converter():
+    """Same container as the VL wrapper, so it needs the same two declarations — and without
+    them this family's experts (89.2% of Lightning-30B) are skipped silently."""
+    model, _ = _text_model()
+    prof = qm._MODEL_PROFILES[TEXT_ARCH]
+    layers = qm._resolve_attr(model, prof["layers_attr"])
+
+    found = [f for layer in layers for f in qm._collect_nongated_stacked_experts(layer)]
+    assert found, "no non-gated container in a text-only NemotronH"
+    assert prof.get("stacked_experts") is True
+    assert prof.get("convert_state") == "nemotron_h"
+    qm._require_supported_expert_layout(layers, TEXT_ARCH, profile=prof)
