@@ -407,12 +407,38 @@ def _e8p_rvq_recipe(bpw, e8p_cb, dev):
 
 _MODEL_PROFILES = {
     'NemotronHForCausalLM': {
-        'layers_attr': 'backbone.layers',
-        'embed_attr': 'backbone.embeddings',
-        'rotary_attr': None,       # no global rotary embedding
+        # The whole Nemotron-3 / 3.5 TEXT family: Lightning-30B-A3B, Super-120B-A12B,
+        # Nano-30B-A3B. Hybrid tower — Mamba-2 / MoE / attention interleaved per
+        # `layers_block_type` — with the same non-gated `NemotronHExperts` the VL wrapper
+        # nests. Verified on a meta `NemotronHForCausalLM` (transformers 5.19.0), against
+        # the real Lightning-30B config: 52 blocks = 23 mamba + 23 moe + 6 attention,
+        # experts `up_proj` [128, 1856, 2688] / `down_proj` [128, 2688, 1856].
+        #
+        # MODULE path, not the checkpoint's. transformers' own conversion mapping renames
+        # `backbone.` -> `model.` on load (`conversion_mapping.py`, the `nemotron_h` entry),
+        # so these two were written for the pre-native trust-remote-code tree and resolved
+        # nothing on 5.17+ — which is an empty quantize, not an error.
+        'layers_attr': 'model.layers',
+        'embed_attr': 'model.embeddings',       # not embed_tokens
+        'rotary_attr': None,       # NemotronHAttention applies no rotary (NoPE)
+        # ...and this one IS the checkpoint spelling, which is why it does not change.
         'sd_prefix': 'backbone.layers',
-        'trust_remote_code': True,
-        'forward_kwargs': 'nemotron_h',
+        # CHECKPOINT spelling again, for the same reason sd_prefix is: the module is
+        # `model.embeddings` but the file says `backbone.embeddings.weight`.
+        'embed_key': 'backbone.embeddings.weight',
+        'trust_remote_code': False,   # native since transformers 5.3; 5.18+ for the VL wrapper
+        # NOT 'nemotron_h'. That branch passes `cache_params=None`, and NemotronHBlock.forward
+        # has no such parameter — it passes `cache_params=past_key_values` to the mixer itself
+        # and forwards `**kwargs`, so they collide on every Mamba block. It also forces eager
+        # attention, whose causality here comes only from a mask the per-layer calibration
+        # forward does not pass. See the Omni entry below for the same reasoning.
+        'forward_kwargs': 'default',
+        # `NemotronHExperts` holds two bare 3-D nn.Parameters with no nn.Linear children, so
+        # nothing walks them without this: 54.7 of 61.3 GiB (89.2%) on Lightning-30B.
+        'stacked_experts': True,
+        # ...and the checkpoint stores them one 2-D tensor per expert, which the streaming
+        # path's own `load_state_dict` does not reconcile. See `_convert_state_nemotron_h`.
+        'convert_state': 'nemotron_h',
     },
     'NemotronH_Omni_Reasoning_V3': {
         # NVIDIA-Nemotron-3.5-Super-VL-120B-A12B (model_type `nemotron_h_omni`): a RADIO
@@ -437,6 +463,7 @@ _MODEL_PROFILES = {
         # NemotronHAttention applies no rotary at all (NoPE), like the text-only entry below.
         'rotary_attr': None,
         'sd_prefix': 'language_model.backbone.layers',
+        'embed_key': 'language_model.backbone.embeddings.weight',
         # Native since transformers 5.18, so no remote code is needed and none is fetched;
         # 5.14-5.17 have `nemotron_h` but not the wrapper and do need `--trust-remote-code`.
         # The text tower is the same class either way. One serving-side caveat, irrelevant to
@@ -470,15 +497,20 @@ _MODEL_PROFILES = {
         # at all, so a non-streaming save would silently drop the 5.40 GiB head — the Qwen3.5
         # failure. It also makes the streaming path derive sd_prefix from the real keys.
         #
-        # Declared but NOT yet actionable: `NemotronHExperts` holds two 3-D nn.Parameters,
-        # `up_proj` [512,2688,1024] and `down_proj` [512,1024,2688], with **no gate** — the
-        # forward is up -> relu**2 -> down. Every stacked-expert site in this module is
-        # written against a gated `gate_up_proj`, so `_require_supported_expert_layout`
-        # refuses this architecture during meta discovery rather than letting a run skip
-        # 210.0 of 231.8 GiB (90.6%) and report success. Lifting that refusal also needs a
-        # `convert_state` converter, since the checkpoint stores experts one 2-D tensor per
-        # expert while the module wants them stacked.
+        # `NemotronHExperts` holds two 3-D nn.Parameters, `up_proj` [512,2688,1024] and
+        # `down_proj` [512,1024,2688], with **no gate** — the forward is up -> relu**2 ->
+        # down, and the input width is the LATENT (1024), since the experts sit behind
+        # fc1_latent_proj. Those parameters have no nn.Linear children, so without this flag
+        # nothing walks them and a run skips 210.0 of 231.8 GiB (90.6%) while reporting
+        # success. `_make_nongated_expert_hook` and `_expand_nongated_experts` handle the
+        # missing gate; `_require_supported_expert_layout` still refuses a stacked container
+        # whose profile omits this flag.
         'stacked_experts': True,
+        # ...and the CHECKPOINT stores those experts one 2-D tensor per expert per
+        # projection, which transformers reconciles with a `MergeModulelist` conversion that
+        # the streaming path's own `load_state_dict` never runs. See
+        # `_convert_state_nemotron_h`.
+        'convert_state': 'nemotron_h',
     },
     'Gemma4ForConditionalGeneration': {
         # Multimodal — language decoder lives at model.language_model. The
@@ -802,6 +834,44 @@ def _streaming_wrapper_keys(weight_map, is_gemma4=False):
     return embed_key, (prefixes[0] if prefixes else None)
 
 
+def _streaming_embed_key(weight_map, profile, derived=None):
+    """The CHECKPOINT key holding the text decoder's input embedding.
+
+    A third spelling problem of the same family as ``sd_prefix`` vs ``layers_attr``. The
+    streaming path used ``profile['embed_attr'] + ".weight"`` — a MODULE path — which was
+    fine while every architecture spelled the two the same. NemotronH does not:
+    transformers renames ``backbone.`` to ``model.`` on load, so the module is
+    ``model.embeddings`` while the checkpoint keeps ``backbone.embeddings.weight``. Measured
+    on Nemotron-3.5-Lightning-30B: 6,242 keys under ``backbone.``, **zero** under
+    ``model.``. The old code therefore raised ``KeyError: 'model.embeddings.weight'`` four
+    frames down inside the shard loader, naming neither the profile nor the real key.
+
+    Resolution order, most specific first:
+
+    1. the profile's declared ``embed_key``, when the checkpoint actually has it;
+    2. ``derived`` — what the multimodal branch found by scanning the real keys;
+    3. ``embed_attr + ".weight"``, which is still right for every architecture whose module
+       and checkpoint spellings agree (Kolibri-1, sarvam, the default profile).
+
+    A declared key that is absent is a miss, not an error: a re-sharded or already-converted
+    checkpoint may legitimately use the module spelling. Only exhausting all three raises,
+    and it names what it looked for.
+    """
+    declared = (profile or {}).get('embed_key')
+    attr = (profile or {}).get('embed_attr') or 'model.embed_tokens'
+    fallback = f"{attr}.weight"
+    for cand in (declared, derived, fallback):
+        if cand and cand in weight_map:
+            return cand
+    tried = [c for c in (declared, derived, fallback) if c]
+    nearby = sorted(k for k in weight_map if 'embed' in k)[:5]
+    raise ValueError(
+        f"no embedding tensor in the checkpoint. Tried {tried}; keys containing 'embed' "
+        f"are {nearby or '(none)'}. Set the profile's `embed_key` to the CHECKPOINT "
+        f"spelling — it is not always `embed_attr` + '.weight', because transformers may "
+        f"rename the module path on load.")
+
+
 def _text_config(cfg, is_multimodal):
     """The config describing the TEXT decoder — the wrapper itself if not multimodal.
 
@@ -1113,38 +1183,130 @@ def _collect_nongated_stacked_experts(layer):
     return out
 
 
-def _require_supported_expert_layout(layers, arch):
-    """Refuse an architecture whose routed experts the quantize path cannot read.
+def _make_nongated_expert_hook(mn, emod, token_counts, hessians):
+    """A forward hook capturing per-expert input Grams for a NON-GATED expert container.
 
-    Every stacked-expert site in this module — the collector, the per-expert Hessian hooks,
-    the quantize loop, the replay restore, the save-side split and the routing report — is
-    written against a gated 3-D ``gate_up_proj``. A non-gated container (NemotronH's
-    `NemotronHExperts`) matches none of them, so the nn.Linear walk and the stacked walk BOTH
-    miss it and the run reports success.
+    The gated sibling lives inside `quantize()` as a closure; this one is module-level so it
+    can be unit-tested against a real `NemotronHExperts` rather than only through a full
+    quantize run.
 
-    On NVIDIA-Nemotron-3.5-Super-VL-120B-A12B that is 40,960 tensors and **210.0 of 231.8
-    GiB, 90.6% of the checkpoint** — a "3 bpw" output weighing more than the bf16 input it
-    came from. Nothing downstream would look wrong: `layer_metrics.json` would list the
-    sublayers that were quantized, and the resulting checkpoint would load.
+    One difference from the gated hook, and it is the whole point: the down-projection's
+    Hessian is built from that expert's **own** up output through the activation,
+    ``act(up(x))``, where a gated container uses ``act(gate) * up``. Getting this wrong
+    produces a plausible-looking Hessian for a distribution the model never sees, which no
+    SQNR or coverage check can detect.
 
-    So this raises, and it is called during meta discovery — before the weights are
-    downloaded — because the alternative is finding out after a 232 GiB pull.
-
-    Scans every layer, not just the first: a hybrid tower interleaves block types, and
-    Nemotron's layer 0 is a Mamba block with no experts in it at all.
+    ``token_counts`` and ``hessians`` are mutated in place, keyed exactly as the gated path
+    keys them — ``(module_name, expert)`` and ``{module_name}.{expert}.{projection}`` — so
+    everything downstream (the routing report, the identity-Hessian fallback, artifact
+    naming) needs no special case.
     """
+    n_exp = emod.up_proj.shape[0]
+
+    def _hook(module, args, kwargs, output):
+        hs = kwargs.get('hidden_states', args[0] if args else None)
+        ti = kwargs.get('top_k_index', args[1] if len(args) > 1 else None)
+        if hs is None or ti is None:
+            return
+        hs = hs.reshape(-1, hs.shape[-1])
+        ti = ti.reshape(-1, ti.shape[-1])
+        for e in range(n_exp):
+            sel = (ti == e).any(dim=-1)
+            n_sel = int(sel.sum())
+            # Counted even when zero: a never-routed expert falls back to an identity
+            # Hessian — plain nearest-neighbour, no error feedback — and that is the single
+            # most useful thing to know about a calibration run.
+            token_counts[(mn, e)] = token_counts.get((mn, e), 0) + n_sel
+            if not n_sel:
+                continue
+            xs = hs[sel]
+            xf = xs.float()
+            uk = f"{mn}.{e}.up_proj"
+            hessians[uk] = hessians.get(uk, 0) + xf.t() @ xf
+            with torch.no_grad():
+                di = emod.act_fn(nn.functional.linear(
+                    xs.to(emod.up_proj.dtype), emod.up_proj[e])).float()
+            dk = f"{mn}.{e}.down_proj"
+            hessians[dk] = hessians.get(dk, 0) + di.t() @ di
+    return _hook
+
+
+def _expand_nongated_experts(nongated, linears, moe_writeback, dropped_stacked_keys,
+                             sd_prefix, layer_idx):
+    """Expand non-gated 3-D expert stacks into per-expert virtual `nn.Linear`s.
+
+    The module-level sibling of the gated expansion in `quantize()`, and deliberately
+    simpler: with no fused `[gate; up]` matrix there is nothing to row-split, so these take
+    the ordinary single-matrix path and need **no** `moe_gate_up` entry.
+
+    The names matter beyond this function. ``{mn}.{e}.up_proj`` plus ``.weight`` *is* the
+    source checkpoint key, which is what lets the save side drop the original through its
+    generic `param_prefix in quantized_prefixes` rule with no special case — and it is the
+    layout vLLM's NemotronH expert mapping reads back (`ckpt_names=("up_proj","down_proj","")`).
+
+    The weight is **copied**, not aliased: the quant loop reads `linears[name].weight.data`
+    while writeback assigns into `param.data[e]`, so a view would let quantizing expert e
+    change the very weights its own Hessian was built from.
+    """
+    for mn, emod in nongated:
+        up, dwn = emod.up_proj, emod.down_proj
+        for e in range(up.shape[0]):
+            un, dn = f"{mn}.{e}.up_proj", f"{mn}.{e}.down_proj"
+            vup = nn.Linear(up.shape[2], up.shape[1], bias=False,
+                            device=up.device, dtype=up.dtype)
+            vup.weight.data = up.data[e].clone()
+            vdn = nn.Linear(dwn.shape[2], dwn.shape[1], bias=False,
+                            device=dwn.device, dtype=dwn.dtype)
+            vdn.weight.data = dwn.data[e].clone()
+            linears[un] = vup
+            linears[dn] = vdn
+            moe_writeback[un] = (up, e)
+            moe_writeback[dn] = (dwn, e)
+        dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.up_proj")
+        dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.down_proj")
+
+
+def _require_supported_expert_layout(layers, arch, profile=None):
+    """Refuse an architecture whose routed experts would be silently skipped.
+
+    Stacked routed experts — gated or not — are bare 3-D ``nn.Parameter``s with no
+    ``nn.Linear`` children, so the ordinary weight walk cannot see them and only the
+    stacked path can. That path is **opt-in**, through ``'stacked_experts': True`` in the
+    profile. An architecture that has such a container and does *not* declare the flag gets
+    its experts quantized by nobody, and the run still reports success: `layer_metrics.json`
+    lists the sublayers that were done, and the checkpoint loads.
+
+    The cost is the whole model. On NVIDIA-Nemotron-3.5-Super-VL-120B-A12B the routed experts
+    are 40,960 tensors and **210.0 of 231.8 GiB, 90.6%** — a "3 bpw" output heavier than the
+    bf16 input it came from. Qwen4Exp paid a smaller version of this bill at 67%.
+
+    Non-gated containers used to be refused outright, because every stacked-expert site was
+    written against a gated ``gate_up_proj``; they are supported now
+    (`_make_nongated_expert_hook`, `_expand_nongated_experts`), so the check narrows to the
+    thing still worth refusing: a container nothing will walk.
+
+    Called during meta discovery — before the weights are downloaded — because the
+    alternative is finding out after a 232 GiB pull. Scans every layer, not just the first:
+    a hybrid tower interleaves block types, and Nemotron's layer 0 is a Mamba block with no
+    experts in it at all.
+    """
+    if _stacked_experts_enabled(arch, profile):
+        return                      # the stacked path will walk them
     for layer_idx, layer in enumerate(layers):
-        found = _collect_nongated_stacked_experts(layer)
+        found = (_collect_nongated_stacked_experts(layer)
+                 or [(mn, m, 'gate_up_proj', tuple(m.gate_up_proj.shape))
+                     for mn, m in _collect_stacked_experts(layer)])
         if not found:
             continue
         mn, _mod, pname, shape = found[0]
         raise ValueError(
-            f"{arch}: routed experts at layers.{layer_idx}.{mn} are stacked but NOT gated "
-            f"({pname} is a 3-D {list(shape)} Parameter with no gate_up_proj), and GLQ's "
-            f"stacked-expert path reads only the gated layout. Quantizing now would skip "
-            f"every routed expert in the model — the overwhelming majority of its weights — "
-            f"and still report success. Refusing instead; non-gated stacked experts are not "
-            f"implemented yet.")
+            f"{arch}: routed experts at layers.{layer_idx}.{mn} are STACKED "
+            f"({pname} is a 3-D {list(shape)} Parameter, so it has no nn.Linear children), "
+            f"but this architecture's profile does not set 'stacked_experts': True. The "
+            f"weight walk cannot see them and the stacked path is not enabled, so every "
+            f"routed expert — the overwhelming majority of this model's weights — would be "
+            f"skipped and the run would still report success. Add 'stacked_experts': True "
+            f"to the profile.")
 
 
 def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
@@ -1201,6 +1363,23 @@ def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
                                    codebook=codebook)
                 with torch.no_grad():
                     dwn.data[e] = dw.to(dtype=dwn.dtype, device=dwn.device)
+                n_restored += 1
+
+    # ...and non-gated stacked experts (NemotronH), which the loop above cannot see: it keys
+    # on a 3-D `gate_up_proj`, so a replayed MoE layer would silently carry bf16 experts into
+    # calibration and every later layer would be fitted against a distribution the finished
+    # checkpoint never produces. At 52-88 layers on a spot box, resume will exercise this.
+    for mn, emod, _pname, _shape in _collect_nongated_stacked_experts(layer):
+        up, dwn = emod.up_proj, emod.down_proj
+        for e in range(up.shape[0]):
+            for param, leaf in ((up, 'up_proj'), (dwn, 'down_proj')):
+                arts = arts_map.get(f"{prefix}.{mn}.{e}.{leaf}")
+                if arts is None:
+                    continue
+                W_hat = dequantize_fn(arts, param.shape[2], param.shape[1], codebook_type,
+                                      codebook=codebook)
+                with torch.no_grad():
+                    param.data[e] = W_hat.to(dtype=param.dtype, device=param.device)
                 n_restored += 1
     return n_restored
 
@@ -2469,9 +2648,79 @@ def _convert_state_kolibri1(state):
     return out
 
 
+_NEMOTRON_H_EXPERT = re.compile(
+    r"^(?P<pre>.*experts)\.(?P<idx>\d+)\.(?P<leaf>up_proj|down_proj|gate_proj)\.weight$")
+
+
+def _convert_state_nemotron_h(state):
+    """Stack NemotronH's per-expert tensors into the two 3-D parameters the module wants.
+
+    The same shape of problem as `_convert_state_kolibri1`, with the gate removed. The
+    checkpoint stores experts one tensor per expert per projection — 1,024 of them per MoE
+    layer on the 120B — while transformers stores them as two 3-D parameters:
+
+        mixer.experts.{e}.up_proj.weight    -> mixer.experts.up_proj    [E, I, H]
+        mixer.experts.{e}.down_proj.weight  -> mixer.experts.down_proj  [E, H, I]
+
+    `from_pretrained` reconciles that with its own `MergeModulelist` conversion
+    (`transformers/conversion_mapping.py`, the `nemotron_h` entry); the streaming path does
+    its own `load_state_dict` and does not, so without this every expert key is "unexpected",
+    `_assert_load_coverage` raises, and 90.6% of the model would otherwise have been
+    quantized from uninitialized memory.
+
+    There is **no gate and no concatenation** here — the forward is `down(act(up(x)))` with
+    `act = relu**2`. A `gate_proj` in the input therefore means this is not the architecture
+    this converter is for, and it raises rather than stacking up/down and dropping the gate,
+    which would load cleanly and be wrong.
+
+    Experts are moved out of `state` as they are consumed rather than stacked with
+    `torch.stack`, which would hold all 512 source tensors and the 5.4 GiB result at the same
+    time — the same reason transformers' own `MergeModulelist` pre-allocates.
+    """
+    out, experts = {}, {}
+    for key, val in state.items():
+        m = _NEMOTRON_H_EXPERT.match(key)
+        if m:
+            experts.setdefault(m.group("pre"), {}) \
+                   .setdefault(int(m.group("idx")), {})[m.group("leaf")] = val
+        else:
+            out[key] = val
+
+    for prefix, per_idx in experts.items():
+        idxs = sorted(per_idx)
+        if idxs != list(range(len(idxs))):
+            missing = sorted(set(range(max(idxs) + 1)) - set(idxs))
+            raise ValueError(
+                f"{prefix}: expert indices are not contiguous from 0 — missing "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''}. Stacking would put "
+                f"weights at the wrong expert index, which routing cannot detect.")
+        for e in idxs:
+            have = set(per_idx[e])
+            if "gate_proj" in have:
+                raise ValueError(
+                    f"{prefix}.{e}: has a gate_proj, so these experts are GATED and this "
+                    f"converter is the wrong one — it would stack up/down and silently drop "
+                    f"the gate. Use the gated path (a 3-D gate_up_proj container).")
+            if have != {"up_proj", "down_proj"}:
+                raise ValueError(
+                    f"{prefix}.{e}: expected up_proj/down_proj, got {sorted(have)}")
+
+        u0, d0 = (per_idx[0][k] for k in ("up_proj", "down_proj"))
+        up = torch.empty((len(idxs), *u0.shape), dtype=u0.dtype, device=u0.device)
+        down = torch.empty((len(idxs), *d0.shape), dtype=d0.dtype, device=d0.device)
+        for e in idxs:
+            leaves = per_idx.pop(e)
+            up[e] = leaves.pop("up_proj")
+            down[e] = leaves.pop("down_proj")
+        out[f"{prefix}.up_proj"] = up
+        out[f"{prefix}.down_proj"] = down
+    return out
+
+
 #: Profiles select a converter by name, the way `forward_kwargs` selects a kwargs branch.
 _STATE_CONVERTERS = {
     "kolibri1": _convert_state_kolibri1,
+    "nemotron_h": _convert_state_nemotron_h,
 }
 
 
@@ -2820,7 +3069,7 @@ def _load_calib_ids(corpus, tokenizer, nsamples, seqlen):
     return interleaved, counts
 
 
-def _report_expert_routing(token_counts, expert_modules):
+def _report_expert_routing(token_counts, expert_modules, emit=None):
     """One line per MoE container: how many calibration token-rows each expert really saw.
 
     A routed expert's Hessian is only as good as its slice of the corpus, and with top-k of
@@ -2838,22 +3087,31 @@ def _report_expert_routing(token_counts, expert_modules):
     """
     if not token_counts:
         return
+    emit = emit or (lambda line: print(line))
     for name, emod in expert_modules:
         counts = sorted(v for (mn, _e), v in token_counts.items() if mn == name)
         if not counts:
             continue
-        width = emod.gate_up_proj.shape[-1]          # the gate/up Hessian's dimension
+        # The first projection's Hessian width, whichever projection the container has:
+        # `gate_up_proj` when the experts are gated, `up_proj` when they are not (NemotronH).
+        # Reading `gate_up_proj` unconditionally is an AttributeError on a non-gated
+        # container, and this runs on every stacked-expert layer AFTER calibration — so it
+        # would crash the run with that layer's Hessians already computed and discarded.
+        first = getattr(emod, 'gate_up_proj', None)
+        if first is None:
+            first = emod.up_proj
+        width = first.shape[-1]
         zeros = sum(1 for c in counts if c == 0)
         median = counts[len(counts) // 2]
         p01 = counts[max(0, len(counts) // 100)]
-        print(f"  {name}: routed rows/expert over {len(counts)} experts — "
-              f"min {counts[0]}, p1 {p01}, median {median}, max {counts[-1]}; "
-              f"median/width {median / width:.2f}x (Hessian is {width} wide)"
-              + (f"; {zeros} expert(s) saw NOTHING -> identity Hessian" if zeros else ""))
+        emit(f"  {name}: routed rows/expert over {len(counts)} experts — "
+             f"min {counts[0]}, p1 {p01}, median {median}, max {counts[-1]}; "
+             f"median/width {median / width:.2f}x (Hessian is {width} wide)"
+             + (f"; {zeros} expert(s) saw NOTHING -> identity Hessian" if zeros else ""))
         if median < width:
-            print(f"    note: the median expert is under-determined "
-                  f"({median} rows < {width}); consider a larger --nsamples or a corpus "
-                  f"that matches this model's languages")
+            emit(f"    note: the median expert is under-determined "
+                 f"({median} rows < {width}); consider a larger --nsamples or a corpus "
+                 f"that matches this model's languages")
 
 
 def quantize(
@@ -3050,7 +3308,7 @@ def quantize(
         # Here, not after the download: the meta model is the first and cheapest place the
         # real expert layout is visible, and the alternative is a 232 GiB pull followed by a
         # run that skips 90% of the weights without saying so.
-        _require_supported_expert_layout(_layers, arch)
+        _require_supported_expert_layout(_layers, arch, profile)
         del _model, _layers
 
         # Download model (if needed) and build weight map
@@ -3147,12 +3405,12 @@ def quantize(
             # (``model.language_model.layers.*`` on tf>=5.10, ``language_model.
             # model.layers.*`` on tf<5.10), so key on that — and exclude the MTP
             # head, which is a second such stack. See `_streaming_wrapper_keys`.
-            embed_key, _derived = _streaming_wrapper_keys(weight_map, is_gemma4=is_gemma4)
+            _mm_embed, _derived = _streaming_wrapper_keys(weight_map, is_gemma4=is_gemma4)
             if _derived:
                 sd_prefix = _derived
+            embed_key = _streaming_embed_key(weight_map, profile, derived=_mm_embed)
         else:
-            embed_attr = profile.get('embed_attr') or 'model.embed_tokens'
-            embed_key = f"{embed_attr}.weight"
+            embed_key = _streaming_embed_key(weight_map, profile)
         embed_weight = _load_tensor_from_shards(weight_map, shard_paths, embed_key)
         vocab_size = embed_weight.shape[0]
         hidden_size = embed_weight.shape[1]
@@ -3199,7 +3457,7 @@ def quantize(
         # already loaded the weights to CPU, and there is no earlier point at which the real
         # module tree exists — but a gate on one of two paths is a gate that the next person
         # routes around by dropping a flag.
-        _require_supported_expert_layout(decoder_layers, arch)
+        _require_supported_expert_layout(decoder_layers, arch, profile)
         if use_gpu:
             embed.to(device)
             if rotary_emb is not None:
@@ -3502,7 +3760,8 @@ def quantize(
         # (gate+up share the routed input; down sees act(gate)*up). Also drop the
         # tiny router projection from quantization — it's routing-critical and
         # negligible in size, so we keep it bf16.
-        gemma4_experts = []        # list of (module_name, experts_module)
+        gemma4_experts = []        # list of (module_name, experts_module) — GATED
+        nongated_experts = []      # list of (module_name, experts_module) — NON-GATED
         moe_expert_hessians = {}   # virtual_name -> accumulated input Gram (GPU)
         moe_expert_tokens = {}     # (module_name, expert) -> routed token-row count
         moe_hooks = []
@@ -3513,6 +3772,11 @@ def quantize(
             linears = {n: m for n, m in linears.items()
                        if not n.endswith('router.proj')}
             gemma4_experts = _collect_stacked_experts(layer)
+            # NemotronH's container has no gate, so the gated collector cannot see it —
+            # 90.6% of that model. Normalised to (name, module) pairs so everything below
+            # treats the two kinds alike.
+            nongated_experts = [(mn, mod) for mn, mod, _p, _s
+                                in _collect_nongated_stacked_experts(layer)]
 
             def _make_expert_hook(mn, emod):
                 n_exp = emod.gate_up_proj.shape[0]
@@ -3554,6 +3818,15 @@ def quantize(
             for mn, emod in gemma4_experts:
                 moe_hooks.append(emod.register_forward_hook(
                     _make_expert_hook(mn, emod), with_kwargs=True))
+            # The non-gated hook is module-level (`_make_nongated_expert_hook`) rather than a
+            # closure, so it can be unit-tested against a real NemotronHExperts instead of
+            # only through a full quantize run. It keys `moe_expert_tokens` and
+            # `moe_expert_hessians` identically, so nothing downstream branches.
+            for mn, emod in nongated_experts:
+                moe_hooks.append(emod.register_forward_hook(
+                    _make_nongated_expert_hook(
+                        mn, emod, moe_expert_tokens, moe_expert_hessians),
+                    with_kwargs=True))
 
         # Install Hessian hooks
         captures = {}
@@ -3589,9 +3862,15 @@ def quantize(
         # dropped from the save.
         for h in moe_hooks:
             h.remove()
-        _report_expert_routing(moe_expert_tokens, gemma4_experts)
-        for k, H in moe_expert_hessians.items():
+        _report_expert_routing(moe_expert_tokens, gemma4_experts + nongated_experts)
+        # Popped one at a time rather than iterated, so each GPU Gram is freed as soon as its
+        # CPU copy exists. Iterating the dict held every one of them on the device until the
+        # `del` below, which on the 120B is 15.8 GiB of GPU Hessians coexisting with 15.8 GiB
+        # of host copies — the peak of the whole run, for no reason. Byte-identical output.
+        for k in list(moe_expert_hessians):
+            H = moe_expert_hessians.pop(k)
             hessians[k] = H.cpu()
+            del H
         del moe_expert_hessians
         moe_writeback = {}   # virtual_name -> (param3d, expert_idx)
         moe_gate_up = {}     # gate_up virtual_name -> (gate_name, up_name, inter)
@@ -3614,6 +3893,11 @@ def quantize(
                 moe_gate_up[gu] = (f"{mn}.{e}.gate_proj", f"{mn}.{e}.up_proj", inter)
             dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.gate_up_proj")
             dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.down_proj")
+        # Non-gated stacks take the same route, minus the gate/up row-split: with no fused
+        # matrix there is nothing to split, so these get no `moe_gate_up` entry and flow
+        # through the ordinary single-matrix store path.
+        _expand_nongated_experts(nongated_experts, linears, moe_writeback,
+                                 dropped_stacked_keys, sd_prefix, layer_idx)
 
         gc.collect()
         if use_gpu:

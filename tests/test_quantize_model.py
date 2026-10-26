@@ -153,11 +153,29 @@ class TestWorkerFunctions:
 
 class TestModelProfiles:
     def test_detect_nemotron(self):
+        """Detection resolves the NemotronH profile — and the values are the CORRECTED ones.
+
+        This used to assert `forward_kwargs == 'nemotron_h'` and `trust_remote_code is True`,
+        both written for the pre-native trust-remote-code module tree. Measured on
+        transformers 5.19.0 against the real Lightning-30B config, both are wrong now:
+        the `nemotron_h` kwargs branch passes `cache_params=None` into a
+        `NemotronHBlock.forward` that has no such parameter (it hands
+        `cache_params=past_key_values` to the mixer and forwards `**kwargs`), so it collides
+        on every Mamba block; and the architecture has been native since transformers 5.3,
+        so no remote code is fetched. See `tests/test_nemotron_nongated_experts.py` for the
+        module-tree assertions behind this.
+        """
         class Cfg:
             architectures = ["NemotronHForCausalLM"]
         profile = _detect_profile(Cfg())
-        assert profile['forward_kwargs'] == 'nemotron_h'
-        assert profile['trust_remote_code'] is True
+        assert profile['forward_kwargs'] == 'default'
+        assert profile['trust_remote_code'] is False
+        # The module/checkpoint split that the old entry collapsed into one spelling.
+        assert profile['layers_attr'] == 'model.layers'
+        assert profile['sd_prefix'] == 'backbone.layers'
+        # Non-gated stacked experts are 89.2% of Lightning-30B; both opt-ins are required.
+        assert profile['stacked_experts'] is True
+        assert profile['convert_state'] == 'nemotron_h'
 
     def test_detect_default(self):
         class Cfg:

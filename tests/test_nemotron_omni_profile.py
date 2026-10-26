@@ -149,21 +149,38 @@ class _Block(nn.Module):
             self.mixer.experts = experts
 
 
-def test_a_nongated_container_is_refused_and_the_message_names_the_parameter():
+#: A profile that opts into the stacked-expert walk, which is what makes a stacked container
+#: safe. Both kinds of container are now supported; what is refused is one nothing will walk.
+_OPTED_IN = {"stacked_experts": True}
+
+
+def test_an_undeclared_stacked_container_is_refused_and_the_message_says_what_to_add():
     """Not merely "it raises": a test satisfied by any exception would pass on a typo in the
-    function itself. The message has to carry the three things a reader needs — where the
-    container is, what shape made it unsupported, and that the omission is GLQ's.
+    function itself. The message must carry where the container is, what shape makes it
+    unwalkable, and the one-line fix.
+
+    Non-gated containers are *supported* now; the thing still worth refusing is a stacked
+    container whose profile omits `stacked_experts`, because the ordinary walk cannot see a
+    bare 3-D Parameter and the stacked walk is opt-in. Qwen4Exp lost 67% of its weights that
+    way, and this model would lose 90.6%.
     """
     layers = [_Block(), _Block(_NonGatedExperts())]      # layer 0 mamba-like: no experts
 
     with pytest.raises(ValueError) as exc:
-        qm._require_supported_expert_layout(layers, ARCH)
+        qm._require_supported_expert_layout(layers, ARCH, profile=None)
 
     msg = str(exc.value)
     assert ARCH in msg
     assert "layers.1.mixer.experts" in msg, msg
-    assert "up_proj" in msg and "gate_up_proj" in msg, msg
-    assert "[4, 8, 6]" in msg, msg
+    assert "up_proj" in msg and "[4, 8, 6]" in msg, msg
+    assert "'stacked_experts': True" in msg, msg
+
+
+def test_an_undeclared_GATED_container_is_refused_too():
+    """The widening. A bare 3-D `gate_up_proj` is equally invisible to the nn.Linear walk, so
+    the refusal is about the opt-in, not about the gate."""
+    with pytest.raises(ValueError, match="'stacked_experts': True"):
+        qm._require_supported_expert_layout([_Block(_GatedExperts())], "Whatever", profile=None)
 
 
 def test_the_refusal_scans_past_the_first_layer():
@@ -171,14 +188,28 @@ def test_the_refusal_scans_past_the_first_layer():
     looked only at `layers[0]` would pass this model straight through."""
     with pytest.raises(ValueError, match="layers.39"):
         qm._require_supported_expert_layout(
-            [_Block() for _ in range(39)] + [_Block(_NonGatedExperts())], ARCH)
+            [_Block() for _ in range(39)] + [_Block(_NonGatedExperts())], ARCH, profile=None)
 
 
-def test_a_gated_container_is_accepted():
-    """The regression that matters most: this gate sits on the path of four shipping models."""
-    qm._require_supported_expert_layout([_Block(), _Block(_GatedExperts())], "Whatever")
+def test_both_kinds_of_container_pass_once_the_profile_opts_in():
+    """The regression that matters most: this check sits in front of four shipping models,
+    all of which declare the flag."""
+    for experts in (_GatedExperts(), _NonGatedExperts()):
+        qm._require_supported_expert_layout([_Block(), _Block(experts)], "Whatever",
+                                            profile=_OPTED_IN)
     assert qm._collect_stacked_experts(_Block(_GatedExperts())), "gated detection broke"
     assert _nongated_names(_Block(_GatedExperts())) == []
+    assert _nongated_names(_Block(_NonGatedExperts())) == ["mixer.experts"]
+
+
+def test_the_real_profile_opts_in_so_the_real_model_is_accepted():
+    """The two halves have to agree: the profile declares `stacked_experts` and the check
+    reads the same flag. A profile that lost the flag would be refused — which is the point —
+    and a check that stopped reading it would let an undeclared arch through."""
+    assert qm._MODEL_PROFILES[ARCH].get("stacked_experts") is True
+    assert qm._stacked_experts_enabled(ARCH, qm._MODEL_PROFILES[ARCH])
+    qm._require_supported_expert_layout([_Block(_NonGatedExperts())], ARCH,
+                                        profile=qm._MODEL_PROFILES[ARCH])
 
 
 def test_a_3d_parameter_that_is_not_an_expert_container_is_ignored():
@@ -187,7 +218,7 @@ def test_a_3d_parameter_that_is_not_an_expert_container_is_ignored():
     blk = _Block()
     blk.conv1d = nn.Conv1d(4, 4, 3)
     assert blk.conv1d.weight.dim() == 3
-    qm._require_supported_expert_layout([blk], "Whatever")
+    qm._require_supported_expert_layout([blk], "Whatever", profile=None)
 
 
 def test_a_container_missing_its_down_proj_is_not_called_an_expert_stack():
@@ -195,7 +226,7 @@ def test_a_container_missing_its_down_proj_is_not_called_an_expert_stack():
     mod.up_proj = nn.Parameter(torch.zeros(4, 8, 6))
     blk = _Block()
     blk.mixer = mod
-    qm._require_supported_expert_layout([blk], "Whatever")
+    qm._require_supported_expert_layout([blk], "Whatever", profile=None)
 
 
 def _nongated_names(layer):
@@ -390,23 +421,33 @@ def test_the_profile_paths_resolve_on_the_real_module_tree():
     assert prof["rotary_attr"] is None, "NemotronHAttention applies no rotary"
 
 
-def test_the_real_experts_are_non_gated_and_the_gate_refuses_the_real_model():
+def test_the_real_experts_are_non_gated_and_the_real_profile_covers_them():
     """End to end on the architecture itself, not a stand-in. Without this, every assertion
-    above could be true of a model that still quantized fine."""
+    above could be true of a model whose experts the quantizer still walks past."""
     model = _meta_model()
-    layers = qm._resolve_attr(model, qm._MODEL_PROFILES[ARCH]["layers_attr"])
+    prof = qm._MODEL_PROFILES[ARCH]
+    layers = qm._resolve_attr(model, prof["layers_attr"])
 
     found = [f for layer in layers for f in qm._collect_nongated_stacked_experts(layer)]
     assert found, "the real model's experts are no longer non-gated 3-D parameters"
     assert all(qm._collect_stacked_experts(layer) == [] for layer in layers), (
-        "a gated container appeared, so the stacked path may already cover this model")
+        "a gated container appeared — the gated path's assumptions may now apply")
+    assert len(found) == 40, f"{len(found)} MoE containers, expected one per MoE layer"
 
     mn, _mod, pname, shape = found[0]
     assert mn.endswith("mixer.experts") and pname == "up_proj"
     assert len(shape) == 3 and shape[0] == 512, shape
 
-    with pytest.raises(ValueError, match="not implemented yet"):
-        qm._require_supported_expert_layout(layers, ARCH)
+    # ...and the profile declares the walk that covers them, so the run is not refused.
+    qm._require_supported_expert_layout(layers, ARCH, profile=prof)
+    assert prof.get("convert_state") == "nemotron_h", (
+        "the checkpoint stores experts per-expert; without the converter the streaming load "
+        "drops every one of them")
+
+    # Drop the opt-in and the same real layers are refused — so the acceptance above is the
+    # profile's doing, not the check having gone quiet.
+    with pytest.raises(ValueError, match="'stacked_experts': True"):
+        qm._require_supported_expert_layout(layers, ARCH, profile=None)
 
 
 def test_the_decoder_layer_takes_the_default_forward_kwargs_not_the_nemotron_h_branch():
