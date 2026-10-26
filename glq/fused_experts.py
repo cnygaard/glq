@@ -478,6 +478,14 @@ def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True) -
     # Walk a snapshot since we'll mutate during iteration.
     targets = [(name, m) for name, m in model.named_modules()
                if isinstance(m, NemotronHExperts)]
+    # Read the config only once there is something to build. This helper runs against every
+    # model GLQ loads, and most of them are not NemotronH — including a bare `nn.Sequential`
+    # in the HF-integration tests, which has no `.config` at all. The original code read
+    # `model.config` inside the loop, so an empty `targets` never touched it; hoisting the
+    # read out (to resolve the text config once) made it unconditional and turned the no-op
+    # into an AttributeError.
+    if not targets:
+        return 0
     # The TEXT config, not the top-level one. On a vision-language wrapper
     # (`nemotron_h_omni`) the MoE geometry lives on `config.text_config` and the wrapper
     # exposes none of it: measured on transformers 5.20.1,

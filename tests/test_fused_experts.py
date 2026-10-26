@@ -246,6 +246,31 @@ class TestNestedConfigResolution:
         outer.get_text_config = lambda: inner
         return outer, inner
 
+    def test_a_model_with_no_experts_is_a_no_op_and_never_reads_config(self):
+        """The regression. This helper runs against every model GLQ loads, most of which are
+        not NemotronH — including a bare `nn.Sequential`, which has no `.config` at all.
+
+        `model.config` used to be read inside the per-target loop, so an empty `targets`
+        never touched it. Hoisting the read out, to resolve the text config once, made it
+        unconditional and turned the no-op into `AttributeError: 'Sequential' object has no
+        attribute 'config'` — five failures in `tests/test_hf_integration.py`, which I had
+        not run locally.
+        """
+        from glq.fused_experts import _replace_nemotron_h_experts
+        assert _replace_nemotron_h_experts(torch.nn.Sequential(torch.nn.Linear(8, 4))) == 0
+
+    def test_a_model_whose_config_raises_is_still_a_no_op(self):
+        """Stronger than the above: proves the config is not touched at all, rather than
+        touched and tolerated."""
+        from glq.fused_experts import _replace_nemotron_h_experts
+
+        class _Exploding(torch.nn.Module):
+            @property
+            def config(self):
+                raise AssertionError("config must not be read when there are no experts")
+
+        assert _replace_nemotron_h_experts(_Exploding()) == 0
+
     def test_the_wrapper_config_really_lacks_the_geometry(self):
         """Guards the test below: if the wrapper ever exposed these at the top level, the
         fix would be unnecessary and this class would be testing nothing."""
