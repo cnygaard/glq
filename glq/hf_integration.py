@@ -587,7 +587,13 @@ class GLQQuantizer(HfQuantizer):
             _replace_stacked_gated_experts,
         )
         from .state_dict_stacker import install_nemotron_h_state_dict_renames
-        n_fused = _replace_nemotron_h_experts(model, block_diagonal=block_diag)
+        # codebook_type and shapes are the same two the gated call below passes, and for the
+        # same reasons: without the codebook these experts always built e8_shell buffers, so
+        # a trellis checkpoint — which is what the default codebook produces — failed on
+        # shapes inside HF's loader; without the shapes every buffer registers at size 0 and
+        # device-map inference sees an empty model.
+        n_fused = _replace_nemotron_h_experts(
+            model, block_diagonal=block_diag, codebook_type=cb_type, shapes=glq_shapes)
         if n_fused:
             install_nemotron_h_state_dict_renames(model)
         # Gated stacked experts (Qwen4Exp, Gemma-4): the same problem NemotronH has, but

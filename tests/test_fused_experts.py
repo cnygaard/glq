@@ -172,6 +172,21 @@ class TestStateDictRenamer:
         assert _StubModel._checkpoint_conversion_mapping == {}
 
 
+@pytest.fixture
+def _tf_window_ok(monkeypatch):
+    """Neutralise the transformers-window guard for tests about the *replacement*.
+
+    `_replace_nemotron_h_experts` now refuses a transformers outside the validated window
+    (>= 5.20.0, or < 5.18.0 for the VL wrapper), because 5.21.0 moved Nemotron's module
+    layout and numerics and 5.20+ cannot coexist with vLLM 0.32.0's pin. This machine runs a
+    version the guard refuses, so without this stub the tests below fail for a reason
+    unrelated to what they assert. The guard itself is covered in
+    `tests/test_nemotron_hf_serving.py`.
+    """
+    import glq.fused_experts as fe
+    monkeypatch.setattr(fe, "_require_tested_transformers", lambda *a, **k: None)
+
+
 class TestReplaceHelper:
 
     def test_replace_noop_without_native_nemotron_h(self, monkeypatch):
@@ -198,7 +213,7 @@ class TestReplaceHelper:
         n = _replace_nemotron_h_experts(model)
         assert n == 0
 
-    def test_replace_substitutes_when_native_present(self):
+    def test_replace_substitutes_when_native_present(self, _tf_window_ok):
         # Skip if native nemotron_h not installed in this env (it isn't on
         # transformers 5.2; CI has 5.6+ and would exercise this path).
         try:
@@ -278,7 +293,7 @@ class TestNestedConfigResolution:
         for attr in ("n_routed_experts", "moe_intermediate_size", "moe_latent_size"):
             assert not hasattr(outer, attr), f"wrapper exposes {attr}; premise is stale"
 
-    def test_experts_are_built_from_the_text_config(self):
+    def test_experts_are_built_from_the_text_config(self, _tf_window_ok):
         from glq.fused_experts import E8RHTFusedExperts, _replace_nemotron_h_experts
         nh = pytest.importorskip(
             "transformers.models.nemotron_h.modeling_nemotron_h",

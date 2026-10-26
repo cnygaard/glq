@@ -195,15 +195,27 @@ class _ExpertPair(nn.Module):
     """Single MoE expert: up_proj -> activation -> down_proj. Non-gated."""
 
     def __init__(self, input_dim: int, intermediate_dim: int,
-                 output_dim: int, block_diagonal: bool = True):
+                 output_dim: int, block_diagonal: bool = True,
+                 codebook_type: str = "e8_shell", packed: dict | None = None):
         super().__init__()
+        # `codebook_type` must reach both projections. It used to be dropped here, so these
+        # always registered e8_shell buffers (`Qidxs*`) while a trellis checkpoint carries
+        # `trellis_packed` — and trellis is the DEFAULT codebook, so that was every
+        # checkpoint the quantizer produces. It failed on shapes inside HF's loader with
+        # nothing naming GLQ. `_GatedExpertPair` has always threaded it; this is the same.
+        #
+        # `packed` carries the true buffer shapes from the checkpoint header, so device-map
+        # inference does not see a 13 GiB model as empty.
+        packed = packed or {}
         self.up_proj = E8RHTLinear(
             input_dim, intermediate_dim,
             bias=False, block_diagonal=block_diagonal,
+            codebook_type=codebook_type, packed_shape=packed.get("up_proj"),
         )
         self.down_proj = E8RHTLinear(
             intermediate_dim, output_dim,
             bias=False, block_diagonal=block_diagonal,
+            codebook_type=codebook_type, packed_shape=packed.get("down_proj"),
         )
 
 
@@ -227,8 +239,12 @@ class E8RHTFusedExperts(nn.Module):
         {i}.down_proj.Qidxs / SU / SV / Wscale / ...
     """
 
-    def __init__(self, config, block_diagonal: bool = True):
+    def __init__(self, config, block_diagonal: bool = True,
+                 codebook_type: str = "e8_shell", packed: dict | None = None):
         super().__init__()
+        # Kept on the module because `_try_build_stacked` needs it: the fused MoE kernel
+        # consumes e8 `Qidxs` tensors, which a trellis container does not have.
+        self.codebook_type = codebook_type
         self.num_experts = int(config.n_routed_experts)
         self.hidden_dim = int(config.hidden_size)
         self.intermediate_dim = int(config.moe_intermediate_size)
@@ -250,7 +266,8 @@ class E8RHTFusedExperts(nn.Module):
         for i in range(self.num_experts):
             pair = _ExpertPair(
                 self.input_dim, self.intermediate_dim, self.output_dim,
-                block_diagonal=block_diagonal,
+                block_diagonal=block_diagonal, codebook_type=codebook_type,
+                packed=(packed or {}).get(i),
             )
             self._modules[str(i)] = pair
 
@@ -275,6 +292,19 @@ class E8RHTFusedExperts(nn.Module):
         """
         if getattr(self, "_stacked_ready", False):
             return True
+        # Trellis has no fused MoE path from here: everything below stacks `Qidxs*`, which a
+        # trellis container does not register (it has `trellis_packed`). Reading it was an
+        # AttributeError from inside a helper whose documented contract is "None on any
+        # unsupported case (caller falls back to Python loop)".
+        #
+        # Declining is correct, not merely safe: `forward` then runs the per-expert loop,
+        # which applies `act_fn` itself and dispatches each projection through
+        # `E8RHTLinear._forward_trellis`. It is also SLOW — a Python loop over every routed
+        # expert, per token — so HF trellis serving is a correctness path. The fast trellis
+        # MoE path lives on the vLLM side (`glq_vllm/fused_moe_method.py`
+        # `_create_weights_trellis`), and is not duplicated here.
+        if getattr(self, "codebook_type", "e8_shell") == "trellis":
+            return False
         # All per-expert E8RHTLinears must be on a CUDA device with codebook(s)
         # attached (set by GLQQuantizer._process_model_after_weight_loading).
         e0 = self[0]
@@ -461,7 +491,91 @@ class E8RHTFusedExperts(nn.Module):
         return final_hidden_states.to(hidden_states.dtype)
 
 
-def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True) -> int:
+#: Versions of transformers this architecture family is known to work on.
+#:
+#: Floor for the VL wrapper: `nemotron_h_omni` landed in **5.18.0**; below that the wrapper
+#: cannot be built at all. The text-only `NemotronHForCausalLM` has been native far longer and
+#: does not inherit that floor.
+#:
+#: Ceiling: vLLM 0.32.0 pins `transformers<5.20.0`, so 5.20+ cannot coexist with the serving
+#: stack — and **5.21.0** moved Nemotron itself, adding a tensor-parallel plan (#48780) and
+#: fixing two Nemotron integration tests that were failing on `output_mismatch` (#48945).
+#: Both the module layout and the numerics changed there, which is the shape of problem that
+#: yields a model that loads and generates quietly wrong text.
+_TF_OMNI_FLOOR = "5.18.0"
+_TF_CEILING = "5.20.0"
+_TF_TESTED = "5.19.0"
+
+
+def _require_tested_transformers(version: str | None = None, *, omni: bool = False) -> None:
+    """Refuse a transformers outside the window this family was validated on.
+
+    Compared with `packaging.version.Version`, never as strings: lexically ``"5.9.0" >
+    "5.18.0"``, so a string comparison would refuse 5.9 and accept 5.21 — exactly backwards.
+    """
+    from packaging.version import Version
+
+    if version is None:
+        import transformers
+        version = transformers.__version__
+    v = Version(str(version).split("+")[0])
+
+    if v >= Version(_TF_CEILING):
+        raise RuntimeError(
+            f"transformers {version} is outside the window GLQ's NemotronH support was "
+            f"validated on (tested: {_TF_TESTED}). vLLM 0.32.0 pins "
+            f"transformers<{_TF_CEILING}, so 5.20+ cannot coexist with the serving stack, "
+            f"and 5.21.0 changed Nemotron itself — a tensor-parallel plan (#48780) and a fix "
+            f"for two integration tests failing on output_mismatch (#48945), so both the "
+            f"module layout and the numerics moved. Pin transformers=={_TF_TESTED}.")
+    if omni and v < Version(_TF_OMNI_FLOOR):
+        raise RuntimeError(
+            f"transformers {version} has no native `nemotron_h_omni`: the NemotronH Omni "
+            f"vision-language wrapper landed in {_TF_OMNI_FLOOR}. Pin "
+            f"transformers=={_TF_TESTED}.")
+
+
+def _nongated_packed_shapes(prefix: str, n_exp: int, shapes: dict | None):
+    """``{expert_idx: {"up_proj": shape, "down_proj": shape}}`` from checkpoint shapes.
+
+    The non-gated sibling of `_fused_packed_shapes`, and simpler: with no fused ``[gate; up]``
+    matrix there is nothing to stack, so each projection's shape is used as recorded.
+
+    **The prefix needs translating.** `_collect_quantized_shapes` keys on the *checkpoint*
+    key, which for this family is ``backbone.layers.N.mixer.experts.E.up_proj``, while
+    ``named_modules()`` yields ``model.layers.N.mixer.experts`` — transformers renames the
+    prefix as it loads (`install_nemotron_h_state_dict_renames`). Looking up the module
+    spelling alone finds nothing, the map comes back empty, every buffer registers at shape
+    ``[0]``, and the symptom is a bad device map rather than an error. Both spellings are
+    tried because the renamer's own docstring notes it is a no-op on checkpoints already
+    written with native prefixes.
+    """
+    if not shapes:
+        return {}
+    candidates = [prefix]
+    if prefix.startswith("model."):
+        candidates.append("backbone." + prefix[len("model."):])
+    elif prefix.startswith("backbone."):
+        candidates.append("model." + prefix[len("backbone."):])
+
+    out = {}
+    for e in range(n_exp):
+        ent = {}
+        for leaf in ("up_proj", "down_proj"):
+            for cand in candidates:
+                base = f"{cand}.{e}." if cand else f"{e}."
+                shp = (shapes.get(base + leaf) or {}).get("trellis_packed")
+                if shp and len(shp) == 2:
+                    ent[leaf] = tuple(shp)
+                    break
+        if ent:
+            out[e] = ent
+    return out
+
+
+def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True,
+                                codebook_type: str = "e8_shell",
+                                shapes: dict | None = None) -> int:
     """Walk `model` and replace each `NemotronHExperts` with `E8RHTFusedExperts`.
 
     Returns the number of substitutions performed. No-op if the native
@@ -494,10 +608,21 @@ def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True) -
     # model will load DENSE in its original dtype". `get_text_config()` returns the config
     # itself for a text-only model, so the flat case is unchanged.
     cfg = model.config
+    is_omni = getattr(model.config, "model_type", None) == "nemotron_h_omni"
     if hasattr(cfg, "get_text_config"):
         cfg = cfg.get_text_config()
+    # Refuse a transformers that moved this architecture, before anything is built — the
+    # failure it prevents is a model that loads and generates quietly wrong text.
+    _require_tested_transformers(omni=is_omni)
     for name, _ in targets:
-        new_mod = E8RHTFusedExperts(cfg, block_diagonal=block_diagonal)
+        # Build on meta: Lightning-30B is 23 MoE layers x 128 experts x 2 = 5,888
+        # E8RHTLinears, and HF materializes them from the checkpoint immediately
+        # afterwards. Matches `_replace_stacked_gated_experts` and
+        # `replace_with_glq_embedding`.
+        with torch.device("meta"):
+            new_mod = E8RHTFusedExperts(
+                cfg, block_diagonal=block_diagonal, codebook_type=codebook_type,
+                packed=_nongated_packed_shapes(name, int(cfg.n_routed_experts), shapes))
         new_mod.requires_grad_(False)
         model.set_submodule(name, new_mod)
     return len(targets)
