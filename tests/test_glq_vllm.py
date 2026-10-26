@@ -920,6 +920,84 @@ def test_shell_ple_quant_decode_roundtrip():
     assert cos > 0.8, f"reconstruction cosine {cos:.3f} too low"
 
 
+# ── Test 2c: NemotronH's backbone. prefix ──────────────────────────────
+
+@requires_vllm
+def test_lookup_bpw_nemotron_backbone_prefix():
+    """NemotronH: vLLM renames the WEIGHTS `backbone.` -> `model.`, not layer_bpw's keys.
+
+    `vllm/model_executor/models/nemotron_h.py` carries
+    `hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"backbone": "model", "mtp": None})`.
+    That rewrites tensor names on the way in; the quantization_config travels untouched, so
+    `layer_bpw` stays in checkpoint form (`backbone.*`, matching `sd_prefix`) while
+    `get_quant_method` is asked about `model.*`.
+
+    Without the alias EVERY layer missed, the whitelist branch handed each one to
+    `UnquantizedLinearMethod`, vLLM built dense linears expecting `.weight`, and the GLQ
+    buffers had nowhere to land — surfacing as
+    `AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'` from inside
+    vLLM's loader, naming nothing. Measured on
+    NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-3bpw: 6,004 whitelist entries,
+    all `backbone.*`, and zero matched.
+
+    Keys below are the real spellings from that checkpoint.
+    """
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 3,
+        "layer_bpw": {
+            "backbone.layers.0.mixer.in_proj": 3,       # Mamba-2
+            "backbone.layers.0.mixer.out_proj": 3,
+            "backbone.layers.7.mixer.q_proj": 3,        # attention, unmerged
+            "backbone.layers.7.mixer.k_proj": 3,
+            "backbone.layers.7.mixer.v_proj": 3,
+            "backbone.layers.7.mixer.o_proj": 3,
+            "backbone.layers.1.mixer.shared_experts.up_proj": 3,
+        },
+    })
+
+    # Direct, checkpoint form.
+    assert cfg._lookup_bpw("backbone.layers.0.mixer.in_proj") == 3
+    # The form vLLM actually asks about — this is the bug.
+    assert cfg._lookup_bpw("model.layers.0.mixer.in_proj") == 3
+    assert cfg._lookup_bpw("model.layers.0.mixer.out_proj") == 3
+    assert cfg._lookup_bpw("model.layers.1.mixer.shared_experts.up_proj") == 3
+    # Merged attention: vLLM builds QKVParallelLinear as `qkv_proj`, and the alias has to
+    # compose with _MERGE_MAP to reach backbone.…q_proj.
+    assert cfg._lookup_bpw("model.layers.7.mixer.qkv_proj") == 3
+    assert cfg._lookup_bpw("model.layers.7.mixer.o_proj") == 3
+    # A genuinely bf16 layer still declines — the whitelist must not become
+    # "quantize everything".
+    assert cfg._lookup_bpw("model.layers.0.mixer.conv1d") is None
+    assert cfg._lookup_bpw("model.embeddings") is None
+    assert cfg._lookup_bpw("lm_head") is None
+
+
+@requires_vllm
+def test_moe_is_quantized_nemotron_backbone_prefix():
+    """The routed-expert container needs the alias independently of `_lookup_bpw`.
+
+    `_moe_containers` is precomputed by stripping the last two segments off every
+    `layer_bpw` key, so it holds `backbone.layers.1.mixer.experts` while vLLM asks about
+    `model.layers.1.mixer.experts`. The function's own docstring records why it cannot just
+    call `_lookup_bpw`: the whitelist lists experts per-expert-per-projection and never the
+    container, so a declined MoE layer gets vLLM's bf16 `w13_weight`/`w2_weight` instead —
+    4.69 GiB per layer on Flash-Next, with the traceback pointing at the allocator.
+    """
+    from glq_vllm.config import GLQvLLMConfig
+    lb = {f"backbone.layers.1.mixer.experts.{e}.{p}": 3
+          for e in range(4) for p in ("up_proj", "down_proj")}
+    cfg = GLQvLLMConfig.from_config({"bpw": 3, "layer_bpw": lb})
+
+    assert cfg._moe_is_quantized("backbone.layers.1.mixer.experts") is True
+    assert cfg._moe_is_quantized("model.layers.1.mixer.experts") is True
+    # A container that is genuinely absent must stay False, or the fix has just made the
+    # check permissive.
+    assert cfg._moe_is_quantized("model.layers.3.mixer.experts") is False
+    # Segment-matched, not prefix-matched: `expert` must not match `experts`.
+    assert cfg._moe_is_quantized("model.layers.1.mixer.expert") is False
+
+
 # ── Test 2b: _lookup_bpw across vLLM prefix transforms ─────────────────
 
 @requires_vllm

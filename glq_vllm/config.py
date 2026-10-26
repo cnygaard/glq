@@ -36,6 +36,40 @@ _MERGE_MAP = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
               ".in_proj_qkvz": (".in_proj_qkv", ".in_proj_z"),
               ".kv_proj": (".key_proj", ".value_proj")}
 
+def _backbone_forms(prefix: str) -> set[str]:
+    """Alias spellings for NemotronH's ``backbone.`` root. ``-> {alternative forms}``
+
+    vLLM renames the **weights** on the way in — `nemotron_h.py` carries
+    ``hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"backbone": "model",
+    "mtp": None})`` — but the quantization_config travels untouched, so ``layer_bpw`` keeps
+    the checkpoint spelling (``backbone.*``, matching ``sd_prefix``) while
+    ``get_quant_method`` is asked about ``model.*``.
+
+    Without this every lookup missed, so the whitelist branch in `get_quant_method` handed
+    each layer to `UnquantizedLinearMethod`, vLLM built dense linears expecting ``.weight``,
+    and the GLQ buffers had nowhere to land. It surfaced as
+    ``AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'`` from
+    inside vLLM's own loader, naming nothing — measured on a 3 bpw Lightning-30B whose 6,004
+    whitelist entries matched zero layers.
+
+    Both directions, as the sibling aliases in `_lookup_bpw` are: a checkpoint written with
+    native prefixes is equally legal, and an alias that matches nothing is free. The nested
+    form covers the VL wrapper, whose ``sd_prefix`` is ``language_model.backbone.layers``.
+    """
+    forms = set()
+    if prefix.startswith("model.") and ".language_model." not in prefix:
+        forms.add("backbone." + prefix[len("model."):])
+    if prefix.startswith("backbone."):
+        forms.add("model." + prefix[len("backbone."):])
+    if prefix.startswith("language_model.model."):
+        forms.add("language_model.backbone."
+                  + prefix[len("language_model.model."):])
+    if prefix.startswith("language_model.backbone."):
+        forms.add("language_model.model."
+                  + prefix[len("language_model.backbone."):])
+    return forms
+
+
 #: Fused layers whose vLLM partition structure differs from the checkpoint's matrix
 #: structure. Qwen3.5's in_proj_qkvz is a MergedColumnParallelLinear with FOUR output
 #: partitions [key, key, value, value] whose weights-mapper attaches shard_id=(0, 1, 2)
@@ -180,6 +214,7 @@ class GLQvLLMConfig(QuantizationConfig):
         if prefix.startswith("language_model.model."):
             forms.add("model.language_model."
                       + prefix[len("language_model.model."):])
+        forms |= _backbone_forms(prefix)
         merge_map = _MERGE_MAP
         best = None
         for f in forms:
@@ -221,6 +256,7 @@ class GLQvLLMConfig(QuantizationConfig):
             forms.add("language_model.model."
                       + prefix[len("model.language_model."):])
             forms.add("model." + prefix[len("model.language_model."):])
+        forms |= _backbone_forms(prefix)
         return any(f in self._moe_containers for f in forms)
 
     def _is_prefused(self, prefix: str) -> bool:
