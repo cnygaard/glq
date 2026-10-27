@@ -271,7 +271,7 @@ class GLQvLLMConfig(QuantizationConfig):
         if prefix.startswith("language_model.model."):
             forms.add("model.language_model." + prefix[len("language_model.model."):])
         # NemotronH: layer_bpw keeps the checkpoint's `backbone.*` while vLLM asks about
-        # `model.*`. `_lookup_bpw` got this alias in 8c44ff6 and this function did not —
+        # `model.*`. `_lookup_bpw` got this alias first and this function did not —
         # and the asymmetry is the worst possible one. The layer RESOLVES as quantized (so
         # GLQ claims it, the whitelist check passes, the footprint is right) but is NOT
         # recognised as pre-fused, so Mamba2's in_proj — one jointly-quantized checkpoint

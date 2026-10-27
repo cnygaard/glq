@@ -6,11 +6,15 @@ set built from one and matched against the other misses every entry, and the mis
 the layer stays unquantized, its GLQ payload has nowhere to land, and the symptom surfaces
 somewhere else entirely.
 
-It has cost three separate sites so far:
+It has cost four separate sites so far:
 
 * `glq_vllm/config.py` — `layer_bpw` is `backbone.*`, `get_quant_method` asks about `model.*`.
   Surfaced as ``AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'``
-  from inside vLLM's loader, naming nothing (fixed in 8c44ff6).
+  from inside vLLM's loader, naming nothing (fixed by the vLLM whitelist alias).
+* `glq_vllm/config.py` again, in `_is_prefused`, which did not get that alias. The costliest
+  of the four: the layer resolved as quantized but not as pre-fused, so every NemotronH Mamba
+  `in_proj` loaded a ZERO weight and the model produced fluent garbage while the footprint
+  and whitelist checks passed.
 * `glq/fused_experts.py` — `_collect_quantized_shapes` keys on `backbone.*` while
   `named_modules()` yields `model.*`; the packed map came back empty, every buffer registered
   at size 0, and accelerate's `infer_auto_device_map` saw an empty model.

@@ -342,7 +342,7 @@ def test_the_omni_floor_applies_only_to_the_vl_wrapper():
 #
 # It hid behind the footprint: the experts are 10.47 of 14.65 GiB, so missing 0.31 GiB of
 # mamba projections keeps the total inside any tolerance. This is the same bug class as the
-# vLLM whitelist alias (commit 8c44ff6) and the expert packed-shape lookup above - the third
+# vLLM whitelist alias in `_lookup_bpw` and the expert packed-shape lookup above - the third
 # site, which is why the aliasing now has one origin in `glq.name_aliases`.
 
 

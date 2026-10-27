@@ -1751,7 +1751,7 @@ def test_renumbering_is_confined_to_the_mtp_tree():
 # checkpoint stores it as ONE jointly-quantized matrix. `_is_prefused` is what tells
 # create_weights to load such a matrix whole — and it looked `layer_bpw` up by the vLLM
 # spelling (`model.*`) while the keys are the checkpoint spelling (`backbone.*`). Its
-# sibling `_lookup_bpw` got the alias in 8c44ff6; this function did not. So pre_fused came
+# sibling `_lookup_bpw` got the alias first; this function did not. So pre_fused came
 # back False, five shard slots were allocated, the one-matrix load had nowhere to go, and
 # `load_column_parallel_weight` answered that contradiction by doing NOTHING. Every Mamba
 # mixer's in_proj served zeros, the model emitted garbage, and the footprint, the whitelist
