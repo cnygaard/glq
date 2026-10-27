@@ -72,17 +72,33 @@ def parse_graph_gib(log):
     return float(hits[-1]) if hits else None
 
 
-def is_degenerate(text, min_words=5, min_unique_ratio=0.3):
+def is_degenerate(text, min_words=5, min_unique_ratio=0.3,
+                  min_compress_ratio=0.35, compress_min_chars=96):
     """True when a sample looks like broken decode rather than a short answer.
 
     Uses a unique-word *ratio*, not a unique count: the characteristic quantization failure
     is a repeating n-gram ("alpha beta gamma alpha beta gamma ...") which keeps the unique
     count above any small threshold while being obviously broken.
+
+    Plus a compression check, because word uniqueness has a blind spot that shipped a false
+    RUN_OK: a repeated SUB-token loop ('inellsellsellsells...ells theells the') has almost
+    no whitespace, so it splits into a few huge, mostly-unique "words" (ratio 0.600).
+    zlib sees through it. Measured on real samples: broken decode compresses to <= 0.203 of
+    its length, coherent text (direct answers and reasoning preambles alike) to >= 0.603.
+    Applied only above ``compress_min_chars``, since zlib's fixed overhead makes the ratio
+    meaningless on short strings — the word checks own those.
     """
     words = text.split()
     if len(words) < min_words:
         return True
-    return len(set(words)) / len(words) < min_unique_ratio
+    if len(set(words)) / len(words) < min_unique_ratio:
+        return True
+    raw = text.encode("utf-8")
+    if len(raw) >= compress_min_chars:
+        import zlib
+        if len(zlib.compress(raw, 9)) / len(raw) < min_compress_ratio:
+            return True
+    return False
 
 
 def footprint_ok(actual, expected, tol=0.15):
@@ -94,6 +110,23 @@ def footprint_ok(actual, expected, tol=0.15):
     if actual is None:
         return False
     return abs(actual - expected) <= tol * expected
+
+
+def coherence_sampling(greedy=False):
+    """Sampling for the coherence sample — the knob that decides whether two runtimes
+    can be compared.
+
+    `run_hf` generates with `do_sample=False`, so at the historical vLLM default
+    (temperature 0.7 / top_p 0.9 / seed 7) a vLLM-vs-HF output difference says nothing
+    about the model: the arms sampled differently. `--greedy` makes the vLLM side match,
+    which is what turns a cross-runtime comparison into evidence. Off by default so
+    already-recorded runs keep their meaning.
+    """
+    if greedy:
+        # No top_p, no seed: at temperature 0 they are inert, and listing them invites the
+        # reader to think the arms differ in more than one way.
+        return {"temperature": 0.0}
+    return {"temperature": 0.7, "top_p": 0.9, "seed": 7}
 
 
 def resolve_capture_sizes(spec, batches):
@@ -234,7 +267,8 @@ def run_vllm(args, failures):
     caps = resolve_capture_sizes(args.capture_sizes, batches)
     archs = local_architectures(args.model)
 
-    kw = dict(model=args.model, dtype=args.dtype, trust_remote_code=True,
+    kw = dict(model=args.model, dtype=args.dtype,
+              trust_remote_code=args.trust_remote_code,
               max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_mem,
               max_num_seqs=max(batches))
     if args.quant == "glq":
@@ -304,7 +338,8 @@ def run_vllm(args, failures):
     if not args.eager and graph_gib is None:
         failures.append("no CUDA graphs captured — the tok/s below is an eager number")
 
-    sp = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=args.maxtok, seed=7)
+    sp = SamplingParams(max_tokens=args.maxtok,
+                        **coherence_sampling(args.greedy))
     out = llm.chat([[{"role": "user", "content": COHERENCE_Q}]], sp, use_tqdm=False)
     text = out[0].outputs[0].text
     print(f"SAMPLE {text.strip()[:400]!r}", flush=True)
@@ -505,7 +540,8 @@ def run_hf(args, failures):
     import glq.hf_integration  # noqa: F401
     from transformers import AutoConfig, AutoTokenizer
 
-    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    trc = args.trust_remote_code
+    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=trc)
     model_cls = resolve_hf_class(cfg)
     print(f"HF class {model_cls.__name__} (from architectures)", flush=True)
 
@@ -521,10 +557,10 @@ def run_hf(args, failures):
         _extra["offload_buffers"] = True
     model = model_cls.from_pretrained(
         args.model, dtype=getattr(torch, args.dtype),
-        device_map=_dm, trust_remote_code=True, **_extra)
+        device_map=_dm, trust_remote_code=trc, **_extra)
     model.eval()
     load_s = time.perf_counter() - t0
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trc)
 
     # HF loads in-process, so unlike the vLLM path the CUDA counter is the right instrument.
     # Report where things actually landed. A hybrid run that silently put everything on
@@ -655,6 +691,16 @@ def build_parser():
                          "slowest on both")
     ap.add_argument("--capture-sizes", default=None,
                     help="override cudagraph capture sizes (default covers --batches)")
+    ap.add_argument("--greedy", action="store_true",
+                    help="temperature=0 for the coherence sample, so it is reproducible "
+                         "and comparable against --runtime hf (which always generates "
+                         "greedily). Default keeps the historical 0.7/0.9/seed-7 sampling.")
+    ap.add_argument("--trust-remote-code", dest="trust_remote_code",
+                    action="store_true",
+                    help="execute modeling code shipped in the checkpoint. OFF by default: "
+                         "it is a security issue, and for a GLQ model it also changes which "
+                         "code path runs (remote NemotronH classes match none of GLQ's "
+                         "fused-expert substitutions, which then silently no-op).")
     ap.add_argument("--eager", action="store_true", help="skip CUDA graphs (eager numbers "
                                                          "do not generalize — see the skill)")
     ap.add_argument("--mm0", action="store_true",
