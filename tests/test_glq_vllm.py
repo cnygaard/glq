@@ -1733,3 +1733,51 @@ def test_renumbering_is_confined_to_the_mtp_tree():
     })
     assert cfg._lookup_bpw("model.layers.0.self_attn.q_proj") == 3
     assert cfg._lookup_bpw("model.layers.7.self_attn.q_proj") is None
+
+
+# ======================================================================================
+# NemotronH Mamba in_proj: one checkpoint matrix, five vLLM partitions
+# ======================================================================================
+#
+# MEASURED on Lightning-30B (GLQ trellis, 3 AND 4 bpw), by pushing the same captured
+# input through both runtimes' layer-0 `in_proj` directly:
+#
+#     vLLM in_proj : MergedColumnParallelLinear  quant_method=GLQLinearMethod
+#        in_proj.glq_shard_sizes = [4096, 4096, 1024, 1024, 64]      <- FIVE slots
+#     y_vllm absmax = 0.0000e+00   SQNR(W_hf, W_vllm) = 0.00 dB      <- weight is ZERO
+#     out_proj (single partition):  SQNR = 54.90 dB                  <- correct
+#
+# vLLM builds Mamba2's in_proj as a 5-partition merged linear ([z, x, B, C, dt]); the
+# checkpoint stores it as ONE jointly-quantized matrix. `_is_prefused` is what tells
+# create_weights to load such a matrix whole — and it looked `layer_bpw` up by the vLLM
+# spelling (`model.*`) while the keys are the checkpoint spelling (`backbone.*`). Its
+# sibling `_lookup_bpw` got the alias in 8c44ff6; this function did not. So pre_fused came
+# back False, five shard slots were allocated, the one-matrix load had nowhere to go, and
+# `load_column_parallel_weight` answered that contradiction by doing NOTHING. Every Mamba
+# mixer's in_proj served zeros, the model emitted garbage, and the footprint, the whitelist
+# check and two full quantize runs all looked fine.
+
+
+@requires_vllm
+def test_is_prefused_resolves_the_nemotron_backbone_spelling():
+    """`in_proj` is a direct layer_bpw entry under the checkpoint spelling, so it is
+    pre-fused under the vLLM spelling too. Both directions, as `_lookup_bpw` does."""
+    from glq_vllm.config import GLQvLLMConfig
+    cfg = GLQvLLMConfig.from_config({
+        "bpw": 4, "codebook": "trellis", "variant": "3inst", "trellis_layout": "kernel",
+        "layer_bpw": {
+            "backbone.layers.0.mixer.in_proj": 4,
+            "backbone.layers.0.mixer.out_proj": 4,
+            # attention: separate per-projection entries, merged at load into qkv_proj
+            "backbone.layers.5.mixer.q_proj": 4,
+            "backbone.layers.5.mixer.k_proj": 4,
+            "backbone.layers.5.mixer.v_proj": 4,
+        },
+    })
+    assert cfg._is_prefused("model.layers.0.mixer.in_proj") is True
+    assert cfg._is_prefused("backbone.layers.0.mixer.in_proj") is True
+    # The control: a layer whose checkpoint form IS per-shard must stay un-prefused, or
+    # the alias has merely made every merged layer load whole and broken attention.
+    assert cfg._is_prefused("model.layers.5.mixer.qkv_proj") is False
+    # And a layer that is simply absent must not become pre-fused by the alias either.
+    assert cfg._is_prefused("model.layers.9.mixer.in_proj") is False

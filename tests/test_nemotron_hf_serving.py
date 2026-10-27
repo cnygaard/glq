@@ -319,3 +319,109 @@ def test_the_omni_floor_applies_only_to_the_vl_wrapper():
     _require_tested_transformers("5.17.0")                 # text-only: fine
     with pytest.raises(RuntimeError, match="5.18"):
         _require_tested_transformers("5.17.0", omni=True)  # the VL wrapper is not
+
+
+# ======================================================================================
+# The `backbone.` / `model.` rename, and the nn.Linear walk it was silently missing
+# ======================================================================================
+#
+# MEASURED, not theorised. Arm 6 of the Lightning-30B debug run loaded 14.42 GiB (so the
+# MoE experts WERE replaced) and then failed in the Mamba mixer:
+#
+#   File ".../models/nemotron_h/modeling_nemotron_h.py", line 440, in forward
+#     projected_states = self.in_proj(hidden_states)
+#   File ".../torch/nn/modules/linear.py", line 134, in forward
+#     return F.linear(input, self.weight, self.bias)
+#   RuntimeError: expected mat1 and mat2 to have the same dtype, but got:
+#                 c10::BFloat16 != c10::Half
+#
+# A plain `nn.Linear`, in a layer the checkpoint quantizes and `layer_bpw` lists. The
+# experts survived because `_replace_nemotron_h_experts` matches on module TYPE; the mamba
+# projections are matched by NAME, against a whitelist built from checkpoint keys
+# (`backbone.*`) while `named_modules()` yields `model.*`. Every mamba projection missed.
+#
+# It hid behind the footprint: the experts are 10.47 of 14.65 GiB, so missing 0.31 GiB of
+# mamba projections keeps the total inside any tolerance. This is the same bug class as the
+# vLLM whitelist alias (commit 8c44ff6) and the expert packed-shape lookup above - the third
+# site, which is why the aliasing now has one origin in `glq.name_aliases`.
+
+
+def _mamba_mixer_model(hidden=64, out=128):
+    """A model shaped like NemotronH's AFTER transformers renames the prefix: modules are
+    `model.layers.N.*`, so the whitelist's `backbone.*` spelling has to be translated."""
+    mixer = nn.Module()
+    mixer.in_proj = nn.Linear(hidden, out, bias=False)
+    mixer.out_proj = nn.Linear(out, hidden, bias=False)
+    layer = nn.Module()
+    layer.mixer = mixer
+    inner = nn.Module()
+    inner.layers = nn.ModuleList([layer])
+    top = nn.Module()
+    top.model = inner
+    return top
+
+
+def test_the_linear_walk_resolves_the_checkpoint_spelling():
+    """The regression gate for the arm-6 crash: a `backbone.*` whitelist must reach the
+    `model.*` modules, or they stay plain nn.Linear with no weight ever loaded."""
+    from glq.hf_integration import replace_with_glq_linear
+    from glq.quantized_linear import E8RHTLinear
+
+    m = _mamba_mixer_model()
+    whitelist = {"backbone.layers.0.mixer.in_proj", "backbone.layers.0.mixer.out_proj"}
+    assert replace_with_glq_linear(m, quantized_layers=whitelist,
+                                   codebook_type="trellis") is True
+    assert isinstance(m.model.layers[0].mixer.in_proj, E8RHTLinear), (
+        "mamba in_proj left as a plain nn.Linear — its GLQ weight will never load")
+    assert isinstance(m.model.layers[0].mixer.out_proj, E8RHTLinear)
+
+
+def test_a_layer_outside_the_whitelist_is_still_left_alone():
+    """The failing control. Without it the test above would pass just as well if the
+    aliasing degenerated into "replace everything", which would convert a multimodal
+    model's unquantized vision tower and break it."""
+    from glq.hf_integration import replace_with_glq_linear
+
+    m = _mamba_mixer_model()
+    replace_with_glq_linear(m, quantized_layers={"backbone.layers.0.mixer.in_proj"},
+                            codebook_type="trellis")
+    assert isinstance(m.model.layers[0].mixer.out_proj, nn.Linear) and not hasattr(
+        m.model.layers[0].mixer.out_proj, "trellis_packed"), (
+        "out_proj was converted despite being absent from the whitelist")
+
+
+def test_the_packed_shapes_also_resolve_for_the_linear_walk():
+    """Shapes are keyed the same way, so a translated name must find them too. Without
+    this the buffers register at size 0 and accelerate's device map sees an empty model."""
+    from glq.hf_integration import replace_with_glq_linear
+
+    m = _mamba_mixer_model(hidden=64, out=128)
+    shapes = {"backbone.layers.0.mixer.in_proj": {"trellis_packed": [96, 48]}}
+    replace_with_glq_linear(m, quantized_layers={"backbone.layers.0.mixer.in_proj"},
+                            codebook_type="trellis", shapes=shapes)
+    assert tuple(m.model.layers[0].mixer.in_proj.trellis_packed.shape) == (96, 48)
+
+
+@pytest.mark.parametrize("given,expected", [
+    ("model.layers.0.mixer.in_proj", "backbone.layers.0.mixer.in_proj"),
+    ("backbone.layers.0.mixer.in_proj", "model.layers.0.mixer.in_proj"),
+    ("language_model.model.layers.0.mixer.in_proj",
+     "language_model.backbone.layers.0.mixer.in_proj"),
+    ("language_model.backbone.layers.0.mixer.in_proj",
+     "language_model.model.layers.0.mixer.in_proj"),
+])
+def test_the_alias_helper_covers_both_directions_and_the_vl_nesting(given, expected):
+    """One origin for the rename, since three call sites need it and the two that existed
+    had already drifted — the expert-shape copy lacked the `language_model.` forms the VL
+    wrapper needs."""
+    from glq.name_aliases import backbone_aliases
+    assert expected in backbone_aliases(given)
+
+
+def test_a_name_with_no_alias_yields_nothing_rather_than_itself():
+    """An empty result is what lets callers do `candidates = [name, *aliases]` without
+    de-duplicating, and keeps a non-NemotronH model free of pointless lookups."""
+    from glq.name_aliases import backbone_aliases
+    assert backbone_aliases("model.layers.0.self_attn.q_proj") == {
+        "backbone.layers.0.self_attn.q_proj"}
+    assert backbone_aliases("visual.blocks.0.attn.qkv") == set()

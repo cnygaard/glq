@@ -55,19 +55,14 @@ def _backbone_forms(prefix: str) -> set[str]:
     Both directions, as the sibling aliases in `_lookup_bpw` are: a checkpoint written with
     native prefixes is equally legal, and an alias that matches nothing is free. The nested
     form covers the VL wrapper, whose ``sd_prefix`` is ``language_model.backbone.layers``.
+
+    Delegates to `glq.name_aliases.backbone_aliases`, the one origin for this rename — the
+    HF nn.Linear walk and the expert packed-shape lookup need the identical mapping, and
+    while each kept its own inline copy they drifted: the expert one never gained the
+    ``language_model.`` forms added here.
     """
-    forms = set()
-    if prefix.startswith("model.") and ".language_model." not in prefix:
-        forms.add("backbone." + prefix[len("model."):])
-    if prefix.startswith("backbone."):
-        forms.add("model." + prefix[len("backbone."):])
-    if prefix.startswith("language_model.model."):
-        forms.add("language_model.backbone."
-                  + prefix[len("language_model.model."):])
-    if prefix.startswith("language_model.backbone."):
-        forms.add("language_model.model."
-                  + prefix[len("language_model.backbone."):])
-    return forms
+    from glq.name_aliases import backbone_aliases
+    return backbone_aliases(prefix)
 
 
 #: Fused layers whose vLLM partition structure differs from the checkpoint's matrix
@@ -275,6 +270,16 @@ class GLQvLLMConfig(QuantizationConfig):
             forms.add("model.language_model." + prefix[len("model."):])
         if prefix.startswith("language_model.model."):
             forms.add("model.language_model." + prefix[len("language_model.model."):])
+        # NemotronH: layer_bpw keeps the checkpoint's `backbone.*` while vLLM asks about
+        # `model.*`. `_lookup_bpw` got this alias in 8c44ff6 and this function did not —
+        # and the asymmetry is the worst possible one. The layer RESOLVES as quantized (so
+        # GLQ claims it, the whitelist check passes, the footprint is right) but is NOT
+        # recognised as pre-fused, so Mamba2's in_proj — one jointly-quantized checkpoint
+        # matrix that vLLM builds as a 5-partition merged linear [z, x, B, C, dt] — got
+        # five shard slots and a one-matrix load with nowhere to land. Every Mamba layer
+        # served a ZERO weight. Measured on Lightning-30B at 3 and 4 bpw:
+        # SQNR(W_hf, W_vllm) = 0.00 dB for in_proj, 54.90 dB for the 1:1 out_proj.
+        forms |= _backbone_forms(prefix)
         return any(f in self.layer_bpw for f in forms)
 
     def embedding_quant_method(self, prefix: str):

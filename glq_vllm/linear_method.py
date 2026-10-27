@@ -353,8 +353,26 @@ class GLQShardedParameter(BasevLLMParameter):
             self._shard_data[idx].copy_(loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+        """A whole-matrix load (no shard id). Only coherent for a single-shard parameter.
+
+        Reaching here with several shards is a contradiction between how the layer was
+        built and what the checkpoint holds: create_weights allocated per-shard slots
+        (``pre_fused`` was False), while the loader is handing over ONE matrix. This used
+        to be a silent no-op, and that silence is what let NemotronH ship with every Mamba
+        ``in_proj`` serving zeros — the slots stayed at their zero init, the footprint was
+        right, and the only symptom was fluent-looking garbage several layers later.
+        Failing here turns that into a load-time error naming the layer's shape.
+        """
         if len(self._shard_data) == 1:
             self._shard_data[0].copy_(loaded_weight)
+            return
+        raise ValueError(
+            f"GLQ: a single-matrix load reached a parameter with "
+            f"{len(self._shard_data)} shard slots {self._shard_sizes}. The checkpoint "
+            f"stores this layer as ONE jointly-quantized matrix but it was built as "
+            f"per-shard — `GLQvLLMConfig._is_prefused` did not recognise its prefix "
+            f"(check checkpoint-vs-module spelling, e.g. `backbone.` vs `model.`). "
+            f"Loading it shard-wise would serve a zero weight.")
 
     @property
     def weight_loader(self) -> Callable:
