@@ -54,3 +54,26 @@ def moe_cpu_refusal(codebook: str) -> str | None:
 # `GLQStackedGatedExperts` reaches the same op and `glq` must not import `glq_vllm`.
 # Re-exported here so this module stays the one place vLLM asks about dispatch.
 from glq.moe_cpu_gate import moe_cpu_fused_refusal  # noqa: E402,F401
+
+
+#: Activation ids the fused CUDA trellis MoE op implements: 0/1/2 the GATED
+#: silu / gelu-tanh / relu2, and 3/4/5 the same three NON-GATED. NemotronH is 5
+#: (``up -> relu**2 -> down``, no gate projection).
+#:
+#: This exists as a named predicate rather than an inline ``< 3`` because getting it wrong
+#: is expensive and silent in one direction and loud in the other. Too narrow, and the layer
+#: falls back to ``fused_moe_method._apply_trellis`` — correct, but its ``topk_ids.unique()``
+#: is a host sync, so CUDA-graph capture dies with
+#: ``cudaErrorStreamCaptureUnsupported`` at *every* batch size and the model cannot serve
+#: without ``--enforce-eager``. Too wide, and an id outside the table reaches a kernel that
+#: selects the function with ``% 3`` and would quietly compute silu.
+_TRELLIS_MOE_ACTIVATIONS = frozenset(range(6))
+
+
+def trellis_moe_activation_ok(activation_type: int | None) -> bool:
+    """Can the fused CUDA trellis MoE op evaluate this activation id?
+
+    ``None`` means the layer never declared one, which is not something to guess at: the
+    fallback loop reads ``layer.activation`` itself and applies whatever it finds.
+    """
+    return activation_type in _TRELLIS_MOE_ACTIVATIONS

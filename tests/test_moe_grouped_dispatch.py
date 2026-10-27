@@ -115,3 +115,38 @@ def test_the_two_switches_are_independent():
     versa — they are separate A/B levers and a shared one cannot isolate either path."""
     assert D.moe_cpu_fused_refusal(**{**FUSED_OK, "force_fallback": True}) \
         != D.moe_cpu_fused_refusal(**{**FUSED_OK, "cpu_fused_enabled": False})
+
+
+# ---- which activations the FUSED CUDA trellis MoE op can evaluate -------------------------
+#
+# The fused op exists to keep the MoE decode step CUDA-graph capturable: the per-expert
+# fallback (`fused_moe_method._apply_trellis`) iterates `topk_ids.unique()`, a host sync, so
+# capture dies with `cudaErrorStreamCaptureUnsupported` at EVERY batch size — not just above
+# the token cap. So an activation wrongly excluded here does not merely cost throughput, it
+# makes the model unservable without `--enforce-eager`. That is what happened to NemotronH:
+# the guard read `< 3` and its non-gated relu2 is id 5.
+
+
+def test_the_gated_three_are_accepted():
+    for i in (0, 1, 2):                       # silu / gelu-tanh / relu2, gated
+        assert D.trellis_moe_activation_ok(i), i
+
+
+def test_the_non_gated_three_are_accepted():
+    """3/4/5 are the same three functions without the gate multiply. NemotronH is 5."""
+    for i in (3, 4, 5):
+        assert D.trellis_moe_activation_ok(i), i
+
+
+@pytest.mark.parametrize("bad", [6, 7, -1, None])
+def test_an_id_outside_the_table_is_refused(bad):
+    """Not merely tidiness: the CUDA activation kernel picks the function with `% 3`, so an
+    unknown id would silently compute silu rather than fail."""
+    assert not D.trellis_moe_activation_ok(bad)
+
+
+def test_the_predicate_covers_exactly_the_kernels_documented_range():
+    """Pinned against the kernel's own TORCH_CHECK (`>= 0 && < 6`). If one side moves, this
+    is the test that notices — the two live in different languages and cannot share a
+    constant."""
+    assert {i for i in range(-2, 9) if D.trellis_moe_activation_ok(i)} == set(range(6))

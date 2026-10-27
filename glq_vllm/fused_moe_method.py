@@ -22,6 +22,7 @@ from .linear_method import (
     _detect_block_diag, _pack_block_meta,
 )
 from ._dispatch import _grouped_enabled
+from ._dispatch import trellis_moe_activation_ok as _trellis_moe_activation_ok
 
 #: One-shot latch for the "CPU MoE took the per-expert loop" notice. A 26B-A4B has 30 MoE
 #: layers and decodes one token at a time, so a per-call warning would be unreadable.
@@ -923,7 +924,10 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             if (getattr(layer, 'glq_trellis_fused_ok', False)
                     and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                     and x.shape[0] <= _bd_cap
-                    and self._activation_type(activation) < 3
+                    # 0-5: the gated three AND the non-gated three. This used to be `< 3`,
+                    # which sent NemotronH (non-gated relu2, id 5) to the loop below and so
+                    # made the whole model unservable without --enforce-eager.
+                    and _trellis_moe_activation_ok(self._activation_type(activation))
                     and _ik._try_load_cuda_ext()
                     and hasattr(_ik._glq_cuda, 'glq_fused_moe_trellis_3inst_cuda')
                     and hasattr(torch.ops, 'glq')
