@@ -264,8 +264,12 @@ def _gpu_cells(group: list[BenchRecord]) -> tuple[list[str], bool]:
 
     aime = latest([r for r in group if r.benchmark.task == "aime_2026" and _avg_k(r) == 8
                    and r.benchmark.value is not None])
+    # Full-dataset runs only. `n_tasks` is None when harbor got no `-l` limit; a limited run
+    # is a capability smoke, which belongs in no table — 1/3 would print as 33.3% beside
+    # full-dataset scores.
     tb = latest([r for r in group if r.benchmark.task.startswith("terminal_bench")
                  and r.benchmark.config.get("dataset") == TB_DATASET
+                 and not r.benchmark.config.get("n_tasks")
                  and r.benchmark.value is not None])
 
     toks, ttft = [], []
@@ -321,7 +325,8 @@ def model_gpu_table(records: list[BenchRecord]) -> str:
         f"{_MISSING} = not measured on that GPU. **tok/s** is per-stream decode, "
         "`1000 / mean TPOT` from `vllm bench sweep serve` (128-token prompts, 256 output "
         "tokens, prefill excluded); **TTFT** is the mean time to first token at that "
-        "concurrency. **AIME 2026** is avg@8; single-pass runs are not shown. **VRAM** is the "
+        "concurrency. **AIME 2026** is avg@8; single-pass runs are not shown. **Terminal-Bench** is "
+        "full-dataset runs only. **VRAM** is the "
         "weights resident after load (vLLM's `Model loading took` line); the KV-cache pool "
         "is not included. Every number belongs to the GPU in its row — figures from "
         "different GPUs do not compare."]

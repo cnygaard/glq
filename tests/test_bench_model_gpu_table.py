@@ -52,11 +52,12 @@ def aime(model, gpu, acc, avg_k=8, ts="2026-10-28T00:00:00Z", vram=None, offload
 
 
 def tbench(model, gpu, reward, dataset="terminal-bench/terminal-bench@4.0.0",
-           ts="2026-10-28T00:00:00Z"):
+           ts="2026-10-28T00:00:00Z", n_tasks=None):
+    """`n_tasks` None is a full run: the adapter passes harbor no `-l` limit."""
     return BenchRecord(
         model=model,
         benchmark=BenchmarkResult("terminal_bench", "reward_mean", reward,
-                                  config={"dataset": dataset, "n_tasks": 66}),
+                                  config={"dataset": dataset, "n_tasks": n_tasks}),
         hardware=_hw(gpu), timestamp_utc=ts)
 
 
@@ -322,3 +323,15 @@ def test_the_legend_says_vram_is_weights_only_not_the_kv_pool():
     legend = t.split("\n\n", 1)[1]
     assert "weights" in legend and "KV" in legend
     assert "GPU memory right after load" not in legend
+
+
+def test_a_terminal_bench_smoke_run_never_fills_the_column():
+    """A 1-3 task run is a capability smoke: it shows whether a model drives a terminal at
+    all, and the skill rules it out of every table and card. 0/3 or 1/3 rendered as "0.0%"
+    or "33.3%" beside full-dataset scores would read as a measured result."""
+    recs = [tbench(GLQ, PRO6000, 1 / 3, n_tasks=3, ts="2026-10-29T00:00:00Z")]
+    assert row(report.model_gpu_table(recs), GLQ.id, "RTX PRO 6000")[
+        "Terminal-Bench 4.0"] == "—"
+    recs.append(tbench(GLQ, PRO6000, 0.25, ts="2026-10-01T00:00:00Z"))   # older, full
+    assert row(report.model_gpu_table(recs), GLQ.id, "RTX PRO 6000")[
+        "Terminal-Bench 4.0"] == "25.0%"
