@@ -335,3 +335,16 @@ def test_a_terminal_bench_smoke_run_never_fills_the_column():
     recs.append(tbench(GLQ, PRO6000, 0.25, ts="2026-10-01T00:00:00Z"))   # older, full
     assert row(report.model_gpu_table(recs), GLQ.id, "RTX PRO 6000")[
         "Terminal-Bench 4.0"] == "25.0%"
+
+
+def test_decode_measured_with_weights_offloaded_is_marked():
+    """`decode_sweep` passes `serve_extra` to `vllm serve`, so `--cpu-offload-gb` can reach
+    it. Offloaded decode is bound by PCIe, not the GPU — measured ~0.47 ms/token/GiB on
+    PCIe 5 and 3.6x that on an L4 — so an unmarked number would read as the card's speed."""
+    rec = sweep(BF16, L4, {1: (3.2, 900.0)})
+    rec.benchmark.config["serve_extra"] = "--cpu-offload-gb 40"
+    t = report.model_gpu_table([rec])
+    assert row(t, BF16.id, "L4")["Batch=1 tok/s"] == "3.2 §"
+    assert "§" in t.split("\n\n", 1)[1]
+    plain = report.model_gpu_table([sweep(GLQ, L4, {1: (21.5, 180.0)})])
+    assert "§" not in plain

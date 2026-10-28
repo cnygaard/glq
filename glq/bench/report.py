@@ -234,8 +234,8 @@ def _avg_k(r: BenchRecord) -> int:
     return int(r.benchmark.config.get("avg_k") or r.benchmark.extra.get("avg_k") or 1)
 
 
-def _gpu_cells(group: list[BenchRecord]) -> tuple[list[str], bool]:
-    """The table cells for one (model, GPU); also whether VRAM came from an offloaded run."""
+def _gpu_cells(group: list[BenchRecord]) -> tuple[list[str], set[str]]:
+    """The table cells for one (model, GPU), and the footnote marks they used."""
     def latest(rs):
         return max(rs, key=lambda r: r.timestamp_utc or "") if rs else None
 
@@ -272,21 +272,28 @@ def _gpu_cells(group: list[BenchRecord]) -> tuple[list[str], bool]:
                  and not r.benchmark.config.get("n_tasks")
                  and r.benchmark.value is not None])
 
-    toks, ttft = [], []
+    toks, ttft, marks = [], [], set()
     sweeps = [r for r in group if r.benchmark.task == "decode_sweep"]
     for b in GPU_TABLE_BATCHES:
         hit = latest([r for r in sweeps
                       if str(b) in (r.benchmark.extra.get("per_concurrency") or {})])
         pc = hit.benchmark.extra["per_concurrency"][str(b)] if hit else {}
         t, f = pc.get("per_stream_tok_s"), pc.get("mean_ttft_ms")
-        toks.append(_MISSING if t is None else f"{t:.1f}")
+        # `serve_extra` reaches `vllm serve`, so a sweep can run with weights offloaded.
+        # That decode is bound by PCIe, not the card, and must not read as the card's speed.
+        off = hit is not None and "cpu-offload" in (hit.benchmark.config.get("serve_extra") or "")
+        if off and t is not None:
+            marks.add("§")
+        toks.append(_MISSING if t is None else f"{t:.1f}" + (" §" if off else ""))
         ttft.append(_MISSING if f is None else f"{f:.0f}")
 
     cells = [m.id, gpu_short(head.hardware.gpu_model if head.hardware else None), vram, bpw,
              _MISSING if aime is None else f"{aime.benchmark.value * 100:.1f}%",
              _MISSING if tb is None else f"{tb.benchmark.value * 100:.1f}%",
              *toks, *ttft]
-    return cells, offloaded
+    if offloaded:
+        marks.add("‡")
+    return cells, marks
 
 
 def model_gpu_table(records: list[BenchRecord]) -> str:
@@ -311,11 +318,11 @@ def model_gpu_table(records: list[BenchRecord]) -> str:
         return ((m.base_model or m.id).lower(), -vram, gpu,
                 _METHOD_RANK.get((m.quant_method or "none").lower(), 2), model_id)
 
-    rows, any_offload = [], False
+    rows, marks = [], set()
     for _key, rs in sorted(groups.items(), key=order):
-        cells, offloaded = _gpu_cells(rs)
+        cells, used = _gpu_cells(rs)
         rows.append(cells)
-        any_offload |= offloaded
+        marks |= used
 
     batches = GPU_TABLE_BATCHES
     headers = (["Model", "GPU model", "VRAM GiB", "BPW", "AIME 2026 avg@8", TB_LABEL]
@@ -330,9 +337,13 @@ def model_gpu_table(records: list[BenchRecord]) -> str:
         "weights resident after load (vLLM's `Model loading took` line); the KV-cache pool "
         "is not included. Every number belongs to the GPU in its row — figures from "
         "different GPUs do not compare."]
-    if any_offload:
+    if "‡" in marks:
         legend.append("‡ resident share only: the run offloaded weights to host memory "
                       "(`--cpu-offload-gb`), so this is not the model's full size.")
+    if "§" in marks:
+        legend.append("§ decoded with weights offloaded to host memory (`--cpu-offload-gb`): "
+                      "bound by PCIe transfer, not by the GPU, so not comparable to rows "
+                      "that fit on the card.")
     return _md_table(headers, rows) + "\n\n" + "\n\n".join(legend)
 
 
