@@ -140,3 +140,87 @@ class TestMultimodalDetection:
 
     def test_plain_causal_lm_does_not(self):
         assert not rm.needs_mm0(["LlamaForCausalLM"])
+
+
+class TestCoherenceSampling:
+    """The coherence sample's sampling, which decides whether two runtimes are comparable.
+
+    `run_hf` generates with `do_sample=False`, so at the vLLM default (temperature 0.7,
+    top_p 0.9, seed 7) a vLLM-vs-HF output difference says nothing about the model — the
+    two arms sampled differently. `--greedy` makes the vLLM side match, which is what
+    turns a cross-runtime comparison into evidence.
+    """
+
+    def test_default_is_the_historical_sampled_setting(self):
+        """Unchanged by default: existing records keep their meaning."""
+        assert rm.coherence_sampling(False) == {
+            "temperature": 0.7, "top_p": 0.9, "seed": 7}
+
+    def test_greedy_drops_top_p_and_seed(self):
+        """temperature=0 makes top_p and a seed meaningless; carrying them invites the
+        reader to think the two arms differ in more than one way."""
+        assert rm.coherence_sampling(True) == {"temperature": 0.0}
+
+
+class TestTrustRemoteCode:
+    """CLAUDE.md: never --trust-remote-code unless you have to, it is a security issue.
+
+    It was hardcoded True at four call sites. Beyond the security point it also changes
+    which code path a GLQ model takes: with remote code live, transformers builds NVIDIA's
+    own NemotronH classes, `_replace_nemotron_h_experts` matches none of them and returns
+    0 by design, and an arm meant to test GLQ's fused experts silently tests something
+    else.
+    """
+
+    def test_defaults_to_off(self):
+        args = rm.build_parser().parse_args(["--model", "x"])
+        assert args.trust_remote_code is False
+
+    def test_opt_in_available(self):
+        args = rm.build_parser().parse_args(["--model", "x", "--trust-remote-code"])
+        assert args.trust_remote_code is True
+
+
+class TestDegenerateSubtokenLoops:
+    """`is_degenerate` printed RUN_OK on a broken model. Verbatim, vLLM 0.32.0, the
+    Nemotron-3.5-Lightning-30B GLQ checkpoint while every Mamba in_proj served zeros:
+
+        'inellsellsellsells...ells theells theells theells the'
+
+    A repeated SUB-token loop has almost no whitespace, so it splits into a few enormous
+    "words" whose uniqueness ratio (0.600) clears the 0.3 floor. Compression catches it:
+    measured on today's real samples, every broken one compresses to <= 0.203 of its
+    length and every coherent one to >= 0.603 — a 3x gap, where word uniqueness put the
+    worst broken sample right beside coherent text.
+    """
+
+    BROKEN_SUBTOKEN = ("in" + "ells" * 56 + " theells theells theells the")
+    BROKEN_MIXED = ("ellsells the the the the from fromellsells the the the the the the "
+                    "the andellsellsellsellsellsellsellsells subject subjectells subject "
+                    "subject subjectells from from from from from theellsells the from the "
+                    "from the from subject subjectells the from the from the from the")
+    COHERENT = ("Red, Blue, Yellow. Red is the color of fire and passion. Blue is the "
+                "color of the sky and calmness. Yellow is the color of sunshine and warmth.")
+    COHERENT_REASONING = ("Here's a thinking process:\n\n1.  **Analyze User Input:**\n"
+                          "   - User wants: \"Name three primary colors and give one short "
+                          "fact about each.\"\n   - Key elements: \n     - Three primary "
+                          "colors\n     - One short fact for each\n")
+
+    def test_a_subtoken_loop_is_degenerate(self):
+        assert rm.is_degenerate(self.BROKEN_SUBTOKEN)
+
+    def test_a_mixed_word_and_subtoken_loop_is_degenerate(self):
+        assert rm.is_degenerate(self.BROKEN_MIXED)
+
+    def test_the_correct_answer_from_the_fixed_model_passes(self):
+        assert not rm.is_degenerate(self.COHERENT)
+
+    def test_a_reasoning_preamble_passes(self):
+        """Structured, list-heavy reasoning repeats phrases legitimately; it must not
+        trip the compression check."""
+        assert not rm.is_degenerate(self.COHERENT_REASONING)
+
+    def test_a_short_answer_is_not_judged_by_compression(self):
+        """zlib's fixed overhead makes any short string 'incompressible' or worse, so the
+        ratio means nothing there — the existing word checks own short text."""
+        assert not rm.is_degenerate("The capital of France is Paris, a city on the Seine.")
