@@ -180,6 +180,104 @@ def test_default_device_argv_is_unchanged():
     assert "+cpu" not in flat and "--extra-index-url" not in flat
 
 
+# ---- the CUDA build toolchain has to match torch's CUDA after vLLM is installed ---------
+#
+# Measured 2026-10-28, in the distro matrix (ubuntu:24.04 and fedora:43, source mode) and in a
+# box venv built by the same install.sh: install.sh pins nvcc/cccl to torch's
+# `cuda-toolkit==13.0.3.0`, then this module installs vLLM 0.32.0, whose
+# `humming-kernels[cu13]` asks for `nvidia-cuda-nvcc` and `nvidia-cuda-cccl` with no version.
+# The venv ends with nvcc and CCCL 13.2.86 beside torch's CUDA 13.0 runtime headers, and
+# CCCL's `cuda_toolkit.h` refuses that pair outright:
+#
+#   error: #error "CUDA compiler and CUDA toolkit headers are incompatible"
+#
+# on a two-line file that includes <thrust/complex.h>, so every kernel build fails before it
+# reaches any GLQ code. A 13.0-matched nvcc compiles the same file.
+
+TOOLKIT = "13.0.3.0"
+
+
+def _commands(components, version=TOOLKIT, device="cuda"):
+    seen = []
+    M._install_python_extras(lambda cmd, **kw: seen.append([str(c) for c in cmd]),
+                             Path("/home/u/.glq/venv"), components, device=device,
+                             toolkit_version=lambda venv: version)
+    return seen
+
+
+def _is_repin(cmd):
+    return any(a.startswith("cuda-toolkit[") for a in cmd)
+
+
+def test_a_cuda_install_repins_the_toolchain_after_vllm():
+    seen = _commands(("core", "vllm"))
+    assert _is_repin(seen[-1]), f"the toolchain is not re-pinned last: {seen}"
+    assert seen[-1][-1] == f"cuda-toolkit[nvcc,cccl]=={TOOLKIT}", seen[-1]
+    vllm_at = next(i for i, c in enumerate(seen) if "vllm" in c)
+    assert vllm_at < len(seen) - 1, "the re-pin must come after the vLLM install"
+
+
+def test_the_repin_follows_every_component_install():
+    """quantize and bench are separate pip calls after vLLM's; the last word has to be the
+    toolchain's, whatever ran before it."""
+    seen = _commands(("core", "vllm", "quantize", "bench"))
+    assert _is_repin(seen[-1]), seen
+    assert sum(_is_repin(c) for c in seen) == 1, seen
+
+
+def test_the_repin_uses_the_version_torch_pinned_not_the_newest():
+    """The whole point: a bare `cuda-toolkit[nvcc,cccl]` would resolve the newest toolchain,
+    which is exactly the mismatch being fixed."""
+    seen = _commands(("core", "vllm"), version="13.0.3.0")
+    assert seen[-1][-1].endswith("==13.0.3.0"), seen[-1]
+
+
+def test_no_pinned_toolkit_means_no_repin():
+    """A torch that pins no cuda-toolkit (as install.sh already allows) is left alone."""
+    assert not any(_is_repin(c) for c in _commands(("core", "vllm"), version=None))
+
+
+def test_nothing_installed_means_no_repin():
+    assert _commands(("core",)) == []
+
+
+def test_a_cpu_install_never_gets_a_cuda_toolchain(monkeypatch):
+    from glq.installer import cpu_wheel
+    monkeypatch.setattr(cpu_wheel, "latest_cpu_wheel_url",
+                        lambda arch, fetch=None: cpu_wheel.FALLBACK_X86)
+    seen = _commands(("core", "vllm"), device="cpu")
+    assert not any(_is_repin(c) for c in seen), seen
+
+
+def test_the_version_is_read_from_the_venv_without_importing_torch():
+    """This process may hold a stale torch (see `_self_check`), so the version comes from the
+    venv's own interpreter, by package metadata, as install.sh reads it."""
+    calls = []
+
+    class Done:
+        returncode, stdout, stderr = 0, "13.0.3.0\n", ""
+
+    got = M._torch_cuda_toolkit_version(Path("/home/u/.glq/venv"),
+                                        run=lambda cmd, **kw: calls.append(cmd) or Done())
+    assert got == "13.0.3.0"
+    cmd = " ".join(map(str, calls[0]))
+    assert str(Path("/home/u/.glq/venv") / "bin" / "python") in cmd
+    assert "importlib.metadata" in cmd and "cuda-toolkit" in cmd
+    assert "import torch" not in cmd
+
+
+def test_an_unreadable_version_is_none_not_an_error():
+    class Failed:
+        returncode, stdout, stderr = 1, "", "PackageNotFoundError: cuda-toolkit"
+
+    assert M._torch_cuda_toolkit_version(Path("/x"), run=lambda *a, **k: Failed()) is None
+
+    def missing(*a, **k):
+        raise FileNotFoundError("/x/bin/python")
+
+    assert M._torch_cuda_toolkit_version(Path("/x"), run=missing) is None
+
+
 def _picode_commands(monkeypatch, home) -> list[str]:
     """The commands `_install_picode` would run, with HOME pinned.
 

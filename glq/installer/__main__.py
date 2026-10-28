@@ -72,10 +72,30 @@ from glq.tooling import (GEMMA4_TOOL_TEMPLATE,  # noqa: E402
                          tool_serve_args)
 
 
-def _install_python_extras(run: Runner, venv: Path, components, device: str = "cuda") -> None:
+def _torch_cuda_toolkit_version(venv: Path, run=None) -> str | None:
+    """The `cuda-toolkit` version torch pinned in `venv`, or None if it pinned none.
+
+    Read by the venv's own interpreter, from package metadata, exactly as install.sh reads
+    it: this process may be holding a different torch than the one on disk (see
+    `_self_check`), and importing torch to ask would be both slow and wrong.
+    """
+    cmd = [str(_venv_bin(venv, "python")), "-c",
+           "import importlib.metadata as m; print(m.version('cuda-toolkit'))"]
+    runner = run or subprocess.run
+    try:
+        proc = runner(cmd, capture_output=True, text=True)
+    except Exception:                                             # noqa: BLE001
+        return None
+    ver = (proc.stdout or "").strip()
+    return ver if proc.returncode == 0 and ver else None
+
+
+def _install_python_extras(run: Runner, venv: Path, components, device: str = "cuda",
+                           toolkit_version=None) -> None:
     pip = _venv_bin(venv, "pip")
     wanted = []
     extra_pip_args = []
+    installed = False
     if "vllm" in components:
         if device == "cpu":
             # vLLM's CPU backend is a GitHub-release wheel (`+cpu`), not on PyPI — a bare
@@ -99,6 +119,7 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
     if wanted:
         print(f"\n== installing: {', '.join(wanted)}")
         run([pip, "install", "--upgrade", *wanted, *extra_pip_args])
+        installed = True
     if "quantize" in components:
         # Deliberately a separate command with NO --upgrade: `glq[quantize]` names glq
         # itself, and --upgrade would replace a --glq-source dev install with the PyPI
@@ -106,6 +127,7 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         # the extra's missing deps (pyproject stays the single source of truth for them).
         print("\n== installing: glq[quantize]")
         run([pip, "install", "glq[quantize]"])
+        installed = True
     if "bench" in components:
         # `glq-bench`'s quality tasks need `datasets` to fetch MMLU-Pro / AIME, and
         # `decode_sweep` needs `pandas` — which vLLM's sweep tool imports only at the very
@@ -118,6 +140,23 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         # Same NO --upgrade reasoning as above: the spec names glq itself.
         print("\n== installing: glq[bench]")
         run([pip, "install", "glq[bench]"])
+        installed = True
+    if installed and device != "cpu":
+        # Last, after every install above: they can move the CUDA build toolchain, and the
+        # kernels need it to match torch's CUDA. install.sh pins nvcc and the CCCL headers to
+        # torch's `cuda-toolkit` before handing over, and then the vLLM install undoes it —
+        # vLLM 0.32.0 requires `humming-kernels[cu13]`, which asks for `nvidia-cuda-nvcc` and
+        # `nvidia-cuda-cccl` with no version. Measured 2026-10-28: nvcc and CCCL 13.2.86
+        # beside torch's CUDA 13.0 runtime headers, which CCCL's `cuda_toolkit.h` refuses
+        # ("CUDA compiler and CUDA toolkit headers are incompatible") on any file that
+        # includes torch, so no kernel could build. The CPU path installs no toolchain.
+        ver = (toolkit_version or _torch_cuda_toolkit_version)(venv)
+        if ver:
+            print(f"\n== re-pinning the CUDA build toolchain to torch's cuda-toolkit {ver}")
+            run([pip, "install", "--upgrade", f"cuda-toolkit[nvcc,cccl]=={ver}"])
+        else:
+            print("\n== torch pinned no cuda-toolkit here; leaving the CUDA build "
+                  "toolchain as it is")
 
 
 def _self_check(venv: Path, components, device: str | None,
