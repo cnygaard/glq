@@ -5,6 +5,8 @@ Subcommands:
   index     compute the % -of-bf16 weighted quality index from records
   report    render a markdown performance table from records
   compare   side-by-side table for an explicit set of models
+  leaderboard  LEADERBOARD.md, structured by the HF collections
+  collections  the HF collections LEADERBOARD.md follows (JSON)
   card      put the per-GPU speed/quality table into a model's HF card
   plot      render performance plots (matplotlib)
   pull/push sync the centralized results repo
@@ -98,13 +100,41 @@ def _cmd_compare(args) -> int:
     return 0
 
 
+def _collections(args):
+    """``(start_here, families)`` from a ``--collections`` snapshot, else live from the Hub."""
+    from . import hfcollections
+    if getattr(args, "collections", None):
+        return hfcollections.from_json(Path(args.collections).read_text(encoding="utf-8"))
+    return hfcollections.fetch_collections()
+
+
 def _cmd_leaderboard(args) -> int:
     from . import report
     from .record import utcnow_iso
     recs = _load_records(args)
-    md = report.leaderboard(recs, weights=_load_weights(args.weights),
+    # The structure IS the collections. Without them there is no faithful file to write, and
+    # writing a differently shaped one would publish it as if nothing had changed.
+    try:
+        start, families = _collections(args)
+    except Exception as e:                                           # noqa: BLE001
+        print(f"glq-bench: could not read the HF collections ({e}); LEADERBOARD.md not "
+              f"written. Pass --collections FILE to use a saved snapshot.", file=sys.stderr)
+        return 2
+    md = report.leaderboard(recs, start_here=start, families=families,
                             generated_utc=None if args.no_timestamp else utcnow_iso())
     _emit(md, args.out or "LEADERBOARD.md")
+    return 0
+
+
+def _cmd_collections(args) -> int:
+    """Print or save the collections the leaderboard is structured by."""
+    from . import hfcollections
+    try:
+        start, families = hfcollections.fetch_collections()
+    except Exception as e:                                           # noqa: BLE001
+        print(f"glq-bench: could not read the HF collections: {e}", file=sys.stderr)
+        return 2
+    _emit(hfcollections.to_json(start, families), args.out)
     return 0
 
 
@@ -277,12 +307,20 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--filter", action="append", default=[], help="key=value (e.g. base=google/gemma-4-31B-it)")
         s.set_defaults(func=fn)
 
-    lb = sub.add_parser("leaderboard", help="generate the full LEADERBOARD.md (index + per-base tables)")
+    lb = sub.add_parser("leaderboard", help="generate LEADERBOARD.md: recommended checkpoints, "
+                                            "then one section per family collection")
     lb.add_argument("--records", default=None, help="read records from this JSONL instead of the repo")
-    lb.add_argument("--weights", default=None, help="JSON/YAML task->weight map")
+    lb.add_argument("--collections", default=None,
+                    help="read the collections from this snapshot (`glq-bench collections "
+                         "--out`) instead of the Hub")
     lb.add_argument("--out", default=None, help="output file (default LEADERBOARD.md; '-' for stdout)")
     lb.add_argument("--no-timestamp", action="store_true", help="omit the generated-on timestamp")
     lb.set_defaults(func=_cmd_leaderboard)
+
+    cl = sub.add_parser("collections", help="show the HF collections LEADERBOARD.md follows "
+                                            "(JSON; a snapshot for --collections)")
+    cl.add_argument("--out", default=None, help="output file (default stdout)")
+    cl.set_defaults(func=_cmd_collections)
 
     cd = sub.add_parser("card", help="put the per-GPU speed/quality table into a model's HF "
                                      "card (prints a diff; uploads only with --push)")
