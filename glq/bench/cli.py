@@ -5,6 +5,7 @@ Subcommands:
   index     compute the % -of-bf16 weighted quality index from records
   report    render a markdown performance table from records
   compare   side-by-side table for an explicit set of models
+  card      put the per-GPU speed/quality table into a model's HF card
   plot      render performance plots (matplotlib)
   pull/push sync the centralized results repo
 
@@ -104,6 +105,50 @@ def _cmd_leaderboard(args) -> int:
     md = report.leaderboard(recs, weights=_load_weights(args.weights),
                             generated_utc=None if args.no_timestamp else utcnow_iso())
     _emit(md, args.out or "LEADERBOARD.md")
+    return 0
+
+
+def _cmd_card(args) -> int:
+    """Splice the per-GPU table into a model's HF card. A dry run unless --push."""
+    import difflib
+    import os
+
+    from . import report
+    if args.push and args.card_file:
+        print("glq-bench: --push reads the card from the Hub, so it cannot overwrite edits "
+              "made there since your local copy; drop --card-file", file=sys.stderr)
+        return 2
+    recs = _load_records(args)
+    try:
+        section = report.card_section(recs, args.model)
+        if args.card_file:
+            old = Path(args.card_file).read_text(encoding="utf-8")
+        else:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(args.model, "README.md", force_download=True,
+                                   token=os.environ.get("HF_TOKEN"))
+            old = Path(path).read_text(encoding="utf-8")
+        new = report.splice_card(old, section)
+    except ValueError as e:
+        print(f"glq-bench: {e}", file=sys.stderr)
+        return 2
+
+    if new == old:
+        print("card already up to date", flush=True)
+    else:
+        sys.stdout.writelines(difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            "README.md (current)", "README.md (with glq-bench section)"))
+    if args.out:
+        _emit(new, args.out)
+    if args.push and new != old:
+        from huggingface_hub import HfApi
+        HfApi(token=os.environ.get("HF_TOKEN")).upload_file(
+            path_or_fileobj=new.encode("utf-8"), path_in_repo="README.md",
+            repo_id=args.model, commit_message="Model card: speed and quality by GPU")
+        print(f"pushed README.md to {args.model}", flush=True)
+    elif not args.push:
+        print("(dry run — nothing uploaded; re-run with --push to publish)", flush=True)
     return 0
 
 
@@ -238,6 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
     lb.add_argument("--out", default=None, help="output file (default LEADERBOARD.md; '-' for stdout)")
     lb.add_argument("--no-timestamp", action="store_true", help="omit the generated-on timestamp")
     lb.set_defaults(func=_cmd_leaderboard)
+
+    cd = sub.add_parser("card", help="put the per-GPU speed/quality table into a model's HF "
+                                     "card (prints a diff; uploads only with --push)")
+    cd.add_argument("--model", required=True, help="HF repo id of the model whose card to update")
+    cd.add_argument("--records", default=None, help="read records from this JSONL instead of the repo")
+    cd.add_argument("--card-file", dest="card_file", default=None,
+                    help="read the current card from this file instead of the Hub (offline review)")
+    cd.add_argument("--out", default=None, help="also write the new card to this file")
+    cd.add_argument("--push", action="store_true",
+                    help="upload the new README.md to the model repo (token from HF_TOKEN)")
+    cd.set_defaults(func=_cmd_card)
 
     c = sub.add_parser("compare", help="side-by-side table for explicit models")
     c.add_argument("--records", default=None)

@@ -46,6 +46,27 @@ Pass `--records file.jsonl` to any read command to work offline against a local 
 quality tasks (perplexity inverts). bf16 = 100%; quality-only (tok/s + VRAM reported
 beside it, not folded in). Override task weights with `--weights weights.yaml`.
 
+## Speed and quality by GPU (LEADERBOARD.md and model cards)
+`glq-bench leaderboard` leads with one row per **(model, GPU)**: VRAM, bpw, AIME 2026
+avg@8, Terminal-Bench, and decode tok/s and TTFT at batch 1 / 8 / 32. Keyed on the GPU too,
+because speed and VRAM do not transfer between cards. Each column has exactly one source:
+
+| column | from |
+|---|---|
+| VRAM GiB | any in-process task's VRAM-at-load (`aime_2026`, `mmlu_pro`, ...) — `decode_sweep` runs its own server and does not record it |
+| AIME 2026 avg@8 | `aime_2026` run with `--avg-k 8` — single-pass records are never shown |
+| Terminal-Bench | `terminal_bench` at the version the adapter pins — other versions are never shown |
+| Batch=N tok/s, TTFT | `decode_sweep` with `--task-config '{"concurrencies": [1, 8, 32]}'` |
+
+The same table, limited to one model's base family, goes into that model's HF card:
+```bash
+glq-bench card --model <repo-id>          # prints the diff against the live card; uploads nothing
+glq-bench card --model <repo-id> --push   # uploads README.md (HF_TOKEN from the environment)
+```
+It replaces the block between `<!-- glq-bench:model-gpu-table:begin/end -->` markers, or
+inserts one before `## How GLQ works`. A card without that heading ahead of the appended
+base-model card is refused, not guessed at.
+
 ## Layout
 `provenance` (versions/GPU) · `hfmeta` (base/quant/bpw/links) · `runtime` (vLLM load
 + serving command + load-mem) · `record` (schema/JSONL) · `tasks/` (adapters +
