@@ -152,7 +152,15 @@ def collection_repo_ids(fetch=_fetch_json) -> list[str]:
     except Exception as exc:                                          # noqa: BLE001
         raise DiscoveryError(
             f"could not read the GLQ collection ({COLLECTION_SLUG}): {exc}") from exc
+    return public_model_ids(data)
 
+
+def public_model_ids(data: dict) -> list[str]:
+    """The public model ids of one collection's API response, in the curator's order.
+
+    The one copy of the rule: ``glq-bench leaderboard`` builds its sections from the same
+    collections the installer offers, and must drop the same items for the same reasons.
+    """
     ids = []
     for item in data.get("items", []):
         if item.get("type") != "model":
