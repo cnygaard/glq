@@ -223,12 +223,17 @@ def test_rows_group_by_base_then_bigger_gpu_first_then_glq_bf16_others():
 
 # --------------------------------------------------------------------------- leaderboard
 
-def test_the_leaderboard_leads_with_the_table():
+def test_the_leaderboards_tables_are_this_per_gpu_table():
+    """Every section of LEADERBOARD.md uses these columns — the structure is tested in
+    test_bench_leaderboard_collections.py; this pins that the table is the same one."""
+    from glq.bench.hfcollections import Collection
     recs = [aime(BF16, PRO6000, 0.87), aime(GLQ, PRO6000, 0.9),
             sweep(GLQ, PRO6000, {1: (130.9, 42.0)})]
-    md = report.leaderboard(recs, generated_utc="2026-10-28T00:00:00Z")
-    assert "## Speed and quality by GPU" in md
-    assert md.index("## Speed and quality by GPU") < md.index("# Quality index")
+    start = Collection("Start here", "xv0y5ncu/start-here", "", [GLQ.id])
+    md = report.leaderboard(recs, start_here=start, families=[],
+                            generated_utc="2026-10-28T00:00:00Z")
+    assert header_of(md) == header_of(report.model_gpu_table(recs))
+    assert row(md, GLQ.id, "RTX PRO 6000")["Batch=1 tok/s"] == "130.9"
 
 
 # --------------------------------------------------------------------------- model card
