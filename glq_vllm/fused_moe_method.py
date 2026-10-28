@@ -22,6 +22,7 @@ from .linear_method import (
     _detect_block_diag, _pack_block_meta,
 )
 from ._dispatch import _grouped_enabled
+from ._dispatch import trellis_moe_activation_ok as _trellis_moe_activation_ok
 
 #: One-shot latch for the "CPU MoE took the per-expert loop" notice. A 26B-A4B has 30 MoE
 #: layers and decodes one token at a time, so a per-call warning would be unreadable.
@@ -868,11 +869,16 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def _activation_type(activation) -> int:
-        """Map activation string/enum to integer for C++ dispatch."""
-        act = activation.value if hasattr(activation, 'value') else str(activation) if activation else "silu"
-        return {"silu": 0, "gelu": 1, "gelu_tanh": 1, "gelu_pytorch_tanh": 1,
-                "relu2": 2, "silu_no_mul": 3, "gelu_no_mul": 4,
-                "relu2_no_mul": 5}.get(act, 5)
+        """Map activation string/enum to the integer the C++ kernels dispatch on.
+
+        Delegates to `_dispatch.activation_id` so the table lives next to
+        `trellis_moe_activation_ok`, the predicate that decides whether an id is safe to
+        run fused. An activation GLQ does not implement comes back as
+        `ACTIVATION_UNSUPPORTED`, which every guard refuses — see that function for why
+        guessing one was a silent-corruption bug rather than a harmless default.
+        """
+        from ._dispatch import activation_id
+        return activation_id(activation)
 
     @torch.compiler.disable
     def apply(
@@ -923,7 +929,10 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             if (getattr(layer, 'glq_trellis_fused_ok', False)
                     and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                     and x.shape[0] <= _bd_cap
-                    and self._activation_type(activation) < 3
+                    # 0-5: the gated three AND the non-gated three. This used to be `< 3`,
+                    # which sent NemotronH (non-gated relu2, id 5) to the loop below and so
+                    # made the whole model unservable without --enforce-eager.
+                    and _trellis_moe_activation_ok(self._activation_type(activation))
                     and _ik._try_load_cuda_ext()
                     and hasattr(_ik._glq_cuda, 'glq_fused_moe_trellis_3inst_cuda')
                     and hasattr(torch.ops, 'glq')

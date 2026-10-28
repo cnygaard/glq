@@ -36,6 +36,35 @@ _MERGE_MAP = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
               ".in_proj_qkvz": (".in_proj_qkv", ".in_proj_z"),
               ".kv_proj": (".key_proj", ".value_proj")}
 
+def _backbone_forms(prefix: str) -> set[str]:
+    """Alias spellings for NemotronH's ``backbone.`` root. ``-> {alternative forms}``
+
+    vLLM renames the **weights** on the way in — `nemotron_h.py` carries
+    ``hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"backbone": "model",
+    "mtp": None})`` — but the quantization_config travels untouched, so ``layer_bpw`` keeps
+    the checkpoint spelling (``backbone.*``, matching ``sd_prefix``) while
+    ``get_quant_method`` is asked about ``model.*``.
+
+    Without this every lookup missed, so the whitelist branch in `get_quant_method` handed
+    each layer to `UnquantizedLinearMethod`, vLLM built dense linears expecting ``.weight``,
+    and the GLQ buffers had nowhere to land. It surfaced as
+    ``AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'`` from
+    inside vLLM's own loader, naming nothing — measured on a 3 bpw Lightning-30B whose 6,004
+    whitelist entries matched zero layers.
+
+    Both directions, as the sibling aliases in `_lookup_bpw` are: a checkpoint written with
+    native prefixes is equally legal, and an alias that matches nothing is free. The nested
+    form covers the VL wrapper, whose ``sd_prefix`` is ``language_model.backbone.layers``.
+
+    Delegates to `glq.name_aliases.backbone_aliases`, the one origin for this rename — the
+    HF nn.Linear walk and the expert packed-shape lookup need the identical mapping, and
+    while each kept its own inline copy they drifted: the expert one never gained the
+    ``language_model.`` forms added here.
+    """
+    from glq.name_aliases import backbone_aliases
+    return backbone_aliases(prefix)
+
+
 #: Fused layers whose vLLM partition structure differs from the checkpoint's matrix
 #: structure. Qwen3.5's in_proj_qkvz is a MergedColumnParallelLinear with FOUR output
 #: partitions [key, key, value, value] whose weights-mapper attaches shard_id=(0, 1, 2)
@@ -180,6 +209,7 @@ class GLQvLLMConfig(QuantizationConfig):
         if prefix.startswith("language_model.model."):
             forms.add("model.language_model."
                       + prefix[len("language_model.model."):])
+        forms |= _backbone_forms(prefix)
         merge_map = _MERGE_MAP
         best = None
         for f in forms:
@@ -221,6 +251,7 @@ class GLQvLLMConfig(QuantizationConfig):
             forms.add("language_model.model."
                       + prefix[len("model.language_model."):])
             forms.add("model." + prefix[len("model.language_model."):])
+        forms |= _backbone_forms(prefix)
         return any(f in self._moe_containers for f in forms)
 
     def _is_prefused(self, prefix: str) -> bool:
@@ -239,6 +270,16 @@ class GLQvLLMConfig(QuantizationConfig):
             forms.add("model.language_model." + prefix[len("model."):])
         if prefix.startswith("language_model.model."):
             forms.add("model.language_model." + prefix[len("language_model.model."):])
+        # NemotronH: layer_bpw keeps the checkpoint's `backbone.*` while vLLM asks about
+        # `model.*`. `_lookup_bpw` got this alias first and this function did not —
+        # and the asymmetry is the worst possible one. The layer RESOLVES as quantized (so
+        # GLQ claims it, the whitelist check passes, the footprint is right) but is NOT
+        # recognised as pre-fused, so Mamba2's in_proj — one jointly-quantized checkpoint
+        # matrix that vLLM builds as a 5-partition merged linear [z, x, B, C, dt] — got
+        # five shard slots and a one-matrix load with nowhere to land. Every Mamba layer
+        # served a ZERO weight. Measured on Lightning-30B at 3 and 4 bpw:
+        # SQNR(W_hf, W_vllm) = 0.00 dB for in_proj, 54.90 dB for the 1:1 out_proj.
+        forms |= _backbone_forms(prefix)
         return any(f in self.layer_bpw for f in forms)
 
     def embedding_quant_method(self, prefix: str):

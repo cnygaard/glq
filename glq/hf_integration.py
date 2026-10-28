@@ -357,17 +357,29 @@ def replace_with_glq_linear(model, block_diagonal=False, quantized_layers=None,
     ``MODULES_TO_NOT_CONVERT`` exclusion list — used as the fallback when
     the checkpoint can't be peeked.
     """
+    from .name_aliases import with_aliases
+
     has_replaced = False
     for name, module in list(model.named_modules()):
         skip = any(excl in name for excl in MODULES_TO_NOT_CONVERT)
         if skip or not isinstance(module, nn.Linear):
             continue
-        if quantized_layers is not None and name not in quantized_layers:
+        # `quantized_layers` and `shapes` are both keyed on the CHECKPOINT key, which for
+        # NemotronH is `backbone.*`, while `named_modules()` yields `model.*` — transformers
+        # renames the prefix on load. Matching the module spelling alone skipped every Mamba
+        # mixer projection: they stayed plain nn.Linear, their GLQ payload never loaded, and
+        # because the MoE experts (matched by TYPE, not name) dominate the footprint the miss
+        # stayed inside any size tolerance. See `glq.name_aliases`.
+        candidates = with_aliases(name)
+        if quantized_layers is not None and not any(c in quantized_layers
+                                                    for c in candidates):
             continue
 
         # True packed shape off the checkpoint header, so the meta skeleton weighs what
         # the model will actually weigh and device_map="auto" can place it.
-        packed = ((shapes or {}).get(name, {}) or {}).get("trellis_packed")
+        packed = next((s for c in candidates
+                       if (s := ((shapes or {}).get(c, {}) or {}).get("trellis_packed"))),
+                      None)
         with torch.device("meta"):
             new_module = E8RHTLinear(
                 module.in_features,

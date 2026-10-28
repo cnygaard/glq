@@ -4557,12 +4557,24 @@ __global__ void glq_moe_gated_activation_batched_kernel(
     int b = (int)(idx / intermediate);
     int i = (int)(idx % intermediate);
     float g = __half2float(in[(long)b * w13_out + i]);
-    float up = __half2float(in[(long)b * w13_out + intermediate + i]);
     float a;
-    if (act_type == 0) a = g / (1.0f + expf(-g));
-    else if (act_type == 1) a = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+    // 0/1/2 are the GATED silu / gelu-tanh / relu2; 3/4/5 are the same three NON-GATED
+    // (NemotronH is 5: up -> relu**2 -> down, no gate). `% 3` picks the function, and for
+    // act_type < 3 it is the identity, so the gated arithmetic below is unchanged — this
+    // kernel is shared with glq_fused_moe_grouped_gemm_cuda and glq_fused_moe_e8p_cuda,
+    // whose outputs must stay bit-identical. Mirrors launch_moe_activation's single-row
+    // switch, which already had the non-gated cases.
+    int kind = act_type % 3;
+    if (kind == 0) a = g / (1.0f + expf(-g));
+    else if (kind == 1) a = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
     else { float r = fmaxf(g, 0.0f); a = r * r; }
-    out[(long)b * intermediate + i] = __float2half(a * up);
+    if (act_type < 3) {
+        // Gated: the second half of the w13 row is the `up` projection. Non-gated layers
+        // have w13_out == intermediate, so that half does not exist and must not be read.
+        float up = __half2float(in[(long)b * w13_out + intermediate + i]);
+        a *= up;
+    }
+    out[(long)b * intermediate + i] = __float2half(a);
 }
 
 // Grouped TC matmul + deterministic reduce over a PRE-GROUPED input (no gather).
@@ -5073,9 +5085,12 @@ torch::Tensor glq_fused_moe_trellis_3inst_cuda(
     CHECK_INPUT(x);
     CHECK_INPUT(w13_trellis_packed);
     CHECK_INPUT(w2_trellis_packed);
-    TORCH_CHECK(activation_type < 3,
-                "trellis MoE path supports gated activations (0/1/2) only, got ",
-                activation_type);
+    // 0/1/2 gated, 3/4/5 the same three non-gated (NemotronH is 5). Still a check rather
+    // than nothing: an id outside the table would otherwise silently compute silu, because
+    // the activation kernel selects with `% 3`.
+    TORCH_CHECK(activation_type >= 0 && activation_type < 6,
+                "trellis MoE path supports activations 0-5 (0/1/2 gated silu/gelu-tanh/relu2, "
+                "3/4/5 the same non-gated), got ", activation_type);
     TORCH_CHECK(w13_trellis_packed.scalar_type() == torch::kInt16
                     && w2_trellis_packed.scalar_type() == torch::kInt16,
                 "trellis_packed must be int16");

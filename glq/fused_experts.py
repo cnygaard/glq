@@ -552,11 +552,8 @@ def _nongated_packed_shapes(prefix: str, n_exp: int, shapes: dict | None):
     """
     if not shapes:
         return {}
-    candidates = [prefix]
-    if prefix.startswith("model."):
-        candidates.append("backbone." + prefix[len("model."):])
-    elif prefix.startswith("backbone."):
-        candidates.append("model." + prefix[len("backbone."):])
+    from .name_aliases import with_aliases
+    candidates = with_aliases(prefix)
 
     out = {}
     for e in range(n_exp):

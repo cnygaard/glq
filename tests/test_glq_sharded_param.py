@@ -200,3 +200,34 @@ def test_vector_shard_default_unchanged():
         m_pad = _glq_pad(sz)
         assert sd.shape == (m_pad,), (
             f"SU shard expected ({m_pad},); got {tuple(sd.shape)}")
+
+
+# A one-matrix load (`shard_id=None`) into a multi-shard parameter used to be a silent
+# no-op: `load_column_parallel_weight` only wrote when there was exactly one shard. On
+# NemotronH that left every Mamba `in_proj` at zeros — vLLM allocated five slots for
+# [z, x, B, C, dt], the checkpoint supplied one jointly-quantized matrix, and nothing
+# complained. Measured: y_vllm absmax 0.0, SQNR(W_hf, W_vllm) 0.00 dB on layer 0, with the
+# footprint, the whitelist and two quantize runs all reading as healthy.
+
+
+@requires_vllm
+def test_a_whole_matrix_load_into_a_sharded_parameter_fails_loudly():
+    """The silence that let a zero-weight layer ship. A one-matrix load (`shard_id=None`)
+    reaching a multi-shard GLQ parameter is a structural contradiction: the caller
+    allocated per-shard slots, the checkpoint supplied one matrix. The only correct
+    answer is an error naming the mismatch, so a misconfigured layer fails at LOAD
+    rather than serving zeros through a correct-looking footprint."""
+    five = GLQShardedParameter([4096, 4096, 1024, 1024, 64], inner_dim=48,
+                               dtype=torch.int16, weight_loader=_noop_loader)
+    whole = torch.ones(10304 * 3, 48, dtype=torch.int16)      # one packed matrix
+    with pytest.raises(ValueError, match="5 shard"):
+        five.load_column_parallel_weight(whole)
+    # Nothing may have been silently written either.
+    assert all(int(s.abs().sum()) == 0 for s in five._shard_data)
+
+    # The single-shard case — a genuine ColumnParallelLinear — must keep working.
+    one = GLQShardedParameter([10304], inner_dim=48, dtype=torch.int16,
+                              weight_loader=_noop_loader)
+    src = torch.full_like(one._shard_data[0], 7)
+    one.load_column_parallel_weight(src)
+    assert torch.equal(one._shard_data[0], src)
