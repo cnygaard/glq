@@ -393,3 +393,37 @@ def test_glq_code_names_nemotron_among_the_supported_families():
     `tool_serve_args` now knows."""
     src = (Path(__file__).resolve().parents[1] / "glq" / "code.py").read_text()
     assert "Nemotron 3.5" in src
+
+
+# ---- the reasoning parser glq-chat serves with ------------------------------------------
+#
+# glq-chat sends no chat-template kwargs, so a model only produces a reasoning block in the
+# chat if its template thinks by DEFAULT. Without a parser that block lands in `content`:
+# measured on Nemotron 3.5, whose template ends the prompt in `<think>\n` and whose `</think>`
+# is not a special token, so the user saw the whole trace, a literal `</think>`, then the answer.
+
+@pytest.mark.parametrize("model, parser", [
+    (NEMOTRON[0], "nemotron_v3"),
+    ("xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw", "qwen3"),
+    (KOLIBRI, "kolibri1"),
+])
+def test_default_thinking_families_get_their_reasoning_parser(model, parser):
+    assert T.reasoning_serve_args(model) == ["--reasoning-parser", parser]
+
+
+@pytest.mark.parametrize("model", [
+    # gemma-4's template defaults enable_thinking to false: no reasoning block in glq-chat.
+    "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw",
+    # SmolLM3 has no reasoning parser in the table at all.
+    "xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel",
+    "some-org/unheard-of-model",
+])
+def test_other_families_get_no_reasoning_parser(model):
+    assert T.reasoning_serve_args(model) == []
+
+
+@pytest.mark.parametrize("model", [NEMOTRON[0], "Qwen/Qwen3.8-27B", KOLIBRI])
+def test_the_reasoning_parser_is_the_one_glq_code_uses(model):
+    """One source for parser names: a second copy is how the tool parsers drifted twice."""
+    tool = T.tool_serve_args(model)
+    assert T.reasoning_serve_args(model)[1] == tool[tool.index("--reasoning-parser") + 1]

@@ -31,6 +31,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,6 +40,7 @@ from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
                             DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS,
                             DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
+from glq.tooling import reasoning_serve_args
 from glq.tooling import recommended_sampling as _recommended_sampling
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -146,6 +148,78 @@ def completion_kwargs(*, model, messages, temperature, top_p, top_k, max_tokens)
     return kwargs
 
 
+#: The accordion title of a reasoning message. Gradio renders any message whose `metadata`
+#: has a `title` as a collapsible "thought" (gradio.app/guides/agents-and-tool-usage).
+THINKING_TITLE = "Thinking"
+
+#: Shown in place of an answer when the reply limit ran out mid-thought. Without it the chat
+#: shows a thought and then nothing, which reads as a hang.
+LIMIT_NOTE = ("*The reply limit was reached while the model was still thinking. Raise "
+              "**max tokens** in Settings and ask again.*")
+
+
+def history_messages(history) -> list[dict]:
+    """Gradio's chat history as OpenAI messages, without the reasoning.
+
+    A thought is display only: sending it back would put the model's previous reasoning into
+    the next prompt as if it were part of the answer. Thoughts are recognised the way Gradio
+    renders them, by a `title` in `metadata`.
+    """
+    messages = []
+    for turn in history or []:
+        # Gradio 'messages' format: {"role": ..., "content": ..., "metadata": ...}
+        if not isinstance(turn, dict) or (turn.get("metadata") or {}).get("title"):
+            continue
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    return messages
+
+
+def _reply_messages(reasoning, answer, started, ended):
+    """The thought and, once it has begun, the answer — the list the UI is given."""
+    meta = {"title": THINKING_TITLE, "status": "pending" if ended is None else "done"}
+    if ended is not None:
+        meta["duration"] = round(ended - started, 1)
+    messages = [{"role": "assistant", "content": reasoning, "metadata": meta}]
+    if answer:
+        messages.append({"role": "assistant", "content": answer})
+    return messages
+
+
+def stream_reply(stream, clock=time.monotonic):
+    """Turn a streamed chat completion into what the chat shows, update by update.
+
+    With a reasoning parser on the server, vLLM streams the reasoning separately from the
+    answer: as `reasoning` since 0.32, as `reasoning_content` before that. Until any arrives
+    this yields the answer as a plain string, so a model that does not think looks exactly as
+    it always did. Once reasoning arrives it yields the whole message list on every update, as
+    Gradio's guide does for a thinking model: the thought (pending while it grows, then done
+    with its duration) and the answer as a second message from its first token on.
+    """
+    reasoning, answer, finish = "", "", None
+    started = ended = None
+    for chunk in stream:
+        if not chunk.choices:                   # e.g. a usage-only chunk at the end
+            continue
+        choice = chunk.choices[0]
+        delta = choice.delta
+        thought = (getattr(delta, "reasoning", None)
+                   or getattr(delta, "reasoning_content", None) or "")
+        finish = choice.finish_reason or finish
+        if thought:
+            started = clock() if started is None else started
+            reasoning += thought
+        if delta.content:
+            if reasoning and ended is None:
+                ended = clock()
+            answer += delta.content
+        yield (_reply_messages(reasoning, answer, started, ended) if reasoning else answer)
+    if reasoning and ended is None:
+        ended = clock()
+        if not answer and finish == "length":
+            answer = LIMIT_NOTE
+        yield _reply_messages(reasoning, answer, started, ended)
+
+
 def show_model_picker(models: list[str]) -> bool:
     """Is there anything to pick between?
 
@@ -157,7 +231,7 @@ def show_model_picker(models: list[str]) -> bool:
 
 
 def build_ui(base_url: str, models: list[str], api_key: str = "glq",
-             max_model_len: int = DEFAULT_MAX_MODEL_LEN):
+             max_model_len: int = DEFAULT_MAX_MODEL_LEN, thinking: bool = False):
     # Imported here, not at module scope: `glq[chat]` is an extra, and `main()` must be able
     # to report a missing gradio itself rather than failing at import — which is also what
     # lets these paths be tested without it.
@@ -166,22 +240,13 @@ def build_ui(base_url: str, models: list[str], api_key: str = "glq",
     client = _openai_client(base_url, api_key)
 
     def respond(message, history, model, temperature, top_p, top_k, max_tokens):
-        messages = []
-        for turn in history or []:
-            # Gradio 'messages' format: {"role": ..., "content": ...}
-            if isinstance(turn, dict):
-                messages.append({"role": turn["role"], "content": turn["content"]})
+        messages = history_messages(history)
         messages.append({"role": "user", "content": message})
 
         stream = client.chat.completions.create(
             **completion_kwargs(model=model, messages=messages, temperature=temperature,
                                 top_p=top_p, top_k=top_k, max_tokens=max_tokens))
-
-        out = ""
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            out += delta
-            yield out
+        yield from stream_reply(stream)
 
     served = models[0] if models else None
     with gr.Blocks(title="GLQ chat") as demo:
@@ -207,8 +272,11 @@ def build_ui(base_url: str, models: list[str], api_key: str = "glq",
             top_k = gr.Slider(0, 200, value=sampling["top_k"], step=1,
                               label="top_k (0 = off)")
             ceiling = max_tokens_ceiling(max_model_len)
-            max_tokens = gr.Slider(64, ceiling, value=min(1024, ceiling), step=64,
-                                   label="max tokens")
+            # A thinking model spends its reasoning out of the same budget, so 1,024 can run
+            # out before the answer starts; give it the whole ceiling.
+            max_tokens = gr.Slider(64, ceiling,
+                                   value=ceiling if thinking else min(1024, ceiling),
+                                   step=64, label="max tokens")
 
         # No `type=` argument: Gradio 6 removed it and made the messages format the only
         # one (it was required in 5.x). `respond` therefore always receives history as a
@@ -626,6 +694,10 @@ def main(argv=None) -> int:
     if _mtp_err:
         print(f"error: {_mtp_err}", file=sys.stderr)
         return 2
+    # A family whose template thinks by default gets its reasoning parser, so vLLM returns the
+    # reasoning apart from the answer and the chat can show it as a "Thinking" block. Without
+    # it the trace lands in the reply itself (for Nemotron 3.5 with a literal `</think>`).
+    _reasoning = reasoning_serve_args(args.model or "")
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -669,6 +741,7 @@ def main(argv=None) -> int:
         # the pool vLLM queues rather than failing, so a second browser tab waits instead of
         # being refused — the over-subscription `_WINDOW_CONCURRENCY` documents.
         window_concurrency=1,
+        extra_args=_reasoning,
     )
 
     # The last guard, and the most expensive failure it prevents: a checkpoint larger than
@@ -736,7 +809,8 @@ def main(argv=None) -> int:
         # first, or the share tunnel dies wherever the user happened to launch from.
         os.chdir(writable_workdir())
         build_ui(args.base_url, models,
-                 max_model_len=supervisor.max_model_len).launch(
+                 max_model_len=supervisor.max_model_len,
+                 thinking=bool(_reasoning)).launch(
             server_port=args.port, share=args.share,
             inbrowser=args.browser and _display_available())
     return 0
