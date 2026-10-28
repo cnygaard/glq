@@ -312,3 +312,13 @@ def test_the_card_command_writes_the_spliced_card_offline(tmp_path):
     new = out.read_text(encoding="utf-8")
     assert report.CARD_BEGIN in new and "90.0%" in new
     assert card.read_text(encoding="utf-8") == CARD        # the source is not modified
+
+
+def test_the_legend_says_vram_is_weights_only_not_the_kv_pool():
+    """`load_gpu_mem_gib` is parsed from vLLM's "Model loading took X GiB" line: the
+    weights, not the KV-cache pool. Calling it "GPU memory after load" overstated it —
+    CLAUDE.md wants the KV cache in a footprint claim, so the legend must not imply it."""
+    t = report.model_gpu_table([aime(GLQ, PRO6000, 0.9, vram=17.84)])
+    legend = t.split("\n\n", 1)[1]
+    assert "weights" in legend and "KV" in legend
+    assert "GPU memory right after load" not in legend

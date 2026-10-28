@@ -104,6 +104,49 @@ def _disk_gb(local_dir: Path | None, model: str, hf_token: str | None) -> float 
         return None
 
 
+def _first(v):
+    """A base_model value as one repo id: cards store it as a string or a list."""
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else None
+    return str(v).strip().strip("'\"") if v else None
+
+
+def _card_base_model(model: str, local_dir: Path | None, hf_token: str | None) -> str | None:
+    """``base_model`` from the checkpoint's model card, or None.
+
+    Needed because a quantized checkpoint's config often does not name its parent —
+    nvidia/Gemma-4-31B-IT-NVFP4's config.json has no ``_name_or_path`` — while its card's
+    frontmatter does. A local dir reads its own README.md (the card GLQ writes at quantize
+    time); a repo id reads the Hub's parsed card metadata.
+    """
+    if local_dir is not None:
+        readme = local_dir / "README.md"
+        if not readme.is_file():
+            return None
+        text = readme.read_text(encoding="utf-8", errors="replace")
+        if not text.startswith("---"):
+            return None
+        front = text.split("---", 2)[1] if text.count("---") >= 2 else ""
+        lines = front.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("base_model:"):
+                continue
+            rest = line[len("base_model:"):].strip()
+            if rest.startswith("["):
+                return _first([s for s in rest.strip("[]").split(",") if s.strip()])
+            if rest:
+                return _first(rest)
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            return _first(nxt[1:]) if nxt.startswith("-") else None
+        return None
+    try:
+        from huggingface_hub import model_info
+        data = model_info(model, token=hf_token).card_data
+        return _first((data.to_dict() if data is not None else {}).get("base_model"))
+    except Exception:  # noqa: BLE001 — offline / gated / no card: no base, not an error
+        return None
+
+
 def model_meta(model: str, *, quant_override: str | None = None,
                hf_token: str | None = None) -> ModelMeta:
     """Build a ``ModelMeta`` for an HF repo id or a local checkpoint dir.
@@ -124,6 +167,14 @@ def model_meta(model: str, *, quant_override: str | None = None,
         base = None
 
     quant_method = _detect_quant_method(cfg, qcfg, quant_override)
+    # No base in the config: a QUANTIZED checkpoint's card names the model it was quantized
+    # from, so use that. An unquantized one is skipped on purpose — google/gemma-4-31B-it's
+    # card names its pretraining parent (google/gemma-4-31B), and taking it would pull the
+    # bf16 baseline out of its own family. Unquantized means it IS the base.
+    if not base and quant_method != "none":
+        base = _card_base_model(model, local_dir, hf_token)
+        if base and _looks_like_local_dir(base):
+            base = None
     avg, lo, hi, is_mixed = _bpw_info(cfg, qcfg)
     arch = (cfg.get("architectures") or [None])[0]
 

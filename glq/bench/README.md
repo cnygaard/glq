@@ -53,7 +53,7 @@ because speed and VRAM do not transfer between cards. Each column has exactly on
 
 | column | from |
 |---|---|
-| VRAM GiB | any in-process task's VRAM-at-load (`aime_2026`, `mmlu_pro`, ...) — `decode_sweep` runs its own server and does not record it |
+| VRAM GiB | the weights vLLM reports at load (`Model loading took X GiB`), from any in-process task (`aime_2026`, `mmlu_pro`, ...) — the KV pool is not included, and `decode_sweep` runs its own server so it does not record this |
 | AIME 2026 avg@8 | `aime_2026` run with `--avg-k 8` — single-pass records are never shown |
 | Terminal-Bench | `terminal_bench` at the version the adapter pins — other versions are never shown |
 | Batch=N tok/s, TTFT | `decode_sweep` with `--task-config '{"concurrencies": [1, 8, 32]}'` |
