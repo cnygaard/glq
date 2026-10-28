@@ -4,8 +4,25 @@ plots live in ``plot.py``.
 """
 from __future__ import annotations
 
+import re
+
 from .index import compute_index
 from .record import BenchRecord
+from .tasks.terminal_bench import _DATASET as TB_DATASET
+
+#: The Terminal-Bench column shows only records of the version the task adapter pins: 4.0
+#: dropped 8 of 3.0's 74 tasks and revised 20, so a score from another version is a different
+#: number in the same column. Read from the adapter, so bumping the pin there moves the label
+#: and the filter together.
+TB_LABEL = "Terminal-Bench " + ".".join(TB_DATASET.rsplit("@", 1)[-1].split(".")[:2])
+
+#: Batch sizes in the per-(model, GPU) table; each is one concurrency of `decode_sweep`.
+GPU_TABLE_BATCHES = (1, 8, 32)
+
+#: Markers around the generated section of a model card. Everything between them is
+#: regenerated; everything outside is never touched.
+CARD_BEGIN = "<!-- glq-bench:model-gpu-table:begin -->"
+CARD_END = "<!-- glq-bench:model-gpu-table:end -->"
 
 
 def _md_table(headers: list[str], rows: list[list]) -> str:
@@ -196,6 +213,178 @@ def compare_table(records: list[BenchRecord], *, models: list[str],
     return _md_table(headers, rows)
 
 
+def gpu_short(name: str | None) -> str:
+    """What people call the card: ``NVIDIA RTX PRO 6000 Blackwell Server Edition`` ->
+    ``RTX PRO 6000``. The full name stays in every record; this is only the label."""
+    if not name:
+        return "unknown GPU"
+    s = re.sub(r"^NVIDIA\s+", "", name.strip())
+    s = re.sub(r"^GeForce\s+", "", s)
+    s = re.sub(r"\s+(Blackwell|Ada|Ampere|Hopper|Lovelace)\b.*$", "", s)
+    s = re.sub(r"\s+(Server|Workstation) Edition$", "", s)
+    return s
+
+
+_MISSING = "—"
+#: Row order within a base family and GPU: GLQ builds, then the bf16 base, then the rest.
+_METHOD_RANK = {"glq": 0, "none": 1, "bf16": 1}
+
+
+def _avg_k(r: BenchRecord) -> int:
+    return int(r.benchmark.config.get("avg_k") or r.benchmark.extra.get("avg_k") or 1)
+
+
+def _gpu_cells(group: list[BenchRecord]) -> tuple[list[str], set[str]]:
+    """The table cells for one (model, GPU), and the footnote marks they used."""
+    def latest(rs):
+        return max(rs, key=lambda r: r.timestamp_utc or "") if rs else None
+
+    head = latest(group)
+    m = head.model
+    method = (m.quant_method or "none").lower()
+    if m.bpw is not None:
+        bpw = f"{m.bpw:g}"
+    elif method in ("none", "bf16"):
+        bpw = "16"
+    else:
+        bpw = _MISSING
+
+    # VRAM: a full-footprint measurement beats one taken with weights offloaded to host,
+    # whose number is only the resident share.
+    measured = [r for r in group if r.serving and r.serving.load_gpu_mem_gib is not None]
+    full = latest([r for r in measured if not r.serving.cpu_offload_gb])
+    offloaded = False
+    if full is not None:
+        vram = f"{round(full.serving.load_gpu_mem_gib, 2):g}"
+    elif measured:
+        vram = f"{round(latest(measured).serving.load_gpu_mem_gib, 2):g} ‡"
+        offloaded = True
+    else:
+        vram = _MISSING
+
+    aime = latest([r for r in group if r.benchmark.task == "aime_2026" and _avg_k(r) == 8
+                   and r.benchmark.value is not None])
+    # Full-dataset runs only. `n_tasks` is None when harbor got no `-l` limit; a limited run
+    # is a capability smoke, which belongs in no table — 1/3 would print as 33.3% beside
+    # full-dataset scores.
+    tb = latest([r for r in group if r.benchmark.task.startswith("terminal_bench")
+                 and r.benchmark.config.get("dataset") == TB_DATASET
+                 and not r.benchmark.config.get("n_tasks")
+                 and r.benchmark.value is not None])
+
+    toks, ttft, marks = [], [], set()
+    sweeps = [r for r in group if r.benchmark.task == "decode_sweep"]
+    for b in GPU_TABLE_BATCHES:
+        hit = latest([r for r in sweeps
+                      if str(b) in (r.benchmark.extra.get("per_concurrency") or {})])
+        pc = hit.benchmark.extra["per_concurrency"][str(b)] if hit else {}
+        t, f = pc.get("per_stream_tok_s"), pc.get("mean_ttft_ms")
+        # `serve_extra` reaches `vllm serve`, so a sweep can run with weights offloaded.
+        # That decode is bound by PCIe, not the card, and must not read as the card's speed.
+        off = hit is not None and "cpu-offload" in (hit.benchmark.config.get("serve_extra") or "")
+        if off and t is not None:
+            marks.add("§")
+        toks.append(_MISSING if t is None else f"{t:.1f}" + (" §" if off else ""))
+        ttft.append(_MISSING if f is None else f"{f:.0f}")
+
+    cells = [m.id, gpu_short(head.hardware.gpu_model if head.hardware else None), vram, bpw,
+             _MISSING if aime is None else f"{aime.benchmark.value * 100:.1f}%",
+             _MISSING if tb is None else f"{tb.benchmark.value * 100:.1f}%",
+             *toks, *ttft]
+    if offloaded:
+        marks.add("‡")
+    return cells, marks
+
+
+def model_gpu_table(records: list[BenchRecord]) -> str:
+    """One row per (model, GPU): VRAM, bpw, AIME 2026 avg@8, Terminal-Bench, and decode
+    tok/s and TTFT at batch 1 / 8 / 32. Every cell comes from a record.
+
+    Keyed on the GPU as well as the model because speed and VRAM do not transfer between
+    cards, and not by a constant factor — the other tables here keep only the newest record
+    per model and so mix GPUs. Rows run base family by base family, bigger card first,
+    GLQ before the bf16 base before the other methods.
+    """
+    groups: dict[tuple[str, str], list[BenchRecord]] = {}
+    for r in records:
+        gpu = gpu_short(r.hardware.gpu_model if r.hardware else None)
+        groups.setdefault((r.model.id, gpu), []).append(r)
+
+    def order(item):
+        (model_id, gpu), rs = item
+        m = rs[0].model
+        vram = max((r.hardware.gpu_total_vram_gib or 0) for r in rs if r.hardware) \
+            if any(r.hardware for r in rs) else 0
+        return ((m.base_model or m.id).lower(), -vram, gpu,
+                _METHOD_RANK.get((m.quant_method or "none").lower(), 2), model_id)
+
+    rows, marks = [], set()
+    for _key, rs in sorted(groups.items(), key=order):
+        cells, used = _gpu_cells(rs)
+        rows.append(cells)
+        marks |= used
+
+    batches = GPU_TABLE_BATCHES
+    headers = (["Model", "GPU model", "VRAM GiB", "BPW", "AIME 2026 avg@8", TB_LABEL]
+               + [f"Batch={b} tok/s" for b in batches]
+               + [f"Batch={b} TTFT ms" for b in batches])
+    legend = [
+        f"{_MISSING} = not measured on that GPU. **tok/s** is per-stream decode, "
+        "`1000 / mean TPOT` from `vllm bench sweep serve` (128-token prompts, 256 output "
+        "tokens, prefill excluded); **TTFT** is the mean time to first token at that "
+        "concurrency. **AIME 2026** is avg@8; single-pass runs are not shown. **Terminal-Bench** is "
+        "full-dataset runs only. **VRAM** is the "
+        "weights resident after load (vLLM's `Model loading took` line); the KV-cache pool "
+        "is not included. Every number belongs to the GPU in its row — figures from "
+        "different GPUs do not compare."]
+    if "‡" in marks:
+        legend.append("‡ resident share only: the run offloaded weights to host memory "
+                      "(`--cpu-offload-gb`), so this is not the model's full size.")
+    if "§" in marks:
+        legend.append("§ decoded with weights offloaded to host memory (`--cpu-offload-gb`): "
+                      "bound by PCIe transfer, not by the GPU, so not comparable to rows "
+                      "that fit on the card.")
+    return _md_table(headers, rows) + "\n\n" + "\n\n".join(legend)
+
+
+def card_section(records: list[BenchRecord], model_id: str) -> str:
+    """The generated block for ``model_id``'s card: the per-GPU table for its base family,
+    so the card shows the bf16 and other references measured on the same cards."""
+    own = [r for r in records if r.model.id == model_id]
+    if not own:
+        raise ValueError(f"no benchmark records for {model_id}: run `glq-bench run` and push "
+                         "the records before updating its card")
+    base = max(own, key=lambda r: r.timestamp_utc or "").model.base_model or model_id
+    family = [r for r in records if (r.model.base_model or r.model.id) == base]
+    body = ("## Speed and quality by GPU\n\n"
+            f"_Generated by `glq-bench` from its benchmark records. Rows other than "
+            f"`{model_id}` are reference builds of the same base model, measured on the same "
+            "GPUs._\n\n" + model_gpu_table(family))
+    return f"{CARD_BEGIN}\n{body}\n{CARD_END}"
+
+
+def splice_card(card: str, section: str) -> str:
+    """Put ``section`` into a model card: replace an existing generated block, or insert one
+    just before ``## How GLQ works``.
+
+    Every GLQ card ends with the base model's own card appended inside ``<details>``, and
+    that text can carry any heading. So the anchor must sit before the first ``<details>``,
+    and a card without one is refused rather than guessed at — a wrong guess edits somebody
+    else's prose in a public repo.
+    """
+    if CARD_BEGIN in card or CARD_END in card:
+        b, e = card.find(CARD_BEGIN), card.find(CARD_END)
+        if b == -1 or e == -1 or e < b:
+            raise ValueError("card has an unmatched glq-bench marker; fix it by hand first")
+        return card[:b] + section + card[e + len(CARD_END):]
+    anchor = card.find("\n## How GLQ works")
+    details = card.find("<details>")
+    if anchor == -1 or (details != -1 and anchor > details):
+        raise ValueError("card not in expected state: no '## How GLQ works' heading before "
+                         "the appended base-model card, so there is no safe place to insert")
+    return card[:anchor + 1] + section + "\n\n" + card[anchor + 1:]
+
+
 def leaderboard(records: list[BenchRecord], *, weights: dict | None = None,
                 generated_utc: str | None = None) -> str:
     """Full auto-generated LEADERBOARD.md: the % -of-bf16 index across all bases,
@@ -217,7 +406,9 @@ def leaderboard(records: list[BenchRecord], *, weights: dict | None = None,
              "comparable (GLQ 4 bpw is ~1.9x bf16 single-stream on an L4 and at parity on "
              "an RTX PRO 6000).", ""]
 
-    parts = ["\n".join(head), index_table(records, weights=weights)]
+    parts = ["\n".join(head),
+             "## Speed and quality by GPU\n\n" + model_gpu_table(records),
+             index_table(records, weights=weights)]
 
     # Per-base comparison tables (sorted by base id).
     by_base: dict[str, list[BenchRecord]] = {}
