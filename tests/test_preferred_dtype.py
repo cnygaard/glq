@@ -182,3 +182,65 @@ def test_the_denylist_is_not_empty():
     """A refactor that emptied it would silently make fp16 unconditional, and the models it
     protects fail with a NaN rather than a clear error."""
     assert FP16_UNSAFE and all(isinstance(t, str) and t.islower() for t in FP16_UNSAFE)
+
+
+# --- NemotronH: fp16 silently disables the model's reasoning ---------------------------
+#
+# Measured 2026-10-27, Nemotron-3.5-Lightning-30B-A3B, vLLM 0.32.0, RTX PRO 6000, greedy,
+# same chat-templated prompt (which ends in `<think>\n`, so the model starts INSIDE its
+# reasoning block):
+#
+#   bf16 base, vLLM, bf16     "Here's a thinking process: ... Primary colors: ..."
+#   GLQ 3bpw,  HF,   bf16     "Here's a thinking process: ... Identify Primary Colors ..."
+#   GLQ 3bpw,  vLLM, bf16     "Here's a thinking process: ... Primary colors: ..."
+#   GLQ 3bpw,  vLLM, fp16     "Red, Blue, Yellow. Red is the color of fire ..."
+#
+# fp16 closes the reasoning block immediately and answers. No NaN, no error, fluent and even
+# correct text — the SILENT mode, and the worst one for a reasoning model: an AIME run would
+# score like a much weaker model with nothing in the output to say why. The residual stream
+# peaks at 952 (fp16 max 65504), so the likely overflow is inside a block — the MoE squares
+# its intermediate (relu^2), which overflows fp16 above ~256.
+
+
+@pytest.mark.parametrize("model", [
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+    "xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-3bpw",
+    "xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw",
+])
+def test_nemotron_gets_bf16(model):
+    assert preferred_dtype(model, "cuda") == "bfloat16"
+
+
+def _local_checkpoint(tmp_path, name, model_type, arch):
+    import json
+    d = tmp_path / name
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps(
+        {"model_type": model_type, "architectures": [arch]}))
+    return str(d)
+
+
+def test_a_local_dir_is_judged_by_its_config_not_its_name(tmp_path):
+    """The gap that made a name-only denylist useless on the boxes: every Lightning-30B run
+    was served from a dir like `/opt/dlami/nvme/lightning30b-glq-3bpw`, which contains no
+    family tag, so it got fp16 and silently lost its reasoning. A local checkpoint knows its
+    own family — `config.json` says `nemotron_h` — so read that."""
+    p = _local_checkpoint(tmp_path, "lightning30b-glq-3bpw", "nemotron_h",
+                          "NemotronHForCausalLM")
+    assert preferred_dtype(p, "cuda") == "bfloat16"
+
+
+def test_a_local_dir_of_a_safe_family_keeps_fp16(tmp_path):
+    """The control: reading config.json must not turn into a blanket bf16 for local dirs —
+    fp16 is measured faster on CUDA for families that fit its range."""
+    p = _local_checkpoint(tmp_path, "g4-local", "gemma4", "Gemma4ForConditionalGeneration")
+    assert preferred_dtype(p, "cuda") == "float16"
+
+
+def test_a_local_dir_without_config_falls_back_to_the_name(tmp_path):
+    d = tmp_path / "my-nemotron-build"
+    d.mkdir()
+    assert preferred_dtype(str(d), "cuda") == "bfloat16"
+    e = tmp_path / "plain-build"
+    e.mkdir()
+    assert preferred_dtype(str(e), "cuda") == "float16"

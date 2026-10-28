@@ -325,6 +325,26 @@ FP16_UNSAFE = (
     # (`interns2_mobius.py`), so a substring cannot catch them. Acceptable because mode 3 is
     # what they would hit, and mode 3 measured as a null.
     "qwen",
+    # NemotronH: fp16 SILENTLY DISABLES REASONING. The chat template ends the prompt in
+    # `<think>\n`; in fp16 the model closes that block at once and answers directly — fluent,
+    # even correct, and no NaN anywhere. Measured 2026-10-27, Nemotron-3.5-Lightning-30B,
+    # vLLM 0.32.0, RTX PRO 6000, greedy, identical prompt:
+    #
+    #   bf16 base  vLLM bf16   "Here's a thinking process: ..."
+    #   GLQ 3bpw   HF   bf16   "Here's a thinking process: ..."
+    #   GLQ 3bpw   vLLM bf16   "Here's a thinking process: ..."
+    #   GLQ 3bpw   vLLM fp16   "Red, Blue, Yellow. Red is the color of fire ..."
+    #
+    # The worst failure shape for a reasoning model: an AIME run would score like a much
+    # weaker model with nothing in the output to say why. Residual stream peaks at 952, inside
+    # fp16's range, so the overflow is most likely within a block — the MoE squares its
+    # intermediate (relu^2), which overflows fp16 above ~256. Not yet localised.
+    #
+    # The price is small and measured. GLQ 3bpw, CUDA graphs, decode 128, repeats 3:
+    #   fp16  B=1 130.915 (130.840-130.946)  B=8 913.6   -- does not reason
+    #   bf16  B=1 127.549 (127.408-127.684)  B=8 882.3   -- reasons
+    # i.e. -2.6% / -3.4%, non-overlapping ranges, for a model that actually thinks.
+    "nemotron",
 )
 
 #: The dtype to serve with, per device. The two entries are chosen for DIFFERENT reasons and
@@ -365,6 +385,31 @@ def preferred_dtype(model_id: str, device: str = "cuda") -> str:
     activations fit fp16's range fp16 is the more accurate of the two and the only risk is
     overflow.
     """
-    if any(tag in model_id.lower() for tag in FP16_UNSAFE):
+    if any(tag in _family_text(model_id) for tag in FP16_UNSAFE):
         return "bfloat16"
     return _DEFAULT_DTYPE.get(device, "bfloat16")
+
+
+def _family_text(model_id: str) -> str:
+    """What the denylist is matched against: the id, plus — for a local checkpoint — the
+    family it declares about itself.
+
+    The id alone fails exactly where it matters most. A checkpoint on a box is served from a
+    directory named by whoever copied it there (`/opt/dlami/nvme/lightning30b-glq-3bpw`
+    carries no family tag), so every NemotronH run on 2026-10-27 got fp16 and lost its
+    reasoning without a word. `config.json`'s `model_type` and `architectures` name the
+    family regardless of the directory name. Hub ids are left as they are: resolving them
+    would mean a network call inside a function that decides a CLI default.
+    """
+    text = model_id.lower()
+    cfg_path = os.path.join(model_id, "config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return text
+        parts = [str(cfg.get("model_type", ""))]
+        parts += [str(a) for a in cfg.get("architectures") or []]
+        text += " " + " ".join(parts).lower()
+    return text
