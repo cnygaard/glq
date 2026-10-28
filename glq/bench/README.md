@@ -46,10 +46,24 @@ Pass `--records file.jsonl` to any read command to work offline against a local 
 quality tasks (perplexity inverts). bf16 = 100%; quality-only (tok/s + VRAM reported
 beside it, not folded in). Override task weights with `--weights weights.yaml`.
 
-## Speed and quality by GPU (LEADERBOARD.md and model cards)
-`glq-bench leaderboard` leads with one row per **(model, GPU)**: VRAM, bpw, AIME 2026
-avg@8, Terminal-Bench, and decode tok/s and TTFT at batch 1 / 8 / 32. Keyed on the GPU too,
-because speed and VRAM do not transfer between cards. Each column has exactly one source:
+## LEADERBOARD.md and model cards
+`glq-bench leaderboard` follows the [GLQ collections on Hugging Face](https://huggingface.co/xv0y5ncu/collections):
+a **Recommended checkpoints** table from the start-here collection, then one section per
+model-family collection (a public collection whose slug contains `-glq-quantized`), by title.
+A checkpoint appears only once it is in a public collection — curating on the Hub is what
+changes the leaderboard — and private repos never appear. Within a section, rows are grouped
+by base model and run GPU by GPU: the collection's checkpoints, then the bf16 base and other
+builds of the same base for reference. Members without records are listed under the table.
+
+```bash
+glq-bench collections                        # what the leaderboard will follow (JSON)
+glq-bench collections --out c.json           # a snapshot, for offline use
+glq-bench leaderboard --collections c.json   # render from it instead of the Hub
+```
+
+Every table has one row per **(model, GPU)**: VRAM, bpw, AIME 2026 avg@8, Terminal-Bench, and
+decode tok/s and TTFT at batch 1 / 8 / 32. Keyed on the GPU too, because speed and VRAM do not
+transfer between cards. Each column has exactly one source:
 
 | column | from |
 |---|---|
