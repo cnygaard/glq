@@ -39,6 +39,14 @@ glq-bench compare --models A,B,C --tasks mmlu_pro,aime_2026
 glq-bench plot --kind all --out plots/     # index / quality-vs-bpw / Pareto / tok-s-by-gpu
 glq-bench pull                  # sync the results repo
 ```
+
+`LEADERBOARD.md` lives at the root of **this** repo, not in the results repo. Regenerate it
+from the glq repo root, so it lands next to the code that produces it:
+```bash
+glq-bench leaderboard --out LEADERBOARD.md
+```
+Do not generate it inside a results-repo checkout: `glq-bench run --push` commits with
+`git add -A`, so a stray copy there would be pushed back into the results repo.
 Pass `--records file.jsonl` to any read command to work offline against a local file.
 
 ## Index
