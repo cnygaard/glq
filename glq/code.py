@@ -291,7 +291,7 @@ def main(argv=None) -> int:
     if tool_args is None:
         print(f"error: no known tool-calling setup for {args.model}. A wrong parser "
               f"fails silently\n(tool calls that never parse), so glq-code refuses to "
-              f"guess. Supported families:\ngemma-4, SmolLM3, Qwen, Kolibri 1.",
+              f"guess. Supported families:\ngemma-4, SmolLM3, Qwen, Kolibri 1, Nemotron 3.5.",
               file=sys.stderr)
         return 2
 

@@ -117,6 +117,19 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
         return ["--enable-auto-tool-choice",
                 "--tool-call-parser", "kolibri1",
                 "--reasoning-parser", "kolibri1"]
+    if "nemotron-3.5" in name:
+        # NVIDIA's card for Nemotron-3.5-Lightning-30B-A3B serves with exactly these two,
+        # and vLLM 0.32.0 has both built in. Keyed on "nemotron-3.5" rather than "nemotron"
+        # because the wider name spans formats that differ: Nemotron-3-Nano's card uses a
+        # `nano_v3` reasoning parser loaded from a plugin file, and Llama-Nemotron is a
+        # Llama model with Llama's tool format.
+        #
+        # No `--default-chat-template-kwargs`: the template opens the <think> block by
+        # default. Serving in bf16 matters more here than any flag (fp16 skips the
+        # reasoning; see FP16_UNSAFE), and `preferred_dtype` already handles that.
+        return ["--enable-auto-tool-choice",
+                "--tool-call-parser", "qwen3_coder",
+                "--reasoning-parser", "nemotron_v3"]
     return None
 
 
@@ -176,6 +189,8 @@ _FAMILY_SAMPLING = {
     # Kolibri 1's card: 1.0 / 0.97 / 128. The 128 is again the point of the table — pi
     # cannot send top_k at all, so an unpinned one silently becomes vLLM's default.
     "kolibri": {"temperature": 1.0, "top_p": 0.97, "top_k": 128},
+    # Nemotron 3.5's card: 1.0 / 0.95 in every example, reasoning on or off, and no top_k.
+    "nemotron-3.5": {"temperature": 1.0, "top_p": 0.95},
 }
 
 #: Neutral values for a family we have no card for — usable on a slider, opinionated about

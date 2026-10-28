@@ -320,3 +320,76 @@ def test_required_plugin_names_an_importable_module_not_the_pip_name():
     hyphen there can never be found, so the guard would refuse a working install."""
     mod, _pip = T.required_plugin(KOLIBRI)
     assert "-" not in mod
+
+
+# ---- Nemotron 3.5 ----------------------------------------------------------------------
+#
+# `glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-4bpw`
+# refused with "no known tool-calling setup". NVIDIA's card gives the recipe: `qwen3_coder`
+# for tool calls and `nemotron_v3` for the <think> block, both built into vLLM 0.32.0.
+#
+# The key is `nemotron-3.5`, not `nemotron`, because the wider name spans formats that
+# differ. From NVIDIA's own cards:
+#   Nemotron-3.5-Lightning-30B-A3B   qwen3_coder + nemotron_v3
+#   Nemotron-3-Nano-30B-A3B          qwen3_coder + nano_v3 (a plugin file, not built in)
+#   Llama-3.3-Nemotron-Super-49B     a Llama model, with Llama's tool format
+
+NEMOTRON = [
+    "xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-4bpw",
+    "xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-3bpw",
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+]
+
+
+@pytest.mark.parametrize("model", NEMOTRON)
+def test_nemotron_3_5_gets_nvidia_s_parsers(model):
+    args = T.tool_serve_args(model)
+    assert args is not None, "the reported failure: glq-code refused this model"
+    assert "--enable-auto-tool-choice" in args
+    assert args[args.index("--tool-call-parser") + 1] == "qwen3_coder"
+    # Without it the <think> block stays in `content` and leaks into the agent's prose.
+    assert args[args.index("--reasoning-parser") + 1] == "nemotron_v3"
+
+
+def test_nemotron_3_5_needs_no_template_kwargs_or_text_only_flag():
+    """Its own chat template opens the <think> block by default, so no
+    `--default-chat-template-kwargs`; and it is a text model, so the Qwen-only
+    `--language-model-only` has nothing to skip."""
+    joined = " ".join(T.tool_serve_args(NEMOTRON[0]))
+    assert "--chat-template" not in joined
+    assert "--default-chat-template-kwargs" not in joined
+    assert "--language-model-only" not in joined
+
+
+@pytest.mark.parametrize("model", [
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
+])
+def test_other_nemotron_lines_stay_unknown(model):
+    """A wrong parser fails silently, so a family whose recipe differs is refused, not
+    guessed. Nano 3's reasoning parser is not built into vLLM at all."""
+    assert T.tool_serve_args(model) is None
+    assert T.sampling_serve_args(model) is None
+
+
+def test_nemotron_3_5_sampling_is_the_cards_numbers():
+    """NVIDIA's examples use temperature 1.0 and top_p 0.95 and name no top_k, so none is
+    emitted (the SmolLM3 case, not the Kolibri one)."""
+    cfg = _cfg(NEMOTRON[0])
+    assert (cfg["temperature"], cfg["top_p"]) == (1.0, 0.95)
+    assert "top_k" not in cfg
+
+
+def test_nemotron_substring_does_not_collide_with_another_family():
+    for other in ("google/gemma-4-26B-A4B-it", "Qwen/Qwen3.8-27B",
+                  "HuggingFaceTB/SmolLM3-3B", KOLIBRI):
+        joined = " ".join(T.tool_serve_args(other) or [])
+        assert "nemotron_v3" not in joined, other
+
+
+def test_glq_code_names_nemotron_among_the_supported_families():
+    """The refusal message lists what glq-code can serve; it must not omit a family that
+    `tool_serve_args` now knows."""
+    src = (Path(__file__).resolve().parents[1] / "glq" / "code.py").read_text()
+    assert "Nemotron 3.5" in src
