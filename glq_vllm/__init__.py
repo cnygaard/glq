@@ -38,6 +38,10 @@ def register():
         # it and the 24 GiB table would be built dense in bf16 (95.37 GiB → OOM).
         from . import _qwen4exp_ple
         _qwen4exp_ple.install()
+        # transformers >= 5.18's native NemotronH Omni config renamed `vit_hidden_size`, which
+        # vLLM's nano_nemotron_vl still reads, so Super-VL failed at engine init.
+        from . import _nemotron_omni_config
+        _nemotron_omni_config.install()
     except ImportError:
         pass
 
