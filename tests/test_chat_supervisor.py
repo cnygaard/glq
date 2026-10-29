@@ -337,6 +337,39 @@ def test_the_server_is_stopped_even_if_the_ui_falls_over(monkeypatch):
     assert events[-1] == "stop"
 
 
+def _build_kwargs(monkeypatch, chat):
+    """The keyword arguments `main` passes to `build_ui`."""
+    seen = {}
+
+    def build(base_url, model_list, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(launch=lambda **_kw: None)
+
+    monkeypatch.setattr(chat, "build_ui", build)
+    return seen
+
+
+def test_a_default_thinking_model_is_served_with_its_reasoning_parser(monkeypatch):
+    """Without it, Nemotron 3.5's reasoning and a literal `</think>` land in the chat."""
+    model = "xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-4bpw"
+    chat, _events, made, _ = _run_chat(monkeypatch, ["--model", model])
+    built = _build_kwargs(monkeypatch, chat)
+
+    assert chat.main(["--model", model]) == 0
+    assert made[0]["extra_args"] == ["--reasoning-parser", "nemotron_v3"]
+    assert built["thinking"] is True
+
+
+def test_a_model_that_does_not_think_by_default_gets_no_parser(monkeypatch):
+    model = "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw"
+    chat, _events, made, _ = _run_chat(monkeypatch, ["--model", model])
+    built = _build_kwargs(monkeypatch, chat)
+
+    assert chat.main(["--model", model]) == 0
+    assert not made[0].get("extra_args")
+    assert built["thinking"] is False
+
+
 def test_no_serve_keeps_the_old_attach_only_behaviour(monkeypatch):
     chat, _, made, _ = _run_chat(monkeypatch, [])
     chat.main(["--no-serve"])
@@ -1581,7 +1614,7 @@ def test_the_slider_ceiling_follows_the_planned_window(monkeypatch):
     monkeypatch.setattr(chat, "_model_max_len", lambda repo: 262144)
     seen = {}
 
-    def build(base_url, models, *, max_model_len):
+    def build(base_url, models, *, max_model_len, **_kw):
         seen["mml"] = max_model_len
         demo = types.SimpleNamespace()
         demo.launch = lambda **kw: None

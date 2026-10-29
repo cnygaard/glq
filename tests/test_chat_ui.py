@@ -56,6 +56,36 @@ def test_chat_interface_no_longer_takes_the_removed_type_argument():
     assert "type" not in inspect.signature(gr.ChatInterface.__init__).parameters
 
 
+def _max_tokens_slider(demo):
+    sliders = [b for b in demo.blocks.values()
+               if isinstance(b, gr.Slider) and b.label == "max tokens"]
+    assert len(sliders) == 1
+    return sliders[0]
+
+
+def test_a_thinking_model_defaults_to_the_largest_reply_limit():
+    """The reasoning counts against max_tokens, so 1,024 can run out before the answer."""
+    demo = C.build_ui("http://127.0.0.1:8000/v1", MODELS, max_model_len=8192, thinking=True)
+    assert _max_tokens_slider(demo).value == C.max_tokens_ceiling(8192)
+
+
+def test_other_models_keep_the_1024_default():
+    demo = C.build_ui("http://127.0.0.1:8000/v1", MODELS, max_model_len=8192)
+    assert _max_tokens_slider(demo).value == 1024
+
+
+def test_gradio_keeps_a_thoughts_metadata_in_history():
+    """`history_messages` drops thoughts by their `metadata.title`. That only works if Gradio
+    carries the metadata of a yielded dict into the history it passes back — pinned here."""
+    ci = gr.ChatInterface(lambda m, h: m)
+    thought = {"role": "assistant", "content": "hmm",
+               "metadata": {"title": "Thinking", "status": "done"}}
+    stored = ci._message_as_message_dict([thought, {"role": "assistant", "content": "ok"}],
+                                         "assistant")
+    assert stored[0]["metadata"]["title"] == "Thinking"
+    assert C.history_messages(stored) == [{"role": "assistant", "content": "ok"}]
+
+
 def test_served_models_reads_the_server_not_the_config(monkeypatch):
     """Preferred over ~/.glq/config.json because a restarted vLLM may be serving something
     else; the dropdown should reflect reality."""

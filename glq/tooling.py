@@ -133,6 +133,36 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
     return None
 
 
+#: Families whose chat template thinks unless told not to. glq-chat sends no
+#: `chat_template_kwargs`, so these are the only families whose chat replies carry a
+#: reasoning block at all:
+#:
+#:   qwen          Qwen3.x are thinking models (see the `qwen` branch above)
+#:   kolibri       the plugin has thinking ON by default (see the `kolibri` branch above)
+#:   nemotron-3.5  `enable_thinking` defaults to True; the prompt ends in `<think>\n`
+#:
+#: gemma-4 is deliberately absent: its template defaults `enable_thinking` to false, which is
+#: why glq-code has to pass `{"enable_thinking":true}` to make it think at all.
+_THINKS_BY_DEFAULT = ("qwen", "kolibri", "nemotron-3.5")
+
+
+def reasoning_serve_args(model_id: str) -> list[str]:
+    """`--reasoning-parser <name>` for a family that thinks by default, else `[]`.
+
+    Without a parser vLLM returns the reasoning inside `content`, so a chat shows the whole
+    trace — for Nemotron 3.5 followed by a literal `</think>`, which is not a special token.
+    The name is read out of `tool_serve_args`, so glq-chat and glq-code cannot disagree on it.
+    """
+    name = (model_id or "").lower()
+    if not any(family in name for family in _THINKS_BY_DEFAULT):
+        return []
+    args = tool_serve_args(model_id) or []
+    if "--reasoning-parser" not in args:
+        return []
+    i = args.index("--reasoning-parser")
+    return args[i:i + 2]
+
+
 #: Families that need a third-party vLLM plugin on top of glq + vLLM, as
 #: `{substring: (importable module, pip command)}`.
 #:
