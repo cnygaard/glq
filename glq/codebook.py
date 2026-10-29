@@ -15,6 +15,19 @@ except ImportError:
     _triton_available = False
 
 
+def _sq_dists(dots, cb_norms):
+    """-2·dots + ‖C‖², written into `dots` so a search holds one [rows, K] matrix, not three.
+
+    Same kernels in the same order as the out-of-place expression, so the values are
+    bit-identical. When the norms promote the sum (bf16 dots + fp32 norms) the sum gets its
+    own promoted buffer, as before: writing it back into `dots` would round it.
+    """
+    dots.mul_(-2.0)
+    if torch.result_type(dots, cb_norms) == dots.dtype:
+        return dots.add_(cb_norms)
+    return dots + cb_norms
+
+
 def e8_basis() -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generator matrix G for the E8 lattice (8 dimensions).
@@ -262,8 +275,7 @@ class E8ShellCodebook:
 
         if x.shape[0] <= _batch_size:
             xq = x.half() if use_half else x
-            dots = xq @ cb_t.to(xq.dtype)
-            dists = -2.0 * dots + cb_norms
+            dists = _sq_dists(xq @ cb_t.to(xq.dtype), cb_norms)
             indices = dists.argmin(dim=-1)
             return self.codebook[indices], indices
 
@@ -271,9 +283,9 @@ class E8ShellCodebook:
         for start in range(0, x.shape[0], _batch_size):
             chunk = x[start:start + _batch_size]
             xq = chunk.half() if use_half else chunk
-            dots = xq @ cb_t
-            dists = -2.0 * dots + cb_norms
+            dists = _sq_dists(xq @ cb_t, cb_norms)
             all_indices.append(dists.argmin(dim=-1))
+            del dists   # free this chunk's matrix before the next matmul allocates one
         indices = torch.cat(all_indices)
         return self.codebook[indices], indices
 
