@@ -53,7 +53,8 @@ class TestEnumerateShortVectors:
 
 class TestE8ShellCodebook:
     @pytest.fixture(scope="class")
-    def codebook(self):
+    @classmethod
+    def codebook(cls):
         return E8ShellCodebook(device="cpu", verbose=False)
 
     def test_codebook_size(self, codebook):

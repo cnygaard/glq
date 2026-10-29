@@ -64,7 +64,8 @@ class TestBlockLDL:
 
 class TestQuantizeLDLQ:
     @pytest.fixture(scope="class")
-    def codebook(self):
+    @classmethod
+    def codebook(cls):
         return E8ShellCodebook.build(device="cpu", verbose=False)
 
     def test_output_keys(self, codebook):
@@ -111,7 +112,8 @@ class TestQuantizeLDLQ:
 
 class TestQuantizeLDLQ2Stage:
     @pytest.fixture(scope="class")
-    def codebooks(self):
+    @classmethod
+    def codebooks(cls):
         cb = E8ShellCodebook.build(device="cpu", verbose=False)
         cb_small = cb.make_small(256)
         return cb, cb_small
@@ -180,7 +182,8 @@ class TestQuantizeLDLQ2Stage:
 
 class TestQuantizeLDLQNStage:
     @pytest.fixture(scope="class")
-    def codebooks(self):
+    @classmethod
+    def codebooks(cls):
         cb = E8ShellCodebook.build(device="cpu", verbose=False)
         cb_small = cb.make_small(256)
         return cb, cb_small
