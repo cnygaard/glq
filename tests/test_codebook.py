@@ -148,10 +148,11 @@ class TestE8ShellCodebook:
 
         `_batch_size` is the chunk width, not the batch: 20000 rows still go through the
         chunked branch, in 40 chunks rather than 2. Deliberately NOT the production default of
-        16384, which makes `dots` [16384, 65536] fp16 and costs 8 GiB live once
-        `-2.0 * dots + cb_norms` adds two more full-size tensors — measured to take the
-        process from 6.14 to 12.27 GiB peak and OOM-kill this suite on a 40 GiB machine.
-        512 is 64 MiB per matrix.
+        16384, which on CPU makes each distance matrix [16384, 65536] fp32, 4 GiB. Before
+        `_sq_dists` reused `dots`, three of them were live at once — measured to take the
+        process from 6.14 to 12.27 GiB peak and run this suite out of memory on a 40 GiB
+        machine.
+        512 is 128 MiB per matrix.
         """
         x = torch.randn(20000, 8) * codebook.opt_scale
         decoded, indices = codebook._quantize_pytorch(x, _batch_size=512)
@@ -160,6 +161,74 @@ class TestE8ShellCodebook:
         # All indices should be valid
         assert indices.min() >= 0
         assert indices.max() < codebook.CODEBOOK_SIZE
+
+    @pytest.mark.parametrize("chunks", [1, 3])
+    def test_nn_search_holds_one_distance_matrix_at_a_time(self, codebook, chunks):
+        """The CPU search's peak is one chunk's [rows, 65536] distance matrix, not three.
+
+        `-2.0 * dots + cb_norms` kept `dots`, `-2.0 * dots` and `dists` alive together, and
+        the previous chunk's pair overlapped the next chunk's matmul. At the production chunk
+        of 16384 rows that is 4 GiB per matrix: tests/test_kv_e8.py's real-shape test peaked
+        at 16.5 GiB RSS, more than a 16 GB GitHub runner has, and the runner was shut down
+        mid-test (main, run 40793950584). Measured with Linux's resettable peak-RSS mark, so
+        the bound is on the search itself, not on whatever the process held before it.
+        """
+        clear_refs = "/proc/self/clear_refs"
+        if not os.access(clear_refs, os.W_OK):
+            pytest.skip("needs Linux /proc/self/clear_refs to reset the peak-RSS mark")
+
+        def kib(field):
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith(field + ":"):
+                        return int(line.split()[1])
+
+        rows = 1024
+        matrix = rows * codebook.CODEBOOK_SIZE * 4          # one fp32 chunk: 256 MiB
+        x = torch.randn(chunks * rows, 8) * codebook.opt_scale
+        with open(clear_refs, "w") as f:
+            f.write("5")                                    # VmHWM := VmRSS
+        before = kib("VmRSS")
+        codebook._quantize_pytorch(x, _batch_size=rows)
+        peak = (kib("VmHWM") - before) * 1024
+        assert peak < 1.5 * matrix, (
+            f"search peaked {peak / 2**20:.0f} MiB above its start, "
+            f"{peak / matrix:.2f}x one {matrix / 2**20:.0f} MiB distance matrix")
+
+    def test_nn_search_matches_the_out_of_place_reference(self, codebook):
+        """Encode-path exactness: chunked or not, the indices and decoded vectors equal
+        argmin(-2·x·Cᵀ + ‖C‖²) computed the straightforward way."""
+        x = torch.randn(600, 8) * codebook.opt_scale
+        ref = (-2.0 * (x @ codebook.codebook.T) + codebook.codebook_norms).argmin(dim=-1)
+        for rows in (128, 1024):                            # chunked, then one shot
+            decoded, idx = codebook._quantize_pytorch(x, _batch_size=rows)
+            assert torch.equal(idx, ref)
+            assert torch.equal(decoded, codebook.codebook[ref])
+
+    def test_nn_search_keeps_the_promoted_dtype_for_low_precision_input(self, codebook):
+        """A bf16 input gets bf16 dot products but fp32 distances, because the fp32 norms
+        promote the sum. Reusing the bf16 `dots` buffer for the sum would round every
+        distance to bf16 and pick different neighbours."""
+        x = (torch.randn(600, 8) * codebook.opt_scale).bfloat16()
+        dots = x @ codebook.codebook.T.to(torch.bfloat16)
+        ref = (-2.0 * dots + codebook.codebook_norms).argmin(dim=-1)
+        _, idx = codebook._quantize_pytorch(x, _batch_size=1024)
+        assert torch.equal(idx, ref)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_nn_search_on_cuda_without_triton_matches_the_reference(self, codebook):
+        """The fp16 path a CUDA box takes when Triton is missing. The reference is the
+        out-of-place expression over the same chunks, so the comparison isolates the
+        in-place rewrite from cuBLAS picking a different GEMM for a different row count."""
+        cb = codebook.to("cuda")
+        x = (torch.randn(3000, 8) * codebook.opt_scale).cuda()
+        for rows in (512, 4096):                            # chunked, then one shot
+            ref = torch.cat([(-2.0 * (c.half() @ cb.codebook_half_t)
+                              + cb.codebook_norms_half).argmin(dim=-1)
+                             for c in x.split(rows)])
+            decoded, idx = cb._quantize_pytorch(x, _batch_size=rows)
+            assert torch.equal(idx, ref)
+            assert torch.equal(decoded, cb.codebook[ref])
 
     def test_decode_rvq(self, codebook):
         """decode_rvq should match manual two-stage decode."""
