@@ -269,12 +269,13 @@ plus one downloads-earned extra at the end. Everything is on the
 | [`SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw`](https://huggingface.co/xv0y5ncu/SmolLM2-135M-Instruct-GLQ-block-diagonal-4bpw) | SmolLM2-135M | 4.0 | Apache 2.0 | 0.1 GiB | smallest checkpoint; CI smoke tests |
 | [`Devstral-Small-2-24B-Instruct-GLQ-4bpw`](https://huggingface.co/xv0y5ncu/Devstral-Small-2-24B-Instruct-GLQ-4bpw) | Devstral-Small 24B | 4.0² | Apache 2.0 | ~20.5 GiB | coding / agentic (top-15 by downloads; not in start-here) |
 
-**37 public checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has
+**39 public checkpoints total** — the [HF org](https://huggingface.co/xv0y5ncu) also has
 trellis builds of the whole Gemma-4 family (E2B/E4B/12B/26B/31B at 4 bpw), SmolLM3-3B and
 SmolLM2-360M trellis ladders at 3–6 bpw, the Gemma-4 12B/31B/E4B family across
 **3–8 bpw** (incl. `e8p` variants), and
-[Nemotron 3.5 Lightning-30B-A3B](https://huggingface.co/collections/xv0y5ncu/nemotron-35-glq-quantized-6ae27914915e479765fc3107)
-at 3 and 4 bpw (needs glq ≥ 0.8.32). Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
+[Nemotron 3.5](https://huggingface.co/collections/xv0y5ncu/nemotron-35-glq-quantized-6ae27914915e479765fc3107)
+Lightning-30B-A3B at 3 and 4 bpw (needs glq ≥ 0.8.32) and Super-VL-120B-A12B at 3 and 4 bpw
+(needs glq ≥ 0.8.33 and transformers 5.19.0). Per-model **quality** (MMLU-Pro / AIME, paired vs bf16) and **throughput** are in
 each model card and in [How GLQ compares](#how-glq-compares) and
 [Quality & footprint](#quality--footprint) below.
 
