@@ -88,6 +88,41 @@ def test_bytes_per_slot_matches_the_layout_term_by_term():
     assert bytes_per_slot(**FN) == FN_BYTES_PER_SLOT
 
 
+#: Nemotron-3.5-Super-VL 3bpw, one MoE layer: the routed experts run in the 1024-wide latent
+#: (`moe_latent_size`), and relu2 is not gated, so w13 is just up_proj.
+SUPERVL = dict(hidden_size=1024, inter=2688, w13_out=2688, bpw=3)
+
+
+def test_supervl_slot_matches_what_the_arena_logged():
+    """1.976 MiB per slot, the figure the arena printed on all 40 MoE layers when serving this
+    checkpoint (`benchmarks/supervl3_offload_24gb/`). DSpark's k=3 verify step needs
+    4 x top_k 22 = 88 of them per layer, so this byte count is what prices its 6.79 GiB."""
+    assert bytes_per_slot(**SUPERVL) == 2_071_828
+
+
+def test_slot_bytes_need_no_trellis_import():
+    """`glq-chat` and `glq-code` price a DSpark arena with this module before vLLM starts.
+    Through `glq.trellis` that cost 2.75 s per launch — its module-level `torch.compile`
+    imports inductor — for one integer, so the recipe lives in `glq.trellis_recipe`.
+    A subprocess, because this test session has imported `glq.trellis` already."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    code = ("import sys; from glq_vllm.moe_shapes import bytes_per_slot; "
+            "print(bytes_per_slot(hidden_size=1024, inter=2688, w13_out=2688, bpw=3), "
+            "'glq.trellis' in sys.modules, 'vllm' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True, cwd=Path(__file__).resolve().parents[1])
+    assert out.stdout.split() == ["2071828", "False", "False"]
+
+
+def test_the_recipe_has_one_definition():
+    """`glq.trellis` re-exports it, so every existing import reads the same table."""
+    import glq.trellis
+    import glq.trellis_recipe
+    assert glq.trellis.trellis_rvq_recipe is glq.trellis_recipe.trellis_rvq_recipe
+
+
 def test_a_10_GiB_budget_buys_120_slots_per_layer():
     """The rung the S0 hit-rate curve was measured at (`benchmarks/expert_cache_s0.md`), so
     the sizing the cache ships with and the number it was justified by are the same rung."""

@@ -362,6 +362,43 @@ def test_nemotron_3_5_needs_no_template_kwargs_or_text_only_flag():
     assert "--language-model-only" not in joined
 
 
+SUPER_VL = [
+    "xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw",
+    "xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-4bpw",
+]
+
+
+@pytest.mark.parametrize("model", SUPER_VL)
+def test_super_vl_serves_text_only(model):
+    """Super-VL wraps the same language model in a vision and audio tower. With no flag
+    vLLM loads the tower (1.57 GiB) and profiles its encoder with one maximum-size video at
+    the window's budget. Measured with `glq-code --dspark 3` at 262,144 on a 31.86 GiB card:
+    2.29 GiB allocator OOM in that profile, then 1.41 GiB of KV against the 3.05 GiB one
+    request needs, so vLLM refused to start. glq-chat and glq-code send text only."""
+    args = T.tool_serve_args(model)
+    assert args[args.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert args[args.index("--reasoning-parser") + 1] == "nemotron_v3"
+    assert "--language-model-only" in args
+    assert T.text_only_serve_args(model) == ["--language-model-only"]
+
+
+@pytest.mark.parametrize("model", NEMOTRON + [
+    "HuggingFaceTB/SmolLM3-3B", "google/gemma-4-26B-A4B-it", KOLIBRI, ""])
+def test_text_only_flag_stays_off_where_it_has_not_been_measured(model):
+    """Lightning is a text model, so there is nothing to skip. gemma-4's audio and vision
+    towers are served as they always were: the flag has not been run on gemma-4."""
+    assert T.text_only_serve_args(model) == []
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", SUPER_VL[0]])
+def test_tool_args_take_the_text_only_flag_from_the_one_helper(model):
+    """Qwen's flag predates the helper; it must come out of it now, so glq-chat and
+    glq-code cannot disagree on which families serve text only."""
+    args = T.tool_serve_args(model)
+    assert args.count("--language-model-only") == 1
+    assert T.text_only_serve_args(model) == ["--language-model-only"]
+
+
 @pytest.mark.parametrize("model", [
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",

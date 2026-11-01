@@ -46,7 +46,7 @@ from __future__ import annotations
 import textwrap
 from dataclasses import dataclass
 
-from glq.supervisor import _MIN_KV_BYTES, kv_headroom_bytes, window_kv_bytes
+from glq.supervisor import kv_floor_bytes, kv_headroom_bytes
 
 GIB = 1024 ** 3
 
@@ -90,7 +90,7 @@ class FitReport:
     # the plan this verdict judged, read off the supervisor
     window: int
     offload_gib: int
-    arena_gib: int
+    arena_gib: float
     weights_bytes: int | None
     resident_bytes: int
 
@@ -133,13 +133,17 @@ def check_fit(sup, *, ram_bytes=None, swap_bytes=None, available_ram_bytes=None,
     # to believe. `getattr` keeps the existing tolerance for a stand-in object.
     offload_gib = int(getattr(sup, "effective_expert_offload_gib", None)
                       or getattr(sup, "expert_offload_gib", 0) or 0)
-    arena_gib = int(getattr(sup, "expert_arena_gib", 0) or 0)
+    # A float: a DSpark arena is sized to the 1/100 GiB that holds one verify step.
+    arena_gib = float(getattr(sup, "expert_arena_gib", 0) or 0)
+    # Includes a DSpark drafter, which is a second model on the same card.
     resident = int(getattr(sup, "resident_bytes", 0) or 0)
     pinned = int(getattr(sup, "pinned_host_bytes", 0) or 0)
 
     # The floor window is what the card is judged against; `_MIN_KV_BYTES` is the floor under
     # that, since a smaller pool serves no useful context and is therefore part of what fits.
-    kv_floor = max(_MIN_KV_BYTES, window_kv_bytes(int(floor or window or 0), conc))
+    # Priced at the model's own KV cost where one was measured, as the plan was. The base
+    # offload buys the same figure (`kv_floor_bytes`), so the planner and this check agree.
+    kv_floor = kv_floor_bytes(int(floor or window or 0), conc, getattr(sup, "kv_cost", None))
     headroom = kv_headroom_bytes(resident, vram) if vram else 0
     unpinned = max(0, int(ram_bytes) - pinned) if ram_bytes else 0
 
@@ -260,7 +264,7 @@ def refusal_lines(report: FitReport, *, alternatives=(), command="glq-code",
         plan.append(f"{report.offload_gib} GiB pinned in host memory")
         plan.append(f"{report.resident_bytes / GIB:.2f} GiB resident")
     if report.arena_gib:
-        plan.append(f"{report.arena_gib} GiB expert cache")
+        plan.append(f"{report.arena_gib:g} GiB expert cache")
     # Comma-separated, not bullet-separated: a wrapped bullet list leaves a stray "·"
     # starting a line, which reads as a new item rather than a continuation.
     out += para("plan: " + ", ".join(plan)) + [""]

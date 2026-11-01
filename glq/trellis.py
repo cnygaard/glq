@@ -1030,27 +1030,9 @@ def trellis_ldlq_2hess(W, Hin, Hout, cb, Wscale=None, for_kernel=True):
 # ---------------------------------------------------------------------------
 # Trellis RVQ (stacked 5-8 bpw): recipe, N-stage LDLQ, N-stage decode
 # ---------------------------------------------------------------------------
-def trellis_rvq_recipe(bpw):
-    """Per-stage trellis rate K for integer ``bpw`` 2-8.
-
-    2-4 is a single native-rate trellis. 5-8 stacks a K=4 primary with a K=(bpw-4)
-    residual: 5=4+1, 6=4+2, 7=4+3, 8=4+4. Two reasons it is not one native K=5..8 code:
-
-    * Quality — a native rate loses the trellis coding gain as K grows, because a weight's
-      context is only ``ceil(L/K)`` symbols (2 at K=8 with L=16). Measured on 6 real
-      SmolLM3-3B layers, native ties stacked at 5 bpw (+0.09 dB) then trails by 0.32 /
-      0.89 / 2.37 dB at 6 / 7 / 8.
-    * Kernels — ``glq_trellis.cu`` packs each decode chunk into a uint32 of width ``8*R``,
-      so R>=5 has no kernel at all. Every stage here stays at R<=4.
-
-    6 bpw is 4+2 rather than the marginally better 3+3 (+0.22 dB): ``tr_ld_cs`` vectorizes
-    uint2/uint4 but emits three scalar loads for uint3, so 3+3 costs 6 load instructions
-    against 4+2's 2 for the same bits.
-    """
-    bpw = int(bpw)
-    if not 2 <= bpw <= 8:
-        raise ValueError(f"trellis supports integer bpw 2-8, got {bpw}")
-    return [bpw] if bpw <= 4 else [4, bpw - 4]
+# The recipe lives in its own module so serving-side sizing can read it without importing
+# this one; re-exported here, where the quantizer and every older caller import it from.
+from .trellis_recipe import trellis_rvq_recipe  # noqa: E402,F401
 
 
 # Multiplier on the free rms-ratio residual-scale estimate, keyed by the RESIDUAL stage's

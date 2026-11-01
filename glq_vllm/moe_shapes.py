@@ -44,7 +44,7 @@ def trellis_moe_shapes(num_experts: int, hidden_size: int, inter: int,
     rather than nothing, because both the loader and the decode gate on ``numel()`` and a
     missing attribute would be an AttributeError deep inside apply().
     """
-    from glq.trellis import trellis_rvq_recipe
+    from glq.trellis_recipe import trellis_rvq_recipe
 
     rates = trellis_rvq_recipe(int(bpw))          # [K] or [4, bpw-4]
     k1 = rates[0]

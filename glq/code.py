@@ -26,9 +26,10 @@ from pathlib import Path
 from glq import fit
 from glq.chat import (DEFAULT_BASE_URL, _available_ram_bytes, _gpu_name,
                       _installed_config, _model_max_len, _ram_bytes,
-                      _server_port, _swap_bytes, _vram_bytes, checkpoint_mtp,
-                      checkpoint_offload_bytes, default_model, positive_seconds,
-                      resolve_mtp_tokens, sizing_weights_bytes)
+                      _server_port, _swap_bytes, _vram_bytes, add_dspark_flags,
+                      checkpoint_mtp, checkpoint_offload_bytes, default_model,
+                      dspark_kwargs, positive_seconds, resolve_mtp_tokens,
+                      sizing_weights_bytes)
 from glq.installer.configure import pi_max_tokens, write_pi_models
 from glq.installer.discovery import DiscoveryError, cached_discover
 from glq.installer.prompt import open_tty, select_model
@@ -252,6 +253,7 @@ def main(argv=None) -> int:
                         "head (default OFF). Which N wins is hardware-dependent: 1 beat 3 on "
                         "an L4, 3 beat 1 on a 32 GiB Blackwell. Output is NOT byte-identical "
                         "with speculation on, even at temperature 0.")
+    add_dspark_flags(p)
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",
@@ -328,7 +330,12 @@ def main(argv=None) -> int:
     _offload = checkpoint_offload_bytes(args.model)
     # Before the supervisor, with the pi and tool-parser guards above, and for the same
     # reason: a `--speculative-config` this checkpoint cannot honour makes vLLM refuse
-    # minutes into a weight load.
+    # minutes into a weight load. DSpark first, so `--dspark --mtp N` is reported as the
+    # conflict it is rather than as a missing MTP head.
+    _dspark, _dspark_err = dspark_kwargs(args, p)
+    if _dspark_err:
+        print(f"error: {_dspark_err}", file=sys.stderr)
+        return 2
     _mtp_layers, _mtp_quantized, _decoder_layers = checkpoint_mtp(args.model)
     _mtp, _mtp_err = resolve_mtp_tokens(args.mtp, _mtp_layers, _mtp_quantized)
     if _mtp_err:
@@ -369,6 +376,8 @@ def main(argv=None) -> int:
         # head is loaded (so `nontext_bytes` stops being subtracted), its own MoE layer
         # becomes offloadable, and every decode step widens to `1 + mtp` tokens per stream.
         mtp_tokens=_mtp, mtp_layers=_mtp_layers, decoder_layers=_decoder_layers,
+        # DSpark: the drafter's bytes are resident, and its verify step sizes the arena.
+        **_dspark,
         expert_offload_gib=args.cpu_offload_gb,
         # glq-code opts into spending a bounded amount of extra offload on a longer window;
         # glq-chat does not. For a coding agent the window IS the product -- pi carries file

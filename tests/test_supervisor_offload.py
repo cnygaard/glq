@@ -226,15 +226,30 @@ def test_the_window_grows_on_a_24gb_card_once_the_counts_are_right():
 
 
 def test_the_same_fix_also_hands_back_utilization():
-    """The third side of the saving. Counting the MTP head correctly buys context (the test
-    above) and costs one GiB less offload, and what is left over is given back to the card
-    rather than reserved: util 0.920 -> 0.877 on the 23 GiB arm, 0.703 -> 0.651 on the 96 GiB
-    one. The 0.920 is `_MAX_UTILIZATION`, i.e. the published counts saturate the card AND get
-    the shortest window -- the worst corner of both trades."""
-    for vram in (23.0, 95.6):
-        before = _code_sup(vram, **FN_PUBLISHED)
-        after = _code_sup(vram, **FN_CORRECTED)
-        assert after.gpu_memory_utilization < before.gpu_memory_utilization
+    """The third side of the saving, which lands where the card has room for it.
+
+    On the 96 GiB arm every expert is resident, so the saving is VRAM given back to the card
+    rather than reserved: util 0.703 -> 0.651.
+
+    On the 23 GiB arm it keeps experts on the GPU instead: same window and arena, 42 GiB
+    offloaded where the published counts needed 47, so 5 GiB less crosses PCIe per token.
+    Utilization rises a little (0.908 -> 0.914) because those experts are resident. This arm
+    used to read 0.920 -> 0.877, but only because utilization was planned before the arena;
+    vLLM allocates the arena inside that fraction, so a pool sized without it held less KV
+    than the plan priced (`plan_gpu_memory_utilization`)."""
+    before = _code_sup(95.6, **FN_PUBLISHED)
+    after = _code_sup(95.6, **FN_CORRECTED)
+    assert after.gpu_memory_utilization < before.gpu_memory_utilization
+
+    before = _code_sup(23.0, **FN_PUBLISHED)
+    after = _code_sup(23.0, **FN_CORRECTED)
+    assert (after.max_model_len, after.expert_arena_gib) == \
+           (before.max_model_len, before.expert_arena_gib)
+    assert after.expert_offload_gib < before.expert_offload_gib
+    for sup in (before, after):
+        # Both pools hold the arena they plan: weights + arena fit inside the fraction.
+        assert sup.gpu_memory_utilization * 23.0 * GIB > \
+            sup.resident_bytes + sup.expert_arena_gib * GIB
 
 
 def test_a_96gb_card_keeps_its_window_and_reserves_less_for_it():
