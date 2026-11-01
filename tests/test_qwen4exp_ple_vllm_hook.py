@@ -167,6 +167,19 @@ def test_the_glq_method_satisfies_the_0_30_dequantize_contract():
     assert method.dequantize(None, rows, torch.float32).dtype == torch.float32
 
 
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16", "float32"])
+def test_prefetch_buffer_uses_decoded_dtype_not_packed_storage(dtype_name):
+    """Pinned prefetch allocates decoded rows, not int16 checkpoint storage."""
+    import torch
+    dtype = getattr(torch, dtype_name)
+    method = _call(_glq_config(), VLLM_PREFIX)
+    layer = torch.nn.Module()
+    method.create_weights(layer, 160, [8], 160, 8, dtype,
+                          weight_loader=lambda *args: None)
+    assert layer.trellis_packed.dtype == torch.int16
+    assert method.lookup_dtype(layer) == dtype
+
+
 # ---- what it must NOT do ------------------------------------------------------------
 
 def test_a_table_absent_from_layer_bpw_is_left_alone():
@@ -186,13 +199,17 @@ def test_a_table_absent_from_layer_bpw_is_left_alone():
 
 def test_a_non_glq_config_still_reaches_the_original():
     """We wrap, we do not replace. A config we do not recognise must get vLLM's answer —
-    including, on 0.30.0, vLLM's own NotImplementedError rather than a GLQ method."""
+    whether that version raises or falls back to an unquantized method."""
     assert not isinstance(_call(None, VLLM_PREFIX), GLQEmbeddingMethod)
-    if LEGACY:
-        assert _call(object(), VLLM_PREFIX) is None
-    else:
+    config = object()
+    original = _save()._glq_original
+    try:
+        expected = original(config, VLLM_PREFIX)
+    except NotImplementedError:
         with pytest.raises(NotImplementedError):
-            _call(object(), VLLM_PREFIX)
+            _call(config, VLLM_PREFIX)
+    else:
+        assert type(_call(config, VLLM_PREFIX)) is type(expected)
 
 
 def test_a_shell_ple_is_routed_as_shell():
