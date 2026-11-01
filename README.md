@@ -399,7 +399,53 @@ GLQ_MOE_EXPERT_CACHE=8 GLQ_MOE_ARENA_MAX_TOKENS=1 vllm serve … \
 
 `GLQ_MOE_EXPERT_CACHE=0` disables it. `GLQ_MOE_ARENA_MAX_TOKENS` is the widest decode step the
 arena serves — one token per concurrent stream, times `1 + num_speculative_tokens` if you
-enable MTP; steps wider than the cap take the ordinary path.
+enable MTP or DSpark; steps wider than the cap take the ordinary path.
+
+### Speculative decoding with a DSpark drafter
+
+`glq-chat` and `glq-code` take `--dspark` for a checkpoint with a known DSpark drafter. Today
+that is Nemotron 3.5 Super-VL, drafted by
+[`RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark`](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark),
+which loads without remote code. It is off unless you ask for it.
+
+```bash
+glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw --dspark
+glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw \
+    --dspark 3 --max-model-len 262144
+```
+
+- **`--dspark`** lets the planner choose the number of draft tokens. It plans the window, the
+  offload and the expert arena as it would without a drafter, then keeps the deepest step
+  (4 down to 1 draft tokens) whose arena fits beside that window. The window keeps priority:
+  if no step fits, the startup message says DSpark is off and the plan is the one you would
+  get without the flag.
+- **`--dspark N`** asks for N draft tokens. The arena is raised to hold the N+1-token verify
+  step (for N=3 on Super-VL 3 bpw: 88 slots/layer, 6.79 GiB), and vLLM decides at startup
+  whether the window still fits.
+- **`--draft-model REPO`** picks another drafter. Neither flag combines with `--mtp`.
+
+The drafter (2.25 GiB) stays in VRAM. Output is not byte-identical with speculation on, even
+at temperature 0. Measured by hand with the same vLLM flags on an RTX PRO 4500 capped at 21.96
+GiB (PCIe 5 x16, vLLM 0.32.0, AIPerf SPEED-Bench coding prompts, 10 requests of 4,096 output
+tokens, temperature 1.0, one stream, 16,384 window): **31.50 tok/s per request with 4 draft
+tokens against 20.15 without a drafter (1.56×)**. The deeper step is paid for in KV cache: the
+pool fell from 6.02 to 1.97 GiB.
+
+**A 262,144-token window with 3 draft tokens fits a 24 GB budget**, measured through the
+launcher on the same GPU type capped at 22.11 GiB (0.92 of 24 GiB):
+
+```bash
+glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw \
+    --dspark 3 --max-model-len 262144 --cpu-offload-gb 40 --gpu-memory-utilization 0.6931
+```
+
+vLLM loaded 14.15 GiB (drafter and a 6.79 GiB arena included) and kept 5.68 GiB of KV cache,
+1.86 times what one 262,144-token request needs; the arena served 4-token steps on all 40 MoE
+layers. That is one short coding-agent session (4 requests, 77% of draft tokens accepted), not a
+speed measurement. It puts all 39.52 GiB of routed experts in pinned host RAM: that worked on a
+60.3 GiB host in this run, but the planner's own limit is about half of host RAM, so on a
+smaller host it plans fewer experts there and `--cpu-offload-gb`, as above, overrides it.
+Time to first token was 33–38 s per turn for ~1.9k-token prompts, with or without the drafter.
 
 ### Quantize your own model
 

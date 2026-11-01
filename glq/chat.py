@@ -40,7 +40,7 @@ from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
                             DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS,
                             DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
-from glq.tooling import reasoning_serve_args
+from glq.tooling import dspark_drafter, reasoning_serve_args, text_only_serve_args
 from glq.tooling import recommended_sampling as _recommended_sampling
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -567,6 +567,146 @@ def resolve_mtp_tokens(requested, mtp_layers: int, head_is_quantized: bool):
     return n, None
 
 
+#: Deepest DSpark step the launchers offer: the deepest one measured. With GLQ's Super-VL 3 bpw
+#: build on a 21.96 GiB budget, 4 draft tokens gave 31.50 tok/s per request against 20.15
+#: without (`benchmarks/supervl3_spec_24gb/`), and each extra token widens the verify step the
+#: expert arena must hold by `top_k` slots per layer.
+MAX_DSPARK_TOKENS = 4
+
+
+def dspark_tokens(text: str):
+    """argparse type for `--dspark N`: a depth from 1 to `MAX_DSPARK_TOKENS`, or `"auto"`.
+
+    `"auto"` is the flag's `const` (bare `--dspark`). It must pass through here because
+    argparse runs a string `const` through `type` as well.
+    """
+    if text == "auto":
+        return text
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of draft tokens, not {text!r}")
+    if not 1 <= n <= MAX_DSPARK_TOKENS:
+        raise argparse.ArgumentTypeError(
+            f"draft tokens must be 1-{MAX_DSPARK_TOKENS}, not {n}; leave the number out to let "
+            f"the planner choose")
+    return n
+
+
+def checkpoint_moe_facts(repo_id: str) -> tuple[int, int, int]:
+    """``(top_k, moe_layers, arena_slot_bytes)`` for a trellis MoE checkpoint, zeros if
+    unknown — what the planner needs to price the expert arena one DSpark verify step needs.
+
+    The slot is sized the way the vLLM plugin sizes it at load (`fused_moe_method`): the
+    routed experts' width is `moe_latent_size` where the model has one (Super-VL routes in a
+    1024-wide latent, not its 4096 hidden size), and `relu2` is not gated, so w13 is up_proj
+    alone. `moe_layers` counts `"moe"` in `layers_block_type` for a hybrid like NemotronH, and
+    is every decoder layer otherwise. The arena exists only for trellis MoE, so anything else
+    is zeros.
+
+    Same never-block contract as `checkpoint_mtp`, and shared by glq-chat and glq-code.
+    """
+    if not repo_id:
+        return 0, 0, 0
+    try:
+        cfg = _sizing_fetch(repo_id)(
+            f"https://huggingface.co/{repo_id}/resolve/main/config.json")
+        text = cfg.get("text_config") or cfg
+        quant = cfg.get("quantization_config") or {}
+        top_k = int(text.get("num_experts_per_tok") or 0)
+        if quant.get("codebook") != "trellis" or not top_k:
+            return 0, 0, 0
+        blocks = text.get("layers_block_type")
+        if isinstance(blocks, list):
+            layers = sum(1 for b in blocks if b == "moe")
+        else:
+            layers = int(text.get("num_hidden_layers") or 0)
+        inter = int(text.get("moe_intermediate_size") or 0)
+        width = int(text.get("moe_latent_size") or text.get("hidden_size") or 0)
+        act = str(text.get("mlp_hidden_act") or text.get("hidden_act") or "").lower()
+        w13_out = inter if act == "relu2" else 2 * inter
+        if not (layers and inter and width):
+            return 0, 0, 0
+        from glq_vllm.moe_shapes import bytes_per_slot
+        slot = bytes_per_slot(hidden_size=width, inter=inter, w13_out=w13_out,
+                              bpw=int(quant.get("bpw") or 0))
+        return top_k, layers, int(slot)
+    except Exception:                                       # noqa: BLE001 - offline, 404, …
+        return 0, 0, 0
+
+
+def _draft_bytes(repo_id: str) -> int:
+    """The drafter's size on the Hub, which it occupies in VRAM; 0 if unknown."""
+    return int(_checkpoint_bytes(repo_id) or 0)
+
+
+def resolve_dspark(requested, draft_model, model: str):
+    """``(drafter, tokens, auto, error)`` for DSpark speculation — the error exclusive of the
+    rest.
+
+    **Off by default**, like `--mtp`: speculation changes output even at temperature 0.
+    `--dspark` alone lets the planner choose the depth (`requested == "auto"`), up to
+    `MAX_DSPARK_TOKENS`; `--dspark N` pins it. `--draft-model REPO` names the drafter and
+    implies `--dspark`; without it the family's known drafter is used (`dspark_drafter`), and
+    a family with none is an error now rather than a refusal minutes into a weight load.
+    """
+    if requested is None and not draft_model:
+        return None, 0, False, None
+    drafter = draft_model or dspark_drafter(model)
+    if not drafter:
+        return None, 0, False, (
+            f"no DSpark drafter is known for {model}. Pass --draft-model <repo> to name one "
+            f"trained for its base model, or re-run without --dspark.")
+    if requested is None or requested == "auto":
+        return drafter, MAX_DSPARK_TOKENS, True, None
+    return drafter, int(requested), False, None
+
+
+def add_dspark_flags(p) -> None:
+    """`--dspark [N]` and `--draft-model REPO`, the same on glq-chat and glq-code."""
+    p.add_argument("--dspark", nargs="?", const="auto", default=None, type=dspark_tokens,
+                   metavar="N",
+                   help=f"speculate with a DSpark draft model (default OFF). Alone, the "
+                        f"planner picks the deepest step (1-{MAX_DSPARK_TOKENS} tokens) the "
+                        f"card can hold beside the context window, and turns DSpark off, "
+                        f"saying so, when none fits. With N, that depth is used even past the "
+                        f"plan's margins and vLLM checks it at startup. Output is NOT "
+                        f"byte-identical with speculation on, even at temperature 0.")
+    p.add_argument("--draft-model", default=None, metavar="REPO",
+                   help="the DSpark drafter to use (implies --dspark); default: the one known "
+                        "for this model's family")
+
+
+def dspark_kwargs(args, parser):
+    """`VllmSupervisor` keyword arguments for the DSpark flags, and an error message.
+
+    Returns ``(kwargs, error)``. `{}` when DSpark is off. Exits through `parser.error` (code
+    2) when it is combined with `--mtp`, which is the other way to speculate.
+
+    The drafter's size comes from the Hub, because it is resident VRAM the plan must make room
+    for. When it cannot be looked up, an auto DSpark is turned off with a note — it would be
+    planned for nothing — while a pinned depth goes ahead and vLLM's startup check decides.
+
+    Shared by glq-chat and glq-code, like `sizing_weights_bytes`.
+    """
+    if (args.dspark is not None or args.draft_model) and args.mtp:
+        parser.error("--dspark and --mtp are two ways to speculate; pick one")
+    drafter, tokens, auto, err = resolve_dspark(args.dspark, args.draft_model, args.model or "")
+    if err or not drafter:
+        return {}, err
+    size = _draft_bytes(drafter)
+    if not size:
+        if auto:
+            print(f"  DSpark off: could not look up the size of {drafter}, so the plan cannot "
+                  f"make room for it. --dspark N asks for a depth anyway", file=sys.stderr)
+            return {}, None
+        print(f"  could not look up the size of {drafter}; planning without its VRAM, and "
+              f"vLLM checks the real figure at startup", file=sys.stderr)
+    top_k, layers, slot = checkpoint_moe_facts(args.model)
+    return dict(draft_model=drafter, draft_tokens=tokens, draft_auto=auto, draft_bytes=size,
+                moe_top_k=top_k, moe_layers=layers, arena_slot_bytes=slot), None
+
+
 def sizing_weights_bytes(args, device=None):
     """The checkpoint size the supervisor should size against, or None.
 
@@ -626,6 +766,7 @@ def main(argv=None) -> int:
                         "head (default OFF). Which N wins is hardware-dependent: 1 beat 3 on "
                         "an L4, 3 beat 1 on a 32 GiB Blackwell. Output is NOT byte-identical "
                         "with speculation on, even at temperature 0.")
+    add_dspark_flags(p)
     p.add_argument("--max-num-seqs", type=int, default=None,
                    help=f"concurrent sequences vLLM plans for (default "
                         f"{DEFAULT_MAX_NUM_SEQS} on GPU, 4 on the CPU backend; vLLM's own "
@@ -688,7 +829,12 @@ def main(argv=None) -> int:
     # cannot serve without it. (0, 0) for everything that declares nothing.
     _offload = checkpoint_offload_bytes(args.model)
     # With the gradio guard above, and for the same reason: a `--speculative-config` this
-    # checkpoint cannot honour makes vLLM refuse minutes into a weight load.
+    # checkpoint cannot honour makes vLLM refuse minutes into a weight load. DSpark first, so
+    # `--dspark --mtp N` is reported as the conflict it is rather than as a missing MTP head.
+    _dspark, _dspark_err = dspark_kwargs(args, p)
+    if _dspark_err:
+        print(f"error: {_dspark_err}", file=sys.stderr)
+        return 2
     _mtp_layers, _mtp_quantized, _decoder_layers = checkpoint_mtp(args.model)
     _mtp, _mtp_err = resolve_mtp_tokens(args.mtp, _mtp_layers, _mtp_quantized)
     if _mtp_err:
@@ -698,6 +844,9 @@ def main(argv=None) -> int:
     # reasoning apart from the answer and the chat can show it as a "Thinking" block. Without
     # it the trace lands in the reply itself (for Nemotron 3.5 with a literal `</think>`).
     _reasoning = reasoning_serve_args(args.model or "")
+    # The chat sends text only, so a multimodal wrapper's towers stay unloaded; the same
+    # helper sets it for glq-code through `tool_serve_args`.
+    _reasoning += text_only_serve_args(args.model or "")
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -730,6 +879,8 @@ def main(argv=None) -> int:
         # head is loaded (so `nontext_bytes` stops being subtracted), its own MoE layer
         # becomes offloadable, and every decode step widens to `1 + mtp` tokens per stream.
         mtp_tokens=_mtp, mtp_layers=_mtp_layers, decoder_layers=_decoder_layers,
+        # DSpark: the drafter's bytes are resident, and its verify step sizes the arena.
+        **_dspark,
         expert_offload_gib=args.cpu_offload_gb,
         # One stream, because this command serves one person: it starts vLLM, opens a chat
         # UI, and stops the server on the way out. Without this it inherited

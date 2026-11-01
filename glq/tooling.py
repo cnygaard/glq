@@ -83,12 +83,10 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
         # Qwen3.x are THINKING models: without --reasoning-parser qwen3 the <think> block
         # stays in `content` and leaks into the agent's prose — the same failure class as
         # gemma-4's enable_thinking leak (#85), reading as rambling or repetition in a pi
-        # session. --language-model-only skips the multimodal wrapper's bf16 vision tower,
-        # which text-only agent/chat serving never uses — pure VRAM back on 24 GB cards, and
-        # why the vendor recipe's `--mm-encoder-tp-mode` has nothing to act on here.
+        # session. The text-only flag is `text_only_serve_args`'s, below.
         return ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_xml",
                 "--reasoning-parser", "qwen3",
-                "--language-model-only"]
+                *text_only_serve_args(model_id)]
     if "smollm3" in name:
         # SmolLM3 emits hermes-style <tool_call> markup too; SmolLM3+hermes WITHOUT a
         # reasoning parser is the pairing the Terminal-Bench integration validated end
@@ -129,8 +127,36 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
         # reasoning; see FP16_UNSAFE), and `preferred_dtype` already handles that.
         return ["--enable-auto-tool-choice",
                 "--tool-call-parser", "qwen3_coder",
-                "--reasoning-parser", "nemotron_v3"]
+                "--reasoning-parser", "nemotron_v3",
+                *text_only_serve_args(model_id)]
     return None
+
+
+def text_only_serve_args(model_id: str) -> list[str]:
+    """`--language-model-only` for a multimodal wrapper served text-only, else `[]`.
+
+    glq-chat and glq-code send text only, so a vision tower is VRAM and startup memory spent
+    on nothing. vLLM reads the flag as every modality's limit at 0, which skips loading the
+    towers and profiling the encoder; it ignores the flag on a text-only model.
+
+    Two families, each measured with it:
+
+      qwen               the bf16 vision tower — VRAM back on 24 GB cards, and why the vendor
+                         recipe's `--mm-encoder-tp-mode` has nothing to act on here
+      nemotron-3.5 *-vl  vision + projector 1.57 GiB, and the encoder profile: vLLM profiled
+                         it with one maximum-size video at the window's budget. With
+                         `glq-code --dspark 3` at 262,144 on a 31.86 GiB card that left 1.41
+                         GiB of KV against 3.05 GiB for one request, and vLLM refused to start
+
+    gemma-4 is absent, although the flag works there (vLLM 0.32.0, `benchmarks/hw_tiers/`):
+    26B-A4B 4 bpw loaded 13.32 GiB with it against 14.40 without (decode 97.1 against 97.6
+    tok/s), and E4B 5.39 against 6.29. Its towers have always been served, and the planner does not
+    yet subtract them, so turning it on is a separate change.
+    """
+    name = (model_id or "").lower()
+    if "qwen" in name or ("nemotron-3.5" in name and "-vl" in name):
+        return ["--language-model-only"]
+    return []
 
 
 #: Families whose chat template thinks unless told not to. glq-chat sends no
@@ -198,6 +224,32 @@ def required_plugin(model_id: str) -> tuple[str, str] | None:
     for family, spec in _FAMILY_PLUGIN.items():
         if family in name:
             return spec
+    return None
+
+
+#: The DSpark drafter for each family, keyed by the same repo-id substrings. A drafter is a
+#: small separate model that proposes tokens for the served one to verify in a single step.
+#: It is trained against the BASE model, and a GLQ build keeps the base's tokenizer, so the
+#: base's drafter serves it. Listed only when it loads through vLLM's own `dspark` method
+#: without remote code: the launchers never pass `--trust-remote-code` for one.
+_DSPARK_DRAFTERS = {
+    # Measured with GLQ's 3 bpw build on a 21.96 GiB budget, vLLM 0.32.0, AIPerf coding
+    # prompts: 31.50 tok/s per request at 4 draft tokens against 20.15 without
+    # (`benchmarks/supervl3_spec_24gb/`).
+    "nemotron-3.5-super-vl": "RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark",
+}
+
+
+def dspark_drafter(model_id: str) -> str | None:
+    """The DSpark drafter repo for this model's family, or None when there is none.
+
+    Matched on the id, like `required_plugin`: a local directory carries whatever name it was
+    copied under, so `--draft-model` names the drafter for one.
+    """
+    name = (model_id or "").lower()
+    for family, repo in _DSPARK_DRAFTERS.items():
+        if family in name:
+            return repo
     return None
 
 
