@@ -403,8 +403,8 @@ enable MTP or DSpark; steps wider than the cap take the ordinary path.
 
 ### Speculative decoding with a DSpark drafter
 
-`glq-chat` and `glq-code` take `--dspark` for a checkpoint with a known DSpark drafter. Today
-that is Nemotron 3.5 Super-VL, drafted by
+`glq-chat` and `glq-code` take `--dspark` (glq ≥ 0.8.34) for a checkpoint with a known DSpark
+drafter. Today that is Nemotron 3.5 Super-VL, drafted by
 [`RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark`](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark),
 which loads without remote code. It is off unless you ask for it.
 
