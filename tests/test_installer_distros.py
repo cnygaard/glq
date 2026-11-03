@@ -42,10 +42,10 @@ HF_CACHE = os.environ.get("GLQ_DISTRO_HF_CACHE", "/opt/dlami/nvme/hf_cache_distr
 
 #: Fraction of the card each container's vLLM may reserve. 0.35 suits a 24 GB card running
 #: one leg at a time; it is also what caps parallelism, because N legs need N × this.
-#: The smoke model is 1.8 GiB, so on a large card a much smaller slice is ample and lets
-#: `pytest -n` actually overlap — on a 96 GB Blackwell, 0.10 is ~9.8 GiB per leg and eight
-#: legs still fit. Too small and vLLM refuses to start with "No available memory for the
-#: cache blocks", which is a harness misconfiguration, not a glq bug.
+#: The smoke model is 6.15 GiB, so a slice must hold that plus a 2048-token KV cache and
+#: activations: on a 96 GB Blackwell 0.35 is ~33 GiB per leg, ample. Too small and vLLM
+#: refuses to start with "No available memory for the cache blocks", which is a harness
+#: misconfiguration, not a glq bug.
 GPU_UTIL = os.environ.get("GLQ_DISTRO_GPU_UTIL", "0.35")
 
 #: Seconds to wait for vLLM to answer, passed to glq-chat AND used by this
@@ -53,9 +53,12 @@ GPU_UTIL = os.environ.get("GLQ_DISTRO_GPU_UTIL", "0.35")
 #: because concurrent legs make startup much slower than a solo run.
 READY_TIMEOUT = os.environ.get("GLQ_DISTRO_READY_TIMEOUT", "1200")
 
-#: Smallest trellis checkpoint (1.8 GiB) — the format the recommender prefers, and quick
-#: enough to pull once and reuse from the shared cache across all nine containers.
-SMOKE_MODEL = "xv0y5ncu/SmolLM3-3B-trellis-3inst-4bpw-kernel"
+#: A small public trellis checkpoint (6.15 GiB on the Hub, vision and audio towers
+#: included) — the format the recommender prefers, pulled once and reused from the shared
+#: cache across every container. The containers download it without a token, so it must
+#: stay public and ungated: the SmolLM3 build that used to sit here was removed from the
+#: Hub, and every leg then failed stage G on a 401, after the kernel had built fine.
+SMOKE_MODEL = "xv0y5ncu/gemma-4-E4B-it-GLQ-trellis-3inst-4bpw"
 
 pytestmark = pytest.mark.slow
 
@@ -260,9 +263,9 @@ def test_full_install_and_coherent_generation(distro, install_from):
     catches it, which is why the torch_extensions cache is deliberately not shared between
     containers: the per-distro build *is* the thing under test.
 
-    "Coherent" has to be mechanical to be a test, so it is a factual completion at
-    temperature 0: a working stack answers "The capital of France is" with Paris, and a
-    miscompiled kernel does not.
+    "Coherent" has to be mechanical to be a test, so it is a factual question at
+    temperature 0, asked through the model's chat template: a working stack answers "What is
+    the capital of France?" with Paris, and a miscompiled kernel does not.
 
     Non-root for the install, because that is the path a real user takes and it leaves the
     root guard free to be asserted separately.
@@ -347,10 +350,18 @@ if __name__ == "__main__":
     print("EXT_ERR:%s" % (err or "").replace("\n", " | "))
 
     from vllm import LLM, SamplingParams
+    # The smoke model is multimodal (gemma-4: image, video, audio) and this stage is a
+    # text-only probe. All three keys are zeroed: with image and audio alone, vLLM still
+    # builds `<|video|>` placeholders and crashes.
     llm = LLM(model="__MODEL__", quantization="glq",
-              gpu_memory_utilization=__GPU_UTIL__, max_model_len=2048, enforce_eager=True)
-    out = llm.generate(["The capital of France is"],
-                       SamplingParams(temperature=0.0, max_tokens=8))
+              gpu_memory_utilization=__GPU_UTIL__, max_model_len=2048, enforce_eager=True,
+              limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0})
+    # Through the chat template, not a bare completion: the smoke model is instruction
+    # tuned, and gemma-4-it continues "The capital of France is" with "France is France
+    # is ..." on a stack whose kernel built fine (measured on ubuntu:24.04, vLLM 0.32.0).
+    out = llm.chat([{"role": "user",
+                     "content": "What is the capital of France? Answer with one word."}],
+                   SamplingParams(temperature=0.0, max_tokens=16))
     print("GEN_TEXT:" + out[0].outputs[0].text.strip().replace("\n", " "))
 PYEOF
 sed -i "s|__MODEL__|$GLQ_SMOKE_MODEL|" /tmp/gen.py
@@ -439,13 +450,15 @@ if [ "$READY" != "True" ]; then
     done
 fi
 
-curl -s http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
-    -d "{\"model\": \"$GLQ_SMOKE_MODEL\", \"prompt\": \"The capital of France is\", \
-         \"max_tokens\": 8, \"temperature\": 0}" >/tmp/chat_gen.json 2>/dev/null
+# The chat endpoint, for the same reason stage G uses the chat template.
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+    -d "{\"model\": \"$GLQ_SMOKE_MODEL\", \"messages\": [{\"role\": \"user\", \
+         \"content\": \"What is the capital of France? Answer with one word.\"}], \
+         \"max_tokens\": 16, \"temperature\": 0}" >/tmp/chat_gen.json 2>/dev/null
 cat >/tmp/chat_text.py <<'PYEOF'
 import json
 d = json.load(open("/tmp/chat_gen.json"))
-print("CHAT_TEXT:" + d["choices"][0]["text"].strip().replace("\n", " "))
+print("CHAT_TEXT:" + (d["choices"][0]["message"]["content"] or "").strip().replace("\n", " "))
 PYEOF
 chmod 0644 /tmp/chat_text.py
 su tester -c "\$HOME/.glq/venv/bin/python /tmp/chat_text.py" 2>/dev/null || echo "CHAT_TEXT:"
