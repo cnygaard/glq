@@ -76,6 +76,17 @@ def test_the_pinned_fallback_can_serve_the_current_transformers_pin():
         assert tuple(map(int, m.groups())) >= (0, 29, 0), f"fallback predates vLLM 0.29: {url}"
 
 
+def test_the_pinned_fallback_can_sit_beside_gradio_6():
+    """Since v0.30.0 vLLM's CPU assets are tagged manylinux_2_39, so the manylinux_2_34 match
+    above finds nothing and every CPU install takes this fallback. vLLM 0.33.0 raised its
+    pillow floor to 13, past every gradio 6's `pillow<13`, so a fallback that new would send
+    pip back through gradio's releases to 3.36.1, which glq-chat cannot run."""
+    import re
+    for url in (W.FALLBACK_X86, W.FALLBACK_AARCH64):
+        m = re.search(r"/v(\d+)\.(\d+)\.(\d+)/", url)
+        assert m and tuple(map(int, m.groups())) < (0, 33, 0), url
+
+
 def test_percent_encoded_plus_is_normalized():
     """The live API returns %2B for the + in the local version; the printed pip command
     should carry the literal + (pip accepts both, humans grep for one)."""

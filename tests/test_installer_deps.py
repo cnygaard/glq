@@ -43,7 +43,32 @@ def test_serving_pins_transformers_exactly():
     from a ceiling that outlived its cause. An exact pin is the version actually measured."""
     flat = _pip_commands(("core", "vllm"))
     assert "transformers" in flat, f"transformers is left to pip's resolver:\n{flat}"
-    assert "==5.17.0" in flat, f"transformers is not pinned exactly:\n{flat}"
+    assert "==5.19.0" in flat, f"transformers is not pinned exactly:\n{flat}"
+
+
+def _tf_pin(flat):
+    import re
+    m = re.search(r"transformers==(\d+\.\d+\.\d+)", flat)
+    assert m, f"no exact transformers pin found:\n{flat}"
+    return m.group(1)
+
+
+def test_the_transformers_pin_fits_the_vllm_pin():
+    """vLLM 0.32.0 declares `transformers>=5.16.1,<5.20.0`; a pin outside that range makes
+    the installer's one resolve impossible."""
+    from packaging.version import Version
+    assert _vllm_pin(_pip_commands(("core", "vllm"))) == (0, 32, 0), \
+        "the vLLM pin moved: re-read its transformers range before trusting this test"
+    v = Version(_tf_pin(_pip_commands(("core", "vllm"))))
+    assert Version("5.16.1") <= v < Version("5.20.0"), v
+
+
+def test_the_pin_can_serve_super_vl():
+    """Nemotron-3.5-Super-VL's `nemotron_h_omni` config landed in transformers 5.18.0, so on
+    the old 5.17.0 pin every Super-VL serve needed a transformers overlay. The pin must also
+    sit inside the window glq's NemotronH support was validated on."""
+    from glq.fused_experts import _require_tested_transformers
+    _require_tested_transformers(_tf_pin(_pip_commands(("core", "vllm"))), omni=True)
 
 
 def test_the_pin_can_load_qwen4_exp():
@@ -62,6 +87,43 @@ def test_the_pin_keeps_the_floor_gemma4_needs():
     import re
     m = re.search(r"transformers==(\d+)\.(\d+)\.(\d+)", _pip_commands(("core", "vllm")))
     assert m and tuple(map(int, m.groups())) >= (5, 13, 1)
+
+
+def _vllm_pin(flat):
+    import re
+    m = re.search(r"(?<![\w/])vllm==(\d+)\.(\d+)\.(\d+)(?!\S)", flat)
+    assert m, f"vLLM is not pinned exactly:\n{flat}"
+    return tuple(map(int, m.groups()))
+
+
+def test_serving_pins_vllm_exactly():
+    """vLLM 0.33.0 (2026-11-02) requires `pillow>=13`, and every gradio from 6.31.0 back to
+    3.37 caps `pillow<13`. Left unpinned, pip walked 215 gradio releases looking for one
+    without the cap and settled on 3.36.1, which glq-chat cannot run. An exact pin is the
+    version actually measured, like transformers'."""
+    flat = _pip_commands(("core", "vllm", "chat"))
+    _vllm_pin(flat)
+    assert " vllm " not in f" {flat} ", f"a bare `vllm` is left to pip's resolver:\n{flat}"
+
+
+def test_the_vllm_pin_leaves_room_for_gradio_6():
+    """0.33.0 is the first vLLM whose pillow floor (>=13.0.0) excludes every gradio 6
+    (<13.0); 0.32.0 asks for >=12.3.0. Raising the pin past 0.32 needs a gradio that allows
+    pillow 13, and a resolve that proves it."""
+    assert _vllm_pin(_pip_commands(("core", "vllm"))) < (0, 33, 0)
+
+
+def test_chat_installs_a_gradio_glq_chat_can_use():
+    """A bare `gradio` let pip satisfy the request with 3.36.1. glq-chat needs gradio 6 (the
+    `chat` extra says why), so the installer asks for the extra's own spec: then a conflict
+    moves vLLM or fails, instead of quietly installing a UI that cannot start."""
+    import tomllib
+    pyproject = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
+    extra = [s for s in pyproject["project"]["optional-dependencies"]["chat"]
+             if s.startswith("gradio")]
+    assert extra == ["gradio>=6"], extra
+    words = _pip_commands(("core", "chat")).split(" ")
+    assert "gradio>=6" in words and "gradio" not in words, words
 
 
 def test_the_pin_travels_with_vllm_not_with_the_chat_ui():
@@ -170,13 +232,14 @@ def test_cpu_install_never_names_bare_vllm(monkeypatch):
 def test_cpu_install_keeps_the_transformers_pin(monkeypatch):
     """The transformers pin is model-bound, not device-bound — it applies equally on CPU."""
     flat = _pip_commands_cpu(("core", "vllm"), monkeypatch)
-    assert "transformers==5.17.0" in flat, flat
+    assert "transformers==5.19.0" in flat, flat
 
 
 def test_default_device_argv_is_unchanged():
-    """The GPU path must not drift: bare `vllm` from PyPI, no wheel URL, no extra index."""
+    """The GPU path must not drift: the pinned `vllm` from PyPI, no wheel URL, no extra
+    index."""
     flat = _pip_commands(("core", "vllm"))
-    assert " vllm " in f" {flat} "
+    _vllm_pin(flat)
     assert "+cpu" not in flat and "--extra-index-url" not in flat
 
 
@@ -213,7 +276,7 @@ def test_a_cuda_install_repins_the_toolchain_after_vllm():
     seen = _commands(("core", "vllm"))
     assert _is_repin(seen[-1]), f"the toolchain is not re-pinned last: {seen}"
     assert seen[-1][-1] == f"cuda-toolkit[nvcc,cccl]=={TOOLKIT}", seen[-1]
-    vllm_at = next(i for i, c in enumerate(seen) if "vllm" in c)
+    vllm_at = next(i for i, c in enumerate(seen) if any(a.startswith("vllm==") for a in c))
     assert vllm_at < len(seen) - 1, "the re-pin must come after the vLLM install"
 
 
