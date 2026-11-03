@@ -403,15 +403,20 @@ enable MTP or DSpark; steps wider than the cap take the ordinary path.
 
 ### Speculative decoding with a DSpark drafter
 
-`glq-chat` and `glq-code` take `--dspark` (glq ≥ 0.8.34) for a checkpoint with a known DSpark
-drafter. Today that is Nemotron 3.5 Super-VL, drafted by
-[`RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark`](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark),
-which loads without remote code. It is off unless you ask for it.
+`glq-chat` and `glq-code` take `--dspark` for a checkpoint with a known DSpark drafter. Two
+families have one, and both drafters load without remote code. It is off unless you ask for
+it.
+
+| family | drafter | in VRAM | needs |
+|---|---|--:|---|
+| Nemotron 3.5 Super-VL | [`RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark`](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark) | 2.25 GiB | glq ≥ 0.8.34 |
+| Kolibri 1 | [`intuit/Kolibri-1-dspark`](https://huggingface.co/intuit/Kolibri-1-dspark) | 0.77 GiB | glq from main until the next release, and the `aleph-alpha-inference` plugin, which brings the vLLM it supports (0.29.x) |
 
 ```bash
 glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw --dspark
 glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw \
     --dspark 3 --max-model-len 262144
+glq-code --model xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw --dspark
 ```
 
 - **`--dspark`** lets the planner choose the number of draft tokens. It plans the window, the
@@ -424,12 +429,22 @@ glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3in
   whether the window still fits.
 - **`--draft-model REPO`** picks another drafter. Neither flag combines with `--mtp`.
 
-The drafter (2.25 GiB) stays in VRAM. Output is not byte-identical with speculation on, even
-at temperature 0. Measured by hand with the same vLLM flags on an RTX PRO 4500 capped at 21.96
-GiB (PCIe 5 x16, vLLM 0.32.0, AIPerf SPEED-Bench coding prompts, 10 requests of 4,096 output
-tokens, temperature 1.0, one stream, 16,384 window): **31.50 tok/s per request with 4 draft
-tokens against 20.15 without a drafter (1.56×)**. The deeper step is paid for in KV cache: the
-pool fell from 6.02 to 1.97 GiB.
+The drafter stays in VRAM. Output is not byte-identical with speculation on, even at
+temperature 0. On Super-VL, measured by hand with the same vLLM flags on an RTX PRO 4500
+capped at 21.96 GiB (PCIe 5 x16, vLLM 0.32.0, AIPerf SPEED-Bench coding prompts, 10 requests
+of 4,096 output tokens, temperature 1.0, one stream, 16,384 window): **31.50 tok/s per request
+with 4 draft tokens against 20.15 without a drafter (1.56×)**. The deeper step is paid for in
+KV cache: the pool fell from 6.02 to 1.97 GiB.
+
+On Kolibri 1, measured with `benchmarks/run_model.py` on an uncapped 32 GB RTX PRO 4500 (PCIe
+5 x16, 30 GiB host RAM plus 32 GiB swap, vLLM 0.29.0 with aleph-alpha-inference 1.0.0), with
+the plan `glq-code --dspark` makes for that box: fp16, the full 262,144 window, 18 GiB of
+experts on host, a 4 GiB arena, one stream, 256 tokens at temperature 0, 3 repeats. Result:
+**118.56 tok/s with 4 draft tokens against 53.31 without (2.22×)**, with 55.5% of draft tokens
+accepted. The drafter added 0.80 GiB to the loaded weights (15.37 GiB), and the KV pool still
+held 1.73 times the window. That is one prompt, so it is not a benchmark, and it is not
+comparable with the Super-VL figure (different harness and sampling). Through `glq-chat` at
+the card's temperature 1.0, three chat requests had 50.3% of their draft tokens accepted.
 
 **A 262,144-token window with 3 draft tokens fits a 24 GB budget**, measured through the
 launcher on the same GPU type capped at 22.11 GiB (0.92 of 24 GiB):

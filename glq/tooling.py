@@ -237,6 +237,13 @@ _DSPARK_DRAFTERS = {
     # prompts: 31.50 tok/s per request at 4 draft tokens against 20.15 without
     # (`benchmarks/supervl3_spec_24gb/`).
     "nemotron-3.5-super-vl": "RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark",
+    # Serves on vLLM 0.29.x with the aleph-alpha-inference plugin, the one vLLM that plugin
+    # supports. It reads Kolibri-1's hidden states at layers 4, 14, 24, 34 and 44, hence
+    # `kolibri-1` rather than the `kolibri` the family-wide tables use. Measured with GLQ's
+    # 3 bpw build on an RTX PRO 4500 (vLLM 0.29.0, 18 GiB of experts on host, 4 GiB arena,
+    # 262,144 window, B=1, temperature 0): 118.56 tok/s at 4 draft tokens against 53.31
+    # without (`benchmarks/kolibri_dspark_rtxpro4500/`).
+    "kolibri-1": "intuit/Kolibri-1-dspark",
 }
 
 
