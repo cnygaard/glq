@@ -43,6 +43,13 @@ _EXPERTS_BEFORE = 48_970_178_880   # 45.61 GiB
 #: `moe_shapes.bytes_per_slot` for the 1024-wide latent, inter 2688, relu2 (not gated), 3 bpw.
 _TOPK, _MOE_LAYERS, _SLOT = 22, 40, 2_071_828
 
+KOLIBRI = "xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw"
+KOLIBRI_DRAFTER = "intuit/Kolibri-1-dspark"
+_KOLIBRI_DRAFT = 825_838_209      # 0.77 GiB, read live from the Hub 2026-11-02
+#: From its config.json: top-6 routing over 50 MoE layers, hidden 2560, inter 512, silu
+#: (gated), 3 bpw.
+_K_TOPK, _K_MOE_LAYERS, _K_SLOT = 6, 50, 1_481_748
+
 
 def _sup(vram_gib, ram_gib=128.0, **kw):
     base = dict(model=SV, device="cuda", serve=False, weights_bytes=_WEIGHTS,
@@ -320,6 +327,27 @@ def test_plans_without_dspark_are_unchanged(model, mode, vram, ram, expected):
             sup.resident_bytes + sup.expert_arena_gib * GIB
 
 
+@pytest.mark.parametrize("launcher", [_CODE, _CHAT])
+def test_kolibri_on_a_32_gb_card_plans_what_served(launcher):
+    """The plan both launchers made for Kolibri-1 3 bpw on an RTX PRO 4500 (32,623 MiB, 30.07
+    GiB host RAM, vLLM 0.29.0), from these inputs, and that then served
+    (`benchmarks/kolibri_dspark_rtxpro4500/`): the full window, 18 GiB of experts on host, and
+    a 4 GiB arena holding the 5-token verify step on all 50 MoE layers. The drafter is paid
+    for out of the arena (5 GiB without it), not out of the window or the offload."""
+    facts = dict(model=KOLIBRI, device="cuda", serve=False, weights_bytes=30_819_045_448,
+                 expert_offload_bytes=28_740_327_000, nontext_bytes=0,
+                 vram_bytes=32623 * 1024 ** 2, ram_bytes=31_535_316 * 1024,
+                 model_max_len=262_144, moe_top_k=_K_TOPK, moe_layers=_K_MOE_LAYERS,
+                 arena_slot_bytes=_K_SLOT, **launcher)
+    off = VllmSupervisor(**facts)
+    on = VllmSupervisor(**facts, draft_model=KOLIBRI_DRAFTER, draft_tokens=4, draft_auto=True,
+                        draft_bytes=_KOLIBRI_DRAFT)
+    assert _plan(off)[:3] == (262_144, 18, 5.0)
+    assert _plan(on)[:3] == (262_144, 18, 4.0)
+    assert _spec(on) == {"method": "dspark", "model": KOLIBRI_DRAFTER,
+                         "num_speculative_tokens": 4}
+
+
 # ---------------------------------------------------------------------------
 # The launchers: drafter lookup, checkpoint facts, and the flag
 # ---------------------------------------------------------------------------
@@ -332,6 +360,17 @@ def test_the_drafter_is_known_for_both_supervl_builds_only():
     assert dspark_drafter("xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-"
                           "trellis-3inst-4bpw") is None
     assert dspark_drafter("") is None
+
+
+def test_the_kolibri_1_drafter():
+    """The GLQ build and both of Aleph Alpha's bases take it. It reads Kolibri-1's hidden
+    states (layers 4, 14, 24, 34, 44), so a later Kolibri generation does not."""
+    from glq.tooling import dspark_drafter
+
+    for model in (KOLIBRI, "Aleph-Alpha/Kolibri-1", "Aleph-Alpha/Kolibri-1-BF16"):
+        assert dspark_drafter(model) == KOLIBRI_DRAFTER, model
+    assert dspark_drafter("Aleph-Alpha/Kolibri-2") is None
+    assert dspark_drafter(SV) == DRAFTER
 
 
 def _supervl_config(tmp_path, bpw=3, codebook="trellis"):
@@ -351,6 +390,19 @@ def test_checkpoint_moe_facts_reads_the_arena_shape(tmp_path):
     from glq.chat import checkpoint_moe_facts
 
     assert checkpoint_moe_facts(_supervl_config(tmp_path)) == (_TOPK, _MOE_LAYERS, _SLOT)
+
+
+def test_checkpoint_moe_facts_reads_a_kolibri_config(tmp_path):
+    """The other branch: no `layers_block_type`, so every decoder layer is MoE, no
+    `text_config`, and silu is gated, so w13 holds gate and up (2 x 512)."""
+    from glq.chat import checkpoint_moe_facts
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "kolibri1", "hidden_size": 2560, "moe_intermediate_size": 512,
+        "num_experts_per_tok": 6, "num_hidden_layers": 50, "hidden_act": "silu",
+        "quantization_config": {"quant_method": "glq", "codebook": "trellis", "bpw": 3},
+    }))
+    assert checkpoint_moe_facts(str(tmp_path)) == (_K_TOPK, _K_MOE_LAYERS, _K_SLOT)
 
 
 def test_checkpoint_moe_facts_without_a_trellis_moe_is_zeros(tmp_path):
@@ -439,6 +491,20 @@ def test_both_launchers_pass_dspark_to_the_planner(launchers, monkeypatch, flags
         assert seen["draft_bytes"] == _DRAFT
         assert (seen["moe_top_k"], seen["moe_layers"], seen["arena_slot_bytes"]) == \
                (_TOPK, 40, _SLOT)
+
+
+def test_both_launchers_pick_the_kolibri_drafter(launchers, monkeypatch):
+    chat, code = launchers
+    # glq-code refuses Kolibri before the supervisor when the aleph-alpha-inference plugin
+    # is missing; that guard has its own tests, and this one is about the drafter.
+    monkeypatch.setattr(code, "_plugin_installed", lambda module: True)
+    monkeypatch.setattr(chat, "_draft_bytes",
+                        lambda repo: _KOLIBRI_DRAFT if repo == KOLIBRI_DRAFTER else 0)
+    for mod in launchers:
+        seen = _capture(mod, ["--no-serve", "--model", KOLIBRI, "--dspark"], monkeypatch)
+        assert (seen["draft_model"], seen["draft_tokens"], seen["draft_auto"]) == \
+               (KOLIBRI_DRAFTER, 4, True), mod.__name__
+        assert seen["draft_bytes"] == _KOLIBRI_DRAFT
 
 
 def test_both_launchers_serve_super_vl_text_only(launchers, monkeypatch):
