@@ -43,13 +43,14 @@ def _cb(monkeypatch, *, enabled=True):
 def _no_cuda_alloc(monkeypatch):
     """CPU-only CI has no CUDA build, so the probe tensor cannot be allocated for real.
     The shapes still flow through, which is what these tests assert."""
-    real_empty = torch.empty
-
-    def empty(*a, **kw):
-        if str(kw.get("device", "")) .startswith("cuda"):
-            kw = {k: v for k, v in kw.items() if k != "device"}
-        return real_empty(*a, **kw)
-    monkeypatch.setattr(torch, "empty", empty)
+    def on_cpu(real):
+        def make(*a, **kw):
+            if str(kw.get("device", "")).startswith("cuda"):
+                kw = {k: v for k, v in kw.items() if k != "device"}
+            return real(*a, **kw)
+        return make
+    monkeypatch.setattr(torch, "empty", on_cpu(torch.empty))
+    monkeypatch.setattr(torch, "zeros", on_cpu(torch.zeros))
 
 
 def _fake_capture(calls):
@@ -65,7 +66,7 @@ def test_prewarm_populates_the_graph_cache(monkeypatch):
     calls = []
     monkeypatch.setattr(T.bitshift_codebook, "_capture_pair", _fake_capture(calls))
     monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
-    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev: 256)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: 256)
 
     cb.prewarm_shape(256, 80, device=torch.device("cuda"), dtype=torch.float16)
     assert ("pair", 256, 80) in cb._vit_graphs
@@ -79,7 +80,7 @@ def test_prewarm_is_idempotent(monkeypatch):
     calls = []
     monkeypatch.setattr(T.bitshift_codebook, "_capture_pair", _fake_capture(calls))
     monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
-    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev: 256)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: 256)
 
     for _ in range(3):
         cb.prewarm_shape(256, 80, device=torch.device("cuda"), dtype=torch.float16)
@@ -111,7 +112,7 @@ def test_prewarm_skips_shapes_lazy_capture_would_also_skip(monkeypatch):
     calls = []
     monkeypatch.setattr(T.bitshift_codebook, "_capture_pair", _fake_capture(calls))
     monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
-    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev: 128)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: 128)
     monkeypatch.setattr(T, "_GLQ_TRELLIS_CUDAGRAPH_MAX_B", 256, raising=False)
 
     cb.prewarm_shape(256, 200, device=torch.device("cuda"), dtype=torch.float16)
@@ -129,19 +130,28 @@ def test_a_failed_prewarm_recovers_like_a_failed_capture(monkeypatch):
                         lambda self, X, warmup_iters=3: (_ for _ in ()).throw(
                             RuntimeError("capture invalidated")))
     monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
-    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev: 256)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: 256)
     monkeypatch.setattr(T, "_recover_cuda_context", lambda: True)
 
-    cb.prewarm_shape(256, 80, device=torch.device("cuda"), dtype=torch.float16)
+    with pytest.warns(RuntimeWarning) as rec:
+        cb.prewarm_shape(256, 80, device=torch.device("cuda"), dtype=torch.float16)
+    _assert_recovery_warnings(rec)
     assert cb._vit_graph_pool is None
     assert T._GLQ_TRELLIS_CUDAGRAPH_ENABLED is False
+
+
+def _assert_recovery_warnings(rec):
+    """The failure is reported, and so is the process-wide switch to eager."""
+    msgs = [str(w.message) for w in rec]
+    assert any("prewarm capture failed" in m for m in msgs), msgs
+    assert any("capture disabled for this process" in m for m in msgs), msgs
 
 
 def test_prewarm_covers_every_rvq_stage(monkeypatch):
     """4bpw builds several codebooks (rvq_stages) and each has its OWN graph cache and lock.
     Prewarming only the primary leaves the other stages capturing inside the pool."""
     monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
-    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev: 256)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: 256)
     calls = []
     monkeypatch.setattr(T.bitshift_codebook, "_capture_pair", _fake_capture(calls))
 
@@ -208,7 +218,103 @@ def test_prewarm_accepts_a_device_string(monkeypatch):
     calls = []
     monkeypatch.setattr(T.bitshift_codebook, "_capture_pair", _fake_capture(calls))
     monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
-    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev: 256)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: 256)
 
     cb.prewarm_shape(256, 80, device="cuda", dtype=torch.float16)      # string, not device
     assert calls == [(256, 80)], f"string device was ignored: {calls}"
+
+
+# ---- chunked shapes: too wide for one pair graph ----------------------------------------
+
+def _fake_vit_capture(calls):
+    def cap(self, X, overlap, warmup_iters=3):
+        calls.append((tuple(X.shape), overlap is not None))
+        return T._VitGraph("graph", X, overlap, torch.zeros(1))
+    return cap
+
+
+def _chunked(monkeypatch, chunk_b=192):
+    cb = _cb(monkeypatch)
+    cb.idx_dtype = torch.int64
+    calls = []
+    monkeypatch.setattr(T.bitshift_codebook, "_capture_viterbi", _fake_vit_capture(calls))
+    monkeypatch.setattr(T.bitshift_codebook, "_capture_pair", _fake_capture(calls))
+    monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: True)
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_b", lambda self, dev, T=None: chunk_b)
+    return cb, calls
+
+
+def test_prewarm_captures_the_chunked_viterbi_keys(monkeypatch):
+    """GLM-5.3's experts have 4096 rows, so 256 tiles. On a card whose L2 gives _chunk_b=192
+    that is wider than one pair graph: quantize() takes the two-pass path, and quantize_seq
+    splits the 256 rows into two chunks of 128, with and without the overlap. Those graphs
+    were captured lazily, inside the expert pool."""
+    cb, calls = _chunked(monkeypatch)
+    T.prewarm_codebook(cb, 256, 256, device="cuda")
+    assert set(cb._vit_graphs) == {(256, 128, False), (256, 128, True)}
+    assert sorted(calls) == [((256, 128), False), ((256, 128), True)]
+
+
+def test_quantize_seq_chunks_by_the_same_plan(monkeypatch):
+    """The prewarm keys come from `_chunk_plan`, and so do quantize_seq's chunks: one
+    expression, so the two cannot drift apart."""
+    cb, _ = _chunked(monkeypatch, chunk_b=128)
+    plans, shapes = [], []
+    real = T.bitshift_codebook._chunk_plan
+
+    def spy(self, NO, T_dim, device):
+        plans.append(real(self, NO, T_dim, device))
+        return plans[-1]
+    monkeypatch.setattr(T.bitshift_codebook, "_chunk_plan", spy)
+
+    def viterbi(X, overlap=None):
+        shapes.append(tuple(X.shape))
+        return torch.zeros(X.shape[0] // cb.V, X.shape[1], dtype=cb.idx_dtype)
+    cb.viterbi = viterbi
+    cb.quantize_seq(torch.zeros(16, 300), overlap=None)
+    assert plans == [(3, 100)]
+    assert shapes == [(16, 100)] * 3
+
+
+def test_chunk_prewarm_leaves_single_graph_shapes_to_the_pair_prewarm(monkeypatch):
+    cb, calls = _chunked(monkeypatch)
+    cb.prewarm_chunks(256, 80, device="cuda")
+    assert calls == [] and cb._vit_graphs == {}
+
+
+def test_chunk_prewarm_skips_chunks_that_run_eager(monkeypatch):
+    """quantize_seq graphs a chunk only when bs <= _GLQ_TRELLIS_CUDAGRAPH_MAX_B."""
+    cb, calls = _chunked(monkeypatch, chunk_b=128)
+    monkeypatch.setattr(T, "_GLQ_TRELLIS_CUDAGRAPH_MAX_B", 64, raising=False)
+    cb.prewarm_chunks(256, 256, device="cuda")
+    assert calls == []
+
+
+def test_chunk_prewarm_is_idempotent_and_a_no_op_on_cpu(monkeypatch):
+    cb, calls = _chunked(monkeypatch)
+    cb.prewarm_chunks(256, 256, device="cpu")
+    assert calls == []
+    for _ in range(3):
+        cb.prewarm_chunks(256, 256, device="cuda")
+    assert len(calls) == 2
+
+
+def test_chunk_prewarm_respects_the_kill_switch(monkeypatch):
+    cb, calls = _chunked(monkeypatch)
+    monkeypatch.setattr(T, "_trellis_cudagraph_on", lambda: False)
+    cb.prewarm_chunks(256, 256, device="cuda")
+    assert calls == []
+
+
+def test_a_failed_chunk_prewarm_recovers_like_a_failed_capture(monkeypatch):
+    cb, _ = _chunked(monkeypatch)
+    cb._vit_graph_pool = "POOL"
+    monkeypatch.setattr(T.bitshift_codebook, "_capture_viterbi",
+                        lambda self, X, overlap, warmup_iters=3: (_ for _ in ()).throw(
+                            RuntimeError("capture invalidated")))
+    monkeypatch.setattr(T, "_recover_cuda_context", lambda: True)
+    with pytest.warns(RuntimeWarning) as rec:
+        cb.prewarm_chunks(256, 256, device="cuda")
+    _assert_recovery_warnings(rec)
+    assert cb._vit_graph_pool is None
+    assert T._GLQ_TRELLIS_CUDAGRAPH_ENABLED is False

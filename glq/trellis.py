@@ -23,6 +23,7 @@ QTIP is GPL-3.0, same license as GLQ; the Viterbi/pack/permute logic is ported f
 ``lib/codebook/bitshift.py``, ``lib/algo/{ldlq,finetune}.py``. See
 ``~/.claude/plans/hazy-churning-shannon.md``.
 """
+import contextlib
 import math
 import os
 import threading
@@ -73,13 +74,34 @@ def _is_capturing() -> bool:
         return False
 
 
+def cuda_device_scope(device):
+    """Make ``device`` current while capturing or quantizing for it, when it names one.
+
+    CUDA streams, graph pools and kernel launches (Triton, the compiled Viterbi update, the
+    FHT) follow the CURRENT device, not their tensors'. A thread quantizing for cuda:1 with
+    cuda:0 current would capture and launch into cuda:0's stream. An unindexed ``"cuda"``
+    already means the current device, so it changes nothing: one-device runs behave as
+    before, including tests that pass ``"cuda"`` symbolically on a CPU-only host.
+    """
+    if not str(device).startswith("cuda"):
+        return contextlib.nullcontext()
+    d = device if isinstance(device, torch.device) else torch.device(device)
+    if d.index is None:
+        return contextlib.nullcontext()
+    return torch.cuda.device(d)
+
+
 def prewarm_codebook(codebook, T_dim, B, device, dtype=torch.float16):
-    """Prewarm every RVQ stage of a GLQ codebook.
+    """Prewarm every RVQ stage of a GLQ codebook, for B rows of T_dim-long tiles.
 
     A 4 bpw run builds several codebooks (`rvq_stages`), and each carries its OWN graph
     cache, pool and lock — capture being process-global does not make them share state.
     Prewarming only the primary leaves the residual stages capturing inside the pool, which
     is the same failure with fewer occurrences.
+
+    Both capture paths are covered: `prewarm_shape` for a B that fits one pair graph,
+    `prewarm_chunks` for a wider B that `quantize_seq` chunks. Each returns at once for
+    the other's case.
 
     Accepts a TrellisCodebook (wrapping `.cb`) or a bare bitshift_codebook, and is a no-op
     for codebooks that have no capture path at all (e8p / shell).
@@ -87,9 +109,10 @@ def prewarm_codebook(codebook, T_dim, B, device, dtype=torch.float16):
     stages = getattr(codebook, "rvq_stages", None) or [codebook]
     for stage in stages:
         inner = getattr(stage, "cb", stage)
-        fn = getattr(inner, "prewarm_shape", None)
-        if fn is not None:
-            fn(T_dim, B, device=device, dtype=dtype)
+        for name in ("prewarm_shape", "prewarm_chunks"):
+            fn = getattr(inner, name, None)
+            if fn is not None:
+                fn(T_dim, B, device=device, dtype=dtype)
 
 
 def _recover_cuda_context() -> bool:
@@ -429,9 +452,25 @@ class bitshift_codebook(nn.Module):
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._vit_graph_pool):
+        with torch.cuda.graph(graph, pool=self._vit_graph_pool,
+                              stream=self._capture_stream(X.device)):
             out_buf = self.viterbi(x_buf, overlap_buf)
         return _VitGraph(graph, x_buf, overlap_buf, out_buf)
+
+    def _capture_stream(self, device):
+        """This codebook's capture stream, on its own device.
+
+        `torch.cuda.graph` otherwise captures on one class-wide stream, created on whichever
+        device captured first. A second card then captured on the first card's stream, so the
+        caching allocator saw no capture on its own device and called cudaMalloc mid-capture:
+        CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED from cuMemAlloc_v2, measured on cuda:1 after
+        cuda:0. One stream per codebook keeps every graph sharing its pool on one stream, as
+        the class-wide one did on a single card.
+        """
+        s = getattr(self, "_vit_capture_stream", None)
+        if s is None or s.device != device:
+            s = self._vit_capture_stream = torch.cuda.Stream(device=device)
+        return s
 
     @torch.no_grad()
     def _viterbi_graphed(self, X, overlap=None):
@@ -501,7 +540,8 @@ class bitshift_codebook(nn.Module):
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._vit_graph_pool):
+        with torch.cuda.graph(graph, pool=self._vit_graph_pool,
+                              stream=self._capture_stream(X.device)):
             out_buf = self._pair_body(x_buf)
         return _VitGraph(graph, x_buf, None, out_buf)
 
@@ -538,8 +578,9 @@ class bitshift_codebook(nn.Module):
             if key in self._vit_graphs:
                 return
             try:
-                X = torch.empty(int(T_dim), int(B), device=device, dtype=dtype)
-                self._vit_graphs[key] = self._capture_pair(X)
+                with cuda_device_scope(device):
+                    X = torch.empty(int(T_dim), int(B), device=device, dtype=dtype)
+                    self._vit_graphs[key] = self._capture_pair(X)
             except Exception as e:                       # noqa: BLE001
                 # Identical recovery to the lazy path: a failed capture poisons the context,
                 # so the pool must not be handed a half-broken one.
@@ -555,6 +596,55 @@ class bitshift_codebook(nn.Module):
                     f"the per-pass path. {type(e).__name__}: {e}",
                     RuntimeWarning, stacklevel=2)
                 _disable_cudagraph_capture(f"prewarm {key}")
+
+    @torch.no_grad()
+    def prewarm_chunks(self, T_dim, NO, device, dtype=torch.float16):
+        """Capture the per-chunk Viterbi graphs `quantize_seq` replays for NO rows, now,
+        single-threaded.
+
+        `prewarm_shape`'s counterpart for an NO too wide for one pair graph. That takes the
+        two-pass path, where `quantize_seq` splits the rows into chunks and
+        `_viterbi_graphed` used to capture each chunk shape lazily, inside the expert pool.
+        GLM-5.3's 4096-row experts are this case: 256 tiles against a `_chunk_b` of 192 on
+        an RTX PRO 6000, so two chunks of 128. With experts spread over several GPUs, a
+        capture there is also exposed to the other cards' workers.
+
+        The gate, the chunk width and the keys come from the expressions `quantize`,
+        `quantize_seq` and `_viterbi_graphed` use, so the pool only replays.
+        """
+        device = torch.device(device) if not isinstance(device, torch.device) else device
+        if device.type != "cuda" or not _trellis_cudagraph_on():
+            return
+        if NO <= min(self._chunk_b(device, T=T_dim), _GLQ_TRELLIS_CUDAGRAPH_MAX_B):
+            return                                   # one pair graph: prewarm_shape's case
+        _, bs = self._chunk_plan(NO, T_dim, device)
+        if bs > _GLQ_TRELLIS_CUDAGRAPH_MAX_B:
+            return                                   # quantize_seq runs these chunks eager
+        for has_overlap in (False, True):
+            key = (int(T_dim), int(bs), has_overlap)
+            with self._vit_lock:
+                if key in self._vit_graphs:
+                    continue
+                try:
+                    with cuda_device_scope(device):
+                        X = torch.zeros(int(T_dim), int(bs), device=device, dtype=dtype)
+                        overlap = (torch.zeros(int(bs), device=device, dtype=self.idx_dtype)
+                                   if has_overlap else None)
+                        self._vit_graphs[key] = self._capture_viterbi(X, overlap)
+                except Exception as e:                       # noqa: BLE001
+                    # The same recovery as the lazy path and prewarm_shape.
+                    self._vit_graph_pool = None
+                    self._vit_graphs[key] = None
+                    if not _recover_cuda_context():
+                        raise RuntimeError(
+                            f"trellis prewarm capture failed for {key} and the CUDA context "
+                            f"could not be recovered. Re-run with GLQ_TRELLIS_NO_CUDAGRAPH=1. "
+                            f"Original error: {type(e).__name__}: {e}") from e
+                    warnings.warn(
+                        f"trellis prewarm capture failed for {key}; quantization continues "
+                        f"eager. {type(e).__name__}: {e}", RuntimeWarning, stacklevel=2)
+                    _disable_cudagraph_capture(f"prewarm {key}")
+                    return
 
     @torch.no_grad()
     def _pair_graphed(self, X):
@@ -682,14 +772,21 @@ class bitshift_codebook(nn.Module):
         capped = self._state_budget(device) // max(1, per_row)
         return max(1, min(b, capped))
 
+    def _chunk_plan(self, NO, T, device):
+        """``(nchunks, bs)`` for `quantize_seq` over NO rows of length T on ``device``.
+
+        Balanced chunks: take the fewest chunks that respect the device width, then even
+        them out. Rounding NO up to a multiple of the width instead would process 288 rows
+        for a 160-row layer at width 144 — slower than not chunking at all. Shared with
+        `prewarm_chunks`, which captures the graphs these chunks replay.
+        """
+        cap = min(self._chunk_b(device, T=T), NO)
+        nchunks = math.ceil(NO / cap)
+        return nchunks, math.ceil(NO / nchunks)
+
     def quantize_seq(self, X, overlap=None):
         T, NO = X.shape
-        # Balanced chunks: take the fewest chunks that respect the device width, then even
-        # them out. Rounding NO up to a multiple of the width instead would process 288 rows
-        # for a 160-row layer at width 144 — slower than not chunking at all.
-        cap = min(self._chunk_b(X.device, T=T), NO)
-        nchunks = math.ceil(NO / cap)
-        bs = math.ceil(NO / nchunks)
+        nchunks, bs = self._chunk_plan(NO, T, X.device)
         pad_amt = nchunks * bs - NO
         X = torch.nn.functional.pad(X, (0, pad_amt))
         T, N = X.shape
@@ -817,6 +914,37 @@ class TrellisCodebook:
 
     def unpack_trellis(self, packed, T):
         return self.cb.unpack_trellis(packed, T)
+
+
+def replicate_trellis_codebook(codebook, device):
+    """The same trellis codebook on another device, for quantizing experts there.
+
+    Every RVQ stage is rebuilt on ``device`` from the original's variant, K and tlut, so a
+    HYB codebook never refits its k-means tlut. Each copy has its own Viterbi graph cache,
+    pool and lock: the lock serialises one card's workers, and one card must not wait on
+    another's. A copy whose buffers differ from the original's is refused, because the
+    checkpoint must not depend on which card encoded an expert.
+    """
+    stages = list(getattr(codebook, "rvq_stages", None) or [codebook])
+    copies = [TrellisCodebook(variant=s.variant, K=s.K, device=device, tlut=s.tlut)
+              for s in stages]
+    for src, dst in zip(stages, copies):
+        _check_replica(src, dst)
+    copies[0].rvq_stages = copies
+    return copies[0]
+
+
+def _check_replica(src, dst):
+    """Raise unless ``dst`` encodes exactly as ``src``: equal buffers, scale and layout."""
+    a, b = src.cb.state_dict(), dst.cb.state_dict()
+    diff = sorted(k for k in a.keys() | b.keys()
+                  if k not in a or k not in b or not torch.equal(a[k].cpu(), b[k].cpu()))
+    meta = ("variant", "K", "V", "L", "opt_scale", "has_kernel")
+    meta_diff = [m for m in meta if getattr(src, m) != getattr(dst, m)]
+    if diff or meta_diff:
+        raise RuntimeError(
+            f"trellis codebook copy on {dst.device} differs from the original on "
+            f"{src.device}: buffers {diff}, attributes {meta_diff}")
 
 
 # ---------------------------------------------------------------------------
