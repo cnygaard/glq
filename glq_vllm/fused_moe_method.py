@@ -21,7 +21,7 @@ from .linear_method import (
     _ensure_codebook, _glq_pad, _is_pow2, _make_glq_param, _glq_apply_shard,
     _detect_block_diag, _pack_block_meta,
 )
-from ._dispatch import _grouped_enabled
+from ._dispatch import _grouped_enabled, moe_swiglu_limit, swiglu_limit_refusal
 from ._dispatch import trellis_moe_activation_ok as _trellis_moe_activation_ok
 
 #: One-shot latch for the "CPU MoE took the per-expert loop" notice. A 26B-A4B has 30 MoE
@@ -34,16 +34,24 @@ def _round8(n: int) -> int:
     return ((n + 7) // 8) * 8
 
 
-def _apply_activation(h, activation):
+def _apply_activation(h, activation, swiglu_limit=0.0):
     """Apply MoE activation function (gated or non-gated).
 
     activation can be a string (vLLM 0.16) or MoEActivation enum (vLLM 0.18+).
+    ``swiglu_limit`` > 0 clamps gate from above and up on both sides before the gated silu,
+    as vLLM's ``_swiglu_limit_torch`` does for GLM-5.3. vLLM only pairs it with silu.
     """
     act = activation.value if hasattr(activation, 'value') else str(activation) if activation else "silu"
+    if swiglu_limit > 0 and act != "silu":
+        raise ValueError(f"swiglu_limit={swiglu_limit:g} is defined for gated silu only, "
+                         f"not {act!r}")
 
     # Gated activations: split input into gate and up projections
     if act == "silu":
         gate, up = h.chunk(2, dim=-1)
+        if swiglu_limit > 0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         return F.silu(gate) * up
     elif act in ("gelu", "gelu_tanh", "gelu_pytorch_tanh"):
         # gemma-4 experts use gelu_pytorch_tanh (vLLM names it "gelu_tanh").
@@ -127,6 +135,17 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                 "GLQ trellis MoE supports only the 3inst variant — the fused trellis entries "
                 "take no tlut, so a HYB checkpoint would decode against a codebook the kernel "
                 "never sees. Re-quantize with GLQ_TRELLIS_VARIANT=3inst.")
+
+        # GLM-5.3 clamps its SwiGLU, and vLLM passes the limit beside an activation still
+        # named silu. Refuse here what no GLQ path for this layer could apply, rather than
+        # serve the unclamped function; apply() reads the recorded limit.
+        limit = moe_swiglu_limit(self.moe, layer)
+        why = swiglu_limit_refusal(
+            self.codebook_type,
+            self._activation_type(getattr(self.moe, 'activation', None)), limit)
+        if why is not None:
+            raise ValueError(f"GLQ MoE {getattr(self, 'prefix', None) or ''}: {why}")
+        layer.glq_swiglu_limit = limit
 
         # w13 = gate_up_proj (or just up_proj for non-gated)
         is_gated = getattr(self.moe, 'is_act_and_mul', None)
@@ -578,7 +597,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             ew = (topk_weights * mask.float()).sum(dim=1)[token_mask]
             xt = x[token_mask].to(torch.float16)
             h = _shard("w13", xt, hidden, w13_out, e)
-            h = _apply_activation(h, activation)
+            h = _apply_activation(h, activation,
+                                  swiglu_limit=getattr(layer, 'glq_swiglu_limit', 0.0))
             y = _shard("w2", h, inter, hidden, e)
             out[token_mask] += y.to(dtype) * ew.unsqueeze(-1)
         return out
@@ -618,7 +638,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             ext_has_entry=(ext is not None
                            and hasattr(ext, 'glq_fused_moe_trellis_3inst_cpu')),
             force_fallback=_os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") != "0",
-            cpu_fused_enabled=_os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0")
+            cpu_fused_enabled=_os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0",
+            swiglu_limit=getattr(layer, 'glq_swiglu_limit', 0.0))
         if why is not None:
             global _WARNED_CPU_MOE_FALLBACK
             if not _WARNED_CPU_MOE_FALLBACK:
@@ -761,7 +782,8 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             ew = (topk_weights * mask.float()).sum(dim=1)[token_mask]
             xt = x[token_mask].to(torch.float16)
             h = _shard("w13", xt, hidden, w13_out, e)
-            h = _apply_activation(h, activation)
+            h = _apply_activation(h, activation,
+                                  swiglu_limit=getattr(layer, 'glq_swiglu_limit', 0.0))
             y = _shard("w2", h, inter, hidden, e)
             out[token_mask] += y.to(dtype) * ew.unsqueeze(-1)
         return out
@@ -926,6 +948,11 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
             # forces --enforce-eager. GLQ_MOE_FORCE_FALLBACK=1 forces the loop (A/B
             # isolation); tokens > cap (prefill) also take the loop, which is eager anyway
             # and lets the per-expert dense path handle large batches.
+            #
+            # A clamped SwiGLU (GLM-5.3) takes its own op, a distinct name so the hasattr
+            # probe is a real capability test against an older .so. Without it the loop
+            # serves, clamp applied, but eager.
+            limit = getattr(layer, 'glq_swiglu_limit', 0.0)
             if (getattr(layer, 'glq_trellis_fused_ok', False)
                     and _os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") == "0"
                     and x.shape[0] <= _bd_cap
@@ -936,7 +963,10 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                     and _ik._try_load_cuda_ext()
                     and hasattr(_ik._glq_cuda, 'glq_fused_moe_trellis_3inst_cuda')
                     and hasattr(torch.ops, 'glq')
-                    and hasattr(torch.ops.glq, 'fused_moe_trellis_3inst')):
+                    and hasattr(torch.ops.glq, 'fused_moe_trellis_3inst')
+                    and (limit <= 0
+                         or (hasattr(_ik._glq_cuda, 'glq_fused_moe_trellis_3inst_swiglu_cuda')
+                             and hasattr(torch.ops.glq, 'fused_moe_trellis_3inst_swiglu')))):
                 dtype = x.dtype
                 meta = layer._glq_trellis_moe_meta
                 m13, m2 = meta['w13'], meta['w2']
@@ -958,7 +988,7 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                     ids = plan.slot_of.view(topk_ids.shape)
                     W = _ArenaWeights(arena.buffers, layer)
                     arena.maybe_report(self._arena_report_every())
-                output = torch.ops.glq.fused_moe_trellis_3inst(
+                args = (
                     x.half().contiguous(),
                     ids.to(torch.int64),
                     topk_weights.float().contiguous(),
@@ -974,6 +1004,10 @@ class GLQFusedMoEMethod(FusedMoEMethodBase):
                     m2['_bn'], m2['_bm'], m2['_bnm'], m2['_bmm'],
                     self._activation_type(activation),
                 )
+                if limit > 0:
+                    output = torch.ops.glq.fused_moe_trellis_3inst_swiglu(*args, limit)
+                else:
+                    output = torch.ops.glq.fused_moe_trellis_3inst(*args)
                 if dtype != torch.float16:
                     output = output.to(dtype)
                 return output

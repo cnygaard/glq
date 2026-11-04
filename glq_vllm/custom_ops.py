@@ -35,6 +35,14 @@ FUSED_MOE_TRELLIS_3INST_SCHEMA = (
     "Tensor blocks_n_w2_meta, Tensor blocks_m_w2_meta, "
     "int activation_type) -> Tensor")
 
+# The same op with GLM-5.3's SwiGLU clamp. A separate name rather than an extra argument on
+# the one above, so `hasattr` on an older .so answers "no clamp" instead of failing at call.
+FUSED_MOE_TRELLIS_3INST_SWIGLU_SCHEMA = (
+    FUSED_MOE_TRELLIS_3INST_SCHEMA
+    .replace("fused_moe_trellis_3inst(", "fused_moe_trellis_3inst_swiglu(", 1)
+    .replace("int activation_type) -> Tensor",
+             "int activation_type, float swiglu_limit) -> Tensor", 1))
+
 
 def _register_embedding_dequant(dispatch_key):
     """GLQ per-row embedding lookup (gather + dequant + inverse RHT) for the Gemma-4
@@ -335,6 +343,12 @@ def _ensure_registered():
                       cuda.glq_fused_moe_trellis_3inst_cuda, dispatch_key)
         _glq_lib._register_fake("fused_moe_trellis_3inst",
                                 _fused_moe_trellis_3inst_fake)
+    if hasattr(cuda, "glq_fused_moe_trellis_3inst_swiglu_cuda"):
+        _glq_lib.define(FUSED_MOE_TRELLIS_3INST_SWIGLU_SCHEMA)
+        _glq_lib.impl("fused_moe_trellis_3inst_swiglu",
+                      cuda.glq_fused_moe_trellis_3inst_swiglu_cuda, dispatch_key)
+        _glq_lib._register_fake("fused_moe_trellis_3inst_swiglu",
+                                _fused_moe_trellis_3inst_swiglu_fake)
 
     # -- 11. embedding_dequant (see _register_embedding_dequant) --
     _register_embedding_dequant(dispatch_key)
@@ -755,6 +769,24 @@ def _fused_moe_trellis_3inst_fake(x, topk_ids, topk_weights,
     # positional list must stay in lockstep with the schema above — an arity drift here
     # fails deep inside dispatch, possibly mid-capture, which is what
     # test_fused_moe_trellis_3inst_fake_shape exists to catch.
+    return torch.empty((*x.shape[:-1], hidden_size),
+                       dtype=torch.float16, device=x.device)
+
+
+def _fused_moe_trellis_3inst_swiglu_fake(x, topk_ids, topk_weights,
+                                         w13_trellis_packed, w13_trellis_packed2,
+                                         w13_SU, w13_SV, w13_Wscale, w13_inv_resid_scale2,
+                                         w2_trellis_packed, w2_trellis_packed2,
+                                         w2_SU, w2_SV, w2_Wscale, w2_inv_resid_scale2,
+                                         hidden_size, intermediate_size, w13_out_features,
+                                         n_pad_w13, m_pad_w13, n_pad_w2, m_pad_w2,
+                                         blocks_n_w13, blocks_m_w13,
+                                         blocks_n_w13_meta, blocks_m_w13_meta,
+                                         blocks_n_w2, blocks_m_w2,
+                                         blocks_n_w2_meta, blocks_m_w2_meta,
+                                         activation_type, swiglu_limit):
+    # Same contract as the unclamped op; test_the_swiglu_op_schema_matches_its_fake keeps
+    # this list in step with FUSED_MOE_TRELLIS_3INST_SWIGLU_SCHEMA.
     return torch.empty((*x.shape[:-1], hidden_size),
                        dtype=torch.float16, device=x.device)
 
