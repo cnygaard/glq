@@ -405,6 +405,22 @@ def test_checkpoint_moe_facts_reads_a_kolibri_config(tmp_path):
     assert checkpoint_moe_facts(str(tmp_path)) == (_K_TOPK, _K_MOE_LAYERS, _K_SLOT)
 
 
+def test_checkpoint_moe_facts_reads_a_glm5_config(tmp_path):
+    """GLM-5.3 marks its MLPs in `mlp_layer_types`: layers 0-2 are dense, so 42 of its 45
+    decoder layers are MoE, not every one. Hidden 4096, inter 2048, silu (gated), 4 bpw."""
+    from glq.chat import checkpoint_moe_facts
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "glm5_next",
+        "text_config": {
+            "hidden_size": 4096, "moe_intermediate_size": 2048, "num_experts_per_tok": 8,
+            "num_hidden_layers": 45, "hidden_act": "silu", "layers_block_type": None,
+            "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 42},
+        "quantization_config": {"quant_method": "glq", "codebook": "trellis", "bpw": 4},
+    }))
+    assert checkpoint_moe_facts(str(tmp_path)) == (8, 42, 12_599_316)
+
+
 def test_checkpoint_moe_facts_without_a_trellis_moe_is_zeros(tmp_path):
     from glq.chat import checkpoint_moe_facts
 

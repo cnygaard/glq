@@ -106,6 +106,25 @@ def test_qwen_next_gets_bf16_because_vllm_refuses_fp16_for_it():
     assert "qsa" in src.lower(), "the QSA refusal is the evidence for the qwen entry"
 
 
+@pytest.mark.parametrize("model", [
+    "zai-org/GLM-5.3-Flash-BF16",
+    "xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw",
+])
+def test_glm_5_gets_bf16_because_its_kernels_assert_it(model):
+    """vLLM 0.32's GLM-5 kernels take bf16 only: `models/glm5next/nvidia/ops/
+    kpool_compress.py` asserts it at seven sites, and `common/kda.py` names bf16 as a
+    FlashKDA requirement. Read in the source, not run in fp16."""
+    assert preferred_dtype(model, "cuda") == "bfloat16"
+
+
+def test_a_glm_5_directory_is_caught_by_its_config(tmp_path):
+    """A box copy is named by whoever copied it; config.json still names the family."""
+    import json
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"]}))
+    assert preferred_dtype(str(tmp_path), "cuda") == "bfloat16"
+
+
 def test_the_whole_qwen_family_stays_on_bf16_because_fp16_buys_it_nothing():
     """Qwen3.8-27B is `qwen3_5` — a GDN hybrid but with no QSA, so fp16 is NOT refused for
     it and this entry is wider than strict safety requires. It stays wide on measured

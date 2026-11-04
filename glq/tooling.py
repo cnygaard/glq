@@ -129,6 +129,17 @@ def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
                 "--tool-call-parser", "qwen3_coder",
                 "--reasoning-parser", "nemotron_v3",
                 *text_only_serve_args(model_id)]
+    if "glm-5" in name:
+        # vLLM's GLM-5.3-Flash recipe: `glm47` for both. vLLM 0.32.0 registers `glm45` and
+        # `glm47` as aliases of the same two classes; the recipe's name is carried. Keyed on
+        # "glm-5" because GLM-4 checkpoints use other templates and were never checked.
+        #
+        # No `--default-chat-template-kwargs`: the template opens `<think>` at every
+        # generation prompt. The recipe also passes `--tokenizer-mode glm5_next`, which
+        # vLLM 0.32.0 does not have.
+        return ["--enable-auto-tool-choice",
+                "--tool-call-parser", "glm47",
+                "--reasoning-parser", "glm47"]
     return None
 
 
@@ -166,10 +177,11 @@ def text_only_serve_args(model_id: str) -> list[str]:
 #:   qwen          Qwen3.x are thinking models (see the `qwen` branch above)
 #:   kolibri       the plugin has thinking ON by default (see the `kolibri` branch above)
 #:   nemotron-3.5  `enable_thinking` defaults to True; the prompt ends in `<think>\n`
+#:   glm-5         the template opens `<think>` at every generation prompt, with no switch
 #:
 #: gemma-4 is deliberately absent: its template defaults `enable_thinking` to false, which is
 #: why glq-code has to pass `{"enable_thinking":true}` to make it think at all.
-_THINKS_BY_DEFAULT = ("qwen", "kolibri", "nemotron-3.5")
+_THINKS_BY_DEFAULT = ("qwen", "kolibri", "nemotron-3.5", "glm-5")
 
 
 def reasoning_serve_args(model_id: str) -> list[str]:
@@ -280,6 +292,9 @@ _FAMILY_SAMPLING = {
     "kolibri": {"temperature": 1.0, "top_p": 0.97, "top_k": 128},
     # Nemotron 3.5's card: 1.0 / 0.95 in every example, reasoning on or off, and no top_k.
     "nemotron-3.5": {"temperature": 1.0, "top_p": 0.95},
+    # GLM-5.3's generation_config.json, and the card's evaluation settings: 1.0 / 0.95, no
+    # top_k.
+    "glm-5": {"temperature": 1.0, "top_p": 0.95},
 }
 
 #: Neutral values for a family we have no card for — usable on a slider, opinionated about
@@ -449,6 +464,11 @@ FP16_UNSAFE = (
     #   bf16  B=1 127.549 (127.408-127.684)  B=8 882.3   -- reasons
     # i.e. -2.6% / -3.4%, non-overlapping ranges, for a model that actually thinks.
     "nemotron",
+    # GLM-5.3: vLLM 0.32.0's GLM-5 kernels take bf16 only. `models/glm5next/nvidia/ops/
+    # kpool_compress.py` asserts it at seven sites, and `common/kda.py` names bf16 as a
+    # FlashKDA requirement. Read in the source, not run in fp16. Two spellings: the repo id
+    # says "GLM-5.3", while config.json says `glm5_next` / `Glm5NextForConditionalGeneration`.
+    "glm-5", "glm5",
 )
 
 #: The dtype to serve with, per device. The two entries are chosen for DIFFERENT reasons and

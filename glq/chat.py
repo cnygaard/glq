@@ -600,8 +600,9 @@ def checkpoint_moe_facts(repo_id: str) -> tuple[int, int, int]:
     The slot is sized the way the vLLM plugin sizes it at load (`fused_moe_method`): the
     routed experts' width is `moe_latent_size` where the model has one (Super-VL routes in a
     1024-wide latent, not its 4096 hidden size), and `relu2` is not gated, so w13 is up_proj
-    alone. `moe_layers` counts `"moe"` in `layers_block_type` for a hybrid like NemotronH, and
-    is every decoder layer otherwise. The arena exists only for trellis MoE, so anything else
+    alone. `moe_layers` counts `"moe"` in `layers_block_type` for a hybrid like NemotronH,
+    `"sparse"` in `mlp_layer_types` for GLM-5.3 (layers 0-2 are dense), and is every decoder
+    layer otherwise. The arena exists only for trellis MoE, so anything else
     is zeros.
 
     Same never-block contract as `checkpoint_mtp`, and shared by glq-chat and glq-code.
@@ -617,8 +618,11 @@ def checkpoint_moe_facts(repo_id: str) -> tuple[int, int, int]:
         if quant.get("codebook") != "trellis" or not top_k:
             return 0, 0, 0
         blocks = text.get("layers_block_type")
+        mlps = text.get("mlp_layer_types")
         if isinstance(blocks, list):
             layers = sum(1 for b in blocks if b == "moe")
+        elif isinstance(mlps, list):
+            layers = sum(1 for m in mlps if m == "sparse")
         else:
             layers = int(text.get("num_hidden_layers") or 0)
         inter = int(text.get("moe_intermediate_size") or 0)
