@@ -425,7 +425,10 @@ def test_preflight_computes_free_disk_without_awk(tmp_path):
     assert not (tmp_path / "awk_was_called").exists(), \
         "pre-flight still shells out to awk; minimal images do not have it"
     assert "command not found" not in proc.stdout + proc.stderr
-    assert re.search(r"disk:\s+\d+ GB free", proc.stdout), proc.stdout
+    # Both streams: below MIN_FREE_GB the line is a warning on stderr, not a note on stdout.
+    # A CI runner with 16 GB free in $HOME failed this on stdout alone (2026-11-03).
+    out = _out(proc)
+    assert re.search(r"disk:\s+\d+ GB free", out), out
 
 
 # ---- `which` is a vLLM runtime dependency on RPM-family images ---------------------------

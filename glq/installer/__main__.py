@@ -51,19 +51,37 @@ class Runner:
 #: `config.head_dim` while building its ModelConfig and hit
 #: AmbiguousGlobalPerLayerAttributeError once 5.15.0 moved gemma-4 to a per-layer config.
 #: Its comment named its own expiry: lift it when vLLM builds gemma-4 from per-layer
-#: configs. vLLM 0.29 does, and the installer pins no vLLM version at all — both the CUDA
-#: and CPU paths resolve the newest — so the ceiling had stopped protecting anyone.
+#: configs. vLLM 0.29 does, and the installer then pinned no vLLM version at all — both the
+#: CUDA and CPU paths resolved the newest — so the ceiling had stopped protecting anyone.
 #:
 #: It had started doing harm instead: `qwen4_exp` (Qwen3.8-Flash-Next) landed in 5.16.0, so
 #: under the old ceiling install.sh produced an environment that could not load the model at
 #: all, failing with "Transformers does not recognize this architecture".
 #:
-#: 5.17.0 is the version actually measured, on vLLM 0.29.0 / RTX PRO 6000: gemma-4
-#: E2B/12B/26B-GLQ, Qwen3.5 and SmolLM3-GLQ all serve (benchmarks/_gemma4_transformers_gate.py
-#: re-runs it), and gemma-4 E2B, Qwen3.5 and Qwen4Exp all quantize. An exact pin rather than
-#: a floor: "resolve the newest" is the documented failure mode above, so this needs bumping
-#: deliberately, with the gate re-run, rather than drifting on its own.
-GEMMA4_TRANSFORMERS = "transformers==5.17.0"
+#: 5.17.0 was the version measured on vLLM 0.29.0 / RTX PRO 6000: gemma-4 E2B/12B/26B-GLQ,
+#: Qwen3.5 and SmolLM3-GLQ all served, and gemma-4 E2B, Qwen3.5 and Qwen4Exp all quantized.
+#: 5.19.0 replaced it with the vLLM 0.32.0 pin below. That vLLM declares
+#: `transformers>=5.16.1,<5.20.0`, and Nemotron-3.5-Super-VL needs 5.18+ for its native
+#: `nemotron_h_omni` config: on 5.17.0 every Super-VL serve needed a 5.19.0 overlay, which is
+#: how it was measured (glq 0.8.33, vLLM 0.32.0, `benchmarks/supervl3_spec_24gb/`). 5.19.0 is
+#: also the version glq's NemotronH support is validated on (`fused_experts._TF_TESTED`). An
+#: exact pin rather than a floor: "resolve the newest" is the documented failure mode above,
+#: so this needs bumping deliberately, with the serving gate re-run, rather than drifting on
+#: its own.
+GEMMA4_TRANSFORMERS = "transformers==5.19.0"
+
+#: Pinned exactly for the same reason. vLLM 0.33.0 (2026-11-02) raised its floor to
+#: `pillow>=13.0.0`, and every gradio from 6.31.0 back to 3.37 caps `pillow<13`. With a bare
+#: `vllm` beside `gradio` in one resolve, pip walked 215 gradio releases looking for one
+#: without the cap and settled on 3.36.1, which glq-chat cannot run. 0.32.0 asks for
+#: `pillow>=12.3.0`, and it is the vLLM glq 0.8.34's Super-VL DSpark results were measured
+#: on. Raise it once a gradio allows pillow 13, with a resolve that shows it. The CPU path
+#: installs a GitHub-release wheel instead (`cpu_wheel.py`).
+VLLM = "vllm==0.32.0"
+
+#: The `chat` extra's own spec in pyproject.toml. A bare `gradio` is what let pip settle on
+#: 3.36.1 above; with the floor, a conflict has to move vLLM or fail.
+GRADIO = "gradio>=6"
 
 # Template constants live in glq.tooling — the single source both this installer and
 # glq-code read, so the family knowledge cannot drift again.
@@ -113,9 +131,9 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
             wanted += cpu_wheel.cpu_install_args(url)[:1] + [GEMMA4_TRANSFORMERS]
             extra_pip_args = cpu_wheel.cpu_install_args(url)[1:]
         else:
-            wanted += ["vllm", GEMMA4_TRANSFORMERS]
+            wanted += [VLLM, GEMMA4_TRANSFORMERS]
     if "chat" in components:
-        wanted += ["gradio", "openai"]
+        wanted += [GRADIO, "openai"]
     if wanted:
         print(f"\n== installing: {', '.join(wanted)}")
         run([pip, "install", "--upgrade", *wanted, *extra_pip_args])
