@@ -410,7 +410,7 @@ it.
 | family | drafter | in VRAM | needs |
 |---|---|--:|---|
 | Nemotron 3.5 Super-VL | [`RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark`](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark) | 2.25 GiB | glq ≥ 0.8.34 |
-| Kolibri 1 | [`intuit/Kolibri-1-dspark`](https://huggingface.co/intuit/Kolibri-1-dspark) | 0.77 GiB | glq from main until the next release, and the `aleph-alpha-inference` plugin, which brings the vLLM it supports (0.29.x) |
+| Kolibri 1 | [`intuit/Kolibri-1-dspark`](https://huggingface.co/intuit/Kolibri-1-dspark) | 0.77 GiB | glq ≥ 0.8.35, and the `aleph-alpha-inference` plugin, which brings the vLLM it supports (0.29.x) |
 
 ```bash
 glq-code --model xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw --dspark
