@@ -4547,9 +4547,14 @@ __global__ void glq_moe_weighted_scatter_reduce_kernel(
 // Batched gated activation over grouped rows (types 0 silu, 1 gelu-tanh, 2 relu2):
 // out[b,i] = act(gate=in[b,i]) * up=in[b, intermediate+i]. Row strides: in=w13_out,
 // out=intermediate. One launch over all B=M_sum rows (vs per-token launch_moe_activation).
+//
+// swiglu_limit > 0 clamps gate from above and up on both sides first (GLM-5.3, gated silu
+// only; vLLM's _swiglu_limit_torch). Written as compares, not fminf/fmaxf, so a NaN passes
+// through as it does in torch.clamp. Every caller but the clamped trellis op passes 0, and
+// then neither branch runs, so their arithmetic is unchanged.
 __global__ void glq_moe_gated_activation_batched_kernel(
     const half* __restrict__ in, half* __restrict__ out,
-    int B, int intermediate, int w13_out, int act_type
+    int B, int intermediate, int w13_out, int act_type, float swiglu_limit
 ) {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)B * intermediate;
@@ -4557,6 +4562,7 @@ __global__ void glq_moe_gated_activation_batched_kernel(
     int b = (int)(idx / intermediate);
     int i = (int)(idx % intermediate);
     float g = __half2float(in[(long)b * w13_out + i]);
+    if (swiglu_limit > 0.0f && g > swiglu_limit) g = swiglu_limit;
     float a;
     // 0/1/2 are the GATED silu / gelu-tanh / relu2; 3/4/5 are the same three NON-GATED
     // (NemotronH is 5: up -> relu**2 -> down, no gate). `% 3` picks the function, and for
@@ -4572,6 +4578,10 @@ __global__ void glq_moe_gated_activation_batched_kernel(
         // Gated: the second half of the w13 row is the `up` projection. Non-gated layers
         // have w13_out == intermediate, so that half does not exist and must not be read.
         float up = __half2float(in[(long)b * w13_out + intermediate + i]);
+        if (swiglu_limit > 0.0f) {
+            if (up > swiglu_limit) up = swiglu_limit;
+            else if (up < -swiglu_limit) up = -swiglu_limit;
+        }
         a *= up;
     }
     out[(long)b * intermediate + i] = __float2half(a);
@@ -4755,7 +4765,7 @@ torch::Tensor glq_fused_moe_grouped_gemm_cuda(
         long tot = M_sum_max * intermediate_size;
         glq_moe_gated_activation_batched_kernel<<<(int)((tot + 255) / 256), 256, 0, stream>>>(
             (const half*)h_w13.data_ptr<c10::Half>(), (half*)h_act.data_ptr<c10::Half>(),
-            (int)M_sum_max, intermediate_size, w13_out_features, activation_type);
+            (int)M_sum_max, intermediate_size, w13_out_features, activation_type, 0.0f);
     }
 
     // 7. w2 input RHT (grouped, shared SV).
@@ -4981,7 +4991,7 @@ torch::Tensor glq_fused_moe_e8p_cuda(
         long tot = M_sum_max * intermediate_size;
         glq_moe_gated_activation_batched_kernel<<<(int)((tot + 255) / 256), 256, 0, stream>>>(
             (const half*)h_w13.data_ptr<c10::Half>(), (half*)h_act.data_ptr<c10::Half>(),
-            (int)M_sum_max, intermediate_size, w13_out_features, activation_type);
+            (int)M_sum_max, intermediate_size, w13_out_features, activation_type, 0.0f);
     }
 
     // 7. w2 input RHT (grouped, shared SV).
@@ -5058,7 +5068,7 @@ void launch_grouped_matmul_trellis_3inst(
 // MoE checkpoint above 4 bpw exists yet, so that arm is gated by a synthetic parity fixture
 // only, never by real weights.
 // ─────────────────────────────────────────────────────────────────────
-torch::Tensor glq_fused_moe_trellis_3inst_cuda(
+static torch::Tensor fused_moe_trellis_3inst_impl(
     torch::Tensor x,                        // (num_tokens, hidden) fp16
     torch::Tensor topk_ids,                 // (num_tokens, top_k) int64
     torch::Tensor topk_weights,             // (num_tokens, top_k) fp32
@@ -5080,7 +5090,8 @@ torch::Tensor glq_fused_moe_trellis_3inst_cuda(
     torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
     torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
     torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
-    int activation_type
+    int activation_type,
+    float swiglu_limit                      // > 0 clamps the gated silu (GLM-5.3); 0 = off
 ) {
     CHECK_INPUT(x);
     CHECK_INPUT(w13_trellis_packed);
@@ -5222,7 +5233,8 @@ torch::Tensor glq_fused_moe_trellis_3inst_cuda(
         long tot = M_sum_max * intermediate_size;
         glq_moe_gated_activation_batched_kernel<<<(int)((tot + 255) / 256), 256, 0, stream>>>(
             (const half*)h_w13.data_ptr<c10::Half>(), (half*)h_act.data_ptr<c10::Half>(),
-            (int)M_sum_max, intermediate_size, w13_out_features, activation_type);
+            (int)M_sum_max, intermediate_size, w13_out_features, activation_type,
+            swiglu_limit);
     }
 
     // 7. w2 input RHT (grouped, shared SV).
@@ -5257,6 +5269,72 @@ torch::Tensor glq_fused_moe_trellis_3inst_cuda(
             inv_perm.data_ptr<int>(), topk_w_dev, num_tokens, top_k, hidden_size);
     }
     return output;
+}
+
+torch::Tensor glq_fused_moe_trellis_3inst_cuda(
+    torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w13_trellis_packed, torch::Tensor w13_trellis_packed2,
+    torch::Tensor w13_SU, torch::Tensor w13_SV, torch::Tensor w13_Wscale,
+    torch::Tensor w13_inv_resid_scale2,
+    torch::Tensor w2_trellis_packed, torch::Tensor w2_trellis_packed2,
+    torch::Tensor w2_SU, torch::Tensor w2_SV, torch::Tensor w2_Wscale,
+    torch::Tensor w2_inv_resid_scale2,
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2,
+    torch::Tensor blocks_n_w13, torch::Tensor blocks_m_w13,
+    torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
+    torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
+    torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
+    int activation_type
+) {
+    return fused_moe_trellis_3inst_impl(
+        x, topk_ids, topk_weights,
+        w13_trellis_packed, w13_trellis_packed2, w13_SU, w13_SV, w13_Wscale,
+        w13_inv_resid_scale2,
+        w2_trellis_packed, w2_trellis_packed2, w2_SU, w2_SV, w2_Wscale,
+        w2_inv_resid_scale2,
+        hidden_size, intermediate_size, w13_out_features,
+        n_pad_w13, m_pad_w13, n_pad_w2, m_pad_w2,
+        blocks_n_w13, blocks_m_w13, blocks_n_w13_meta, blocks_m_w13_meta,
+        blocks_n_w2, blocks_m_w2, blocks_n_w2_meta, blocks_m_w2_meta,
+        activation_type, 0.0f);
+}
+
+// The same op with GLM-5.3's SwiGLU clamp: gate <= limit, -limit <= up <= limit, then
+// silu(gate) * up. A distinct symbol rather than an extra argument on the entry above, so
+// Python's hasattr probe tells an older .so (no clamp) from this one.
+torch::Tensor glq_fused_moe_trellis_3inst_swiglu_cuda(
+    torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w13_trellis_packed, torch::Tensor w13_trellis_packed2,
+    torch::Tensor w13_SU, torch::Tensor w13_SV, torch::Tensor w13_Wscale,
+    torch::Tensor w13_inv_resid_scale2,
+    torch::Tensor w2_trellis_packed, torch::Tensor w2_trellis_packed2,
+    torch::Tensor w2_SU, torch::Tensor w2_SV, torch::Tensor w2_Wscale,
+    torch::Tensor w2_inv_resid_scale2,
+    int hidden_size, int intermediate_size, int w13_out_features,
+    int n_pad_w13, int m_pad_w13, int n_pad_w2, int m_pad_w2,
+    torch::Tensor blocks_n_w13, torch::Tensor blocks_m_w13,
+    torch::Tensor blocks_n_w13_meta, torch::Tensor blocks_m_w13_meta,
+    torch::Tensor blocks_n_w2, torch::Tensor blocks_m_w2,
+    torch::Tensor blocks_n_w2_meta, torch::Tensor blocks_m_w2_meta,
+    int activation_type, double swiglu_limit
+) {
+    // A clamp on any other activation is not something vLLM defines; computing it anyway
+    // would be a guess.
+    TORCH_CHECK(swiglu_limit <= 0.0 || activation_type == 0,
+                "swiglu_limit applies to gated silu (activation 0) only, got activation ",
+                activation_type);
+    return fused_moe_trellis_3inst_impl(
+        x, topk_ids, topk_weights,
+        w13_trellis_packed, w13_trellis_packed2, w13_SU, w13_SV, w13_Wscale,
+        w13_inv_resid_scale2,
+        w2_trellis_packed, w2_trellis_packed2, w2_SU, w2_SV, w2_Wscale,
+        w2_inv_resid_scale2,
+        hidden_size, intermediate_size, w13_out_features,
+        n_pad_w13, m_pad_w13, n_pad_w2, m_pad_w2,
+        blocks_n_w13, blocks_m_w13, blocks_n_w13_meta, blocks_m_w13_meta,
+        blocks_n_w2, blocks_m_w2, blocks_n_w2_meta, blocks_m_w2_meta,
+        activation_type, swiglu_limit > 0.0 ? (float)swiglu_limit : 0.0f);
 }
 
 

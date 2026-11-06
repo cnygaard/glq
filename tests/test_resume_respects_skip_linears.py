@@ -87,10 +87,33 @@ def test_metrics_and_losses_filter_by_the_same_rule():
     assert set(kept) == {f"{P}.self_attn.o_proj", f"{P}.mlp.shared_expert.gate_proj"}
 
 
+#: Profiles that skip attention wholesale on purpose. vLLM 0.32 builds GLM-5.3's MLA, KDA
+#: and indexer projections with ``quant_config=None``, so a quantized ``o_proj`` there could
+#: not be served. Named here rather than loosening the guard below, which would then stop
+#: catching a list that drops attention by accident.
+ATTENTION_UNQUANTIZED = {"Glm5NextForConditionalGeneration"}
+
+
 @pytest.mark.parametrize("arch", [a for a in _MODEL_PROFILES
                                   if _MODEL_PROFILES[a].get("skip_linears")])
 def test_no_profile_filters_everything(arch):
     """A skip entry broad enough to match an ordinary projection would empty the
     checkpoint. Guard the shape of every profile's list, not just Qwen4Exp's."""
-    ordinary = {f"{P}.self_attn.o_proj": "art", f"{P}.mlp.down_proj": "art"}
+    ordinary = {f"{P}.mlp.down_proj": "art"}
+    if arch not in ATTENTION_UNQUANTIZED:
+        ordinary[f"{P}.self_attn.o_proj"] = "art"
     assert _drop_skipped_artifacts(ordinary, _MODEL_PROFILES[arch]) == ordinary
+
+
+@pytest.mark.parametrize("arch", sorted(ATTENTION_UNQUANTIZED))
+def test_attention_unquantized_profiles_keep_their_mlps(arch):
+    """The exemption above covers attention only: the experts, shared expert and dense
+    MLPs are the whole point of quantizing these models and must all survive."""
+    banked = {f"{P}.self_attn.o_proj": "art",
+              f"{P}.self_attn.indexer.wk": "art",
+              f"{P}.mlp.down_proj": "art",
+              f"{P}.mlp.shared_experts.gate_proj": "art",
+              f"{P}.mlp.experts.7.up_proj": "art"}
+    kept = _drop_skipped_artifacts(banked, _MODEL_PROFILES[arch])
+    assert set(kept) == {f"{P}.mlp.down_proj", f"{P}.mlp.shared_experts.gate_proj",
+                         f"{P}.mlp.experts.7.up_proj"}

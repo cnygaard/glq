@@ -21,7 +21,8 @@ from __future__ import annotations
 def moe_cpu_fused_refusal(*, fused_shape_ok: bool, has_stage2: bool, unpadded: bool,
                           activation_type: int, ext_has_entry: bool,
                           force_fallback: bool, cpu_fused_enabled: bool,
-                          sv_shared: bool = True, is_3inst: bool = True) -> str | None:
+                          sv_shared: bool = True, is_3inst: bool = True,
+                          swiglu_limit: float = 0.0) -> str | None:
     """Why ``glq_fused_moe_trellis_3inst_cpu`` cannot serve this layer, or None if it can.
 
     The limits, in the order they are checked:
@@ -46,6 +47,8 @@ def moe_cpu_fused_refusal(*, fused_shape_ok: bool, has_stage2: bool, unpadded: b
       ``SV`` by construction and has nothing to compare.
     * **activation** — the op is gated-only (``w13_out == 2 * intermediate``); ids 0/1/2
       are silu / gelu-tanh / relu², and 3+ are the ``*_no_mul`` variants.
+    * **SwiGLU clamp** — GLM-5.3 clamps gate and up before ``silu(gate) * up``. The op has
+      no clamp input; both loops apply it.
     * **extension** — a wheel predating the symbol must fall back, not raise.
     """
     if has_stage2:
@@ -66,6 +69,9 @@ def moe_cpu_fused_refusal(*, fused_shape_ok: bool, has_stage2: bool, unpadded: b
     if not 0 <= activation_type < 3:
         return (f"activation id {activation_type}: the fused CPU MoE op is gated-only "
                 f"(0 silu, 1 gelu-tanh, 2 relu^2)")
+    if swiglu_limit > 0:
+        return (f"SwiGLU clamp (swiglu_limit={swiglu_limit:g}): the fused CPU MoE op has no "
+                f"clamp input")
     if not ext_has_entry:
         return ("the CPU extension has no glq_fused_moe_trellis_3inst_cpu entry "
                 "(older glq wheel, or the extension failed to load)")

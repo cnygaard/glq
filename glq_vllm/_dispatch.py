@@ -123,3 +123,37 @@ def activation_id(name) -> int:
     """
     act = name.value if hasattr(name, "value") else str(name) if name else "silu"
     return _ACTIVATION_IDS.get(act, ACTIVATION_UNSUPPORTED)
+
+
+def moe_swiglu_limit(moe, layer) -> float:
+    """The clamp vLLM applies inside this layer's SwiGLU, or 0.0 for none.
+
+    GLM-5.3 computes ``silu(min(gate, L)) * clamp(up, -L, L)``, and vLLM passes ``L`` to
+    FusedMoE while the activation stays named ``silu`` — so the activation id alone cannot
+    see it. vLLM 0.32 stores it on ``FusedMoEConfig`` and again on ``RoutedExperts``; the
+    config is read first. Only a positive limit clamps, as in vLLM's ``_swiglu_limit_torch``.
+    """
+    limit = getattr(moe, "swiglu_limit", None)
+    if limit is None:
+        limit = getattr(layer, "swiglu_limit", None)
+    return float(limit) if limit is not None and limit > 0 else 0.0
+
+
+def swiglu_limit_refusal(codebook: str, activation_type: int, limit: float) -> str | None:
+    """Why this MoE cannot apply its SwiGLU clamp, or None if it can (or has none).
+
+    Only the trellis path implements the clamp: its fused CUDA op, its per-expert loop and
+    the CPU loop all do. The e8p and shell kernels do not, and a fallback would not help —
+    their loops would compute the same unclamped function. So this is a load-time refusal,
+    not a dispatch preference.
+    """
+    if limit <= 0:
+        return None
+    if codebook != "trellis":
+        return (f"this MoE clamps its SwiGLU (swiglu_limit={limit:g}), which GLQ implements "
+                f"for trellis checkpoints only; this one is {codebook}. Serving it would "
+                f"compute the unclamped activation. Re-quantize with --codebook trellis.")
+    if activation_type != 0:
+        return (f"swiglu_limit={limit:g} with activation id {activation_type}: GLQ applies the "
+                f"clamp to gated silu only, as vLLM does.")
+    return None

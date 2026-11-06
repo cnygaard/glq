@@ -432,6 +432,58 @@ def test_glq_code_names_nemotron_among_the_supported_families():
     assert "Nemotron 3.5" in src
 
 
+# ---- GLM-5.3 ---------------------------------------------------------------------------
+#
+# vLLM's GLM-5.3-Flash recipe serves with `--tool-call-parser glm47 --reasoning-parser
+# glm47`. vLLM 0.32.0 registers `glm45` and `glm47` as aliases of the same two classes
+# (`Glm47MoeModelToolParser`, `Glm47MoeParserReasoningAdapter`); the recipe's name is the one
+# carried. Its template opens `<think>` at every generation prompt, with no switch.
+
+GLM5 = [
+    "xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw",
+    "zai-org/GLM-5.3-Flash",
+    "zai-org/GLM-5.3-Flash-BF16",
+]
+
+
+@pytest.mark.parametrize("model", GLM5)
+def test_glm_5_gets_the_recipe_s_parsers(model):
+    args = T.tool_serve_args(model)
+    assert args is not None
+    assert "--enable-auto-tool-choice" in args
+    assert args[args.index("--tool-call-parser") + 1] == "glm47"
+    assert args[args.index("--reasoning-parser") + 1] == "glm47"
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-4.7", "THUDM/glm-4-9b-chat"])
+def test_older_glm_lines_stay_unknown(model):
+    """The key is `glm-5`: GLM-4 checkpoints use other templates and were never checked."""
+    assert T.tool_serve_args(model) is None
+    assert T.sampling_serve_args(model) is None
+
+
+def test_glm_5_thinks_by_default():
+    assert T.reasoning_serve_args(GLM5[0]) == ["--reasoning-parser", "glm47"]
+
+
+def test_glm_5_sampling_is_its_generation_config():
+    """generation_config.json and the card's evaluations: temperature 1.0, top_p 0.95, and
+    no top_k."""
+    cfg = _cfg(GLM5[0])
+    assert (cfg["temperature"], cfg["top_p"]) == (1.0, 0.95)
+    assert "top_k" not in cfg
+
+
+def test_glm_5_keeps_its_vision_tower_until_text_only_is_measured():
+    """`--language-model-only` has not been run on GLM-5.3 yet, so it is not emitted."""
+    assert T.text_only_serve_args(GLM5[0]) == []
+
+
+def test_glq_code_names_glm_5_among_the_supported_families():
+    src = (Path(__file__).resolve().parents[1] / "glq" / "code.py").read_text()
+    assert "GLM-5.3" in src
+
+
 # ---- the reasoning parser glq-chat serves with ------------------------------------------
 #
 # glq-chat sends no chat-template kwargs, so a model only produces a reasoning block in the

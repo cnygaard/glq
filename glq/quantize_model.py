@@ -284,7 +284,27 @@ def ple_reuse_decision(prefix, declared_bpw, all_artifacts, all_layer_metrics) -
     return True
 
 
-def _offloadable_bytes(state_dict: dict, mtp_is_loaded: bool = False) -> tuple[int, int, int]:
+def _layers_beyond_decoder(weight_map, sd_prefix: str, n_layers: int) -> tuple[str, ...]:
+    """Prefixes of ``{sd_prefix}.N.`` stacks with ``N >= n_layers``, sorted.
+
+    A DeepSeek-style MTP head is a further decoder-shaped layer appended after the last one,
+    rather than an ``mtp.*`` tree: GLM-5.3-Flash stores it as ``layers.45`` of a 45-layer
+    model. The layer loop never visits it and the segment rule in `_is_nontext` cannot see
+    it, so it would otherwise be accounted as text weights, its experts as offloadable.
+    """
+    lead = f"{sd_prefix}."
+    found = set()
+    for key in weight_map:
+        if not key.startswith(lead):
+            continue
+        idx = key[len(lead):].split(".", 1)[0]
+        if idx.isdigit() and int(idx) >= n_layers:
+            found.add(int(idx))
+    return tuple(f"{sd_prefix}.{i}." for i in sorted(found))
+
+
+def _offloadable_bytes(state_dict: dict, mtp_is_loaded: bool = False,
+                       nontext_prefixes: tuple = ()) -> tuple[int, int, int]:
     """(ple_offload_bytes, expert_offload_bytes, nontext_bytes) — bytes not resident in VRAM.
 
     ``mtp_is_loaded`` says the draft head was quantized in this run, so a serve can and will
@@ -325,14 +345,18 @@ def _offloadable_bytes(state_dict: dict, mtp_is_loaded: bool = False) -> tuple[i
     head; counting them twice is how `expert_offload_bytes` came to read 47.31 GiB against
     42.63 GiB of real expert tensors, and a consumer subtracting both would under-state
     resident — the dangerous direction.
+
+    ``nontext_prefixes`` names MTP layers appended to the decoder stack, which no name rule
+    can recognise (see `_layers_beyond_decoder`).
     """
     ple = expert = nontext = 0
+    nontext_prefixes = tuple(nontext_prefixes)
     for name, t in state_dict.items():
         try:
             nbytes = t.numel() * t.element_size()
         except AttributeError:                                        # not a tensor
             continue
-        if _is_nontext(name):
+        if _is_nontext(name) or (nontext_prefixes and name.startswith(nontext_prefixes)):
             if not mtp_is_loaded:
                 nontext += nbytes
         elif "experts" in name:
@@ -740,6 +764,41 @@ _MODEL_PROFILES = {
         # `_convert_state_kolibri1`.
         'convert_state': 'kolibri1',
     },
+    'Glm5NextForConditionalGeneration': {
+        # GLM-5.3-Flash (model_type `glm5_next`, text `glm5_next_text`, transformers >= 5.17):
+        # 314B total. A vision tower wrapped around a 45-layer hybrid decoder, 34 KDA (Kimi
+        # linear attention) and 11 MLA layers with a DeepSeek sparse-attention indexer, every
+        # layer carrying 4 hyper-connection streams. Layers 0-2 have a dense MLP; 3-44 have
+        # 288 routed experts (top 8, inter 2048) plus one shared expert, and the routed
+        # experts are 97% of the parameters. The MTP head is a 46th layer, `layers.45`,
+        # outside the decoder loop, and is copied as-is.
+        #
+        # Module and checkpoint paths agree here, verified on a meta-built model.
+        'layers_attr': 'model.language_model.layers',
+        'embed_attr': 'model.language_model.embed_tokens',
+        'rotary_attr': None,       # NoPE: qk_rope_head_dim is 0 and no rotary is built
+        'sd_prefix': 'model.language_model.layers',
+        'embed_key': 'model.language_model.embed_tokens.weight',
+        'trust_remote_code': False,
+        'forward_kwargs': 'default',
+        'multimodal_text': True,
+        # Experts are 3-D Parameters (`gate_up_proj` [288, 4096, 4096], `down_proj`
+        # [288, 4096, 2048]); the checkpoint stores them per expert, and spells the
+        # hyper-connection, forget-gate and short-conv tensors differently from the module.
+        'stacked_experts': True,
+        'convert_state': 'glm5_next',
+        # The indexer reads `attention_mask` as a 2-D [B, S] boolean padding mask and raises
+        # on None. Causality comes from the indexer itself, so all-visible is what the model
+        # passes for an unpadded batch.
+        'bool_attention_mask': True,
+        # `_keep_in_fp32_modules_strict` of the model. A bf16 router bias changes which
+        # experts each calibration token reaches.
+        'keep_fp32': ('e_score_correction_bias', 'conv1d', 'dt_bias', 'A_log'),
+        # Every attention projection, KDA, MLA and indexer alike. vLLM 0.32 builds all of
+        # them with `quant_config=None`, so a quantized one could not load. They are 3% of
+        # the model.
+        'skip_linears': ('.self_attn.',),
+    },
 }
 
 _DEFAULT_PROFILE = {
@@ -1032,6 +1091,150 @@ def _prewarm_expert_graphs(linears, expert_names, codebook, device):
         prewarm(codebook, TD * TD, b_tiles, device=device)
 
 
+def _cuda_index(device):
+    """The card a CUDA device string names; an unindexed ``"cuda"`` is the current one."""
+    d = torch.device(device)
+    return d.index if d.index is not None else torch.cuda.current_device()
+
+
+def _same_card(a, b):
+    if str(a) == str(b):
+        return True
+    return (str(a).startswith("cuda") and str(b).startswith("cuda")
+            and _cuda_index(a) == _cuda_index(b))
+
+
+def _resolve_expert_devices(spec, main_device, codebook_type):
+    """The devices routed experts are quantized on: ``--expert-devices``, resolved.
+
+    Without the flag, the main device alone, as before it existed. There is deliberately no
+    environment variable: two quantizes pinned to one card each with CUDA_VISIBLE_DEVICES are
+    an equally good use of a two-card box, and a variable both jobs inherit would put each on
+    the other's card. ``auto`` is every *visible* card of the main device's model, so it
+    cannot reach a card the process was not given.
+
+    A split must leave the checkpoint byte-identical to a one-card run, so every card has to
+    be the main device's model (cuBLAS kernels and the L2-sized Viterbi chunks follow the
+    model), and only the trellis expert path takes part.
+    """
+    if spec is None:
+        return [main_device]
+    if not str(main_device).startswith("cuda"):
+        raise ValueError("--expert-devices needs --device cuda; the experts are already "
+                         f"quantized on {main_device}")
+    n = torch.cuda.device_count()
+    main = _cuda_index(main_device)
+
+    def model(i):
+        return torch.cuda.get_device_name(i), tuple(torch.cuda.get_device_capability(i))
+
+    if spec.strip() == "auto":
+        idx = [i for i in range(n) if model(i) == model(main)]
+    else:
+        idx = []
+        for tok in (t.strip() for t in spec.split(",")):
+            d = torch.device(tok)
+            if d.type != "cuda" or d.index is None:
+                raise ValueError(f"--expert-devices takes CUDA devices such as "
+                                 f"cuda:0,cuda:1, got {tok!r}")
+            if d.index >= n:
+                raise ValueError(f"{tok} is not visible: this process sees {n} CUDA "
+                                 f"device(s) (check CUDA_VISIBLE_DEVICES)")
+            if d.index in idx:
+                raise ValueError(f"{tok} is listed twice in --expert-devices")
+            idx.append(d.index)
+        other = sorted({model(i) for i in idx} - {model(main)})
+        if other:
+            raise ValueError(
+                f"--expert-devices must all be the same GPU model as {main_device} "
+                f"({model(main)[0]}), got {', '.join(name for name, _ in other)}: the "
+                "encoded bytes must not depend on which card took an expert")
+    if idx != [main] and codebook_type != "trellis":
+        raise ValueError(f"--expert-devices splits experts only with --codebook trellis, "
+                         f"not {codebook_type}")
+
+    devices = [f"cuda:{i}" for i in idx]
+    mem = {d: torch.cuda.mem_get_info(i) for d, i in zip(devices, idx)}
+    print("  expert devices: " + ", ".join(
+        f"{d} ({free / 2**30:.1f} GiB free)" for d, (free, _) in mem.items()))
+    for d, (free, total) in mem.items():
+        used = total - free
+        if used > 2 * 2**30:
+            print(f"  WARNING: {d} has {used / 2**30:.1f} GiB in use; another job may be "
+                  "running there")
+    return devices
+
+
+def _quantize_experts_parallel(names, quantize_one, collect, devices, workers_per_device):
+    """Quantize ``names`` with ``workers_per_device`` threads on each device.
+
+    ``quantize_one(name, dev)`` runs in a worker with ``dev`` current, and its result goes to
+    ``collect(*result)`` on the calling thread, in arrival order. The queue is shared, so a
+    faster card takes more experts. A result is dropped as soon as it is collected, so each
+    expert's W_hat is freed after its writeback rather than at the end of the layer. The
+    first error, from a worker or from ``collect``, stops the other workers and is raised
+    once they have finished. Returns how many experts each device quantized.
+    """
+    import queue
+    import threading
+    from .trellis import cuda_device_scope
+
+    work = queue.SimpleQueue()
+    for name in names:
+        work.put(name)
+    done = queue.SimpleQueue()
+    stop = threading.Event()
+
+    def _worker(dev):
+        try:
+            with cuda_device_scope(dev):
+                while not stop.is_set():
+                    try:
+                        name = work.get_nowait()
+                    except queue.Empty:
+                        return
+                    result = quantize_one(name, dev)
+                    done.put((dev, result, None))
+                    result = None
+        except BaseException as e:      # noqa: BLE001 - re-raised on the calling thread
+            stop.set()
+            done.put((dev, None, e))
+
+    per_device = max(1, min(workers_per_device, len(names)))
+    # Interleaved, so no card's threads all start before another card's first one.
+    threads = [threading.Thread(target=_worker, args=(dev,), name=f"glq-expert-{dev}-{i}",
+                                daemon=True)
+               for i in range(per_device) for dev in devices]
+    counts = dict.fromkeys(devices, 0)
+    for t in threads:
+        t.start()
+    try:
+        for _ in range(len(names)):
+            dev, result, err = done.get()
+            if err is not None:
+                raise err
+            counts[dev] += 1
+            collect(*result)
+            result = None
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
+    return counts
+
+
+def _free_trellis_graphs(codebooks):
+    """Release the Viterbi CUDA-graph pools held by these codebooks and all their RVQ stages."""
+    seen = set()
+    for top in codebooks:
+        for stage in getattr(top, 'rvq_stages', None) or [top]:
+            for obj in (stage, getattr(stage, 'cb', None)):
+                free = getattr(obj, 'free_viterbi_graphs', None)
+                if free is not None and id(obj) not in seen:
+                    seen.add(id(obj))
+                    free()
+
+
 def _stacked_experts_enabled(arch, profile=None):
     """True when this architecture stores routed MoE experts as stacked 3-D Parameters.
 
@@ -1181,6 +1384,69 @@ def _collect_nongated_stacked_experts(layer):
             continue                       # gated: the supported layout
         out.append((mn, mod, 'up_proj', tuple(up.shape)))
     return out
+
+
+def _gated_expert_intermediate(emod, gate_up_out):
+    """The down projection's input for a gated container: activation(gate) * up.
+
+    ``act_fn(gate) * up`` where the container has an ``act_fn`` — gemma-4, Qwen4Exp and
+    Kolibri-1 do, and their checkpoints must not move. GLM-5.3-Flash's container has none:
+    it clamps first (gate <= swiglu_limit, |up| <= swiglu_limit) inside its own
+    ``_apply_gate``, so that is used instead. Calling the module's own method rather than
+    restating the clamp means the Hessian sees exactly what the model feeds the down
+    projection.
+    """
+    act = getattr(emod, 'act_fn', None)
+    if act is not None:
+        g, u = gate_up_out.chunk(2, dim=-1)
+        return act(g) * u
+    apply_gate = getattr(emod, '_apply_gate', None)
+    if apply_gate is None:
+        raise AttributeError(
+            f"{type(emod).__name__} has neither act_fn nor _apply_gate, so the input of its "
+            f"down projection cannot be reconstructed for its Hessian")
+    return apply_gate(gate_up_out)
+
+
+def _make_gated_expert_hook(mn, emod, token_counts, hessians):
+    """A forward hook capturing per-expert input Grams for a GATED 3-D expert container.
+
+    gate+up share the routed input, so one Gram serves the fused ``gate_up_proj``; the down
+    projection's Gram comes from `_gated_expert_intermediate`. ``token_counts`` and
+    ``hessians`` are mutated in place, keyed ``(module_name, expert)`` and
+    ``{module_name}.{expert}.{projection}`` like the non-gated hook below.
+    """
+    n_exp = emod.gate_up_proj.shape[0]
+
+    def _hook(module, args, kwargs, output):
+        hs = kwargs.get('hidden_states', args[0] if args else None)
+        ti = kwargs.get('top_k_index',
+                        args[1] if len(args) > 1 else None)
+        if hs is None or ti is None:
+            return
+        hs = hs.reshape(-1, hs.shape[-1])
+        ti = ti.reshape(-1, ti.shape[-1])
+        for e in range(n_exp):
+            sel = (ti == e).any(dim=-1)
+            n_sel = int(sel.sum())
+            # Counted even when zero: a never-routed expert is the single most
+            # useful thing to know about a calibration run, and the identity
+            # fallback that handles it is otherwise reported only in passing.
+            token_counts[(mn, e)] = token_counts.get((mn, e), 0) + n_sel
+            if not n_sel:
+                continue
+            xs = hs[sel]
+            xf = xs.float()
+            gk = f"{mn}.{e}.gate_up_proj"
+            hessians[gk] = hessians.get(gk, 0) + xf.t() @ xf
+            with torch.no_grad():
+                go = nn.functional.linear(
+                    xs.to(emod.gate_up_proj.dtype),
+                    emod.gate_up_proj[e])
+                di = _gated_expert_intermediate(emod, go).float()
+            dk = f"{mn}.{e}.down_proj"
+            hessians[dk] = hessians.get(dk, 0) + di.t() @ di
+    return _hook
 
 
 def _make_nongated_expert_hook(mn, emod, token_counts, hessians):
@@ -1583,8 +1849,16 @@ def _apply_hc_expansion(hidden_states, cfg):
 
     Driven off the config, so architectures without ``hc_count`` are untouched — this is a
     property of the model, not of its name.
+
+    GLM-5.3-Flash spells it ``hc_mult`` and keeps the streams on their own axis: its text
+    model does ``inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()``, so
+    every block takes ``[B, S, hc_mult, D]``. Contiguous because the block views it as
+    ``[B, S, hc_mult * D]``, which an expanded tensor cannot be.
     """
     inner = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    hc_mult = getattr(inner, "hc_mult", 1) or 1
+    if hc_mult > 1:
+        return hidden_states.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
     hc = getattr(inner, "hc_count", 1) or 1
     if hc <= 1:
         return hidden_states
@@ -1724,6 +1998,12 @@ def _build_forward_kwargs(profile, h, rotary_emb, layer_idx=None, cfg=None,
     # activations the model never produces at inference.
     if profile and profile.get('causal_mask'):
         kwargs['attention_mask'] = _causal_mask_for(h, cfg, position_ids, layer_idx)
+    # A 2-D [B, S] boolean padding mask, as GLM-5.3-Flash's text model builds it: its
+    # sparse-attention indexer reads the mask unconditionally and applies causality itself.
+    # Calibration batches are unpadded, so every position is visible.
+    if profile and profile.get('bool_attention_mask'):
+        kwargs['attention_mask'] = torch.ones(h.shape[0], h.shape[1], dtype=torch.bool,
+                                              device=h.device)
     # Token-lookup layers need the ids, not just the hidden states: Qwen4Exp's PLE layer
     # does `self.ple_embedding(ple_input_ids, ...)` -> `.long()`, an AttributeError on None.
     # The decoder layer's parameter is `ple_input_ids`; passing `input_ids` is silently
@@ -2365,7 +2645,7 @@ def _is_bulk_module_name(name: str) -> bool:
     return any(marker.strip(".") in name for marker in _UNQUANTIZED_BULK)
 
 
-def _move_layer_keeping_bulk_on_cpu(layer, device, dtype):
+def _move_layer_keeping_bulk_on_cpu(layer, device, dtype, keep_fp32=()):
     """Move a layer to `device`, leaving bulk tensors on CPU.
 
     Qwen4Exp's PLE n-gram table is 95.37 GiB, so `layer.to(device)` OOMs a 95 GiB card.
@@ -2376,7 +2656,18 @@ def _move_layer_keeping_bulk_on_cpu(layer, device, dtype):
     It does not need to be on the GPU either. `ple_embedding(input_ids, ...)` is a sparse
     lookup — 128 samples x 2048 tokens gathers ~262k rows of 160 (~80 MB) — so keeping the
     table in CPU RAM costs one host-side gather per forward instead of 95 GiB of VRAM.
+
+    ``keep_fp32`` names parameters and buffers (by substring) that stay fp32 instead of
+    taking ``dtype``: the model's own `_keep_in_fp32_modules_strict`. Taken before the cast,
+    so they arrive at full precision rather than rounded through ``dtype``. Empty by default,
+    which is the historical behaviour every published checkpoint was calibrated with.
     """
+    keep = tuple(keep_fp32)
+    saved = {}
+    if keep:
+        saved = {n: t.detach().to(torch.float32)
+                 for n, t in (*layer.named_parameters(), *layer.named_buffers())
+                 if t.is_floating_point() and any(s in n for s in keep)}
     bulk = [(n, m) for n, m in layer.named_modules() if _is_bulk_module_name(n)]
     detached = []
     for name, mod in bulk:
@@ -2398,6 +2689,18 @@ def _move_layer_keeping_bulk_on_cpu(layer, device, dtype):
         # for a 128 x 2048 calibration set, ~80 MB, against 95 GiB of resident table.
         _install_cpu_gather_bridge(mod, device)
         setattr(parent, leaf, mod)
+    for name, t in saved.items():
+        *path, leaf = name.split(".")
+        parent = layer
+        for part in path:
+            parent = getattr(parent, part)
+        current = getattr(parent, leaf)
+        if isinstance(current, nn.Parameter):
+            setattr(parent, leaf, nn.Parameter(t.to(current.device),
+                                               requires_grad=current.requires_grad))
+        else:
+            parent.register_buffer(leaf, t.to(current.device),
+                                   persistent=leaf not in parent._non_persistent_buffers_set)
     return layer
 
 
@@ -2581,6 +2884,43 @@ _KOLIBRI1_EXPERT = re.compile(
     r"^(?P<pre>.*experts)\.(?P<idx>\d+)\.(?P<leaf>gate_proj|up_proj|down_proj)\.weight$")
 
 
+def _stack_gated_experts(experts, out):
+    """Stack ``{prefix: {expert: {gate_proj, up_proj, down_proj}}}`` into ``out``.
+
+    Writes ``{prefix}.gate_up_proj`` [E, 2I, H], gate rows first, and ``{prefix}.down_proj``
+    [E, H, I] — the layout transformers' `MergeModulelist` + `Concatenate(dim=1)` produce.
+    Experts are popped as they are consumed rather than stacked with `torch.stack`, which
+    would hold every source tensor and the result at the same time.
+    """
+    for prefix, per_idx in experts.items():
+        idxs = sorted(per_idx)
+        if idxs != list(range(len(idxs))):
+            missing = sorted(set(range(max(idxs) + 1)) - set(idxs))
+            raise ValueError(
+                f"{prefix}: expert indices are not contiguous from 0 — missing "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''}. Stacking would put "
+                f"weights at the wrong expert index, which routing cannot detect.")
+        for e in idxs:
+            have = set(per_idx[e])
+            if have != {"gate_proj", "up_proj", "down_proj"}:
+                raise ValueError(
+                    f"{prefix}.{e}: expected gate_proj/up_proj/down_proj, got "
+                    f"{sorted(have)}")
+
+        g0, u0, d0 = (per_idx[0][k] for k in ("gate_proj", "up_proj", "down_proj"))
+        n_gate = g0.shape[0]
+        gate_up = torch.empty((len(idxs), n_gate + u0.shape[0], g0.shape[1]),
+                              dtype=g0.dtype, device=g0.device)
+        down = torch.empty((len(idxs), *d0.shape), dtype=d0.dtype, device=d0.device)
+        for e in idxs:
+            leaves = per_idx.pop(e)
+            gate_up[e, :n_gate] = leaves.pop("gate_proj")
+            gate_up[e, n_gate:] = leaves.pop("up_proj")
+            down[e] = leaves.pop("down_proj")
+        out[f"{prefix}.gate_up_proj"] = gate_up
+        out[f"{prefix}.down_proj"] = down
+
+
 def _convert_state_kolibri1(state):
     """Stack Kolibri-1's per-expert tensors and apply its three renames.
 
@@ -2611,33 +2951,7 @@ def _convert_state_kolibri1(state):
         else:
             out[_KOLIBRI1_RENAMES.get(key, key)] = val
 
-    for prefix, per_idx in experts.items():
-        idxs = sorted(per_idx)
-        if idxs != list(range(len(idxs))):
-            missing = sorted(set(range(max(idxs) + 1)) - set(idxs))
-            raise ValueError(
-                f"{prefix}: expert indices are not contiguous from 0 — missing "
-                f"{missing[:8]}{'...' if len(missing) > 8 else ''}. Stacking would put "
-                f"weights at the wrong expert index, which routing cannot detect.")
-        for e in idxs:
-            have = set(per_idx[e])
-            if have != {"gate_proj", "up_proj", "down_proj"}:
-                raise ValueError(
-                    f"{prefix}.{e}: expected gate_proj/up_proj/down_proj, got "
-                    f"{sorted(have)}")
-
-        g0, u0, d0 = (per_idx[0][k] for k in ("gate_proj", "up_proj", "down_proj"))
-        n_gate = g0.shape[0]
-        gate_up = torch.empty((len(idxs), n_gate + u0.shape[0], g0.shape[1]),
-                              dtype=g0.dtype, device=g0.device)
-        down = torch.empty((len(idxs), *d0.shape), dtype=d0.dtype, device=d0.device)
-        for e in idxs:
-            leaves = per_idx.pop(e)
-            gate_up[e, :n_gate] = leaves.pop("gate_proj")
-            gate_up[e, n_gate:] = leaves.pop("up_proj")
-            down[e] = leaves.pop("down_proj")
-        out[f"{prefix}.gate_up_proj"] = gate_up
-        out[f"{prefix}.down_proj"] = down
+    _stack_gated_experts(experts, out)
 
     # The model declares this buffer fp32-strict (`_keep_in_fp32_modules_strict`), and
     # `assign=True` would otherwise adopt the checkpoint's bf16 and quietly lower the
@@ -2717,10 +3031,72 @@ def _convert_state_nemotron_h(state):
     return out
 
 
+#: GLM-5.3-Flash: checkpoint name -> module name, per layer. Mirrors the `glm5_next` entry
+#: of transformers' `conversion_mapping.py`, which `from_pretrained` applies and the
+#: streaming path's `load_state_dict` does not.
+_GLM5_NEXT_RENAMES = {
+    "self_attn.f_a_proj.weight": "self_attn.forget_gate.f_a_proj.weight",
+    "self_attn.f_b_proj.weight": "self_attn.forget_gate.f_b_proj.weight",
+    "self_attn.dt_bias": "self_attn.forget_gate.dt_bias",
+    "self_attn.A_log": "self_attn.forget_gate.A_log",
+    "hc_attn_fn": "attn_hc.fn",
+    "hc_attn_base": "attn_hc.base",
+    "hc_attn_scale": "attn_hc.scale",
+    "hc_ffn_fn": "ffn_hc.fn",
+    "hc_ffn_base": "ffn_hc.base",
+    "hc_ffn_scale": "ffn_hc.scale",
+}
+
+#: The KDA short conv: three checkpoint tensors, concatenated in this order on dim 0.
+_GLM5_NEXT_CONV1D = ("self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight",
+                     "self_attn.v_conv1d.weight")
+
+
+def _convert_state_glm5_next(state):
+    """Map one GLM-5.3-Flash checkpoint layer onto `Glm5NextTextDecoderLayer`'s names.
+
+    Three conversions, all from transformers' own `glm5_next` mapping:
+
+    * renames for the forget gate (`self_attn.f_a_proj` -> `self_attn.forget_gate.f_a_proj`,
+      likewise `f_b_proj`, `dt_bias`, `A_log`) and the hyper-connections
+      (`hc_attn_fn` -> `attn_hc.fn`, and so on for base/scale and the ffn side);
+    * `q/k/v_conv1d.weight` concatenated on dim 0 into `self_attn.conv1d.weight`;
+    * per-expert `mlp.experts.{e}.{gate,up,down}_proj.weight` stacked into the two 3-D
+      parameters, gate rows first (`_stack_gated_experts`).
+
+    The tests check the order against transformers' own `save_pretrained` round trip, which
+    is the only thing that catches a wrong concat order: it loads cleanly either way.
+    """
+    out, experts, conv = {}, {}, {}
+    for key, val in state.items():
+        m = _KOLIBRI1_EXPERT.match(key)
+        if m:
+            experts.setdefault(m.group("pre"), {}) \
+                   .setdefault(int(m.group("idx")), {})[m.group("leaf")] = val
+        elif key in _GLM5_NEXT_CONV1D:
+            conv[key] = val
+        else:
+            out[_GLM5_NEXT_RENAMES.get(key, key)] = val
+
+    if conv:
+        missing = [k for k in _GLM5_NEXT_CONV1D if k not in conv]
+        if missing:
+            raise ValueError(
+                f"KDA short conv is partial: have {sorted(conv)}, missing {missing}. "
+                f"conv1d.weight is q, k and v concatenated, so it cannot be built from part "
+                f"of them.")
+        out["self_attn.conv1d.weight"] = torch.cat(
+            [conv.pop(k) for k in _GLM5_NEXT_CONV1D], dim=0)
+
+    _stack_gated_experts(experts, out)
+    return out
+
+
 #: Profiles select a converter by name, the way `forward_kwargs` selects a kwargs branch.
 _STATE_CONVERTERS = {
     "kolibri1": _convert_state_kolibri1,
     "nemotron_h": _convert_state_nemotron_h,
+    "glm5_next": _convert_state_glm5_next,
 }
 
 
@@ -3135,6 +3511,7 @@ def quantize(
     resume_prefix: str = None,
     mtp_bpw: int = None,
     calib_corpus: str = DEFAULT_CALIB_CORPUS,
+    expert_devices: str = None,
 ):
     """
     Quantize a HuggingFace model with GLQ and save to output_dir.
@@ -3159,6 +3536,11 @@ def quantize(
             match the model's own. None (default) leaves it as it is. Opt-in because it
             changes the output of a checkpoint that has such a head, and the flag is
             what carries that into the resume run key. See `quantize_mtp_head`.
+        expert_devices: quantize each MoE layer's routed experts on several identical
+            GPUs: ``"auto"`` (every visible card of the main device's model) or a list such
+            as ``"cuda:0,cuda:1"``. None (default) keeps them on ``device``. Trellis only;
+            the checkpoint is byte-identical either way, so the resume run key ignores it.
+            ``GLQ_QUANT_EXPERT_WORKERS`` is then per device. See `_resolve_expert_devices`.
     """
     from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
@@ -3225,6 +3607,7 @@ def quantize(
         )
     if streaming:
         print(f"  streaming=True (layer-by-layer safetensors loading)")
+    expert_devices = _resolve_expert_devices(expert_devices, device, codebook_type)
 
     # ---- Load config and detect profile ----
     cfg = AutoConfig.from_pretrained(
@@ -3381,6 +3764,15 @@ def quantize(
         codebook.rvq_stages = _cbs
     else:
         codebook = E8ShellCodebook(device=device, target_size=codebook_size)
+    # One codebook per expert device: each card needs its own Viterbi graphs and lock, and
+    # the main device keeps the original.
+    expert_codebooks = {}
+    for _d in expert_devices:
+        if _same_card(_d, device):
+            expert_codebooks[_d] = codebook
+        else:
+            from .trellis import replicate_trellis_codebook
+            expert_codebooks[_d] = replicate_trellis_codebook(codebook, _d)
 
     # ---- Setup for layer-by-layer quantization ----
     use_gpu = str(device).startswith("cuda")
@@ -3709,7 +4101,8 @@ def quantize(
             # hidden states are bf16 — F.linear then dies on the dtype mismatch. Only the
             # device move is GPU-conditional.
             _move_layer_keeping_bulk_on_cpu(
-                layer, device if use_gpu else "cpu", dtype)
+                layer, device if use_gpu else "cpu", dtype,
+                keep_fp32=profile.get('keep_fp32', ()))
             layer.eval()
         else:
             layer = decoder_layers[layer_idx]
@@ -3778,46 +4171,13 @@ def quantize(
             nongated_experts = [(mn, mod) for mn, mod, _p, _s
                                 in _collect_nongated_stacked_experts(layer)]
 
-            def _make_expert_hook(mn, emod):
-                n_exp = emod.gate_up_proj.shape[0]
-
-                def _hook(module, args, kwargs, output):
-                    hs = kwargs.get('hidden_states', args[0] if args else None)
-                    ti = kwargs.get('top_k_index',
-                                    args[1] if len(args) > 1 else None)
-                    if hs is None or ti is None:
-                        return
-                    hs = hs.reshape(-1, hs.shape[-1])
-                    ti = ti.reshape(-1, ti.shape[-1])
-                    for e in range(n_exp):
-                        sel = (ti == e).any(dim=-1)
-                        n_sel = int(sel.sum())
-                        # Counted even when zero: a never-routed expert is the single most
-                        # useful thing to know about a calibration run, and the identity
-                        # fallback that handles it is otherwise reported only in passing.
-                        moe_expert_tokens[(mn, e)] = \
-                            moe_expert_tokens.get((mn, e), 0) + n_sel
-                        if not n_sel:
-                            continue
-                        xs = hs[sel]
-                        xf = xs.float()
-                        gk = f"{mn}.{e}.gate_up_proj"
-                        moe_expert_hessians[gk] = (
-                            moe_expert_hessians.get(gk, 0) + xf.t() @ xf)
-                        with torch.no_grad():
-                            go = nn.functional.linear(
-                                xs.to(emod.gate_up_proj.dtype),
-                                emod.gate_up_proj[e])
-                            g, u = go.chunk(2, dim=-1)
-                            di = (emod.act_fn(g) * u).float()
-                        dk = f"{mn}.{e}.down_proj"
-                        moe_expert_hessians[dk] = (
-                            moe_expert_hessians.get(dk, 0) + di.t() @ di)
-                return _hook
-
+            # Module-level (`_make_gated_expert_hook`) so it can be tested against a real
+            # container; it keys both dicts exactly as the non-gated hook below does.
             for mn, emod in gemma4_experts:
                 moe_hooks.append(emod.register_forward_hook(
-                    _make_expert_hook(mn, emod), with_kwargs=True))
+                    _make_gated_expert_hook(
+                        mn, emod, moe_expert_tokens, moe_expert_hessians),
+                    with_kwargs=True))
             # The non-gated hook is module-level (`_make_nongated_expert_hook`) rather than a
             # closure, so it can be unit-tested against a real NemotronHExperts instead of
             # only through a full quantize run. It keys `moe_expert_tokens` and
@@ -4041,8 +4401,10 @@ def quantize(
                             and 'shared' not in n]
             non_expert_names = [n for n in quant_names if n not in expert_names]
 
-            def _quantize_one(name):
-                """Quantize a single sublayer. Returns (name, W_hat, artifacts, metrics)."""
+            def _quantize_one(name, dev=device):
+                """Quantize a single sublayer on ``dev``. Returns (name, W_hat, artifacts,
+                metrics); W stays where it is, the trellis quantizer copies it to its
+                codebook's device."""
                 mod = linears[name]
                 W = mod.weight.data
                 layer_prefix = f"{sd_prefix}.{layer_idx}.{name}"
@@ -4052,9 +4414,10 @@ def quantize(
                     sub_bpw = 2
                 else:
                     sub_bpw = bpw
-                H_gpu = hessians[name].to(device)
+                H_gpu = hessians[name].to(dev)
                 W_hat, artifacts, metrics = quantize_layer_e8_shell_rht(
-                    W, H_gpu, codebook, bpw=sub_bpw, tune_iters=tune_iters)
+                    W, H_gpu, expert_codebooks.get(dev, codebook), bpw=sub_bpw,
+                    tune_iters=tune_iters)
                 del H_gpu
                 artifacts_cpu = {k: v.cpu() for k, v in artifacts.items()}
                 return name, W_hat, artifacts_cpu, metrics
@@ -4152,43 +4515,46 @@ def quantize(
                           f"(batched, {n_batches} groups×chunks, chunk={chunk}) "
                           f"avg SQNR={avg_sqnr:.1f}dB")
                 else:
-                    # Shell codebook: keep the proven per-expert ThreadPool until a
-                    # shell quantize_fast-batches parity test lands.
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    # Shell and trellis: a pool of per-expert threads on each expert device.
+                    # The shell keeps it until a shell quantize_fast-batches parity test lands.
                     n_parallel = min(int(os.environ.get("GLQ_QUANT_EXPERT_WORKERS", "8")),
                                      len(expert_names))
+                    n_dev = len(expert_devices)
+                    x_dev = f" x {n_dev} devices" if n_dev > 1 else ""
                     print(f"  quantizing {len(expert_names)} experts "
-                          f"({n_parallel} workers) ...", flush=True)
-                    # Capture the CUDA graphs BEFORE the pool exists. Capture is
-                    # process-global and exclusive, so a sibling worker's RHT/LDLQ kernel
-                    # invalidates one in flight (cudaErrorStreamCaptureInvalidated) — which
-                    # is what killed capture on the first expert of a 1024-expert layer.
-                    # Experts in a group share a shape, so one capture serves all of them
-                    # and the pool then only replays, which IS safe concurrently.
-                    # quantize() transposes: a weight (out, in) captures as (T=in, B=out).
-                    _prewarm_expert_graphs(linears, expert_names, codebook, device)
+                          f"({n_parallel} workers{x_dev}) ...", flush=True)
+                    # Capture the CUDA graphs BEFORE the pool exists, on every device.
+                    # Capture is process-global and exclusive, so a sibling worker's
+                    # RHT/LDLQ kernel invalidates one in flight
+                    # (cudaErrorStreamCaptureInvalidated) — which is what killed capture on
+                    # the first expert of a 1024-expert layer — and with two cards, either
+                    # card's workers can. Experts in a group share a shape, so one capture
+                    # per device serves all of them and the pool then only replays, which IS
+                    # safe concurrently.
+                    for _d in expert_devices:
+                        _prewarm_expert_graphs(linears, expert_names,
+                                               expert_codebooks.get(_d, codebook), _d)
                     progress = _ExpertProgress(len(expert_names))
-                    with ThreadPoolExecutor(max_workers=n_parallel) as expert_pool:
-                        futures = {}
-                        for name in expert_names:
-                            f = expert_pool.submit(_quantize_one, name)
-                            futures[f] = name
-                        # as_completed, not `for f in futures`: dict order is SUBMISSION
-                        # order, so the collector blocked on expert 0 even when hundreds
-                        # had finished — no progress could be reported, and a slow early
-                        # future stalled collection. _collect_result is keyed by name, so
-                        # arrival order does not affect what is stored.
-                        for f in as_completed(futures):
-                            name, W_hat, artifacts_cpu, metrics = f.result()
-                            _collect_result(name, W_hat, artifacts_cpu, metrics)
-                            expert_sqnrs.append(metrics['sqnr'])
-                            progress.update(sqnr=metrics['sqnr'])
+
+                    # Collected in arrival order; _collect_result is keyed by name, so the
+                    # order does not affect what is stored.
+                    def _collect_expert(name, W_hat, artifacts_cpu, metrics):
+                        _collect_result(name, W_hat, artifacts_cpu, metrics)
+                        expert_sqnrs.append(metrics['sqnr'])
+                        progress.update(sqnr=metrics['sqnr'])
+
+                    counts = _quantize_experts_parallel(expert_names, _quantize_one,
+                                                        _collect_expert, expert_devices,
+                                                        n_parallel)
                     progress.finish()
 
                     dt_experts = time.perf_counter() - t0_experts
                     avg_sqnr = sum(expert_sqnrs) / len(expert_sqnrs)
+                    split = ""
+                    if n_dev > 1:
+                        split = f"{x_dev}; " + ", ".join(f"{d} {n}" for d, n in counts.items())
                     print(f"  {len(expert_names)} experts in {dt_experts:.1f}s "
-                          f"({n_parallel} parallel) avg SQNR={avg_sqnr:.1f}dB")
+                          f"({n_parallel} parallel{split}) avg SQNR={avg_sqnr:.1f}dB")
 
         del hessians
 
@@ -4226,9 +4592,22 @@ def quantize(
               f"Elapsed: {elapsed/60:.1f}m  |  "
               f"ETA: {remaining/60:.1f}m remaining")
 
+        # Release this layer before the next one loads. Some of these locals are only rebound
+        # after the next layer's calibration forward, so until then they held this layer alive
+        # through it: on GLM-5.3 the last W_hat and the stacked expert parameters behind
+        # gup/dwn/moe_writeback (13.5 GiB) helped run the next layer's forward out of GPU
+        # memory, next to the expert pool's futures, which held every expert's fp32 W_hat
+        # (27 GiB) before `_quantize_experts_parallel` replaced them.
+        W_hat = gup = dwn = vgu = vdn = emod = None
+        moe_writeback, gate_up_fusion, linears = {}, {}, {}
+        gemma4_experts, nongated_experts = [], []
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
+            for _d in expert_devices:
+                if not _same_card(_d, device):
+                    with torch.cuda.device(_d):
+                        torch.cuda.empty_cache()
 
     if pool is not None:
         pool.shutdown()
@@ -4287,11 +4666,9 @@ def quantize(
         # width, not a 16x16 tile — and torch does not reclaim a graph's private pool while
         # the graph is alive. Measured on an L40S quantizing gemma-4's PLE: 20.8 GiB of a
         # 44 GiB card still held by those pools when the embedding step began, on top of
-        # which it then tried to allocate from_state.
-        for _cb_obj in (codebook, getattr(codebook, 'cb', None)):
-            _free = getattr(_cb_obj, 'free_viterbi_graphs', None)
-            if _free is not None:
-                _free()
+        # which it then tried to allocate from_state. Every RVQ stage and every expert
+        # device's copy holds its own.
+        _free_trellis_graphs([codebook, *expert_codebooks.values()])
         gc.collect()
         if use_gpu:
             torch.cuda.empty_cache()
@@ -4710,7 +5087,9 @@ def quantize(
     # checkpoint's config.json is unchanged. Absent means "assume resident" downstream, which
     # is the pre-existing behaviour and cannot over-promise.
     _ple_off, _expert_off, _nontext = _offloadable_bytes(
-        state_dict, mtp_is_loaded=bool(mtp_layer_bpw))
+        state_dict, mtp_is_loaded=bool(mtp_layer_bpw),
+        nontext_prefixes=(_layers_beyond_decoder(weight_map, sd_prefix, n_layers)
+                          if streaming else ()))
     if _ple_off:
         config_dict["quantization_config"]["ple_offload_bytes"] = int(_ple_off)
     if _expert_off:
@@ -4923,6 +5302,13 @@ def build_parser():
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers for CPU quantization "
                              "(0=auto, 1=sequential, ignored on GPU)")
+    parser.add_argument("--expert-devices", type=str, default=None,
+                        help="quantize MoE routed experts on several identical GPUs: 'auto' "
+                             "(every visible card of the --device model) or a list such as "
+                             "cuda:0,cuda:1. Off by default, so two quantizes pinned with "
+                             "CUDA_VISIBLE_DEVICES never share a card. Trellis only; the "
+                             "checkpoint is byte-identical to a one-GPU run, and "
+                             "GLQ_QUANT_EXPERT_WORKERS becomes per device")
     parser.add_argument("--codebook", type=str, default=DEFAULT_CODEBOOK,
                         choices=["e8_shell", "e8_relaxed", "e8p", "trellis"],
                         help="Codebook variant: e8_shell (optimal ball; the only path for "
@@ -4986,6 +5372,7 @@ def main():
         resume_prefix=args.resume_prefix,
         mtp_bpw=args.mtp_bpw,
         calib_corpus=args.calib_corpus,
+        expert_devices=args.expert_devices,
     )
 
 

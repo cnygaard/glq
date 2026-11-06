@@ -788,12 +788,17 @@ class GLQStackedGatedExperts(nn.Module):
 
     def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int,
                  act_fn, block_diagonal: bool = True,
-                 codebook_type: str = "e8_shell", packed: dict | None = None):
+                 codebook_type: str = "e8_shell", packed: dict | None = None,
+                 swiglu_limit: float | None = None):
         super().__init__()
         self.num_experts = int(num_experts)
         self.hidden_dim = int(hidden_dim)
         self.intermediate_dim = int(intermediate_dim)
         self.act_fn = act_fn
+        # GLM-5.3 clamps gate and up before the SwiGLU (`Glm5NextTextExperts._apply_gate`).
+        # None for every other model, which keeps `_activate` exactly `act_fn(g) * u`.
+        self.swiglu_limit = (float(swiglu_limit)
+                             if swiglu_limit is not None and swiglu_limit > 0 else None)
         for i in range(self.num_experts):
             self._modules[str(i)] = _GatedExpertPair(
                 self.hidden_dim, self.intermediate_dim,
@@ -889,7 +894,8 @@ class GLQStackedGatedExperts(nn.Module):
             ext_has_entry=(ext is not None
                            and hasattr(ext, "glq_fused_moe_trellis_3inst_cpu")),
             force_fallback=os.environ.get("GLQ_MOE_FORCE_FALLBACK", "0") != "0",
-            cpu_fused_enabled=os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0")
+            cpu_fused_enabled=os.environ.get("GLQ_FUSED_TRELLIS_CPU", "1") != "0",
+            swiglu_limit=self.swiglu_limit or 0.0)
 
     def _stacked_is_live(self) -> bool:
         """Do the stacked buffers still own the per-expert weights?
@@ -1118,11 +1124,22 @@ class GLQStackedGatedExperts(nn.Module):
             # One fused projection, then chunk — mirrors the native
             # `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` and keeps the 2I-row RHT basis.
             gate, up = pair.gate_up_proj(current_state).chunk(2, dim=-1)
-            h = pair.down_proj(self.act_fn(gate) * up)
+            h = pair.down_proj(self._activate(gate, up))
             h = h * top_k_weights[token_idx, top_k_pos, None]
             _accumulate_expert_rows(final_hidden_states, token_idx, h)
 
         return final_hidden_states
+
+    def _activate(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """``act_fn(gate) * up``, clamped first when the source module clamps.
+
+        Mirrors transformers' ``Glm5NextTextExperts._apply_gate``: gate is clamped from
+        above only, up on both sides.
+        """
+        if self.swiglu_limit is not None:
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        return self.act_fn(gate) * up
 
 
 def _is_stacked_gated_experts(mod: nn.Module) -> bool:
@@ -1185,7 +1202,7 @@ def _replace_stacked_gated_experts(model: nn.Module, block_diagonal: bool = True
             new_mod = GLQStackedGatedExperts(
                 n_exp, hidden, two_inter // 2, act_fn,
                 block_diagonal=block_diagonal, codebook_type=codebook_type,
-                packed=packed)
+                packed=packed, swiglu_limit=getattr(mod, "swiglu_limit", None))
         new_mod.requires_grad_(False)
         model.set_submodule(name, new_mod)
     return len(targets)
