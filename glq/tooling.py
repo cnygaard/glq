@@ -31,13 +31,40 @@ def _default_templates_dir() -> Path:
     return Path(os.environ.get("GLQ_HOME", Path.home() / ".glq")) / "templates"
 
 
+#: Fine-tunes whose name does not carry their family, as `{substring: family}`. Every lookup
+#: in this module matches on the name, so without an entry here such a model is an unknown
+#: family: glq-code refuses it and glq-chat serves it with none of the family's settings.
+#:
+#: An entry is evidence about ONE checkpoint, not a rule about an architecture. Mapping by
+#: `config.json`'s `model_type` instead would treat every fine-tune of the architecture as
+#: using the base's tool markup, and a fine-tune can change its template, which is the silent
+#: failure `tool_serve_args` refuses to risk. So each entry names what was compared.
+#:
+#:   arete-27b  NousResearch/Arete-27B: Qwen3.8-27B after supervised fine-tuning, same
+#:              `Qwen3_5ForConditionalGeneration`. Chat template compared with Qwen3.8-27B's
+#:              on 2026-11-08: identical `<tool_call>` / `<function=` / `<think>` markup; the
+#:              only change drops the `{% generation %}` training-mask markers. Its
+#:              generation_config.json is Qwen's 1.0 / 0.95 / top_k 20.
+_DERIVED_FAMILIES = {
+    "arete-27b": "qwen",
+}
+
+
+def _family_name(model_id: str) -> str:
+    """The name every lookup here matches on: the id, lowercased, plus the family of any
+    fine-tune in `_DERIVED_FAMILIES` whose name does not say it."""
+    name = (model_id or "").lower()
+    extra = [family for alias, family in _DERIVED_FAMILIES.items() if alias in name]
+    return " ".join([name, *extra])
+
+
 def tool_serve_args(model_id: str, templates_dir=None) -> list[str] | None:
     """vLLM serve args that make tool calling work for this model's family.
 
     None for an unknown family — the caller must refuse rather than guess, because a
     wrong parser fails silently at the worst layer.
     """
-    name = model_id.lower()
+    name = _family_name(model_id)
     if "gemma-4" in name:
         tpl = Path(templates_dir or _default_templates_dir()) / GEMMA4_TOOL_TEMPLATE
         return ["--enable-auto-tool-choice",
@@ -164,7 +191,7 @@ def text_only_serve_args(model_id: str) -> list[str]:
     tok/s), and E4B 5.39 against 6.29. Its towers have always been served, and the planner does not
     yet subtract them, so turning it on is a separate change.
     """
-    name = (model_id or "").lower()
+    name = _family_name(model_id)
     if "qwen" in name or ("nemotron-3.5" in name and "-vl" in name):
         return ["--language-model-only"]
     return []
@@ -191,7 +218,7 @@ def reasoning_serve_args(model_id: str) -> list[str]:
     trace — for Nemotron 3.5 followed by a literal `</think>`, which is not a special token.
     The name is read out of `tool_serve_args`, so glq-chat and glq-code cannot disagree on it.
     """
-    name = (model_id or "").lower()
+    name = _family_name(model_id)
     if not any(family in name for family in _THINKS_BY_DEFAULT):
         return []
     args = tool_serve_args(model_id) or []
@@ -232,7 +259,7 @@ def required_plugin(model_id: str) -> tuple[str, str] | None:
     exactly one vLLM minor, so `glq[vllm]` would move vLLM out of range — plain `glq`
     installed *after* the plugin is the order that works.
     """
-    name = (model_id or "").lower()
+    name = _family_name(model_id)
     for family, spec in _FAMILY_PLUGIN.items():
         if family in name:
             return spec
@@ -265,7 +292,7 @@ def dspark_drafter(model_id: str) -> str | None:
     Matched on the id, like `required_plugin`: a local directory carries whatever name it was
     copied under, so `--draft-model` names the drafter for one.
     """
-    name = (model_id or "").lower()
+    name = _family_name(model_id)
     for family, repo in _DSPARK_DRAFTERS.items():
         if family in name:
             return repo
@@ -303,7 +330,7 @@ _NEUTRAL_SAMPLING = {"temperature": 1.0, "top_p": 1.0, "top_k": 0}
 
 
 def _family_sampling(model_id: str):
-    name = (model_id or "").lower()
+    name = _family_name(model_id)
     for family, params in _FAMILY_SAMPLING.items():
         if family in name:
             return params
@@ -525,7 +552,7 @@ def _family_text(model_id: str) -> str:
     family regardless of the directory name. Hub ids are left as they are: resolving them
     would mean a network call inside a function that decides a CLI default.
     """
-    text = model_id.lower()
+    text = _family_name(model_id)
     cfg_path = os.path.join(model_id, "config.json")
     if os.path.isfile(cfg_path):
         try:
