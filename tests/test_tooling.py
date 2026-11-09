@@ -516,3 +516,64 @@ def test_the_reasoning_parser_is_the_one_glq_code_uses(model):
     """One source for parser names: a second copy is how the tool parsers drifted twice."""
     tool = T.tool_serve_args(model)
     assert T.reasoning_serve_args(model)[1] == tool[tool.index("--reasoning-parser") + 1]
+
+
+# ---- Arete-27B: a Qwen3.8-27B fine-tune whose name does not say so -----------------------
+#
+# NousResearch/Arete-27B is Qwen3.8-27B after supervised fine-tuning, with the architecture
+# unchanged (`Qwen3_5ForConditionalGeneration`). Every lookup here matches on the name, and
+# "Arete" carries no "qwen", so glq-code refused it ("no known tool-calling setup") and
+# glq-chat served it in fp16 with the vision tower, no reasoning parser and vLLM's default
+# sampling. Its chat template was compared with Qwen3.8-27B's on 2026-11-08: the tool-call
+# and think markup are identical (`<tool_call>`, `<function=`, `<think>`), and the only
+# change drops the `{% generation %}` training-mask markers. Its generation_config.json is
+# Qwen's 1.0 / 0.95 / top_k 20.
+
+QWEN38 = "Qwen/Qwen3.8-27B"
+ARETE = [
+    "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw",
+    "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-6bpw",
+    "NousResearch/Arete-27B",
+    "/opt/dlami/nvme/Arete-27B-GLQ-trellis-3inst-5bpw",
+]
+
+
+@pytest.mark.parametrize("model", ARETE)
+def test_arete_serves_with_qwen_s_tool_and_reasoning_parsers(model):
+    assert T.tool_serve_args(model) == T.tool_serve_args(QWEN38)
+
+
+@pytest.mark.parametrize("model", ARETE)
+def test_arete_thinks_by_default_and_loads_text_only(model):
+    assert T.reasoning_serve_args(model) == ["--reasoning-parser", "qwen3"]
+    assert T.text_only_serve_args(model) == ["--language-model-only"]
+
+
+@pytest.mark.parametrize("model", ARETE)
+def test_arete_samples_with_its_generation_config(model):
+    assert T.sampling_serve_args(model) == T.sampling_serve_args(QWEN38)
+    assert T.recommended_sampling(model) == {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+
+
+@pytest.mark.parametrize("model", ARETE)
+def test_arete_is_served_in_bf16(model):
+    assert T.preferred_dtype(model, "cuda") == "bfloat16"
+
+
+@pytest.mark.parametrize("model", ARETE)
+def test_arete_needs_no_plugin_and_has_no_drafter(model):
+    assert T.required_plugin(model) is None
+    assert T.dspark_drafter(model) is None
+
+
+@pytest.mark.parametrize("model", ["NousResearch/Arete-9B", "someone/Arete-Instruct"])
+def test_other_arete_names_stay_unknown(model):
+    """The alias names the one checkpoint whose template was compared. Another model called
+    Arete may be built on something else entirely."""
+    assert T.tool_serve_args(model) is None
+    assert T.sampling_serve_args(model) is None
+
+
+def test_glq_code_names_arete_among_the_supported_families():
+    src = (Path(__file__).resolve().parents[1] / "glq" / "code.py").read_text()
+    assert "Arete-27B" in src
