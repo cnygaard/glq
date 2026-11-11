@@ -40,7 +40,7 @@ from glq.supervisor import (DEFAULT_GPU_MEMORY_UTILIZATION,
                             DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_NUM_SEQS,
                             DEFAULT_READY_TIMEOUT,
                             VllmSupervisor)
-from glq.tooling import dspark_drafter, reasoning_serve_args, text_only_serve_args
+from glq.tooling import dspark_drafter, reasoning_serve_args, role_serve_args
 from glq.tooling import recommended_sampling as _recommended_sampling
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -114,7 +114,7 @@ def max_tokens_ceiling(max_model_len: int) -> int:
     return max(256, max_model_len // 2)
 
 
-#: The slider defaults, per model family — see `tooling._FAMILY_SAMPLING` for the values and
+#: The slider defaults, per model family — see `tooling.PROFILES` (`sampling`) for the values and
 #: which of them vLLM would have applied anyway. Sending all three keeps one visible,
 #: consistent answer to "what am I sampling with"; the old defaults were the worst of both,
 #: overriding temperature with 0.7 while leaving top_p and top_k to the checkpoint.
@@ -848,9 +848,10 @@ def main(argv=None) -> int:
     # reasoning apart from the answer and the chat can show it as a "Thinking" block. Without
     # it the trace lands in the reply itself (for Nemotron 3.5 with a literal `</think>`).
     _reasoning = reasoning_serve_args(args.model or "")
-    # The chat sends text only, so a multimodal wrapper's towers stay unloaded; the same
-    # helper sets it for glq-code through `tool_serve_args`.
-    _reasoning += text_only_serve_args(args.model or "")
+    # The chat's flags from the profile table: that reasoning parser, plus the text-only load
+    # (the chat sends text only, so a multimodal wrapper's towers stay unloaded). The same
+    # profile gives glq-code its flags, so the two commands cannot disagree.
+    _chat_args = role_serve_args(args.model or "", "chat")
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -896,7 +897,7 @@ def main(argv=None) -> int:
         # the pool vLLM queues rather than failing, so a second browser tab waits instead of
         # being refused — the over-subscription `_WINDOW_CONCURRENCY` documents.
         window_concurrency=1,
-        extra_args=_reasoning,
+        extra_args=_chat_args,
     )
 
     # The last guard, and the most expensive failure it prevents: a checkpoint larger than

@@ -312,6 +312,30 @@ def _card_for(tmp_path, repo_id, **kw):
     return build_card(out, "google/gemma-4-e4b-it", repo_id=repo_id, write=False)
 
 
+GLM_REPO = "xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw"
+_MOE_LAYERS = {"model.layers.1.mlp.experts.0.gate_proj": 4,
+               "model.layers.1.self_attn.q_proj": 4}
+
+
+def test_a_glm_5_card_serves_with_full_cuda_graphs_in_every_recipe(tmp_path):
+    """Under vLLM's default graph mode GLM-5.3 returns NaN logits, so every way the card shows
+    to run it carries `cudagraph_mode: FULL`: each `vllm serve` block and the Python `LLM(...)`
+    example, which defaults to the same graph mode."""
+    body = _card_for(tmp_path, GLM_REPO, arch="Glm5NextForConditionalGeneration",
+                     layer_bpw=_MOE_LAYERS)
+    serve_blocks = [b for b in body.split("```") if "vllm serve" in b]
+    assert len(serve_blocks) >= 2, "expected the offload and the tool-calling recipes"
+    for block in serve_blocks:
+        assert "--compilation-config '{\"cudagraph_mode\":\"FULL\"}'" in block, block
+    assert 'compilation_config={"cudagraph_mode": "FULL"}' in body
+
+
+def test_other_cards_carry_no_graph_mode(tmp_path):
+    body = _card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw", layer_bpw=_MOE_LAYERS)
+    assert "--compilation-config" not in body
+    assert "compilation_config=" not in body
+
+
 def test_a_plugin_free_model_gets_the_installer_one_liner(tmp_path):
     block = _install_block(_card_for(tmp_path, "xv0y5ncu/Test-GLQ-4bpw"))
     assert "install.sh" in block, block

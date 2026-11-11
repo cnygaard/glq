@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from glq.installer.__main__ import next_steps  # noqa: E402
@@ -40,6 +42,33 @@ def test_serve_command_is_complete_and_copy_pasteable():
     assert f"{VENV}/bin/vllm serve {MODEL}" in t
     assert "--quantization glq" in t          # without this vLLM cannot load a GLQ repo
     assert "--port 8000" in t
+
+
+def _serve_argv(text):
+    """The printed `vllm serve` command as the shell would hand it over: continuations joined,
+    then shlex-split, so quoting is checked the way a paste exercises it."""
+    import re
+    import shlex
+    flat = re.sub(r"\s*\\\n\s*", " ", text)
+    line = next(ln for ln in flat.splitlines() if "/bin/vllm serve " in ln)
+    return shlex.split(line)
+
+
+GLM5 = "xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw"
+
+
+@pytest.mark.parametrize("components", [ALL, ("core", "vllm")])
+def test_glm_5_is_printed_with_full_cuda_graphs(components):
+    """Under vLLM's default graph mode GLM-5.3 returns NaN logits; the by-hand command must
+    carry what glq-chat and glq-code pass, whatever components were installed — it is a
+    correctness flag, not a tool flag."""
+    argv = _serve_argv(_text(components=components, model=GLM5))
+    i = argv.index("--compilation-config")
+    assert argv[i + 1] == '{"cudagraph_mode":"FULL"}'
+
+
+def test_other_families_are_printed_without_a_graph_mode():
+    assert "--compilation-config" not in _serve_argv(_text())
 
 
 def test_no_command_references_the_unshipped_examples_directory():

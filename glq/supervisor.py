@@ -390,36 +390,16 @@ def plan_arena_and_offload(*, weights_bytes, ple_offload_bytes, expert_offload_b
 #: window and then cannot serve one request in it.
 _KV_BYTES_PER_TOKEN = 28_201
 
-#: Families whose KV is MEASURED far below that envelope, as `(fixed bytes per request, bytes
-#: per token)`. Matched on the repo id like `tooling`'s family keys; everything else keeps the
-#: envelope, so no other plan moves.
-#:
-#: Why two terms. Nemotron-3.5-Super-VL keeps KV in only 8 of its 88 layers (40 are Mamba), so
-#: a long window costs a third of the envelope, but each request also carries a fixed share.
-#: vLLM's own figures, with the DSpark drafter loaded (RTX PRO 4500 capped at 21.96 GiB, vLLM
-#: 0.32.0, `benchmarks/supervl3_spec_24gb/`), as pool / "Maximum concurrency":
-#:
-#:        16,384 window   0.67 GiB per request
-#:       262,144          3.12
-#:       524,288          5.53
-#:     1,048,576         10.43   (vLLM's refusal: what one request needs)
-#:
-#: One per-token figure cannot cover that: 262,144's 12.8 KB/token under-prices 131,072, and
-#: 131,072's would price 262,144 out of a 24 GB card. 0.75 GiB + 10,000 B/token sits above
-#: every point (3.19 GiB at 262,144 against 3.12, 10.52 at 1M against 10.43), before
-#: `_KV_SAFETY_FACTOR`. Without the drafter the cost is lower still (2.26 GiB at 262,144), so
-#: one figure serves both.
-_KV_COST_BY_FAMILY = {
-    "nemotron-3.5-super-vl": (int(0.75 * 1024**3), 10_000),
-}
-
-
 def kv_cost(model_id) -> tuple[int, int]:
-    """`(fixed bytes per request, bytes per token)` to price a window for this model."""
-    name = (model_id or "").lower()
-    for family, cost in _KV_COST_BY_FAMILY.items():
-        if family in name:
-            return cost
+    """`(fixed bytes per request, bytes per token)` to price a window for this model.
+
+    A family whose KV was MEASURED far below the envelope carries its own figure in its
+    `tooling` profile (`ModelProfile.kv_cost`, with the measurements; Nemotron-3.5-Super-VL
+    today). Everything else keeps the envelope, so no other plan moves.
+    """
+    p = tooling.profile_for(model_id or "", "template")
+    if p is not None and p.kv_cost is not None:
+        return p.kv_cost
     return 0, _KV_BYTES_PER_TOKEN
 
 #: 131072 and 262144 are here because both published long-context families declare
@@ -1322,7 +1302,7 @@ class VllmSupervisor:
             # fullgraph compile cannot trace the fused CPU decode path — --enforce-eager
             # is a requirement, not a preference. The KV pool travels in the child env
             # (VLLM_CPU_KVCACHE_SPACE), not a flag.
-            return [self.vllm_bin, "serve", self.model,
+            argv = [self.vllm_bin, "serve", self.model,
                     "--quantization", "glq",
                     "--dtype", dtype,
                     "--port", str(self.port),
@@ -1330,17 +1310,26 @@ class VllmSupervisor:
                     "--max-model-len", str(self.max_model_len),
                     "--max-num-seqs", str(self.max_num_seqs),
                     *self.extra_args]
-        return [self.vllm_bin, "serve", self.model,
-                "--quantization", "glq",
-                "--dtype", dtype,
-                "--port", str(self.port),
-                "--gpu-memory-utilization", _fraction_arg(self.gpu_memory_utilization),
-                "--max-model-len", str(self.max_model_len),
-                "--max-num-seqs", str(self.max_num_seqs),
-                *self._offload_args(),
-                *kv_compression.serve_args(self.fp8_kv),
-                *self._speculative_args(),
-                *self.extra_args]
+        else:
+            argv = [self.vllm_bin, "serve", self.model,
+                    "--quantization", "glq",
+                    "--dtype", dtype,
+                    "--port", str(self.port),
+                    "--gpu-memory-utilization", _fraction_arg(self.gpu_memory_utilization),
+                    "--max-model-len", str(self.max_model_len),
+                    "--max-num-seqs", str(self.max_num_seqs),
+                    *self._offload_args(),
+                    *kv_compression.serve_args(self.fp8_kv),
+                    *self._speculative_args(),
+                    # Flags this model needs to answer correctly at all (GLM-5.3: FULL CUDA
+                    # graphs, NaN logits otherwise), from its profile in `tooling`. Here, where
+                    # glq-chat and glq-code meet, so neither can forget them.
+                    *tooling.correctness_serve_args(self.model, self.device),
+                    *self.extra_args]
+        # One compilation config: vLLM keeps only the last such flag WHOLE, so a caller's own
+        # (`{"mode":0}`) would silently drop the FULL graphs above. Merged instead, later
+        # settings winning per key, so a caller setting `cudagraph_mode` still gets theirs.
+        return tooling.merge_compilation_config(argv)
 
     def _speculative_args(self) -> list[str]:
         """`--speculative-config` for MTP or DSpark, or nothing.

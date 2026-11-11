@@ -36,8 +36,7 @@ from glq.installer.prompt import open_tty, select_model
 from glq.installer.recommend import PREFERRED_FAMILIES
 from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
-from glq.tooling import (ensure_gemma4_template, required_plugin,
-                         sampling_serve_args, tool_serve_args)
+from glq.tooling import ensure_gemma4_template, required_plugin, role_serve_args
 
 #: The window a coding session falls back to when the card cannot be sized — a CPU box, or
 #: a `--model` whose config we could not read. A coding agent carries file contents, diffs
@@ -168,15 +167,16 @@ def _pick_model(cfg, *, current=None):
     # happened to be an unsupported family, and `select_model` then defaults to index 1 —
     # the largest entry. A wrong default that still looks like a considered one.
     #
-    # The filter itself is not optional: `tool_serve_args` is what decides, and glq-code
-    # exits 2 on anything it does not know. In the live collection the two entries it
-    # removes are the SmolLM2 pair, which are also the smallest and most inviting.
+    # The filter itself is not optional: `role_serve_args(…, "code")` is what decides, the
+    # same call `main` refuses on, and glq-code exits 2 on anything it does not know. In the
+    # live collection the two entries it removes are the SmolLM2 pair, which are also the
+    # smallest and most inviting.
     # Both halves of "can this command actually serve it": a known tool parser, AND any
     # plugin that family needs. Offering an entry the guard below would immediately refuse
     # is the same inconsistency this filter exists to prevent — a menu that lies. Latent
     # rather than active today, since no Kolibri build is in the start-here collection.
     def _servable(rid):
-        if tool_serve_args(rid) is None:
+        if role_serve_args(rid, "code") is None:
             return False
         plug = required_plugin(rid)
         return plug is None or _plugin_installed(plug[0])
@@ -289,7 +289,11 @@ def main(argv=None) -> int:
               "and pick it)", file=sys.stderr)
         return 3
 
-    tool_args = tool_serve_args(args.model)
+    # Tool calling plus the model card's sampling, from the profile table (`tooling.PROFILES`)
+    # through the one composition glq-code shares with the installer's printed command. The
+    # sampling is pinned server-side because pi cannot send `top_k` at all (not an OpenAI
+    # field, and the pi config has no slot for it).
+    tool_args = role_serve_args(args.model, "code")
     if tool_args is None:
         print(f"error: no known tool-calling setup for {args.model}. A wrong parser "
               f"fails silently\n(tool calls that never parse), so glq-code refuses to "
@@ -320,10 +324,6 @@ def main(argv=None) -> int:
               f"       Installed now: vllm {_installed_vllm() or 'not found'}.",
               file=sys.stderr)
         return 2
-    # The model card's sampling, pinned server-side because pi cannot send `top_k` at all
-    # (not an OpenAI field, and the pi config has no slot for it). Appended, not substituted:
-    # correct sampling with no tool parser is a useless coding session.
-    tool_args = tool_args + (sampling_serve_args(args.model) or [])
 
     # Declared host-offloadable bytes: the supervisor sizes the pool and window from
     # what actually lands in VRAM, and turns PLE offload on for a checkpoint that

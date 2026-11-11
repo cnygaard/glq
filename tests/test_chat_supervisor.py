@@ -360,6 +360,23 @@ def test_a_default_thinking_model_is_served_with_its_reasoning_parser(monkeypatc
     assert built["thinking"] is True
 
 
+def test_glm_5_is_served_with_full_cuda_graphs_in_the_chat(monkeypatch):
+    """Under vLLM's default FULL_AND_PIECEWISE graphs GLM-5.3 returns NaN logits; FULL serves
+    it correctly (`tests/test_serve_profiles.py` has the measurements). The flag is added by
+    the supervisor, so build the REAL one from the exact kwargs glq-chat passed and read the
+    command it would run."""
+    model = "xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw"
+    chat, _events, made, _ = _run_chat(monkeypatch, ["--model", model])
+    _build_kwargs(monkeypatch, chat)
+
+    assert chat.main(["--model", model]) == 0
+    argv = VllmSupervisor(**{"device": "cuda", **made[0]}).argv()
+    i = argv.index("--compilation-config")
+    assert argv[i:i + 2] == ["--compilation-config", '{"cudagraph_mode":"FULL"}']
+    # and the chat's own flags still arrive: GLM thinks by default
+    assert made[0]["extra_args"] == ["--reasoning-parser", "glm47"]
+
+
 def test_a_model_that_does_not_think_by_default_gets_no_parser(monkeypatch):
     model = "xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw"
     chat, _events, made, _ = _run_chat(monkeypatch, ["--model", model])

@@ -41,7 +41,7 @@ import uuid
 import urllib.error
 import urllib.request
 
-from glq.tooling import sampling_serve_args, tool_serve_args
+from glq.tooling import correctness_serve_args, sampling_serve_args, tool_serve_args
 
 from ..artifact_sync import DEFAULT_INTERVAL, ArtifactSync
 
@@ -199,6 +199,9 @@ def serve_command(model: str, quant: str | None, config: dict, port: int,
     # not pin is one that never applies. Same helper glq-code uses, so an agentic bench run and
     # an interactive coding session sample identically.
     cmd += sampling_serve_args(model) or []
+    # Flags the model needs to answer correctly at all (GLM-5.3: FULL CUDA graphs, NaN logits
+    # under vLLM's default), the same ones glq-code's supervisor passes.
+    cmd += correctness_serve_args(model, "cuda")
     if quant and quant not in ("none", "bf16"):
         cmd += ["--quantization", quant]
     return cmd

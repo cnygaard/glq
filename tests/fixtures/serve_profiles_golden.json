@@ -1,0 +1,1291 @@
+{
+ "id:": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:/opt/dlami/nvme/Arete-27B-GLQ-trellis-3inst-5bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:Aleph-Alpha/Kolibri-1": {
+  "dspark_drafter": "intuit/Kolibri-1-dspark",
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "kolibri1"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 128,
+   "top_p": 0.97
+  },
+  "required_plugin": [
+   "aleph_alpha_inference",
+   "pip install 'aleph-alpha-inference>=1'"
+  ],
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":128,\"top_p\":0.97}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "kolibri1",
+   "--reasoning-parser",
+   "kolibri1"
+  ]
+ },
+ "id:HuggingFaceTB/SmolLM3-3B": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 0.6,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":0.6,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "hermes"
+  ]
+ },
+ "id:NousResearch/Arete-27B": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:NousResearch/Arete-9B": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:Qwen/Qwen3.8-27B": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:THUDM/glm-4-9b-chat": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:XV0Y5NCU/Gemma-4-26B-A4B-IT-GLQ-4BPW": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 64,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":64,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "gemma4",
+   "--reasoning-parser",
+   "gemma4",
+   "--chat-template",
+   "<T>/tool_chat_template_gemma4.jinja",
+   "--default-chat-template-kwargs",
+   "{\"enable_thinking\":true}"
+  ]
+ },
+ "id:google/gemma-4-26B-A4B-it": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 64,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":64,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "gemma4",
+   "--reasoning-parser",
+   "gemma4",
+   "--chat-template",
+   "<T>/tool_chat_template_gemma4.jinja",
+   "--default-chat-template-kwargs",
+   "{\"enable_thinking\":true}"
+  ]
+ },
+ "id:mistralai/Devstral-Small-2-24B-Instruct-2512": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:mistralai/Ministral-3-3B-Reasoning-2512": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:mistralai/Mistral-Small-3.2-24B-Instruct-2506": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:nvidia/GLM-5.3-Flash-NVFP4": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "glm47"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "glm47",
+   "--reasoning-parser",
+   "glm47"
+  ]
+ },
+ "id:nvidia/Llama-3_3-Nemotron-Super-49B-v1_5": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "nemotron_v3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--reasoning-parser",
+   "nemotron_v3"
+  ]
+ },
+ "id:nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B": {
+  "dspark_drafter": "RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark",
+  "kv_cost": [
+   805306368,
+   10000
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "nemotron_v3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--reasoning-parser",
+   "nemotron_v3",
+   "--language-model-only"
+  ]
+ },
+ "id:someorg/BrandNewArch-9B-GLQ-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:someorg/Kolibri-2-Preview": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "kolibri1"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 128,
+   "top_p": 0.97
+  },
+  "required_plugin": [
+   "aleph_alpha_inference",
+   "pip install 'aleph-alpha-inference>=1'"
+  ],
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":128,\"top_p\":0.97}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "kolibri1",
+   "--reasoning-parser",
+   "kolibri1"
+  ]
+ },
+ "id:someorg/Nemotron-3.5-Nano-VL-8B": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "nemotron_v3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--reasoning-parser",
+   "nemotron_v3",
+   "--language-model-only"
+  ]
+ },
+ "id:someorg/glm5-local-name": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:xv0y5ncu/Arete-27B-GLQ-trellis-3inst-5bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "glm47"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "glm47",
+   "--reasoning-parser",
+   "glm47"
+  ]
+ },
+ "id:xv0y5ncu/Kolibri-1-GLQ-trellis-3inst-3bpw": {
+  "dspark_drafter": "intuit/Kolibri-1-dspark",
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "kolibri1"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 128,
+   "top_p": 0.97
+  },
+  "required_plugin": [
+   "aleph_alpha_inference",
+   "pip install 'aleph-alpha-inference>=1'"
+  ],
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":128,\"top_p\":0.97}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "kolibri1",
+   "--reasoning-parser",
+   "kolibri1"
+  ]
+ },
+ "id:xv0y5ncu/Ministral-3-3B-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:xv0y5ncu/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "nemotron_v3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--reasoning-parser",
+   "nemotron_v3"
+  ]
+ },
+ "id:xv0y5ncu/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GLQ-trellis-3inst-3bpw": {
+  "dspark_drafter": "RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark",
+  "kv_cost": [
+   805306368,
+   10000
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "nemotron_v3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--reasoning-parser",
+   "nemotron_v3",
+   "--language-model-only"
+  ]
+ },
+ "id:xv0y5ncu/Qwen3.5-0.8B-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:xv0y5ncu/Qwen3.8-Flash-Next-GLQ-trellis-3inst-3bpw-ple4": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "qwen3"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 20,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":20,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [
+   "--language-model-only"
+  ],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "qwen3_xml",
+   "--reasoning-parser",
+   "qwen3",
+   "--language-model-only"
+  ]
+ },
+ "id:xv0y5ncu/SmolLM2-360M-Instruct-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:xv0y5ncu/SmolLM3-3B-trellis-3inst-6bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 0.6,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":0.6,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "hermes"
+  ]
+ },
+ "id:xv0y5ncu/gemma-4-26B-A4B-it-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 64,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":64,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "gemma4",
+   "--reasoning-parser",
+   "gemma4",
+   "--chat-template",
+   "<T>/tool_chat_template_gemma4.jinja",
+   "--default-chat-template-kwargs",
+   "{\"enable_thinking\":true}"
+  ]
+ },
+ "id:xv0y5ncu/gemma-4-E2B-it-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 64,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_k\":64,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "gemma4",
+   "--reasoning-parser",
+   "gemma4",
+   "--chat-template",
+   "<T>/tool_chat_template_gemma4.jinja",
+   "--default-chat-template-kwargs",
+   "{\"enable_thinking\":true}"
+  ]
+ },
+ "id:zai-org/GLM-4.7": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "id:zai-org/GLM-5.3-Flash": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [
+   "--reasoning-parser",
+   "glm47"
+  ],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 0.95
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":0.95}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "glm47",
+   "--reasoning-parser",
+   "glm47"
+  ]
+ },
+ "local:broken-config": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:flash-box-copy": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:g4-local": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:lightning30b-glq-3bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:my-nemotron-build": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:plain-build": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:q27-copy": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ }
+}
