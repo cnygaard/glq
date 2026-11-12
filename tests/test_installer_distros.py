@@ -111,7 +111,12 @@ DISTROS = [
     # prebuilt wheel is not a convenience but the only thing that works.
     Distro("fedora43",   "fedora:43",                                      "dnf"),
     Distro("fedora",     "fedora:44",                                      "dnf"),
-    Distro("ubi9",       "registry.access.redhat.com/ubi9/ubi:latest",     "dnf"),
+    # Fedora 45 keeps 44's compiler (gcc 16.2.1, so the source arm meets the same CUDA 13.0
+    # ceiling) and is the first with a python3 past the 3.12-3.14 CI runs on: python3-3.15.2
+    # (both read from the image's repos, 2026-11-12). The wheel arm is what tells whether
+    # torch and vLLM can be installed on it at all.
+    Distro("fedora45",   "fedora:45",                                      "dnf"),
+    Distro("ubi9",      "registry.access.redhat.com/ubi9/ubi:latest",     "dnf"),
     Distro("almalinux",  "almalinux:9",                                    "dnf"),
     Distro("amazon2023", "amazonlinux:2023",                               "dnf"),
     Distro("arch",       "archlinux:latest",                               "pacman"),
@@ -177,6 +182,17 @@ def _sh(distro: Distro, script: str, timeout=3600) -> subprocess.CompletedProces
 
 def _out(p) -> str:
     return p.stdout + p.stderr
+
+
+#: What `vllm download-kernels` installs: FlashInfer's prebuilt cubins and its jit-cache.
+FLASHINFER_KERNEL_PKGS = frozenset({"flashinfer-cubin", "flashinfer-jit-cache"})
+
+
+def _missing_flashinfer_kernels(out: str) -> set[str]:
+    """The kernel packages absent from the `FI_PKG:` lines stage D prints (`pip list`)."""
+    have = {ln[len("FI_PKG:"):].split()[0].lower()
+            for ln in out.splitlines() if ln.startswith("FI_PKG:") and ln[len("FI_PKG:"):].strip()}
+    return set(FLASHINFER_KERNEL_PKGS - have)
 
 
 # ------------------------------------------------------------- the advice loop
@@ -329,6 +345,13 @@ su tester -c 'GLQ_HOME=$HOME/.glq PIP_CACHE_DIR=/pipcache HF_HOME=/hf \
     >/tmp/install.log 2>&1
 echo "D_EXIT=$?"
 tail -15 /tmp/install.log
+
+echo "===D2 FlashInfer's precompiled kernels in the venv"
+# The vllm component runs `vllm download-kernels`. It prints nothing on success, and a failure
+# is only a note while the install carries on, so D_EXIT says nothing about it: the packages
+# in the venv are the evidence.
+su tester -c '$HOME/.glq/venv/bin/pip list 2>/dev/null' | grep -i '^flashinfer' | sed 's/^/FI_PKG:/'
+grep -a -A2 "precompiled kernels" /tmp/install.log || echo "(no kernel-download section in the install log)"
 
 echo "===E self-check"
 su tester -c '$HOME/.glq/venv/bin/glq-setup --verify'; echo "E_EXIT=$?"
@@ -516,6 +539,17 @@ __GLQ_CHAT_STAGE_END__
         f"nothing about glq was tested here.\n{out[-2000:]}")
 
     assert "D_EXIT=0" in out, f"{distro.name}: install failed\n{out[-4000:]}"
+
+    # The mechanism, again: a failed kernel download leaves D_EXIT=0. Source mode only,
+    # because the wheel arm runs the last release's installer, which may predate the step;
+    # its FI_PKG lines are printed either way.
+    if install_from == "source":
+        missing = _missing_flashinfer_kernels(out)
+        assert not missing, (
+            f"{distro.name}: the install finished without FlashInfer's precompiled kernels "
+            f"(missing {sorted(missing)}), so vLLM compiles them on its first start.\n"
+            + "\n".join(ln for ln in out.split("===D2")[-1].splitlines()[:12]))
+
     assert "E_EXIT=0" in out, f"{distro.name}: self-check failed\n{out[-3000:]}"
     assert "F_EXIT=0" not in out.split("===F")[-1], f"{distro.name}: root guard did not fire"
     assert "refusing to run as root" in out
