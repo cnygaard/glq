@@ -170,8 +170,15 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         #
         # A speed-up, not a requirement: FlashInfer compiles what is missing on its own, so a
         # failure here (say, flashinfer.ai unreachable) is a note, never a failed install.
+        # That includes no `vllm` at all: when its install above failed, running it raises
+        # rather than returning a code (measured on fedora:45, whose Python 3.15 vLLM
+        # refuses), and the self-check below is what reports the missing server.
         print("\n== FlashInfer's precompiled kernels (vllm download-kernels)")
-        if run([_venv_bin(venv, "vllm"), "download-kernels"]):
+        try:
+            failed = run([_venv_bin(venv, "vllm"), "download-kernels"])
+        except OSError as exc:
+            failed = exc
+        if failed:
             print("   note: `vllm download-kernels` failed; vLLM compiles these kernels "
                   "on its first start instead (a few minutes, once)")
     if installed and device != "cpu":

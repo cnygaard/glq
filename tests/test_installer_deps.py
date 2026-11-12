@@ -409,6 +409,27 @@ def test_a_failed_kernel_download_does_not_abort_the_install(capsys):
     assert "download-kernels" in out and "compile" in out, out
 
 
+def test_a_missing_vllm_does_not_crash_the_kernel_download(capsys):
+    """When the vLLM install above failed, there is no `<venv>/bin/vllm`, and running it
+    raises instead of returning a code. Measured in the distro matrix on fedora:45
+    (2026-11-12): the venv landed on Python 3.15, vLLM (`requires_python <3.15`) did not
+    install, and the installer died on `FileNotFoundError: .../venv/bin/vllm` before the
+    toolchain re-pin. The download is a speed-up, so this is the same note as any failure."""
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append([str(c) for c in cmd])
+        if _is_download_kernels(seen[-1]):
+            raise FileNotFoundError(2, "No such file or directory", seen[-1][0])
+        return 0
+
+    M._install_python_extras(run, VENV, ("core", "vllm"), device="cuda",
+                             toolkit_version=lambda venv: TOOLKIT)
+    assert _is_repin(seen[-1]), "the install stopped at the missing vllm binary"
+    out = capsys.readouterr().out
+    assert "download-kernels" in out and "compile" in out, out
+
+
 def _picode_commands(monkeypatch, home) -> list[str]:
     """The commands `_install_picode` would run, with HOME pinned.
 
