@@ -45,6 +45,19 @@ MIN_FREE_GB=25
 # build there dies with "unsupported GNU version" on every .cu file.
 MAX_NVCC_GCC=15
 
+# The Pythons the serving stack installs on. vLLM 0.32.0 and 0.33.0 both declare
+# `requires_python <3.15`, torch 2.13/2.14 publish wheels up to cp314, and glq's prebuilt
+# wheels cover cp312-cp314. fedora:45's python3 is 3.15.2, and taking it (this script used to
+# accept any python3 >= 3.12) gave a venv vLLM would not install into and a kernel with no
+# prebuilt wheel, so it compiled under gcc 16, which CUDA refuses. Measured in the distro
+# matrix, 2026-11-12.
+MIN_PY_MINOR=12
+MAX_PY_MINOR=14
+
+# Tried in this order. Versioned names first: plain `python3` is the distro's newest, which
+# on Fedora 45 is already past MAX_PY_MINOR while python3.14 sits beside it.
+PY_CANDIDATES="python3.14 python3.13 python3.12 python3"
+
 say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -144,7 +157,12 @@ pkg_hint() {
         #     transaction, taking gcc with it. Asking for it is worse than omitting it.
         *rhel*|*centos*|*rocky*|*almalinux*|*amzn*)
                                     echo "sudo dnf install -y python3.12 python3.12-devel gcc-c++ which" ;;
-        *fedora*)                   echo "sudo dnf install -y python3-devel gcc-c++ curl which" ;;
+        # python3.14 by name, not python3: Fedora 45's python3 is 3.15, past MAX_PY_MINOR, and
+        # it packages python3.14 separately (a venv and pip work from it). On Fedora 43 and 44
+        # and on Azure Linux 4.0, which lands here through ID_LIKE=fedora, both names resolve
+        # to their default python3 / python3-devel (`dnf repoquery --whatprovides`, in each
+        # image, 2026-11-12).
+        *fedora*)                   echo "sudo dnf install -y python3.14 python3.14-devel gcc-c++ curl which" ;;
         *steamos*)                  echo "sudo steamos-readonly disable && sudo pacman -Syu --needed --noconfirm python gcc curl   # or use distrobox" ;;
         *arch*|*manjaro*|*endeavouros*)
                                     echo "sudo pacman -Syu --needed --noconfirm python gcc curl" ;;
@@ -190,6 +208,28 @@ compat_gcc_hint() {
     esac
 }
 
+# The minor version of Python 3 interpreter $1; fails if it does not run.
+py_minor() {
+    "$1" -c 'import sys; print(sys.version_info[1] if sys.version_info[0] == 3 else -1)' 2>/dev/null
+}
+
+# The first of PY_CANDIDATES within MIN_PY_MINOR..MAX_PY_MINOR (mode "supported"), or the first
+# one past MAX_PY_MINOR (mode "newer", to say why it was passed over). Prints nothing if none.
+pick_python() {
+    local mode="$1" IFS=' ' c m
+    for c in $PY_CANDIDATES; do
+        command -v "$c" >/dev/null 2>&1 || continue
+        m=$(py_minor "$c") || continue
+        case "$m" in ''|*[!0-9]*) continue ;; esac
+        if [ "$mode" = newer ]; then
+            [ "$m" -gt "$MAX_PY_MINOR" ] && { printf '%s' "$c"; return 0; }
+        elif [ "$m" -ge "$MIN_PY_MINOR" ] && [ "$m" -le "$MAX_PY_MINOR" ]; then
+            printf '%s' "$c"; return 0
+        fi
+    done
+    return 0
+}
+
 preflight() {
     local blockers=0
     detect_distro
@@ -205,14 +245,10 @@ preflight() {
     esac
 
     # python
-    local py="" pyver=""
-    for c in python3.14 python3.13 python3.12 python3; do
-        if command -v "$c" >/dev/null 2>&1 && \
-           "$c" -c 'import sys; raise SystemExit(0 if sys.version_info>=(3,12) else 1)' 2>/dev/null; then
-            py="$c"; pyver="$("$c" --version 2>&1)"; break
-        fi
-    done
+    local py="" pyver="" newer=""
+    py="$(pick_python supported)"
     if [ -n "$py" ]; then
+        pyver="$("$py" --version 2>&1)"
         say "  python:  $pyver  ($py)"
         if "$py" -c 'import venv' 2>/dev/null; then
             say "  venv:    available"
@@ -220,7 +256,13 @@ preflight() {
             warn "  venv:    MISSING — the installer cannot create a virtualenv"; blockers=$((blockers+1))
         fi
     else
-        warn "  python:  MISSING or older than 3.12 (glq needs >= 3.12)"; blockers=$((blockers+1))
+        newer="$(pick_python newer)"
+        if [ -n "$newer" ]; then
+            warn "  python:  $("$newer" --version 2>&1) ($newer) is newer than vLLM supports (3.$MIN_PY_MINOR-3.$MAX_PY_MINOR); install python3.$MAX_PY_MINOR beside it"
+        else
+            warn "  python:  MISSING or older than 3.$MIN_PY_MINOR (glq needs >= 3.$MIN_PY_MINOR)"
+        fi
+        blockers=$((blockers+1))
     fi
 
     command -v curl >/dev/null 2>&1 && say "  curl:    present" || {
@@ -314,16 +356,11 @@ check_not_root() {
 }
 
 find_python() {
+    # The same choice pre-flight reported, so the venv is built on the interpreter it named.
     local py
-    for py in python3.14 python3.13 python3.12 python3; do
-        if command -v "$py" >/dev/null 2>&1; then
-            if "$py" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)'; then
-                printf '%s' "$py"
-                return 0
-            fi
-        fi
-    done
-    die "no Python >= 3.12 found. Install one, e.g.: sudo apt-get install -y python3"
+    py="$(pick_python supported)"
+    [ -n "$py" ] && { printf '%s' "$py"; return 0; }
+    die "no Python 3.$MIN_PY_MINOR-3.$MAX_PY_MINOR found (vLLM does not install on a newer one). Install one, e.g.: $(pkg_hint)"
 }
 
 check_venv_module() {
