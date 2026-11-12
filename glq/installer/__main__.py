@@ -159,6 +159,21 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         print("\n== installing: glq[bench]")
         run([pip, "install", "glq[bench]"])
         installed = True
+    if "vllm" in components and device != "cpu":
+        # FlashInfer's precompiled kernels. Without `flashinfer-cubin` and
+        # `flashinfer-jit-cache`, every vLLM start warns "FlashInfer's precompiled kernels are
+        # missing … Run `vllm download-kernels`" and compiles them instead: about 166 s of a
+        # 632 s first GLM-5.3 start on an RTX PRO 6000 (2026-11-05). vLLM's own command picks
+        # the wheels matching the INSTALLED flashinfer-python and CUDA, so it runs after every
+        # install above. Before the re-pin below, because it installs flashinfer-jit-cache
+        # with its dependencies, and the toolchain must keep the last word.
+        #
+        # A speed-up, not a requirement: FlashInfer compiles what is missing on its own, so a
+        # failure here (say, flashinfer.ai unreachable) is a note, never a failed install.
+        print("\n== FlashInfer's precompiled kernels (vllm download-kernels)")
+        if run([_venv_bin(venv, "vllm"), "download-kernels"]):
+            print("   note: `vllm download-kernels` failed; vLLM compiles these kernels "
+                  "on its first start instead (a few minutes, once)")
     if installed and device != "cpu":
         # Last, after every install above: they can move the CUDA build toolchain, and the
         # kernels need it to match torch's CUDA. install.sh pins nvcc and the CCCL headers to

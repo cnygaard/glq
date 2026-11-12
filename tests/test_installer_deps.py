@@ -341,6 +341,74 @@ def test_an_unreadable_version_is_none_not_an_error():
     assert M._torch_cuda_toolkit_version(Path("/x"), run=missing) is None
 
 
+# ---- FlashInfer's precompiled kernels --------------------------------------------------------
+#
+# Without `flashinfer-cubin` and `flashinfer-jit-cache`, every vLLM start on a fresh install
+# warns "FlashInfer's precompiled kernels are missing … Run `vllm download-kernels`" and
+# compiles them instead: about 166 s of a 632 s first GLM-5.3 start on an RTX PRO 6000
+# (2026-11-05). `vllm download-kernels` installs both wheels at the versions matching the
+# installed flashinfer-python and CUDA.
+
+VENV = Path("/home/u/.glq/venv")
+
+
+def _is_download_kernels(cmd):
+    return cmd[-1:] == ["download-kernels"]
+
+
+def test_a_cuda_install_downloads_flashinfer_kernels_with_the_venvs_vllm():
+    seen = _commands(("core", "vllm"))
+    got = [c for c in seen if _is_download_kernels(c)]
+    assert got == [[str(VENV / "bin" / "vllm"), "download-kernels"]], seen
+
+
+def test_the_kernel_download_follows_vllm_and_precedes_the_repin():
+    """After vLLM, because the command matches the INSTALLED flashinfer-python. Before the
+    re-pin, because flashinfer-jit-cache installs with dependencies and the toolchain must
+    keep the last word."""
+    seen = _commands(("core", "vllm"))
+    vllm_at = next(i for i, c in enumerate(seen) if any(a.startswith("vllm==") for a in c))
+    dk_at = next(i for i, c in enumerate(seen) if _is_download_kernels(c))
+    assert vllm_at < dk_at, seen
+    assert _is_repin(seen[-1]), seen
+
+
+def test_the_kernel_download_runs_once_after_every_component_install():
+    seen = _commands(("core", "vllm", "chat", "quantize", "bench"))
+    at = [i for i, c in enumerate(seen) if _is_download_kernels(c)]
+    assert len(at) == 1, seen
+    assert at[0] == len(seen) - 2 and _is_repin(seen[-1]), seen
+
+
+def test_a_cpu_install_never_downloads_flashinfer_kernels(monkeypatch):
+    from glq.installer import cpu_wheel
+    monkeypatch.setattr(cpu_wheel, "latest_cpu_wheel_url",
+                        lambda arch, fetch=None: cpu_wheel.FALLBACK_X86)
+    assert not any(_is_download_kernels(c)
+                   for c in _commands(("core", "vllm"), device="cpu"))
+
+
+def test_no_vllm_means_no_kernel_download():
+    assert not any(_is_download_kernels(c)
+                   for c in _commands(("core", "chat", "quantize", "bench")))
+
+
+def test_a_failed_kernel_download_does_not_abort_the_install(capsys):
+    """A speed-up, not a requirement: FlashInfer compiles the kernels itself when they are
+    missing. A blocked flashinfer.ai must not cost the user their install."""
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append([str(c) for c in cmd])
+        return 1 if _is_download_kernels(seen[-1]) else 0
+
+    M._install_python_extras(run, VENV, ("core", "vllm"), device="cuda",
+                             toolkit_version=lambda venv: TOOLKIT)
+    assert _is_repin(seen[-1]), "the install stopped at the failed kernel download"
+    out = capsys.readouterr().out
+    assert "download-kernels" in out and "compile" in out, out
+
+
 def _picode_commands(monkeypatch, home) -> list[str]:
     """The commands `_install_picode` would run, with HOME pinned.
 
