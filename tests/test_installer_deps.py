@@ -54,13 +54,13 @@ def _tf_pin(flat):
 
 
 def test_the_transformers_pin_fits_the_vllm_pin():
-    """vLLM 0.32.0 declares `transformers>=5.16.1,<5.20.0`; a pin outside that range makes
-    the installer's one resolve impossible."""
+    """vLLM 0.33.0 declares `transformers>=5.16.1,<5.21.0` (0.32.0: `<5.20.0`); a pin
+    outside that range makes the installer's one resolve impossible."""
     from packaging.version import Version
-    assert _vllm_pin(_pip_commands(("core", "vllm"))) == (0, 32, 0), \
+    assert _vllm_pin(_pip_commands(("core", "vllm"))) == (0, 33, 0), \
         "the vLLM pin moved: re-read its transformers range before trusting this test"
     v = Version(_tf_pin(_pip_commands(("core", "vllm"))))
-    assert Version("5.16.1") <= v < Version("5.20.0"), v
+    assert Version("5.16.1") <= v < Version("5.21.0"), v
 
 
 def test_the_pin_can_serve_super_vl():
@@ -106,11 +106,23 @@ def test_serving_pins_vllm_exactly():
     assert " vllm " not in f" {flat} ", f"a bare `vllm` is left to pip's resolver:\n{flat}"
 
 
-def test_the_vllm_pin_leaves_room_for_gradio_6():
-    """0.33.0 is the first vLLM whose pillow floor (>=13.0.0) excludes every gradio 6
-    (<13.0); 0.32.0 asks for >=12.3.0. Raising the pin past 0.32 needs a gradio that allows
-    pillow 13, and a resolve that proves it."""
-    assert _vllm_pin(_pip_commands(("core", "vllm"))) < (0, 33, 0)
+def _gradio_floor(flat):
+    import re
+    m = re.search(r"(?<![\w/])gradio>=(\d+)\.(\d+)(?:\.(\d+))?(?!\S)", flat)
+    assert m, f"gradio has no floor:\n{flat}"
+    return tuple(int(g or 0) for g in m.groups())
+
+
+def test_the_gradio_floor_admits_the_vllm_pins_pillow():
+    """vLLM 0.33.0 asks for `pillow>=13.0.0`, and every gradio from 6.31.0 back to 3.37 caps
+    `pillow<13`: with a floor below 6.32.0, pip walks back through 215 gradio releases to
+    3.36.1, which glq-chat cannot run. gradio 6.32.0 (2026-11-12) is the first 6.x with
+    `pillow<14`. Resolved on Python 3.12 with pip's dry run (vllm==0.33.0,
+    transformers==5.19.0, gradio>=6.32.0, openai): 212 packages, no backtracking, gradio
+    6.32.0 beside pillow 13.0.0."""
+    flat = _pip_commands(("core", "vllm", "chat"))
+    assert _vllm_pin(flat) >= (0, 33, 0)
+    assert _gradio_floor(flat) >= (6, 32, 0), flat
 
 
 def test_chat_installs_a_gradio_glq_chat_can_use():
@@ -121,9 +133,9 @@ def test_chat_installs_a_gradio_glq_chat_can_use():
     pyproject = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
     extra = [s for s in pyproject["project"]["optional-dependencies"]["chat"]
              if s.startswith("gradio")]
-    assert extra == ["gradio>=6"], extra
+    assert extra == ["gradio>=6.32.0"], extra
     words = _pip_commands(("core", "chat")).split(" ")
-    assert "gradio>=6" in words and "gradio" not in words, words
+    assert "gradio>=6.32.0" in words and "gradio" not in words, words
 
 
 def test_the_pin_travels_with_vllm_not_with_the_chat_ui():
@@ -405,6 +417,27 @@ def test_a_failed_kernel_download_does_not_abort_the_install(capsys):
     M._install_python_extras(run, VENV, ("core", "vllm"), device="cuda",
                              toolkit_version=lambda venv: TOOLKIT)
     assert _is_repin(seen[-1]), "the install stopped at the failed kernel download"
+    out = capsys.readouterr().out
+    assert "download-kernels" in out and "compile" in out, out
+
+
+def test_a_missing_vllm_does_not_crash_the_kernel_download(capsys):
+    """When the vLLM install above failed, there is no `<venv>/bin/vllm`, and running it
+    raises instead of returning a code. Measured in the distro matrix on fedora:45
+    (2026-11-12): the venv landed on Python 3.15, vLLM (`requires_python <3.15`) did not
+    install, and the installer died on `FileNotFoundError: .../venv/bin/vllm` before the
+    toolchain re-pin. The download is a speed-up, so this is the same note as any failure."""
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append([str(c) for c in cmd])
+        if _is_download_kernels(seen[-1]):
+            raise FileNotFoundError(2, "No such file or directory", seen[-1][0])
+        return 0
+
+    M._install_python_extras(run, VENV, ("core", "vllm"), device="cuda",
+                             toolkit_version=lambda venv: TOOLKIT)
+    assert _is_repin(seen[-1]), "the install stopped at the missing vllm binary"
     out = capsys.readouterr().out
     assert "download-kernels" in out and "compile" in out, out
 

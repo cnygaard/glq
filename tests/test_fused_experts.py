@@ -178,7 +178,7 @@ def _tf_window_ok(monkeypatch):
 
     `_replace_nemotron_h_experts` now refuses a transformers outside the validated window
     (>= 5.20.0, or < 5.18.0 for the VL wrapper), because 5.21.0 moved Nemotron's module
-    layout and numerics and 5.20+ cannot coexist with vLLM 0.32.0's pin. This machine runs a
+    layout and numerics and 5.20 was never validated. This machine runs a
     version the guard refuses, so without this stub the tests below fail for a reason
     unrelated to what they assert. The guard itself is covered in
     `tests/test_nemotron_hf_serving.py`.

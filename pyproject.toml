@@ -49,8 +49,9 @@ quantize = ["transformers", "datasets", "safetensors", "accelerate", "sentencepi
 hub = ["jinja2", "huggingface_hub", "pyyaml"]
 # examples/chat — Gradio UI talking to vLLM's OpenAI-compatible endpoint
 # gradio>=6: ChatInterface dropped `type=` and made the messages history
-# format the only one, which is what glq/chat.py builds against.
-chat = ["gradio>=6", "openai"]
+# format the only one, which is what glq/chat.py builds against. 6.32.0 is the first
+# gradio 6 whose pillow cap (<14) admits vLLM 0.33.0's `pillow>=13`.
+chat = ["gradio>=6.32.0", "openai"]
 # model-performance benchmarking toolkit (glq-bench)
 bench = ["vllm", "datasets", "huggingface_hub", "jinja2", "pyyaml", "matplotlib", "pandas"]
 

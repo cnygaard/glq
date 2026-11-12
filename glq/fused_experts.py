@@ -497,11 +497,12 @@ class E8RHTFusedExperts(nn.Module):
 #: cannot be built at all. The text-only `NemotronHForCausalLM` has been native far longer and
 #: does not inherit that floor.
 #:
-#: Ceiling: vLLM 0.32.0 pins `transformers<5.20.0`, so 5.20+ cannot coexist with the serving
-#: stack — and **5.21.0** moved Nemotron itself, adding a tensor-parallel plan (#48780) and
-#: fixing two Nemotron integration tests that were failing on `output_mismatch` (#48945).
-#: Both the module layout and the numerics changed there, which is the shape of problem that
-#: yields a model that loads and generates quietly wrong text.
+#: Ceiling: 5.20 was never validated here. vLLM 0.32.0 pinned `transformers<5.20.0`, so it
+#: could not be; 0.33.0 allows `<5.21.0`, but the installer still pins 5.19.0. And **5.21.0**
+#: moved Nemotron itself, adding a tensor-parallel plan (#48780) and fixing two Nemotron
+#: integration tests that were failing on `output_mismatch` (#48945). Both the module layout
+#: and the numerics changed there, which is the shape of problem that yields a model that
+#: loads and generates quietly wrong text.
 _TF_OMNI_FLOOR = "5.18.0"
 _TF_CEILING = "5.20.0"
 _TF_TESTED = "5.19.0"
@@ -523,8 +524,7 @@ def _require_tested_transformers(version: str | None = None, *, omni: bool = Fal
     if v >= Version(_TF_CEILING):
         raise RuntimeError(
             f"transformers {version} is outside the window GLQ's NemotronH support was "
-            f"validated on (tested: {_TF_TESTED}). vLLM 0.32.0 pins "
-            f"transformers<{_TF_CEILING}, so 5.20+ cannot coexist with the serving stack, "
+            f"validated on (tested: {_TF_TESTED}; nothing at or above {_TF_CEILING} was), "
             f"and 5.21.0 changed Nemotron itself — a tensor-parallel plan (#48780) and a fix "
             f"for two integration tests failing on output_mismatch (#48945), so both the "
             f"module layout and the numerics moved. Pin transformers=={_TF_TESTED}.")

@@ -67,21 +67,25 @@ class Runner:
 #: also the version glq's NemotronH support is validated on (`fused_experts._TF_TESTED`). An
 #: exact pin rather than a floor: "resolve the newest" is the documented failure mode above,
 #: so this needs bumping deliberately, with the serving gate re-run, rather than drifting on
-#: its own.
+#: its own. vLLM 0.33.0 declares `transformers>=5.16.1,<5.21.0`, so the pin stays inside it.
 GEMMA4_TRANSFORMERS = "transformers==5.19.0"
 
 #: Pinned exactly for the same reason. vLLM 0.33.0 (2026-11-02) raised its floor to
 #: `pillow>=13.0.0`, and every gradio from 6.31.0 back to 3.37 caps `pillow<13`. With a bare
 #: `vllm` beside `gradio` in one resolve, pip walked 215 gradio releases looking for one
-#: without the cap and settled on 3.36.1, which glq-chat cannot run. 0.32.0 asks for
-#: `pillow>=12.3.0`, and it is the vLLM glq 0.8.34's Super-VL DSpark results were measured
-#: on. Raise it once a gradio allows pillow 13, with a resolve that shows it. The CPU path
+#: without the cap and settled on 3.36.1, which glq-chat cannot run. That held the pin at
+#: 0.32.0 until gradio 6.32.0 (2026-11-12), the first gradio 6 with `pillow<14`: a dry-run
+#: resolve on Python 3.12 of this pin, the transformers pin and GRADIO below gave 212
+#: packages with no backtracking (torch 2.14.0, cuda-toolkit 13.0.3, pillow 13.0.0,
+#: flashinfer-python 0.7.2.post1). glq 0.8.34's Super-VL DSpark results were measured on
+#: 0.32.0. Both declare `requires_python <3.15`, which install.sh enforces. The CPU path
 #: installs a GitHub-release wheel instead (`cpu_wheel.py`).
-VLLM = "vllm==0.32.0"
+VLLM = "vllm==0.33.0"
 
 #: The `chat` extra's own spec in pyproject.toml. A bare `gradio` is what let pip settle on
-#: 3.36.1 above; with the floor, a conflict has to move vLLM or fail.
-GRADIO = "gradio>=6"
+#: 3.36.1 above; with the floor, a conflict has to move vLLM or fail. 6.32.0 rather than 6:
+#: below it every gradio 6 caps pillow under vLLM 0.33.0's floor.
+GRADIO = "gradio>=6.32.0"
 
 # Template constants live in glq.tooling — the single source both this installer and
 # glq-code read, so the family knowledge cannot drift again.
@@ -170,15 +174,23 @@ def _install_python_extras(run: Runner, venv: Path, components, device: str = "c
         #
         # A speed-up, not a requirement: FlashInfer compiles what is missing on its own, so a
         # failure here (say, flashinfer.ai unreachable) is a note, never a failed install.
+        # That includes no `vllm` at all: when its install above failed, running it raises
+        # rather than returning a code (measured on fedora:45, whose Python 3.15 vLLM
+        # refuses), and the self-check below is what reports the missing server.
         print("\n== FlashInfer's precompiled kernels (vllm download-kernels)")
-        if run([_venv_bin(venv, "vllm"), "download-kernels"]):
+        try:
+            failed = run([_venv_bin(venv, "vllm"), "download-kernels"])
+        except OSError as exc:
+            failed = exc
+        if failed:
             print("   note: `vllm download-kernels` failed; vLLM compiles these kernels "
                   "on its first start instead (a few minutes, once)")
     if installed and device != "cpu":
         # Last, after every install above: they can move the CUDA build toolchain, and the
         # kernels need it to match torch's CUDA. install.sh pins nvcc and the CCCL headers to
         # torch's `cuda-toolkit` before handing over, and then the vLLM install undoes it —
-        # vLLM 0.32.0 requires `humming-kernels[cu13]`, which asks for `nvidia-cuda-nvcc` and
+        # vLLM 0.32.0 requires `humming-kernels[cu13]` (0.33.0 still pulls humming-kernels,
+        # 0.1.19 in the 2026-11-12 resolve), which asks for `nvidia-cuda-nvcc` and
         # `nvidia-cuda-cccl` with no version. Measured 2026-10-28: nvcc and CCCL 13.2.86
         # beside torch's CUDA 13.0 runtime headers, which CCCL's `cuda_toolkit.h` refuses
         # ("CUDA compiler and CUDA toolkit headers are incompatible") on any file that

@@ -30,6 +30,7 @@ OS_RELEASE = {
     "ubuntu": 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n',
     "debian": 'ID=debian\nVERSION_ID="12"\nPRETTY_NAME="Debian GNU/Linux 12"\n',
     "fedora": 'ID=fedora\nVERSION_ID=44\nPRETTY_NAME="Fedora Linux 44"\n',
+    "fedora45": 'ID=fedora\nVERSION_ID=45\nPRETTY_NAME="Fedora Linux 45 (Container Image)"\n',
     "rhel": 'ID="rhel"\nID_LIKE="fedora"\nVERSION_ID="9.4"\nPRETTY_NAME="Red Hat Enterprise Linux 9.4"\n',
     "rocky": 'ID="rocky"\nID_LIKE="rhel centos fedora"\nVERSION_ID="9.4"\n',
     "almalinux": 'ID="almalinux"\nID_LIKE="rhel centos fedora"\nVERSION_ID="9.4"\n',
@@ -50,11 +51,29 @@ OS_RELEASE = {
 }
 
 
-def _preflight(distro, tmp_path, extra=(), gcc_version=None, trap_awk=False):
+def _python_shims(tmp_path, pythons):
+    """A PATH directory of fake interpreters, `{name: minor}`; a minor of None is a binary
+    that fails every call, which install.sh must treat like an absent one. Each answers
+    `--version` and prints its minor for any `-c` program that reads `version_info`."""
+    shim = tmp_path / "shim-python"
+    shim.mkdir(exist_ok=True)
+    for name, minor in pythons.items():
+        body = ("#!/bin/sh\nexit 127\n" if minor is None else
+                "#!/bin/sh\n"
+                f'[ "$1" = "--version" ] && echo "Python 3.{minor}.2" && exit 0\n'
+                f'case "$2" in *version_info*) echo {minor} ;; esac\nexit 0\n')
+        (shim / name).write_text(body)
+        (shim / name).chmod(0o755)
+    return shim
+
+
+def _preflight(distro, tmp_path, extra=(), gcc_version=None, trap_awk=False, pythons=None):
     osr = tmp_path / f"os-release-{distro}"
     osr.write_text(OS_RELEASE[distro])
     env = {**os.environ, "GLQ_OS_RELEASE": str(osr),
            "GLQ_HOME": str(tmp_path / "glqhome")}
+    if pythons is not None:
+        env["PATH"] = f"{_python_shims(tmp_path, pythons)}:{env['PATH']}"
     if gcc_version is not None:
         # A PATH shim rather than an env override: the check reads `gcc -dumpversion`, and
         # faking the answer at that seam tests the real detection instead of a test-only
@@ -229,6 +248,40 @@ def test_rhel_family_hint_names_python_312_or_newer(distro, tmp_path):
     assert newest >= 12, (
         f"{distro}: hint offers python3.{newest}, but the distro default is 3.9 and glq "
         f"needs >= 3.12 — name 3.12 or newer explicitly: {hint}")
+
+
+# ------------------------------------------------- the python ceiling, and Fedora 45
+#
+# vLLM 0.32.0 and 0.33.0 both declare `requires_python <3.15,>=3.11`, torch 2.13/2.14 publish
+# wheels up to cp314, and glq's prebuilt wheels cover cp312-cp314. Fedora 45's python3 is
+# 3.15.2. Measured in the distro matrix (2026-11-12): install.sh took that python3, vLLM did
+# not install, and with no cp315 wheel GLQ's kernel had to compile under gcc 16, which CUDA
+# refuses. Fedora 45 packages python3.14 separately; on 43, 44 and Azure Linux 4.0 the same
+# names resolve to their default python3 (dnf --whatprovides, in each image).
+
+_NONE_SUPPORTED = {"python3.14": None, "python3.13": None, "python3.12": None}
+
+
+def test_a_python_newer_than_vllm_supports_blocks_preflight(tmp_path):
+    proc = _preflight("fedora45", tmp_path, pythons={**_NONE_SUPPORTED, "python3": 15})
+    out = _out(proc)
+    assert proc.returncode != 0, f"pre-flight accepted Python 3.15, which vLLM refuses:\n{out}"
+    line = [ln for ln in out.splitlines() if "python:" in ln]
+    assert line and "3.15" in line[0] and "3.14" in line[0], out
+
+
+def test_a_supported_python_wins_over_a_newer_default(tmp_path):
+    """Fedora 45 after the advice: python3 is 3.15, python3.14 sits beside it."""
+    out = _out(_preflight("fedora45", tmp_path,
+                          pythons={**_NONE_SUPPORTED, "python3.14": 14, "python3": 15}))
+    assert re.search(r"python:\s+Python 3\.14", out), out
+    assert "newer than" not in out, out
+
+
+@pytest.mark.parametrize("distro", ["fedora", "fedora45", "azurelinux"])
+def test_the_fedora_hint_installs_python_314(distro, tmp_path):
+    hint = _hint_line(distro, tmp_path)
+    assert re.search(r"\bpython3\.14\b", hint) and "python3.14-devel" in hint, hint
 
 
 @pytest.mark.parametrize("distro", ["rhel", "rocky", "almalinux", "amzn"])
