@@ -182,6 +182,19 @@ def test_pi_exit_code_is_propagated(monkeypatch, tmp_path):
     assert code.main(["--model", SMOL]) == 7
 
 
+def test_glm_5_is_served_with_full_cuda_graphs(monkeypatch, tmp_path):
+    """glq-code served GLM-5.3 as NaN logits ("!!!!") under vLLM's default FULL_AND_PIECEWISE
+    graphs, while FULL serves it correctly (`tests/test_serve_profiles.py` has the
+    measurements). The flag is added by the supervisor, so build the REAL one from the exact
+    kwargs glq-code passed and read the command it would run."""
+    _, made, _, _ = _run_code(monkeypatch, tmp_path)
+    assert code.main(["--model", "xv0y5ncu/GLM-5.3-Flash-GLQ-trellis-3inst-4bpw"]) == 0
+    argv = VllmSupervisor(**{"device": "cuda", **made[0]}).argv()
+    i = argv.index("--compilation-config")
+    assert argv[i:i + 2] == ["--compilation-config", '{"cudagraph_mode":"FULL"}']
+    assert "--tool-call-parser" in made[0]["extra_args"]
+
+
 def test_gemma4_models_serve_with_the_gemma4_tool_stack(monkeypatch, tmp_path):
     _, made, _, _ = _run_code(monkeypatch, tmp_path)
     code.main(["--model", GEMMA])

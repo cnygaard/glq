@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -94,7 +95,7 @@ def _parse_summary(path: str) -> dict[int, dict]:
 
 
 def _serve_flags(*, quant: str | None, dtype: str | None, max_model_len: int, port: int,
-                 gpu_mem, serve_extra: str) -> str:
+                 gpu_mem, serve_extra: str, model: str | None = None) -> str:
     """The `vllm serve` flags for the server this sweep starts and stops itself.
 
     ``--dtype`` matters here more than anywhere: this task produces the decode tok/s in the
@@ -103,8 +104,16 @@ def _serve_flags(*, quant: str | None, dtype: str | None, max_model_len: int, po
     The published speed would then describe a configuration no user runs. Omitted rather than
     passed as ``auto`` when unset, following the same rule as ``kv_cache_dtype``: "auto" is
     not the same thing to every engine version.
+
+    For the same reason the model's correctness flags (`tooling.correctness_serve_args`,
+    GLM-5.3's FULL CUDA graphs) are passed: glq-chat and glq-code serve with them. They are
+    shell-quoted, because vLLM's sweep `shlex.split`s this string. A compilation config in
+    `serve_extra` is merged into ours (`tooling.merge_compilation_config`) rather than left to
+    replace it; per key, `serve_extra`'s setting wins. Otherwise `serve_extra` is appended as
+    written.
     """
     from ..runtime import is_baseline_quant
+    from ...tooling import correctness_serve_args, merge_compilation_config
     flags = f"--max-model-len {max_model_len} --port {port}"
     if not is_baseline_quant(quant):
         flags += f" --quantization {quant}"
@@ -112,6 +121,13 @@ def _serve_flags(*, quant: str | None, dtype: str | None, max_model_len: int, po
         flags += f" --dtype {dtype}"
     if gpu_mem is not None:
         flags += f" --gpu-memory-utilization {float(gpu_mem)}"
+    ours = correctness_serve_args(model, "cuda") if model else []
+    if ours:
+        both = ours + shlex.split(serve_extra or "")
+        merged = merge_compilation_config(both)
+        if merged != both:
+            return f"{flags} {shlex.join(merged)}"
+        flags += f" {shlex.join(ours)}"
     if serve_extra:
         flags += f" {serve_extra}"
     return flags
@@ -147,7 +163,7 @@ def run(ctx, config: dict):
     vllm = _resolve_vllm()
     serve_flags = _serve_flags(quant=ctx.quant, dtype=getattr(ctx, "dtype", None),
                                max_model_len=max_model_len, port=port, gpu_mem=gpu_mem,
-                               serve_extra=serve_extra)
+                               serve_extra=serve_extra, model=ctx.model)
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = os.path.join(tmp, "bench_params.json")

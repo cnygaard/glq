@@ -61,6 +61,21 @@ def _tool_parsers(repo_id: str) -> dict:
             out[key] = args[args.index(flag) + 1]
     out["needs_template"] = "--chat-template" in args
     return out
+
+
+def _compilation_config_ctx(cc: dict | None) -> dict:
+    """The template's two spellings of a required vLLM compilation config, or None for both.
+
+    `vllm serve` takes compact JSON (single-quoted in the recipe, so the shell leaves it
+    alone); the Python `LLM(...)` example takes a dict literal, which `json.dumps` with its
+    default separators also spells, for the values this table holds (strings, ints).
+    """
+    if not cc:
+        return {"compilation_config_json": None, "compilation_config_py": None}
+    return {"compilation_config_json": json.dumps(cc, separators=(",", ":"), sort_keys=True),
+            "compilation_config_py": json.dumps(cc, sort_keys=True)}
+
+
 _TEMPLATE = "model_card.md.j2"
 
 # Frontmatter keys carried over verbatim from the base model's card.
@@ -279,6 +294,12 @@ def build_card(out_dir, base_model_id: str, *, repo_id: str | None = None,
         "required_plugin": tooling.required_plugin(repo_id or ""),
         "install_one_liner": INSTALL_ONE_LINER,
         "tool_parsers": _tool_parsers(repo_id or ""),
+        # The vLLM compilation config the model needs to answer correctly at all (GLM-5.3:
+        # FULL CUDA graphs, NaN logits under vLLM's default), shown in every recipe. Looked
+        # up by the repo id, then by the dir's own config.json: the card is rendered from a
+        # local quantize output whose directory name need not carry the family.
+        **_compilation_config_ctx(tooling.compilation_config(repo_id)
+                                  or tooling.compilation_config(str(out))),
         "pi_config": _pi_config(repo_id),
         "opencode_config": _opencode_config(repo_id),
         "orig_body": orig_body,

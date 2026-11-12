@@ -86,8 +86,8 @@ GRADIO = "gradio>=6"
 # Template constants live in glq.tooling — the single source both this installer and
 # glq-code read, so the family knowledge cannot drift again.
 from glq.tooling import (GEMMA4_TOOL_TEMPLATE,  # noqa: E402
-                         GEMMA4_TOOL_TEMPLATE_URL, sampling_serve_args,
-                         tool_serve_args)
+                         GEMMA4_TOOL_TEMPLATE_URL, correctness_serve_args,
+                         role_serve_args)
 
 
 def _torch_cuda_toolkit_version(venv: Path, run=None) -> str | None:
@@ -432,19 +432,24 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
     is_gemma4 = "gemma-4" in model.lower()
     tools = ""
     if "picode" in components:
+        # glq-code's own composition (tool calling plus the model card's sampling), so this
+        # command starts the server glq-code would have started. `top_k` is the one parameter
+        # a tool-using client cannot supply — it is not an OpenAI field — so omitting it here
+        # changes what the model samples with while everything still appears to work.
+        #
         # hermes for families the shared helper does not know: the by-hand command is
         # advisory, and printing SOMETHING beats printing nothing — glq-code, which
         # actually starts servers, refuses unknown families instead.
-        args = tool_serve_args(model, templates_dir=GLQ_HOME / "templates") or             ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
-        # The model card's sampling too, so this command starts the server glq-code would
-        # have started. `top_k` is the one parameter a tool-using client cannot supply — it
-        # is not an OpenAI field — so omitting it here changes what the model samples with
-        # while everything still appears to work.
-        args = args + (sampling_serve_args(model) or [])
+        args = (role_serve_args(model, "code", templates_dir=GLQ_HOME / "templates")
+                or ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"])
         tools = " " + " ".join(_shell_arg(a) for a in args)
     # A serving-time choice, so it belongs on the command the user copies — vLLM's own
     # flags, which is why they can simply be appended.
     kv_flags = kv_env.shell_suffix(fp8_kv)
+    # Flags the model needs to answer correctly at all (GLM-5.3: FULL CUDA graphs, NaN logits
+    # under vLLM's default), whatever components were installed: glq-chat and glq-code pass
+    # them, so the by-hand command must too. CUDA only; the CPU command runs eager.
+    fix_flags = "".join(f" {_shell_arg(a)}" for a in correctness_serve_args(model, "cuda"))
     # "~30 s" was a guess copied from a source comment. Measured in a container on 8 cores,
     # cold cache, one arch: 38.3 s — and the build parallelises over MAX_JOBS, so a 4-core
     # machine is proportionally slower. Quote the range rather than the best case; someone
@@ -476,7 +481,7 @@ def next_steps(*, venv, model: str, components, port: int, size_gib: float = 0.0
           f"--quantization glq --enforce-eager --port {port}{tools}"
           if device == "cpu" else
           f"{_venv_bin(venv, 'vllm')} serve {model} --quantization glq "
-          f"--port {port}{kv_flags}{tools}"))
+          f"--port {port}{fix_flags}{kv_flags}{tools}"))
     if tools and is_gemma4:
         out.insert(len(out) - 1,
                    "   (the tool-choice flags are what pi needs; the chat template is "

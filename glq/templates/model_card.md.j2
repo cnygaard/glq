@@ -97,6 +97,9 @@ def main():
 {% if multimodal %}
         limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},  # text-only serving
 {% endif %}
+{% if compilation_config_py %}
+        compilation_config={{ compilation_config_py }},  # required, see below
+{% endif %}
     )
     out = llm.generate(["The capital city of New Zealand is"],
                        SamplingParams(max_tokens=64, temperature=0))
@@ -113,6 +116,14 @@ if __name__ == "__main__":
 ```
 
 `glq` registers with vLLM automatically via its plugin entry point — no extra import needed.
+{% if compilation_config_json %}
+
+> **Serve this model with `--compilation-config '{{ compilation_config_json }}'`** (in Python,
+> `compilation_config={{ compilation_config_py }}`). In GLQ's own testing (vLLM 0.32.0, RTX PRO
+> 6000), this model returned NaN logits under vLLM's default CUDA-graph mode and correct output
+> with this setting. Every command on this card includes it, and `glq-chat` / `glq-code` pass it
+> for you.
+{% endif %}
 
 {% if is_moe %}
 ## Fit it on a smaller card — weight offload (vLLM ≥ 0.30.0)
@@ -127,7 +138,10 @@ vllm serve {{ repo_id }} \
     --quantization glq \
     --offload-backend uva \
     --cpu-offload-gb 24 \
-    --cpu-offload-params experts \
+    --cpu-offload-params experts \{% if compilation_config_json %}
+
+    --compilation-config '{{ compilation_config_json }}' \{% endif %}
+
     --max-model-len {{ max_ctx }}{% if has_ple %} \
     --max-num-seqs 1{% endif %}{% if multimodal %} \
     --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'{% endif %}
@@ -216,7 +230,10 @@ To serve it yourself instead, the parser flags are not optional:
 ```bash
 vllm serve {{ repo_id }} \
     --quantization glq \
-    --port 8000 \
+    --port 8000 \{% if compilation_config_json %}
+
+    --compilation-config '{{ compilation_config_json }}' \{% endif %}
+
     --enable-auto-tool-choice \
     --tool-call-parser {{ tool_parsers.tool }}{% if tool_parsers.reasoning %} \
     --reasoning-parser {{ tool_parsers.reasoning }}{% endif +%}
