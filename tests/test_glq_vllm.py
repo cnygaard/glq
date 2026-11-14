@@ -1107,7 +1107,7 @@ def test_dequant_matches_hf():
     from glq_vllm.dequant import dequantize_glq_weight, get_codebook, get_codebook2
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, device_map="cpu", torch_dtype=torch.float16
+        MODEL_ID, device_map="cpu", dtype=torch.float16
     )
     layer = model.model.layers[0].self_attn.q_proj
     hf_weight = layer.dequantize()
