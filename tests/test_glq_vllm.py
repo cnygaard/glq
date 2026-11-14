@@ -28,8 +28,12 @@ requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GPU required"
 )
 
-MODEL_ID = "xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw"
-TOKENIZER_ID = "HuggingFaceTB/SmolLM3-3B"
+# Must be an E8 shell checkpoint: the dequant test reads Qidxs/SU/SV/inv_resid_scale, and the
+# GPU test asserts every quantized layer keeps int16 Qidxs. A trellis checkpoint has none of
+# these. The previous MODEL_ID, xv0y5ncu/SmolLM3-3B-GLQ-3.5bpw, no longer exists on the Hub
+# (404), and both tests failed before reaching the code they test.
+MODEL_ID = "xv0y5ncu/SmolLM2-360M-Instruct-GLQ-4bpw"   # public, e8_shell 4 bpw, 2 stages
+TOKENIZER_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 
 def _init_tp_once():
@@ -1092,7 +1096,7 @@ def test_lookup_bpw_resolves_the_ple_kv_proj_merge():
 
 # ── Test 3: Dequant correctness (CPU, no vLLM server) ──────────────────
 
-@pytest.mark.slow          # downloads MODEL_ID, a 3B checkpoint
+@pytest.mark.slow          # downloads MODEL_ID (0.32 GiB)
 @pytest.mark.skipif(
     not _HAS_TRANSFORMERS, reason="transformers not installed"
 )
