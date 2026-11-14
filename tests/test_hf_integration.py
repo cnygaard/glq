@@ -183,3 +183,38 @@ class TestGLQQuantizer:
         layer = model[0]
         assert layer.codebook is not None
         assert layer.codebook2 is layer.codebook
+
+
+class _ConfigWithDeprecatedAlias:
+    """A model config shaped like transformers 5.x: `dtype` is the field, and `torch_dtype`
+    is a deprecated alias whose every read logs "`torch_dtype` is deprecated! Use `dtype`
+    instead!". Reading it here fails the test, so the warning cannot come back unnoticed."""
+
+    def __init__(self, dtype):
+        self.dtype = dtype
+
+    @property
+    def torch_dtype(self):
+        raise AssertionError("read the deprecated config.torch_dtype alias")
+
+
+class TestComputeDtype:
+    def test_loading_does_not_read_the_deprecated_torch_dtype(self):
+        model = nn.Sequential(nn.Linear(64, 32))
+        model.config = _ConfigWithDeprecatedAlias(torch.float16)
+        q = GLQQuantizer(GLQConfig(bpw=2))
+        q._process_model_before_weight_loading(model)
+        q._process_model_after_weight_loading(model)
+        assert model[0].codebook is not None
+
+    @pytest.mark.parametrize("declared, expected", [
+        (torch.float16, torch.float16), ("float16", torch.float16),
+        ("bfloat16", torch.bfloat16), (None, torch.bfloat16)])
+    def test_an_embedding_computes_in_the_configs_dtype(self, declared, expected):
+        from glq.quantized_linear import E8RHTEmbedding
+        model = nn.Sequential(E8RHTEmbedding(num_embeddings=64, embedding_dim=32,
+                                             embed_scale=1.0))
+        model.config = _ConfigWithDeprecatedAlias(declared)
+        q = GLQQuantizer(GLQConfig(bpw=2))
+        q._process_model_after_weight_loading(model)
+        assert model[0]._compute_dtype == expected
