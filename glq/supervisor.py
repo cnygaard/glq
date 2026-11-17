@@ -16,6 +16,8 @@ process factory, the health probe and the clock are all injected.
 """
 from __future__ import annotations
 
+import glob
+import importlib.util
 import json
 import math
 import os
@@ -794,6 +796,38 @@ def _gib_arg(gib) -> str:
     return f"{math.ceil(value * 100) / 100:.2f}"
 
 
+def _wheel_cudnn_dir(find_spec=importlib.util.find_spec) -> str | None:
+    """torch's own cuDNN: the `lib` directory of the `nvidia-cudnn-*` wheel, or None.
+
+    Found from the package, without importing torch. None for a torch built against a system
+    cuDNN, and for the CPU wheels, which carry no cuDNN at all.
+    """
+    try:
+        spec = find_spec("nvidia.cudnn")
+    except (ImportError, ValueError):
+        return None
+    for root in (getattr(spec, "submodule_search_locations", None) or []) if spec else []:
+        lib = os.path.join(root, "lib")
+        if glob.glob(os.path.join(lib, "libcudnn.so*")):
+            return lib
+    return None
+
+
+def _torch_cudnn_first(ld_path: str, cudnn_dir: str | None) -> str:
+    """`ld_path` with torch's cuDNN directory first, when another cuDNN is on it.
+
+    Otherwise unchanged: with no other cuDNN on the path there is nothing to win against, and
+    without a wheel cuDNN, torch needs the system one found. See `child_env`.
+    """
+    if not cudnn_dir:
+        return ld_path
+    mine = os.path.realpath(cudnn_dir)
+    others = [p for p in ld_path.split(os.pathsep) if p and os.path.realpath(p) != mine]
+    if not any(glob.glob(os.path.join(p, "libcudnn*.so*")) for p in others):
+        return ld_path
+    return os.pathsep.join([cudnn_dir, *others])
+
+
 def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
               available_bytes=None, ple_offload: bool = False,
               expert_arena_gib: float = 0, max_num_seqs: int = 0,
@@ -809,6 +843,15 @@ def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
     to a sibling tool cannot find it. Measured: FlashInfer JIT-compiles its sampler on
     sm_120, runs `ninja` by name, and dies with FileNotFoundError while
     ~/.glq/venv/bin/ninja sits there unused, installed by install.sh for this exact purpose.
+
+    LD_LIBRARY_PATH: torch's own cuDNN goes first when another cuDNN is on the path. The AWS
+    Deep Learning AMI puts cuDNN 9.20.0 there (`/usr/local/cuda-13.3/lib`, from
+    `/etc/profile.d/dlami.sh`), torch 2.14.0 ships 9.24.0, and the loader searches
+    `LD_LIBRARY_PATH` before cuDNN's own RUNPATH. 9.24's runtime-compiled engines then pulled
+    9.20's `libcudnn_graph.so.9`, cuDNN refused the mix (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED),
+    and vLLM stopped in its encoder profile at the vision tower's Conv3d: glq-code with
+    GLM-5.3-Flash on a g7e.12xlarge, 2026-11-16. Prepended rather than filtered: the rest of
+    that path (CUPTI, Open MPI, NCCL) is left as the AMI set it.
     """
     bindir = os.path.dirname(sys.executable)
     path = os.environ.get("PATH", "")
@@ -831,6 +874,8 @@ def child_env(device: str = "cuda", ram_bytes=None, weights_bytes=None,
         # cores back by setting this itself.
         env.setdefault("VLLM_CPU_NUM_OF_RESERVED_CPU", "0")
         return env
+    if env.get("LD_LIBRARY_PATH"):
+        env["LD_LIBRARY_PATH"] = _torch_cudnn_first(env["LD_LIBRARY_PATH"], _wheel_cudnn_dir())
     if ple_offload:
         # vLLM already defaults this ON, but a checkpoint whose n-gram table does not fit
         # beside its decoder CANNOT SERVE without it -- at a 262k context the resident
