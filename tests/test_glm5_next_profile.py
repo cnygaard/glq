@@ -454,6 +454,60 @@ def _glm_meta_text_model(mod, Glm5NextTextConfig):
         return mod.Glm5NextTextModel(Glm5NextTextConfig(**_tiny_text_kwargs()))
 
 
+def _glm_layers_with_known_values(mod, cfg, n=2):
+    """`n` decoder layers in fp32 with every floating tensor filled from a fixed seed.
+
+    A bare layer leaves its `torch.empty` parameters as whatever memory they land on (see the
+    test below). Seeded normal values are finite, the same on every run, and almost never
+    exactly representable in bf16, so comparing them before and after a move shows a rounding.
+    """
+    gen = torch.Generator().manual_seed(0)
+    layers = [mod.Glm5NextTextDecoderLayer(cfg, i).float() for i in range(n)]
+    with torch.no_grad():
+        for layer in layers:
+            for t in (*layer.parameters(), *layer.buffers()):
+                if t.is_floating_point():
+                    t.copy_(torch.randn(t.shape, generator=gen, dtype=t.dtype))
+    return layers
+
+
+def test_the_compared_layers_hold_known_values_not_uninitialised_memory(monkeypatch):
+    """transformers 5.23.0 builds the hyper-connections' `base` and `scale` (and `dt_bias`,
+    `A_log`) with `torch.empty`; only the model's `_init_weights` fills them, and a bare
+    decoder layer never runs it. Whatever memory they land on is what the device-move test then
+    compares. On reused memory that held NaN, `torch.equal(NaN, NaN)` is False, so the test
+    reported "attn_hc.base was rounded on the way" with every bit preserved (Python 3.12 CI,
+    PR #199). On fresh zeroed memory it passed while proving nothing: zero survives bf16.
+
+    `torch.empty` here hands out NaN-filled memory, the CI condition made deterministic. Every
+    tensor the move must keep in fp32 has to hold finite values that bf16 cannot represent, so
+    a pass means nothing was rounded and a rounding is always visible."""
+    mod, _, Glm5NextTextConfig = _glm()
+    cfg = Glm5NextTextConfig(**_tiny_text_kwargs())
+    keep = qm._keep_fp32_names(qm._MODEL_PROFILES[ARCH],
+                               _glm_meta_text_model(mod, Glm5NextTextConfig))
+
+    real_empty = torch.empty
+
+    def nan_empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        return t.fill_(float("nan")) if t.is_floating_point() else t
+
+    monkeypatch.setattr(torch, "empty", nan_empty)
+    layers = _glm_layers_with_known_values(mod, cfg)
+    monkeypatch.undo()
+
+    compared = 0
+    for layer in layers:
+        for k, v in layer.state_dict().items():
+            if v.is_floating_point() and any(s in k for s in keep):
+                compared += 1
+                assert torch.isfinite(v).all(), f"{k} holds uninitialised memory"
+                assert not torch.equal(v.to(torch.bfloat16).float(), v), (
+                    f"{k} is exactly representable in bf16, so a rounding would not show")
+    assert compared >= len(keep), (compared, keep)
+
+
 def test_fp32_strict_tensors_stay_fp32_through_the_device_move():
     """transformers keeps `e_score_correction_bias`, `conv1d`, `dt_bias` and `A_log` in fp32
     even in a bf16 model (`_keep_in_fp32_modules_strict`); 5.23.0 adds the hyper-connections'
@@ -467,10 +521,8 @@ def test_fp32_strict_tensors_stay_fp32_through_the_device_move():
     assert set(mod.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict) <= set(keep)
     assert set(p["keep_fp32"]) <= set(keep)
 
-    torch.manual_seed(0)
-    layers = [mod.Glm5NextTextDecoderLayer(cfg, i).float() for i in range(2)]
-    with torch.no_grad():
-        layers[1].mlp.gate.e_score_correction_bias.normal_()
+    # Known values, not whatever memory the layers' `torch.empty` parameters land on.
+    layers = _glm_layers_with_known_values(mod, cfg)
     before = {i: {k: v.clone() for k, v in l.state_dict().items()} for i, l in enumerate(layers)}
 
     for i, layer in enumerate(layers):
