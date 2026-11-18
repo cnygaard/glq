@@ -734,10 +734,16 @@ class GLQQuantizer(HfQuantizer):
         # Detect the compute dtype the rest of the model is using so the
         # E8RHTEmbedding output matches (Gemma-4 lm_head is bf16; F.linear
         # rejects mismatched dtypes). Some test mocks have no `config`.
+        # `dtype` first: transformers 5 keeps `torch_dtype` only as a deprecated alias of it,
+        # and every read logs "`torch_dtype` is deprecated! Use `dtype` instead!" (once per
+        # HF load of any GLQ model). The alias is read only on a config with no `dtype`.
         cfg = getattr(model, "config", None)
-        compute_dtype = (getattr(cfg, "torch_dtype", None)
-                         or getattr(cfg, "dtype", None)
-                         or torch.bfloat16) if cfg is not None else torch.bfloat16
+        if cfg is None:
+            compute_dtype = torch.bfloat16
+        else:
+            declared = (cfg.dtype if hasattr(cfg, "dtype")
+                        else getattr(cfg, "torch_dtype", None))
+            compute_dtype = declared or torch.bfloat16
         if isinstance(compute_dtype, str):
             compute_dtype = getattr(torch, compute_dtype, torch.bfloat16)
 
