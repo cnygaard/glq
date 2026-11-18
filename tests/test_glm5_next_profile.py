@@ -447,15 +447,25 @@ def test_gated_hook_still_uses_act_fn_where_the_container_has_one():
 
 # ------------------------------------------------------- fp32-strict tensors in calibration
 
+def _glm_meta_text_model(mod, Glm5NextTextConfig):
+    """The text model on meta, as the streaming quantizer builds it: its instance attribute
+    is the strict-fp32 set transformers upcasts when it loads the model."""
+    with torch.device("meta"):
+        return mod.Glm5NextTextModel(Glm5NextTextConfig(**_tiny_text_kwargs()))
+
+
 def test_fp32_strict_tensors_stay_fp32_through_the_device_move():
     """transformers keeps `e_score_correction_bias`, `conv1d`, `dt_bias` and `A_log` in fp32
-    even in a bf16 model (`_keep_in_fp32_modules_strict`). The router bias in particular
-    decides which experts each calibration token reaches, so rounding it to bf16 changes the
-    per-expert Hessians."""
+    even in a bf16 model (`_keep_in_fp32_modules_strict`); 5.23.0 adds the hyper-connections'
+    `attn_hc`/`ffn_hc` `base` and `scale`. The router bias in particular decides which experts
+    each calibration token reaches, so rounding it to bf16 changes the per-expert Hessians.
+    Whatever the installed transformers lists, the quantizer keeps it, plus the profile's own."""
     mod, _, Glm5NextTextConfig = _glm()
     cfg = Glm5NextTextConfig(**_tiny_text_kwargs())
     p = qm._MODEL_PROFILES[ARCH]
-    assert set(p["keep_fp32"]) == set(mod.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict)
+    keep = qm._keep_fp32_names(p, _glm_meta_text_model(mod, Glm5NextTextConfig))
+    assert set(mod.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict) <= set(keep)
+    assert set(p["keep_fp32"]) <= set(keep)
 
     torch.manual_seed(0)
     layers = [mod.Glm5NextTextDecoderLayer(cfg, i).float() for i in range(2)]
@@ -464,14 +474,49 @@ def test_fp32_strict_tensors_stay_fp32_through_the_device_move():
     before = {i: {k: v.clone() for k, v in l.state_dict().items()} for i, l in enumerate(layers)}
 
     for i, layer in enumerate(layers):
-        qm._move_layer_keeping_bulk_on_cpu(layer, "cpu", torch.bfloat16,
-                                           keep_fp32=p["keep_fp32"])
+        qm._move_layer_keeping_bulk_on_cpu(layer, "cpu", torch.bfloat16, keep_fp32=keep)
         for k, v in layer.state_dict().items():
-            if any(s in k for s in p["keep_fp32"]):
+            if any(s in k for s in keep):
                 assert v.dtype == torch.float32, k
                 assert torch.equal(v, before[i][k]), f"{k} was rounded on the way"
             elif v.is_floating_point():
                 assert v.dtype == torch.bfloat16, k
+
+
+def test_the_profiles_list_is_unchanged_where_transformers_adds_nothing():
+    """Byte-identical calibration where the installed transformers lists only the profile's
+    four (5.19.0, the installer's pin, through 5.22.2): same names, same order."""
+    mod, _, Glm5NextTextConfig = _glm()
+    p = qm._MODEL_PROFILES[ARCH]
+    model = _glm_meta_text_model(mod, Glm5NextTextConfig)
+    keep = qm._keep_fp32_names(p, model)
+    assert keep[:len(p["keep_fp32"])] == tuple(p["keep_fp32"])
+    if set(model._keep_in_fp32_modules_strict) <= set(p["keep_fp32"]):
+        assert keep == tuple(p["keep_fp32"])
+
+
+def test_transformers_additions_follow_the_profiles_own_names():
+    from types import SimpleNamespace
+    model = SimpleNamespace(_keep_in_fp32_modules_strict={"A_log", "ffn_hc.base", "attn_hc.scale"})
+    keep = qm._keep_fp32_names({"keep_fp32": ("conv1d", "A_log")}, model)
+    assert keep == ("conv1d", "A_log", "attn_hc.scale", "ffn_hc.base")
+
+
+def test_a_profile_without_keep_fp32_stays_empty_whatever_transformers_lists():
+    """Every other architecture's published checkpoints were calibrated with every float
+    tensor cast; reading transformers' list for them would change their calibration."""
+    from types import SimpleNamespace
+    model = SimpleNamespace(_keep_in_fp32_modules_strict={"A_log", "dt_bias"})
+    assert qm._keep_fp32_names({}, model) == ()
+    assert qm._keep_fp32_names({"keep_fp32": ()}, model) == ()
+
+
+def test_a_model_without_a_strict_list_keeps_the_profiles():
+    from types import SimpleNamespace
+    profile = {"keep_fp32": ("conv1d", "A_log")}
+    assert qm._keep_fp32_names(profile, SimpleNamespace()) == ("conv1d", "A_log")
+    assert qm._keep_fp32_names(profile, SimpleNamespace(_keep_in_fp32_modules_strict=None)) == (
+        "conv1d", "A_log")
 
 
 def test_without_keep_fp32_every_float_tensor_is_cast_as_before():

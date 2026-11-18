@@ -791,8 +791,9 @@ _MODEL_PROFILES = {
         # on None. Causality comes from the indexer itself, so all-visible is what the model
         # passes for an unpadded batch.
         'bool_attention_mask': True,
-        # `_keep_in_fp32_modules_strict` of the model. A bf16 router bias changes which
-        # experts each calibration token reaches.
+        # `_keep_in_fp32_modules_strict` of the model through transformers 5.22.2; a newer
+        # transformers' additions are taken from the model itself (`_keep_fp32_names`). A
+        # bf16 router bias changes which experts each calibration token reaches.
         'keep_fp32': ('e_score_correction_bias', 'conv1d', 'dt_bias', 'A_log'),
         # Every attention projection, KDA, MLA and indexer alike. vLLM 0.32 builds all of
         # them with `quant_config=None`, so a quantized one could not load. They are 3% of
@@ -2645,6 +2646,28 @@ def _is_bulk_module_name(name: str) -> bool:
     return any(marker.strip(".") in name for marker in _UNQUANTIZED_BULK)
 
 
+def _keep_fp32_names(profile, model) -> tuple:
+    """The tensor names a streaming quantize keeps fp32 through the device move.
+
+    A profile with `keep_fp32` names the model's `_keep_in_fp32_modules_strict` as it stood
+    when the profile was written, and also takes whatever the installed transformers marks
+    strict on ``model``: the meta instance's merged set, which is what transformers upcasts
+    when it loads the model. transformers 5.23.0 added GLM-5.3's hyper-connection
+    `attn_hc`/`ffn_hc` `base` and `scale` to the four it listed through 5.22.2; a hard-coded
+    list would round them to bf16 through calibration while the model keeps them fp32.
+
+    The profile's names come first, in their order, and additions follow sorted, so where
+    transformers adds nothing (5.19.0, the installer's pin, through 5.22.2) the tuple is the
+    profile's own and calibration is byte-identical. A profile without `keep_fp32` stays
+    empty: every other architecture's checkpoints were calibrated with every float cast.
+    """
+    keep = tuple(profile.get('keep_fp32', ()) or ())
+    if not keep:
+        return ()
+    strict = getattr(model, "_keep_in_fp32_modules_strict", None) or ()
+    return keep + tuple(sorted(set(strict) - set(keep)))
+
+
 def _move_layer_keeping_bulk_on_cpu(layer, device, dtype, keep_fp32=()):
     """Move a layer to `device`, leaving bulk tensors on CPU.
 
@@ -3631,6 +3654,7 @@ def quantize(
     weight_map = None
     shard_paths = None
     BlockClass = None
+    keep_fp32 = ()      # streaming: the profile's fp32-strict names plus transformers'
     _rotary_cls = None  # generic-streaming rotary class (built off-meta in the rotary section)
     is_mistral3 = "Mistral3" in arch  # Mistral3ForConditionalGeneration (multimodal 24B)
     # Pure-text Ministral3 (123B Devstral-2) uses its own LM class but the same
@@ -3692,6 +3716,9 @@ def quantize(
         # real expert layout is visible, and the alternative is a 232 GiB pull followed by a
         # run that skips 90% of the weights without saying so.
         _require_supported_expert_layout(_layers, arch, profile)
+        # Read off the meta model while it exists: the installed transformers' strict-fp32
+        # set joins the profile's own (see `_keep_fp32_names`).
+        keep_fp32 = _keep_fp32_names(profile, _model)
         del _model, _layers
 
         # Download model (if needed) and build weight map
@@ -4101,8 +4128,7 @@ def quantize(
             # hidden states are bf16 — F.linear then dies on the dtype mismatch. Only the
             # device move is GPU-conditional.
             _move_layer_keeping_bulk_on_cpu(
-                layer, device if use_gpu else "cpu", dtype,
-                keep_fp32=profile.get('keep_fp32', ()))
+                layer, device if use_gpu else "cpu", dtype, keep_fp32=keep_fp32)
             layer.eval()
         else:
             layer = decoder_layers[layer_idx]
