@@ -62,9 +62,11 @@ def _default_templates_dir() -> Path:
 #:              `Qwen3_5ForConditionalGeneration`. Chat template compared with Qwen3.8-27B's
 #:              on 2026-11-08: identical `<tool_call>` / `<function=` / `<think>` markup; the
 #:              only change drops the `{% generation %}` training-mask markers. Its
-#:              generation_config.json is Qwen's 1.0 / 0.95 / top_k 20.
+#:              generation_config.json is Qwen's 1.0 / 0.95 / top_k 20. Mapped to the 27B
+#:              line rather than to plain "qwen": its KV dimensions are Qwen3.8-27B's, and
+#:              every KV figure behind `_QWEN38_27B` was measured on Arete builds.
 _DERIVED_FAMILIES = {
-    "arete-27b": "qwen",
+    "arete-27b": "qwen3.8-27b",
 }
 
 
@@ -216,6 +218,35 @@ _QWEN = ModelProfile(
     # (`interns2_mobius.py`), so a substring cannot catch them. Acceptable because the silent
     # mode is what they would hit, and it measured as a null (see `preferred_dtype`).
     fp16_unsafe=True,
+)
+
+_QWEN38_27B = dataclasses.replace(
+    _QWEN, family="qwen3.8-27b", match=("qwen3.8-27b",),
+    # The dense 27B (Arete-27B is a fine-tune of it, by alias above). Its KV is over twice the
+    # envelope: 16 of its 64 layers are full attention, 4 KV heads x 256 at bf16, so
+    # 16 x 2 x 4 x 256 x 2 = 65,536 B/token against the envelope's 28,201. glq-code priced it
+    # at the envelope and planned 131,072 for the 4 and 5 bpw builds on a 32 GB card: both
+    # glq-code and glq-chat passed their fit check, and vLLM refused to start ("8.48 GiB KV
+    # cache is needed, which is larger than the available KV cache memory (7.22 GiB)").
+    #
+    # vLLM's own figures, GLQ builds of Arete-27B, bf16 KV, GiB for one request:
+    #
+    #     vLLM 0.32.0  262,144   16.32  RTX PRO 4500 (32 GB), 5 bpw: the startup refusal
+    #                  162,288   10.22  same, 12 GiB offloaded: the pool, and its largest window
+    #                   83,888    5.42  same, util 0.9: the pool, and its largest window
+    #                   36,864    2.58-2.59  RTX PRO 6000, 4/5/6 bpw, bf16: pool / max concurrency
+    #     vLLM 0.33.0  131,072    8.48  RTX PRO 4500, 5 bpw, glq-chat: the startup refusal
+    #                  110,656    7.22  same: the pool, and its largest window
+    #
+    # Each version fits one layout exactly: (ceil(L / B) + E) blocks of 16 x B x 4 KiB, a block
+    # spanning the 16 full-attention layers. B is the attention block vLLM picks so that a page
+    # holds one GDN layer's state (fp32 SSM, 3,207,168 B): 784 on 0.32.0, 832 on 0.33.0, which
+    # logs it ("Setting attention block size to 832 tokens"). E, the extra blocks per request
+    # (presumably GDN state; read from the fit, not from vLLM's source), is 6 on 0.32.0 and 9 on
+    # 0.33.0. So the fixed part is at most (B - 1 + E x B) tokens' worth: 0.34 GiB on 0.32.0,
+    # 0.51 on 0.33.0. 0.51 GiB + 65,536 B/token covers both at every window up to 262,144,
+    # within 7% of every figure above, before `_KV_SAFETY_FACTOR`.
+    kv_cost=(int(0.51 * 1024**3), 65_536),
 )
 
 _SMOLLM3 = ModelProfile(
@@ -399,6 +430,7 @@ _MISTRAL = ModelProfile(
 #: is reachable by its own key).
 PROFILES = (
     _GEMMA4,
+    _QWEN38_27B,
     _QWEN,
     _SMOLLM3,
     _KOLIBRI_1,

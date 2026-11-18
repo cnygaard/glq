@@ -24,8 +24,8 @@
  "id:/opt/dlami/nvme/Arete-27B-GLQ-trellis-3inst-5bpw": {
   "dspark_drafter": null,
   "kv_cost": [
-   0,
-   28201
+   547608330,
+   65536
   ],
   "preferred_dtype": {
    "cpu": "bfloat16",
@@ -127,8 +127,8 @@
  "id:NousResearch/Arete-27B": {
   "dspark_drafter": null,
   "kv_cost": [
-   0,
-   28201
+   547608330,
+   65536
   ],
   "preferred_dtype": {
    "cpu": "bfloat16",
@@ -186,8 +186,8 @@
  "id:Qwen/Qwen3.8-27B": {
   "dspark_drafter": null,
   "kv_cost": [
-   0,
-   28201
+   547608330,
+   65536
   ],
   "preferred_dtype": {
    "cpu": "bfloat16",
@@ -648,8 +648,8 @@
  "id:xv0y5ncu/Arete-27B-GLQ-trellis-3inst-5bpw": {
   "dspark_drafter": null,
   "kv_cost": [
-   0,
-   28201
+   547608330,
+   65536
   ],
   "preferred_dtype": {
    "cpu": "bfloat16",
@@ -886,8 +886,8 @@
  "id:xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw": {
   "dspark_drafter": null,
   "kv_cost": [
-   0,
-   28201
+   547608330,
+   65536
   ],
   "preferred_dtype": {
    "cpu": "bfloat16",

@@ -194,8 +194,166 @@ def test_a_template_lookup_never_reads_config_json(tmp_path):
 
 def test_a_fine_tune_alias_reaches_its_family():
     from glq.tooling import profile_for
-    assert profile_for("NousResearch/Arete-27B", "template").family == "qwen"
+    assert profile_for("NousResearch/Arete-27B", "template").family == "qwen3.8-27b"
     assert profile_for("NousResearch/Arete-9B", "template") is None
+
+
+# ---- the dense Qwen3.8-27B line: a measured KV cost of its own ------------------------------
+
+_GIB = 1024 ** 3
+
+#: Every id spelling of the line: the base, the fine-tune (by its alias), a GLQ build, a box copy.
+_QWEN38_27B_IDS = [
+    "Qwen/Qwen3.8-27B",
+    "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw",
+    "NousResearch/Arete-27B",
+    "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-5bpw",
+    "/opt/dlami/nvme/Arete-27B-GLQ-trellis-3inst-5bpw",
+]
+
+#: KV figures from vLLM's own log lines (bf16 KV, GLQ builds of Arete-27B, whose KV dimensions
+#: equal Qwen3.8-27B's), as (vLLM, kind, window, GiB). Kinds:
+#:   need     a startup refusal, quoting what one request at `window` needs
+#:   largest  a pool of GiB, and the largest window vLLM said it could serve from it
+#:   ratio    pool / "Maximum concurrency" at `window` (two rounded figures)
+_QWEN38_27B_KV_MEASURED = (
+    # vLLM 0.32.0, RTX PRO 4500 (32 GB), 5 bpw, 2026-11-07
+    ("0.32.0", "need", 262_144, 16.32),
+    ("0.32.0", "largest", 83_888, 5.42),          # util 0.9
+    ("0.32.0", "largest", 162_288, 10.22),        # 12 GiB offloaded
+    # vLLM 0.32.0, RTX PRO 6000, the AIME runs at 36,864
+    ("0.32.0", "ratio", 36_864, 63.48 / 24.56),   # 4 bpw
+    ("0.32.0", "ratio", 36_864, 60.37 / 23.35),   # 5 bpw
+    ("0.32.0", "ratio", 36_864, 57.61 / 22.28),   # 6 bpw
+    ("0.32.0", "ratio", 36_864, 32.15 / 12.43),   # bf16
+    # vLLM 0.33.0, RTX PRO 4500 (32 GB), 5 bpw, glq-chat 0.8.36, 2026-11-15
+    ("0.33.0", "need", 131_072, 8.48),
+    ("0.33.0", "largest", 110_656, 7.22),
+)
+
+#: How each vLLM pages this model, as every figure above fits it: (tokens per block, extra
+#: blocks per request). A block is 16 full-attention layers x tokens x 4 KiB. The block size is
+#: vLLM's own log line ("Setting attention block size to 832 tokens"); the extra blocks are
+#: read from the fit.
+_VLLM_LAYOUT = {"0.32.0": (784, 6), "0.33.0": (832, 9)}
+
+
+def _vllm_need_bytes(window, vllm):
+    """What vLLM asks of this model for one request at `window`."""
+    block, extra = _VLLM_LAYOUT[vllm]
+    return (-(-window // block) + extra) * 16 * block * 4096
+
+
+@pytest.mark.parametrize("vllm,kind,window,gib", _QWEN38_27B_KV_MEASURED)
+def test_the_layout_reproduces_each_measurement(vllm, kind, window, gib):
+    """The layout is only evidence if it reproduces every figure: a refusal's need to vLLM's two
+    decimals; for a largest window, its need fits the pool and one block more does not."""
+    need = _vllm_need_bytes(window, vllm) / _GIB
+    if kind == "need":
+        assert round(need, 2) == gib
+    elif kind == "largest":
+        block = _VLLM_LAYOUT[vllm][0]
+        assert need <= gib < _vllm_need_bytes(window + block, vllm) / _GIB
+    else:
+        assert need == pytest.approx(gib, abs=0.005)
+
+
+@pytest.mark.parametrize("model", _QWEN38_27B_IDS)
+def test_the_qwen38_27b_line_prices_kv_at_or_above_every_measurement(model):
+    """The envelope (28,201 B/token) is under half of this model's 64 KiB, so glq-code planned
+    131,072 on a 32 GB card and vLLM refused it. The priced cost must cover every figure, and
+    what either vLLM needs at ANY window up to the declared 262,144 (block rounding is worst one
+    token past a block boundary), while staying within 8% of every figure, or the planner gives
+    tiers away. The loosest figures are 0.32.0's at 36,864: its blocks were smaller."""
+    from glq.supervisor import kv_cost
+    fixed, per_token = kv_cost(model)
+    for _, _, window, gib in _QWEN38_27B_KV_MEASURED:
+        priced = fixed + window * per_token
+        assert gib * _GIB <= priced <= 1.08 * gib * _GIB, (window, gib, priced / _GIB)
+    for vllm, (block, _) in _VLLM_LAYOUT.items():
+        for window in range(1, 262_145, block):
+            assert fixed + window * per_token >= _vllm_need_bytes(window, vllm), (vllm, window)
+
+
+def test_the_qwen38_27b_line_changes_only_its_kv_cost():
+    """Tool parser, reasoning, sampling, dtype: everything else stays the Qwen profile's."""
+    import dataclasses
+
+    from glq.tooling import _QWEN, profile_for
+    p = profile_for("NousResearch/Arete-27B", "template")
+    skip = {"family", "match", "kv_cost"}
+    for field in dataclasses.fields(p):
+        if field.name not in skip:
+            assert getattr(p, field.name) == getattr(_QWEN, field.name), field.name
+
+
+#: Arete-27B as glq-code sizes it: the Hub tree's bytes (2026-11-15; none of the three declares
+#: non-text bytes), and vLLM's "Model loading took" (5 and 6 bpw on the 32 GB / 96 GB cards,
+#: 4 bpw on the 96 GB one).
+_ARETE = {
+    "4": dict(size=18_236_907_824, weights=16.58),
+    "5": dict(size=21_277_885_240, weights=19.44),
+    "6": dict(size=24_318_755_704, weights=22.44),
+}
+#: vLLM's own non-weight, non-KV use on the 32 GB card, 5 bpw. The larger of two measurements:
+#: vLLM 0.32.0 at util 0.9, 0.9 x 31.86 - 19.44 weights - 5.42 KV = 3.81; glq-chat on vLLM 0.33.0
+#: at util 0.891, 0.891 x 31.86 - 19.44 - 7.27 = 1.68.
+_OTHER_GIB = 0.9 * 31.86 - 19.44 - 5.42
+
+#: The two launchers, as `glq.code.main` and `glq.chat.main` build their supervisors and judge
+#: the fit (the floor each passes to `fit.check_fit`).
+_LAUNCHERS = {
+    "code": (16384, dict(max_model_len_floor=16384, max_num_seqs=1, window_concurrency=1,
+                         window_offload_extra_gib=8)),
+    "chat": (8192, dict(window_concurrency=1)),
+}
+
+#: (launcher, card GiB, bpw) -> the window served, or None where the launcher refuses before
+#: starting vLLM. 31.86 is the RTX PRO 4500 of the measurements, 95.6 the RTX PRO 6000 as
+#: nvidia-smi reports it.
+_ARETE_PLANS = {}
+for _launcher in _LAUNCHERS:
+    for _vram in (16, 22, 24):
+        _ARETE_PLANS.update({(_launcher, _vram, b): None for b in "456"})
+    _ARETE_PLANS.update({(_launcher, 95.6, b): 262_144 for b in "456"})
+_ARETE_PLANS.update({
+    ("code", 31.86, "4"): 65_536, ("code", 31.86, "5"): 32_768, ("code", 31.86, "6"): None,
+    ("chat", 31.86, "4"): 65_536, ("chat", 31.86, "5"): 32_768, ("chat", 31.86, "6"): None,
+})
+
+
+@pytest.mark.parametrize("launcher,vram_gib,bpw", sorted(_ARETE_PLANS))
+def test_each_launcher_either_refuses_arete_27b_or_plans_a_window_vllm_can_hold(
+        launcher, vram_gib, bpw):
+    """The reported failures, on the 32 GB card: `glq-code --model
+    xv0y5ncu/Arete-27B-GLQ-trellis-3inst-5bpw` did not start while `--max-model-len 50000` did,
+    and glq-chat with the same model stopped at vLLM's "8.48 GiB KV cache is needed ... (7.22
+    GiB)". Both had planned 131,072, and their fit check had passed.
+
+    On every card, one of two things must happen: the launcher's own fit check refuses, with
+    VRAM named, before vLLM is started; or the pool it asks for holds what vLLM (0.32.0 and
+    0.33.0) needs for the window it planned. Never a pass followed by vLLM's refusal."""
+    from glq import fit
+    from glq.supervisor import VllmSupervisor
+    floor, kw = _LAUNCHERS[launcher]
+    f = _ARETE[bpw]
+    vram = int(vram_gib * _GIB)
+    sup = VllmSupervisor(
+        model=f"xv0y5ncu/Arete-27B-GLQ-trellis-3inst-{bpw}bpw", device="cuda", serve=False,
+        weights_bytes=f["size"], vram_bytes=vram, ram_bytes=64 * _GIB, model_max_len=262_144,
+        **kw)
+    verdict = fit.check_fit(sup, ram_bytes=64 * _GIB, swap_bytes=0,
+                            available_ram_bytes=56 * _GIB, floor=floor)
+    want = _ARETE_PLANS[(launcher, vram_gib, bpw)]
+    if want is None:
+        assert verdict.fits is False and verdict.reason == "vram", verdict
+        return
+    assert verdict.fits is True, verdict
+    assert sup.max_model_len == want
+    pool_kv = sup.gpu_memory_utilization * vram - (f["weights"] + _OTHER_GIB) * _GIB
+    for vllm in _VLLM_LAYOUT:
+        need = _vllm_need_bytes(sup.max_model_len, vllm)
+        assert pool_kv >= need, (vllm, sup.max_model_len, pool_kv / _GIB, need / _GIB)
 
 
 def test_an_unknown_scope_is_refused():
