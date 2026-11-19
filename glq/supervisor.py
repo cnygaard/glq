@@ -73,16 +73,25 @@ _RUNTIME_OVERHEAD_BYTES = 4 * 1024 ** 3
 #: 5.44) while staying conservative on the smaller model (4.42 against 3.70). **Two data
 #: points is an envelope, not a model** — widen it when a third beats it, and do not fit it
 #: more tightly on the strength of these two.
+#:
+#: A family measured well BELOW it keeps the envelope for everyone else and carries its own
+#: figure instead (`runtime_overhead_for`): Qwen3.8-27B 4 bpw needs about 2.6 GiB against the
+#: 4.51 this reserves, and that difference is what refused it on every 24 GB card.
 _RUNTIME_OVERHEAD_WEIGHT_FRACTION = 0.03
 
 
-def runtime_overhead_bytes(weights_bytes) -> int:
+def runtime_overhead_bytes(weights_bytes, measured=None) -> int:
     """Non-weight, non-KV VRAM to reserve for a model of this resident size.
 
     Everything the pool must hold besides weights and KV blocks. See
     `_RUNTIME_OVERHEAD_WEIGHT_FRACTION` for why this is not a constant and what the two
     measurements behind it are.
+
+    `measured` is the family's own figure where one exists (`runtime_overhead_for`), and wins
+    outright: it was taken against the same resident figure this is added to.
     """
+    if measured is not None:
+        return int(measured)
     if not weights_bytes:
         return _RUNTIME_OVERHEAD_BYTES
     return _RUNTIME_OVERHEAD_BYTES + int(
@@ -115,7 +124,7 @@ DEFAULT_CPU_MAX_NUM_SEQS = 4
 _MAX_UTILIZATION = 0.92
 
 
-def kv_headroom_bytes(resident_bytes, vram_bytes) -> int:
+def kv_headroom_bytes(resident_bytes, vram_bytes, overhead=None) -> int:
     """KV bytes the card can still hold once this much resident weight, plus its overhead, is in.
 
     One affordability question asked from two ends, which is why it lives in one place:
@@ -130,15 +139,19 @@ def kv_headroom_bytes(resident_bytes, vram_bytes) -> int:
     pool. That distinction is not cosmetic: sizing against the minimal pool leaves 2 GiB of
     headroom on a 96 GB card and on a 23 GiB one alike, which is what made the window planner
     inert for exactly the checkpoints it was written for.
+
+    `overhead` is the family's measured figure, or None for the envelope; every planner takes
+    it and passes it here, so one plan never mixes the two.
     """
     if not vram_bytes:
         return 0
     resident = max(0, int(resident_bytes or 0))
     return int(_MAX_UTILIZATION * float(vram_bytes) - resident
-               - runtime_overhead_bytes(resident))
+               - runtime_overhead_bytes(resident, overhead))
 
 
-def plan_gpu_memory_utilization(*, weights_bytes, vram_bytes, kv_bytes=None, arena_bytes=0):
+def plan_gpu_memory_utilization(*, weights_bytes, vram_bytes, kv_bytes=None, arena_bytes=0,
+                                overhead=None):
     """How much of the card vLLM may reserve, sized from the checkpoint.
 
     A fixed fraction cannot be right for every model: measured on a 23 GB L4, the 0.45 that
@@ -166,8 +179,8 @@ def plan_gpu_memory_utilization(*, weights_bytes, vram_bytes, kv_bytes=None, are
     if not weights_bytes or not vram_bytes:
         return DEFAULT_GPU_MEMORY_UTILIZATION
     kv = max(_MIN_KV_BYTES, int(kv_bytes or 0))
-    needed = (weights_bytes + runtime_overhead_bytes(weights_bytes) + int(arena_bytes or 0)
-              + kv)
+    needed = (weights_bytes + runtime_overhead_bytes(weights_bytes, overhead)
+              + int(arena_bytes or 0) + kv)
     return min(max(needed / vram_bytes, DEFAULT_GPU_MEMORY_UTILIZATION), _MAX_UTILIZATION)
 
 
@@ -189,7 +202,7 @@ _PINNED_RAM_FRACTION = 0.5
 
 def plan_expert_offload_gib(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
                             vram_bytes, ram_bytes=None, nontext_bytes=0,
-                            kv_bytes=0) -> int:
+                            kv_bytes=0, overhead=None) -> int:
     """GiB of MoE expert weights to hold in host RAM so the remainder fits the card.
 
     Returns 0 — no offload flags at all — whenever the model already fits, so a box that does
@@ -228,8 +241,8 @@ def plan_expert_offload_gib(*, weights_bytes, ple_offload_bytes, expert_offload_
         # inverting the overhead formula; see that function. ~50 iterations at worst.
         step = 1024**3
         shed, limit = 0, max(0, math.ceil(after_ple / step))
-        while shed < limit and kv_headroom_bytes(after_ple - shed * step,
-                                                 vram_bytes) < int(kv_bytes):
+        while shed < limit and kv_headroom_bytes(after_ple - shed * step, vram_bytes,
+                                                 overhead) < int(kv_bytes):
             shed += 1
         need = max(need, shed * step)
     if need <= 0:
@@ -254,7 +267,8 @@ _ARENA_KV_SLACK_BYTES = 1024**3
 
 
 def plan_expert_arena_gib(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
-                          vram_bytes, offload_gib, nontext_bytes=0, kv_bytes=0) -> int:
+                          vram_bytes, offload_gib, nontext_bytes=0, kv_bytes=0,
+                          overhead=None) -> int:
     """GiB of VRAM to give the routing-aware expert arena (`GLQ_MOE_EXPERT_CACHE`).
 
     Measured on an L4 (`benchmarks/expert_arena_s1/RESULT.md`): a routing-aware arena takes
@@ -286,7 +300,7 @@ def plan_expert_arena_gib(*, weights_bytes, ple_offload_bytes, expert_offload_by
 
     resident = (int(weights_bytes) - int(ple_offload_bytes or 0) - int(nontext_bytes or 0)
                 - int(offload_gib) * 1024**3)
-    spare = (kv_headroom_bytes(max(0, resident), vram_bytes)
+    spare = (kv_headroom_bytes(max(0, resident), vram_bytes, overhead)
              - int(kv_bytes or 0) - _ARENA_KV_SLACK_BYTES)
     if spare < 1024**3:
         return 0
@@ -317,7 +331,8 @@ _ARENA_PINNED_RAM_FRACTION = 0.6
 
 def plan_arena_and_offload(*, weights_bytes, ple_offload_bytes, expert_offload_bytes,
                            vram_bytes, base_offload_gib, ram_bytes=None, nontext_bytes=0,
-                           kv_bytes=0, forced: bool = False) -> tuple[int, int]:
+                           kv_bytes=0, forced: bool = False,
+                           overhead=None) -> tuple[int, int]:
     """``(expert_offload_gib, expert_arena_gib)`` — deepen offload when that buys an arena.
 
     **Why deepening is the right trade, measured.** `plan_expert_offload_gib` offloads the
@@ -361,7 +376,8 @@ def plan_arena_and_offload(*, weights_bytes, ple_offload_bytes, expert_offload_b
     arena = plan_expert_arena_gib(
         weights_bytes=weights_bytes, ple_offload_bytes=ple_offload_bytes,
         expert_offload_bytes=expert_offload_bytes, vram_bytes=vram_bytes,
-        offload_gib=full, nontext_bytes=nontext_bytes, kv_bytes=kv_bytes)
+        offload_gib=full, nontext_bytes=nontext_bytes, kv_bytes=kv_bytes,
+        overhead=overhead)
     if arena <= 0:
         # Deepening bought nothing, so do not pay PCIe for it.
         return int(base_offload_gib), 0
@@ -403,6 +419,26 @@ def kv_cost(model_id) -> tuple[int, int]:
     if p is not None and p.kv_cost is not None:
         return p.kv_cost
     return 0, _KV_BYTES_PER_TOKEN
+
+
+#: Smallest card on which vLLM's API server prefills 8,192 tokens a step rather than 2,048
+#: (vLLM 0.33.0 `EngineArgs.get_batch_defaults`; A100 and GB10 stay on 2,048, which only
+#: leaves them on the envelope here). The step sets the activation peak: Arete-27B 4 bpw
+#: measured 2.50 GiB at 2,048 and 5.08 at 8,192.
+_LARGE_STEP_VRAM_BYTES = 70 * 1024**3
+
+
+def runtime_overhead_for(model_id, vram_bytes) -> int | None:
+    """The family's MEASURED runtime overhead on this card, or None for the envelope.
+
+    Like `kv_cost`, a family carries its own figure in its `tooling` profile
+    (`ModelProfile.runtime_overhead`, with the runs behind it). Only below
+    `_LARGE_STEP_VRAM_BYTES`, where it was measured; None with the VRAM unknown.
+    """
+    if not vram_bytes or int(vram_bytes) >= _LARGE_STEP_VRAM_BYTES:
+        return None
+    p = tooling.profile_for(model_id or "", "template")
+    return None if p is None else p.runtime_overhead
 
 #: 131072 and 262144 are here because both published long-context families declare
 #: `max_position_embeddings = 262144` (gemma-4 and Qwen3.8-Flash-Next, verified live), so the
@@ -502,7 +538,7 @@ def window_kv_bytes(max_model_len, concurrency=_WINDOW_CONCURRENCY, cost=None) -
     return int(total * _KV_SAFETY_FACTOR)
 
 
-def kv_floor_bytes(floor, concurrency=1, cost=None) -> int:
+def kv_floor_bytes(floor, concurrency=1, cost=None, measured=False) -> int:
     """The least KV a plan may leave: the floor window's, and never under `_MIN_KV_BYTES`.
 
     One function for the two places that ask it, `fit.check_fit` (what the card is judged
@@ -511,8 +547,15 @@ def kv_floor_bytes(floor, concurrency=1, cost=None) -> int:
     `WEIGHT_FRACTION` of the card, which on 24 GiB passes Lightning 4 bpw resident at
     16.92 GiB and leaves 0.65 GiB of KV, so glq-chat refused it on 24 GiB while serving it on
     12 and 16, where the same test failed and experts were offloaded.
+
+    `measured`: the family's runtime overhead was measured (`runtime_overhead_for`), and with
+    it its KV cost (a test holds the two together). `_MIN_KV_BYTES` stands in for "a useful
+    context" when KV is priced at the envelope; with both measured, the floor window's own
+    priced KV is that context. For Qwen3.8-27B at glq-code's 16,384 it is 1.74 GiB, against
+    the ~1.47 vLLM 0.33.0 asks for and the 2.38-2.60 it served with on a 24 GB card.
     """
-    return max(_MIN_KV_BYTES, window_kv_bytes(int(floor or 0), concurrency, cost))
+    kv = window_kv_bytes(int(floor or 0), concurrency, cost)
+    return kv if measured else max(_MIN_KV_BYTES, kv)
 
 
 #: Largest window the AUTO planner will choose, by card size. `--max-model-len` overrides it.
@@ -555,7 +598,7 @@ def window_ceiling_for_vram(vram_bytes, cost=None) -> int:
 
 def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
                        floor=DEFAULT_MAX_MODEL_LEN,
-                       concurrency=_WINDOW_CONCURRENCY, cost=None):
+                       concurrency=_WINDOW_CONCURRENCY, cost=None, overhead=None):
     """The served context window: the largest tier the card could afford to hold.
 
     A fixed 8192 was designed for 24 GiB desktops and wastes a 96 GiB card; the model's
@@ -575,7 +618,7 @@ def plan_max_model_len(*, weights_bytes, vram_bytes, model_max_len,
     """
     if not weights_bytes or not vram_bytes or not model_max_len:
         return floor
-    headroom = kv_headroom_bytes(weights_bytes, vram_bytes)
+    headroom = kv_headroom_bytes(weights_bytes, vram_bytes, overhead)
     chosen = floor
     for tier in _WINDOW_TIERS:
         if window_kv_bytes(tier, concurrency, cost) <= headroom:
@@ -962,6 +1005,10 @@ class VllmSupervisor:
         #: Window pricing for this model: `(fixed bytes per request, bytes per token)`. The
         #: envelope unless the family has a measured cost of its own; see `kv_cost`.
         self.kv_cost = kv_cost(model)
+        #: Non-weight, non-KV VRAM for this model on this card: the family's measured figure,
+        #: or None for the envelope; see `runtime_overhead_for`. Every planner below and the
+        #: fit check (`glq.fit`) are given this one value, so a plan never mixes the two.
+        self.runtime_overhead = runtime_overhead_for(model, vram_bytes)
         #: DSpark speculation: a separate draft model (`"method": "dspark"`), as opposed to MTP's
         #: head inside the checkpoint. `draft_tokens` is the depth asked for — PINNED, or with
         #: `draft_auto` the deepest the planner may choose. Its bytes are resident VRAM on top
@@ -1073,7 +1120,8 @@ class VllmSupervisor:
             max_model_len = plan_max_model_len(
                 weights_bytes=resident_bytes, vram_bytes=vram_bytes,
                 model_max_len=model_max_len, floor=max_model_len_floor,
-                concurrency=self.window_concurrency, cost=self.kv_cost)
+                concurrency=self.window_concurrency, cost=self.kv_cost,
+                overhead=self.runtime_overhead)
             if max_model_len > max_model_len_floor:
                 self._window_note = (
                     f" (sized from KV headroom at {self.window_concurrency} concurrent "
@@ -1128,7 +1176,7 @@ class VllmSupervisor:
                 vram_bytes=self._vram_bytes, base_offload_gib=self.expert_offload_gib,
                 ram_bytes=ram_bytes, nontext_bytes=self.nontext_bytes,
                 kv_bytes=self._window_kv(self.max_model_len),
-                forced=self._expert_offload_forced)
+                forced=self._expert_offload_forced, overhead=self.runtime_overhead)
             if (self.expert_offload_gib > self.expert_offload_base_gib
                     and max_model_len_was_auto):
                 # Deepening freed VRAM the window could not claim, because the window was
@@ -1148,7 +1196,7 @@ class VllmSupervisor:
                                       - self.expert_offload_gib * 1024**3),
                     vram_bytes=self._vram_bytes, model_max_len=model_max_len,
                     floor=max_model_len_floor, concurrency=self.window_concurrency,
-                    cost=self.kv_cost)
+                    cost=self.kv_cost, overhead=self.runtime_overhead)
                 if deeper > self.max_model_len:
                     #: The window the base footprint could afford, before deepening freed any
                     #: VRAM. Kept because it is the quantity that answers "did this context
@@ -1163,7 +1211,8 @@ class VllmSupervisor:
                         vram_bytes=self._vram_bytes,
                         offload_gib=self.expert_offload_gib,
                         nontext_bytes=self.nontext_bytes,
-                        kv_bytes=self._window_kv(self.max_model_len))
+                        kv_bytes=self._window_kv(self.max_model_len),
+                        overhead=self.runtime_overhead)
         #: Draft tokens per step actually served: MTP's as asked, DSpark's once the arena has
         #: been checked against the verify step it must hold. Set after the arena because that
         #: check needs it; see `_plan_draft_tokens`.
@@ -1213,7 +1262,8 @@ class VllmSupervisor:
             float(gpu_memory_utilization) if gpu_memory_utilization is not None
             else plan_gpu_memory_utilization(
                 weights_bytes=resident_final, vram_bytes=vram_bytes,
-                kv_bytes=self._window_kv(self.max_model_len), arena_bytes=arena_bytes))
+                kv_bytes=self._window_kv(self.max_model_len), arena_bytes=arena_bytes,
+                overhead=self.runtime_overhead))
         self.fp8_kv = bool(fp8_kv)
         self.serve = serve
         self._spawn, self._probe = spawn, probe
@@ -1458,7 +1508,7 @@ class VllmSupervisor:
         if known:
             resident = max(0, int(with_drafter) - self.ple_offload_bytes - self.nontext_bytes
                            - self.expert_offload_gib * 1024**3)
-            spare = (kv_headroom_bytes(resident, self._vram_bytes)
+            spare = (kv_headroom_bytes(resident, self._vram_bytes, self.runtime_overhead)
                      - self._window_kv(self.max_model_len))
         if self.expert_offload_gib <= 0:
             if not known or spare >= 0:
@@ -1506,11 +1556,13 @@ class VllmSupervisor:
             return plan_expert_offload_gib(
                 weights_bytes=weights_bytes, ple_offload_bytes=self.ple_offload_bytes,
                 expert_offload_bytes=self.expert_offload_bytes, vram_bytes=vram_bytes,
-                ram_bytes=ram_bytes, nontext_bytes=self.nontext_bytes, kv_bytes=kv_bytes)
+                ram_bytes=ram_bytes, nontext_bytes=self.nontext_bytes, kv_bytes=kv_bytes,
+                overhead=self.runtime_overhead)
 
         # At least the KV the fit check will demand, or a card where the weights pass the
         # 0.75 proxy but the floor window does not gets no offload and is then refused.
-        base = budget(kv_floor_bytes(floor, self.window_concurrency, self.kv_cost))
+        base = budget(kv_floor_bytes(floor, self.window_concurrency, self.kv_cost,
+                                     measured=self.runtime_overhead is not None))
         if max_model_len is not None:
             return max(base, budget(self._window_kv(max_model_len)))
         # `model_max_len` unknown means `plan_max_model_len` will return the floor whatever we
@@ -1536,7 +1588,7 @@ class VllmSupervisor:
             # Not redundant with the search inside `budget`: the declared-expert and
             # pinnable-RAM caps can clip `cand` BELOW what this tier needs, and accepting a
             # clipped value would announce a window the card cannot hold.
-            if kv_headroom_bytes(resident_at(cand), vram_bytes) >= kv:
+            if kv_headroom_bytes(resident_at(cand), vram_bytes, self.runtime_overhead) >= kv:
                 return cand
         return base
 
@@ -1551,7 +1603,8 @@ class VllmSupervisor:
         resident = max(0, int(self.weights_bytes) + self.draft_bytes - self.ple_offload_bytes
                        - self.nontext_bytes - self.expert_offload_gib * 1024**3)
         need = self._window_kv(self.max_model_len)
-        return max(0, need - kv_headroom_bytes(resident, self._vram_bytes))
+        return max(0, need - kv_headroom_bytes(resident, self._vram_bytes,
+                                               self.runtime_overhead))
 
     def _say_window_shortfall(self) -> None:
         """Report a window the plan cannot pay for — without changing it.
@@ -1603,7 +1656,7 @@ class VllmSupervisor:
             ple_offload_bytes=self.ple_offload_bytes,
             expert_offload_bytes=self.expert_offload_bytes, vram_bytes=self._vram_bytes,
             ram_bytes=None, nontext_bytes=self.nontext_bytes,
-            kv_bytes=self._window_kv(self.max_model_len))
+            kv_bytes=self._window_kv(self.max_model_len), overhead=self.runtime_overhead)
 
     def _offload_args(self) -> list[str]:
         """Expert-offload flags, or nothing at all when the model already fits.

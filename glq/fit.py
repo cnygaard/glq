@@ -28,6 +28,10 @@ windows that would have served, and disk bytes over-state resident bytes (`recom
 docstring records the 31B at 22.4 GiB on disk against ~16.5 GiB resident). A tight gate here
 refuses working configurations, which is worse than not checking.
 
+A family that carries a MEASURED runtime overhead (`supervisor.runtime_overhead_for`) is judged
+with it, and on its floor window's own priced KV in place of `_MIN_KV_BYTES` — the same figures
+its plan was built from. That is what admits Arete-27B 4 bpw on a 24 GB card, where it serves.
+
 **Host RAM.** The axis nothing checked before, and the one that produced the incident this
 module was written for. See `HOST_UNPINNED_FLOOR_BYTES`.
 
@@ -143,8 +147,15 @@ def check_fit(sup, *, ram_bytes=None, swap_bytes=None, available_ram_bytes=None,
     # that, since a smaller pool serves no useful context and is therefore part of what fits.
     # Priced at the model's own KV cost where one was measured, as the plan was. The base
     # offload buys the same figure (`kv_floor_bytes`), so the planner and this check agree.
-    kv_floor = kv_floor_bytes(int(floor or window or 0), conc, getattr(sup, "kv_cost", None))
-    headroom = kv_headroom_bytes(resident, vram) if vram else 0
+    #
+    # The overhead the plan was sized with — the family's measured figure where it has one —
+    # so the gate cannot judge a plan by a different reserve than the one that built it. With
+    # it measured, the floor window's own priced KV replaces `_MIN_KV_BYTES`; see
+    # `kv_floor_bytes`.
+    overhead = getattr(sup, "runtime_overhead", None)
+    kv_floor = kv_floor_bytes(int(floor or window or 0), conc, getattr(sup, "kv_cost", None),
+                              measured=overhead is not None)
+    headroom = kv_headroom_bytes(resident, vram, overhead) if vram else 0
     unpinned = max(0, int(ram_bytes) - pinned) if ram_bytes else 0
 
     blank = dict(

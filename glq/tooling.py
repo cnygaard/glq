@@ -131,6 +131,10 @@ class ModelProfile:
     dspark_drafter: str | None = None
     #: `(fixed bytes per request, bytes per token)`, MEASURED, for `supervisor.kv_cost`.
     kv_cost: tuple | None = None
+    #: VRAM beyond the planner's resident figure and the KV pool, MEASURED at vLLM's
+    #: 2,048-token prefill step, for `supervisor.runtime_overhead_for`. Cards of 70 GiB and
+    #: up prefill 8,192 tokens a step and keep the envelope.
+    runtime_overhead: int | None = None
     #: Never serve this family in fp16.
     fp16_unsafe: bool = False
     #: A vLLM compilation config this family must be served with on CUDA, because vLLM's
@@ -247,6 +251,33 @@ _QWEN38_27B = dataclasses.replace(
     # 0.51 on 0.33.0. 0.51 GiB + 65,536 B/token covers both at every window up to 262,144,
     # within 7% of every figure above, before `_KV_SAFETY_FACTOR`.
     kv_cost=(int(0.51 * 1024**3), 65_536),
+    # The envelope (`supervisor.runtime_overhead_bytes`, 4 GiB + 3%) refused the 4 bpw build on
+    # every 24 GB card — "SHORT by 1.42 GiB" from glq-code and glq-chat alike — while it serves
+    # there: forced, glq-code ran 16,384 with 2.60 GiB of KV against the ~1.47 that window
+    # needs. Measured with vLLM 0.33.0 on an RTX PRO 4500 (31.86 GiB) and the same card capped
+    # to 24,564 MiB, `vllm serve`'s 2,048-token steps, `benchmarks/arete_24gb/README.md`. vLLM's own
+    # breakdown, GiB, for the served glq-code / glq-chat runs:
+    #
+    #     bpw  card   weights  activation   non-torch    graphs    KV
+    #      4   24      16.58   2.50 / 2.62  0.10 / 0.11  .04/.08  2.38-2.60
+    #      4   32      16.58   2.50         0.10         .04      7.15
+    #      5   32      19.44   2.51 / 2.63  0.37 / 0.38  .04/.08  5.31 / 5.18
+    #      6   32      22.44   2.51 / 2.63  0.13 / 0.14  .04/.08  3.08 / 2.95
+    #
+    # As the planner counts it — planned budget (utilization x nvidia-smi GiB) less the resident
+    # figure (the file) less the KV — that is 2.48-2.62 at 4 bpw, 2.88 / 3.01 at 5 and 2.81 /
+    # 2.94 at 6. One number, because it absorbs what the planner does not model separately: the
+    # vision tower is on disk but not loaded under `--language-model-only` (17.46 GiB loaded
+    # without it at 4 bpw), and vLLM budgets against the CUDA total, 31.43 GiB here against
+    # nvidia-smi's 31.86.
+    #
+    # 3.25 is the worst run (5 bpw, glq-chat, 3.01) plus 0.24 for what one card cannot show: the
+    # same checkpoints' non-torch memory was 0.22-0.24 GiB higher on an RTX PRO 6000. Only
+    # below 70 GiB: at vLLM's 8,192-token step the activation peak was 5.08 GiB for all three
+    # builds. No drafter in any of these runs. The 2026-11-07 figure of 3.81 GiB (5 bpw) came
+    # from an in-process `LLM(...)` probe, 64 sequences and vLLM's 8,192-token in-process
+    # default, which is not how glq-code or glq-chat serve.
+    runtime_overhead=int(3.25 * 1024**3),
 )
 
 _SMOLLM3 = ModelProfile(

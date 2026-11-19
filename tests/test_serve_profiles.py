@@ -275,13 +275,14 @@ def test_the_qwen38_27b_line_prices_kv_at_or_above_every_measurement(model):
             assert fixed + window * per_token >= _vllm_need_bytes(window, vllm), (vllm, window)
 
 
-def test_the_qwen38_27b_line_changes_only_its_kv_cost():
-    """Tool parser, reasoning, sampling, dtype: everything else stays the Qwen profile's."""
+def test_the_qwen38_27b_line_changes_only_its_measured_figures():
+    """Tool parser, reasoning, sampling, dtype: everything but the measured KV cost and
+    runtime overhead stays the Qwen profile's."""
     import dataclasses
 
     from glq.tooling import _QWEN, profile_for
     p = profile_for("NousResearch/Arete-27B", "template")
-    skip = {"family", "match", "kv_cost"}
+    skip = {"family", "match", "kv_cost", "runtime_overhead"}
     for field in dataclasses.fields(p):
         if field.name not in skip:
             assert getattr(p, field.name) == getattr(_QWEN, field.name), field.name
@@ -295,10 +296,13 @@ _ARETE = {
     "5": dict(size=21_277_885_240, weights=19.44),
     "6": dict(size=24_318_755_704, weights=22.44),
 }
-#: vLLM's own non-weight, non-KV use on the 32 GB card, 5 bpw. The larger of two measurements:
-#: vLLM 0.32.0 at util 0.9, 0.9 x 31.86 - 19.44 weights - 5.42 KV = 3.81; glq-chat on vLLM 0.33.0
-#: at util 0.891, 0.891 x 31.86 - 19.44 - 7.27 = 1.68.
-_OTHER_GIB = 0.9 * 31.86 - 19.44 - 5.42
+#: Everything a served run held besides its loaded weights and KV, against the budget the planner
+#: asked for (utilization x nvidia-smi GiB). The largest of nine glq-code / glq-chat runs on vLLM
+#: 0.33.0, 4/5/6 bpw on an RTX PRO 4500 and the same card capped to 24 GiB
+#: (`benchmarks/arete_24gb/README.md`): 5 bpw under glq-chat, 0.8789 x 31.86 - 19.44 - 5.18 = 3.38.
+#: This was 3.81 from a 2026-11-07 in-process `LLM(...)` probe (64 sequences, vLLM's 8,192-token
+#: in-process default), which is not how either launcher serves.
+_OTHER_GIB = 0.8789415 * 31.86 - 19.44 - 5.18
 
 #: The two launchers, as `glq.code.main` and `glq.chat.main` build their supervisors and judge
 #: the fit (the floor each passes to `fit.check_fit`).
@@ -310,16 +314,18 @@ _LAUNCHERS = {
 
 #: (launcher, card GiB, bpw) -> the window served, or None where the launcher refuses before
 #: starting vLLM. 31.86 is the RTX PRO 4500 of the measurements, 95.6 the RTX PRO 6000 as
-#: nvidia-smi reports it.
+#: nvidia-smi reports it. Every non-None cell below 95.6 was served on that card, through the
+#: launcher, at this window (`benchmarks/arete_24gb/README.md`, 24 GiB emulated).
 _ARETE_PLANS = {}
 for _launcher in _LAUNCHERS:
     for _vram in (16, 22, 24):
         _ARETE_PLANS.update({(_launcher, _vram, b): None for b in "456"})
     _ARETE_PLANS.update({(_launcher, 95.6, b): 262_144 for b in "456"})
-_ARETE_PLANS.update({
-    ("code", 31.86, "4"): 65_536, ("code", 31.86, "5"): 32_768, ("code", 31.86, "6"): None,
-    ("chat", 31.86, "4"): 65_536, ("chat", 31.86, "5"): 32_768, ("chat", 31.86, "6"): None,
-})
+    _ARETE_PLANS.update({
+        (_launcher, 24, "4"): 16_384,
+        (_launcher, 31.86, "4"): 65_536, (_launcher, 31.86, "5"): 65_536,
+        (_launcher, 31.86, "6"): 32_768,
+    })
 
 
 @pytest.mark.parametrize("launcher,vram_gib,bpw", sorted(_ARETE_PLANS))
