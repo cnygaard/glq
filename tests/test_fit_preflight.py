@@ -336,3 +336,147 @@ def test_an_undeclared_offload_still_trusts_the_request():
     budget must be taken at face value rather than silently becoming zero."""
     s = _sup(DENSE, ram_gib=120.0, expert_offload_gib=20)
     assert s.pinned_host_bytes == 20 * GIB
+
+
+# ---- a family's MEASURED runtime overhead: Arete-27B 4 bpw on a 24 GB card -------------
+#
+# Measured 2026-11-19 on vLLM 0.33.0, an RTX PRO 4500 (31.86 GiB) and the same card capped to
+# 24,564 MiB, an RTX 4090's nvidia-smi total; `benchmarks/arete_24gb/README.md`. On 0.8.37 both
+# glq-code and glq-chat refused Arete 4 bpw there, "SHORT by 1.42 GiB"; forced, both served,
+# glq-code at 16,384 with 2.60 GiB of KV against the ~1.47 that window needs, 28.0 tok/s.
+#
+# vLLM's breakdown, 4 bpw: weights 16.58 GiB, activation peak 2.50 (2.62 with 16 sequences),
+# non-torch 0.10, CUDA graphs 0.04-0.08. The envelope reserves 4 GiB + 3% of the resident for
+# all of that, 4.51 GiB, beside a resident counted at the file size, 16.98.
+
+ARETE_ID = "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw"
+#: The Hub's safetensors bytes, which is what glq-code and glq-chat count as weights.
+ARETE_FILE = {"4": 18_236_907_824, "5": 21_277_885_240, "6": 24_318_755_704}
+ARETE4 = dict(weights_bytes=ARETE_FILE["4"], ple_offload_bytes=0, expert_offload_bytes=0,
+              model_max_len=262144)
+CHAT_FLOOR = 8192           # glq.supervisor.DEFAULT_MAX_MODEL_LEN
+
+#: nvidia-smi `memory.total` of the 24 GB desktop cards: RTX 4090 / RTX A5000, RTX 3090.
+_24GB_CARDS_MIB = (24564, 24576)
+
+#: Every served run's overhead AS THE PLANNER COUNTS IT: the budget planned (utilization x the
+#: card's nvidia-smi GiB), less the resident figure (the file), less the KV pool vLLM reported.
+#: That one number absorbs everything the planner does not model separately — activations,
+#: graphs, non-torch allocations, the gap between nvidia-smi's total and the CUDA total vLLM
+#: budgets against (31.86 vs 31.43 GiB here), and the vision tower that is on disk but not
+#: loaded under `--language-model-only`.
+#:
+#:     (launcher, card GiB, bpw, window): (planned utilization, KV GiB vLLM reported)
+_ARETE_RUNS = {
+    ("chat", 23.99, "4", 8192): (0.92, 2.47),        # 0.8.37 --force
+    ("code", 23.99, "4", 16384): (0.92, 2.60),       # 0.8.37 --force
+    ("code", 31.86, "4", 65536): (0.8374287, 7.15),  # 0.8.37
+    ("chat", 23.99, "4", 16384): (0.9164003, 2.38),  # this change, from here down
+    ("code", 23.99, "4", 16384): (0.9164003, 2.52),
+    ("chat", 31.86, "5", 65536): (0.8789415, 5.18),
+    ("code", 31.86, "5", 65536): (0.8789415, 5.31),
+    ("chat", 31.86, "6", 32768): (0.8956405, 2.95),
+    ("code", 31.86, "6", 32768): (0.8956405, 3.08),
+}
+
+
+def _measured_overhead_gib(run):
+    (_, vram, bpw, _), (util, kv) = run
+    return util * vram - ARETE_FILE[bpw] / GIB - kv
+
+
+def _arete(vram_gib, **kw):
+    return _sup(ARETE4, model=ARETE_ID, vram_gib=vram_gib, ram_gib=32.0, **kw)
+
+
+@pytest.mark.parametrize("mib", _24GB_CARDS_MIB)
+def test_arete_4bpw_fits_a_24gb_card_for_glq_code(mib):
+    s = _arete(mib / 1024)
+    # The mechanism first: without it a pass could come from anything that loosened the gate.
+    assert s.runtime_overhead is not None, "the family's measured overhead did not engage"
+    r = _check(s, ram_gib=32.0)
+    assert r.fits is True, f"SHORT by {r.vram_short_bytes / GIB:.2f} GiB"
+
+
+@pytest.mark.parametrize("mib", _24GB_CARDS_MIB)
+def test_arete_4bpw_fits_a_24gb_card_for_glq_chat(mib):
+    s = _arete(mib / 1024, max_model_len_floor=CHAT_FLOOR)
+    r = fit.check_fit(s, ram_bytes=32 * GIB, swap_bytes=0, floor=CHAT_FLOOR)
+    assert r.fits is True, f"SHORT by {r.vram_short_bytes / GIB:.2f} GiB"
+
+
+def test_arete_4bpw_is_still_refused_on_an_l4():
+    """22.49 GiB. vLLM itself would refuse 16,384 there — about 20.3 GiB of budget, less
+    16.68 of weights and 2.54 of activations and graphs, leaves ~1.1 GiB of KV against ~1.47 —
+    so the gate must still say no (measured on the box: "SHORT by 1.29 GiB"). A measured
+    overhead narrows the gate; it does not open it."""
+    r = _check(_arete(22.49), ram_gib=32.0)
+    assert r.fits is False
+    assert r.reason == "vram"
+
+
+def test_an_unmeasured_family_of_the_same_size_keeps_the_envelope():
+    """Same bytes, unknown family: nothing about this model was measured, so nothing moves —
+    neither the overhead nor the 2 GiB KV floor."""
+    from glq.supervisor import _MIN_KV_BYTES
+    s = _sup(ARETE4, model="org/ckpt", vram_gib=24564 / 1024, ram_gib=32.0)
+    assert s.runtime_overhead is None
+    r = _check(s, ram_gib=32.0)
+    assert r.fits is False
+    assert r.kv_floor_bytes == _MIN_KV_BYTES
+
+
+def test_the_measured_overhead_stays_off_where_vllm_prefills_8192_tokens():
+    """From 70 GiB vLLM's API server takes 8,192 tokens a step, not 2,048, and the same
+    checkpoints' activation peak measured 5.08 GiB there (RTX PRO 6000) against 2.50-2.63. The
+    small-card figure would under-reserve by ~2.5 GiB, so big cards keep the envelope."""
+    assert _arete(95.59).runtime_overhead is None
+
+
+def test_the_family_overhead_covers_every_measured_run_with_a_cushion():
+    """At least the worst run — 5 bpw under glq-chat — plus the spread in non-torch memory
+    the SAME checkpoints showed between two cards (4 bpw 0.10 here against 0.34 on an RTX PRO
+    6000, 5 bpw 0.37 against 0.59, 6 bpw 0.13 against 0.35). One card cannot show what a
+    3090's driver and attention backend allocate."""
+    from glq import tooling
+    p = tooling.profile_for(ARETE_ID, "template")
+    worst = max(_measured_overhead_gib(r) for r in _ARETE_RUNS.items())
+    assert worst > 3.0, "the table must include the 5 bpw glq-chat run that set this"
+    assert p.runtime_overhead >= (worst + (0.34 - 0.10)) * GIB
+
+
+def test_the_kv_floor_of_a_measured_family_is_its_floor_windows_priced_kv():
+    """`_MIN_KV_BYTES` stands in for "a useful context" when KV is priced at the envelope.
+    A family whose KV cost and overhead were both measured is judged on its floor window's
+    own priced KV instead — 16,384 tokens of Arete is 1.74 GiB with the 15% cushion, against
+    the ~1.47 vLLM 0.33.0 asks for and the 2.38-2.60 GiB it served with on 24 GB."""
+    from glq.supervisor import _MIN_KV_BYTES, window_kv_bytes
+    s = _arete(24564 / 1024)
+    r = _check(s, ram_gib=32.0)
+    assert r.kv_floor_bytes == window_kv_bytes(CODE_FLOOR, 1, s.kv_cost)
+    assert r.kv_floor_bytes < _MIN_KV_BYTES
+
+
+def test_every_measured_overhead_comes_with_a_measured_kv_cost_and_no_drafter():
+    """The measured KV floor above needs both measurements, and the runs behind every
+    measured overhead had no draft model: a family that gains one must be measured again with
+    it, not inherit a figure that never saw its activations."""
+    from glq import tooling
+    for p in tooling.PROFILES:
+        if p.runtime_overhead is not None:
+            assert p.kv_cost is not None, p.family
+            assert p.dspark_drafter is None, p.family
+
+
+def test_the_planner_and_the_gate_use_the_same_overhead():
+    """The window and the pool are sized with the figure the gate judges with — two
+    overheads in one plan is how a plan passes its check and then fails to start."""
+    from glq.supervisor import (_MAX_UTILIZATION, _MIN_KV_BYTES, runtime_overhead_bytes,
+                                window_kv_bytes)
+    vram = 24564 / 1024 * GIB
+    s = _arete(24564 / 1024)
+    assert runtime_overhead_bytes(s.resident_bytes, s.runtime_overhead) == s.runtime_overhead
+    assert s.max_model_len == CODE_FLOOR
+    kv = max(_MIN_KV_BYTES, window_kv_bytes(CODE_FLOOR, 1, s.kv_cost))
+    want = min(_MAX_UTILIZATION, (s.resident_bytes + s.runtime_overhead + kv) / vram)
+    assert s.gpu_memory_utilization == pytest.approx(want, abs=1e-6)
