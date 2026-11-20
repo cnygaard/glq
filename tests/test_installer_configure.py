@@ -174,6 +174,47 @@ def test_write_pi_models_passes_the_limits_through(tmp_path):
     assert entry["contextWindow"] == 8192 and entry["maxTokens"] == 2048
 
 
+# ---- per-model fields: what pi needs to drive a model's reasoning -----------------------
+
+_THINKING = {"reasoning": True,
+             "thinkingLevelMap": {"off": "off", "low": "low", "high": None},
+             "compat": {"thinkingFormat": "chat-template"}}
+
+
+def test_a_model_entry_can_carry_its_familys_fields():
+    """pi reads a model's thinking support from that model's own entry. Without `reasoning`
+    it treats the model as one that cannot think: glq-code on Arete-27B showed "Thinking
+    level: off" under `/thinking`, while the server went on reasoning at the chat template's
+    default. Only the model named gets the fields."""
+    doc = C.pi_models_json("http://x/v1", ["org/a", "org/b"],
+                           model_fields={"org/a": _THINKING})
+    a, b = doc["providers"]["glq"]["models"]
+    assert a == {"id": "org/a", **_THINKING}
+    assert b == {"id": "org/b"}
+
+
+def test_a_familys_fields_cannot_move_the_id_or_the_planned_limits():
+    """The id is what pi addresses the server by, and the limits are the window glq-code
+    planned; a table entry must not be able to change either."""
+    doc = C.pi_models_json("http://x/v1", ["org/a"], context_window=8192, max_tokens=4096,
+                           model_fields={"org/a": {"id": "other", "contextWindow": 1,
+                                                   "maxTokens": 1, "reasoning": True}})
+    assert doc["providers"]["glq"]["models"][0] == {
+        "id": "org/a", "contextWindow": 8192, "maxTokens": 4096, "reasoning": True}
+
+
+def test_write_pi_models_passes_the_fields_through_and_keeps_other_providers(tmp_path):
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({"providers": {
+        "anthropic": {"apiKey": "sk-theirs", "models": [{"id": "claude"}]}}}))
+    C.write_pi_models(path, "http://127.0.0.1:8000/v1", ["org/a"], context_window=8192,
+                      max_tokens=4096, model_fields={"org/a": _THINKING})
+    doc = json.loads(path.read_text())
+    assert doc["providers"]["anthropic"]["apiKey"] == "sk-theirs"
+    assert doc["providers"]["glq"]["models"][0] == {
+        "id": "org/a", "contextWindow": 8192, "maxTokens": 4096, **_THINKING}
+
+
 # ---- per-command model defaults (glq-code → Qwen, glq-chat → gemma-4) ------------------
 
 def test_config_records_per_command_models(tmp_path):

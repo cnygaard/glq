@@ -1,0 +1,24 @@
+VERSION 0.79.8 case=thinking glq_listed=1 decoy_listed=1 err=none
+    provider  model                                      context  max-out  thinking  images
+    decoy     decoy-model                                128K     16.4K    no        no    
+    glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    yes       no    
+VERSION 0.79.8 case=plain glq_listed=1 decoy_listed=1 err=none
+    provider  model                                      context  max-out  thinking  images
+    decoy     decoy-model                                128K     16.4K    no        no    
+    glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    no        no    
+VERSION 0.79.9 case=thinking glq_listed=1 decoy_listed=1 err=none
+    provider  model                                      context  max-out  thinking  images
+    decoy     decoy-model                                128K     16.4K    no        no    
+    glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    yes       no    
+VERSION 0.79.9 case=plain glq_listed=1 decoy_listed=1 err=none
+    provider  model                                      context  max-out  thinking  images
+    decoy     decoy-model                                128K     16.4K    no        no    
+    glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    no        no    
+VERSION 1.6.0 case=thinking glq_listed=1 decoy_listed=1 err=none
+    provider  model                                      context  max-out  thinking  images
+    decoy     decoy-model                                128K     16.4K    no        no    
+    glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    yes       no    
+VERSION 1.6.0 case=plain glq_listed=1 decoy_listed=1 err=none
+    provider  model                                      context  max-out  thinking  images
+    decoy     decoy-model                                128K     16.4K    no        no    
+    glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    no        no    

@@ -1,0 +1,49 @@
+{
+  "providers": {
+    "glq": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "glq",
+      "models": [
+        {
+          "id": "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw",
+          "contextWindow": 65536,
+          "maxTokens": 32768,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "off",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": null,
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "enable_thinking": {
+                "$var": "thinking.enabled"
+              },
+              "preserve_thinking": true,
+              "reasoning_effort": {
+                "$var": "thinking.effort",
+                "omitWhenOff": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "decoy": {
+      "baseUrl": "http://127.0.0.1:9/v1",
+      "api": "openai-completions",
+      "apiKey": "x",
+      "models": [
+        {
+          "id": "decoy-model"
+        }
+      ]
+    }
+  }
+}

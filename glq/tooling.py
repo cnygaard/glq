@@ -30,6 +30,7 @@ Stdlib only: the installer's core profile has no huggingface_hub and no requests
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
@@ -141,6 +142,12 @@ class ModelProfile:
     #: default gives wrong output for it. Every launcher passes it: the supervisor (glq-chat,
     #: glq-code), the installer's printed command, the model card, glq-bench's own servers.
     compilation_config: dict | None = None
+    #: pi's own fields for this family's reasoning levels (`reasoning`, `thinkingLevelMap`,
+    #: `compat`), which glq-code adds to the model's entry in `~/.pi/agent/models.json`.
+    #: Without them pi takes a thinking model for one that cannot think. Set only where the
+    #: chat template's accepted values were read: a value the template rejects fails every
+    #: request.
+    pi_thinking: dict | None = None
 
 
 _GEMMA4 = ModelProfile(
@@ -278,6 +285,49 @@ _QWEN38_27B = dataclasses.replace(
     # from an in-process `LLM(...)` probe, 64 sequences and vLLM's 8,192-token in-process
     # default, which is not how glq-code or glq-chat serve.
     runtime_overhead=int(3.25 * 1024**3),
+    # pi's reasoning levels, from this line's chat template (Arete-27B's chat_template.jinja,
+    # lines 46-55; Qwen3.8-27B's matches, see `_DERIVED_FAMILIES`). `reasoning_effort` defaults
+    # to xhigh and must be xhigh, medium or low; anything else raises, so vLLM fails that
+    # request. xhigh and low each add an instruction to the system prompt, medium adds none.
+    # `enable_thinking=false` closes the think block, and `preserve_thinking` (default true)
+    # keeps earlier turns' reasoning in the prompt.
+    #
+    # The fields are the user's own pi config for Qwen3.8-27B under llama.cpp, with one
+    # change: off is "none", not "off". What pi sends, captured against a stub server, then
+    # sent to vLLM 0.33.0 serving Arete 4 bpw (prompt tokens of one short chat, 2026-11-20):
+    #
+    #   pi 0.79.9 and 1.6.0   chat_template_kwargs: enable_thinking per level, and
+    #                         reasoning_effort = this map's value, omitted when off
+    #   pi 0.73.1 to 0.79.0   no chat-template format: a top-level reasoning_effort = the map's
+    #                         value. vLLM passes it to the template and sets enable_thinking
+    #                         itself, but accepts only none/minimal/low/medium/high/xhigh/max:
+    #                         "off" was HTTP 400, "none" turned thinking off.
+    #
+    #   level    xhigh   low   medium   off   (no kwargs: 60, the xhigh prompt)
+    #   tokens      60    48       22    24
+    #
+    # Both generations of pi gave the same prompt for each level. A `--thinking` for a level
+    # mapped to null is clamped to a neighbour (low for minimal, xhigh for high, xhigh or
+    # medium for max). Every pi from 0.73.1 to 1.6.0 accepts the entry; that matters because
+    # pi drops the whole models.json, every other provider included, when one entry fails
+    # its schema check.
+    #
+    # Where a session starts is pi's choice, not glq-code's: a resumed session's level, the
+    # user's per-model setting, their default (which `/thinking` saves), else medium. Arete's
+    # AIME numbers were measured at the template default, xhigh.
+    pi_thinking={
+        "reasoning": True,
+        "thinkingLevelMap": {"off": "none", "minimal": None, "low": "low", "medium": "medium",
+                             "high": None, "xhigh": "xhigh", "max": None},
+        "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+                "enable_thinking": {"$var": "thinking.enabled"},
+                "preserve_thinking": True,
+                "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": True},
+            },
+        },
+    },
 )
 
 _SMOLLM3 = ModelProfile(
@@ -752,6 +802,16 @@ def required_plugin(model_id: str) -> tuple[str, str] | None:
     """
     p = profile_for(model_id, "template")
     return p.plugin if p is not None else None
+
+
+def pi_model_fields(model_id: str) -> dict:
+    """pi's fields for this model's reasoning levels, to add to its `models.json` entry, or {}.
+
+    Matched on the name ("template" scope): the values are what one chat template accepts.
+    A copy, because the table is shared by every caller.
+    """
+    p = profile_for(model_id, "template")
+    return copy.deepcopy(p.pi_thinking) if p is not None and p.pi_thinking else {}
 
 
 def dspark_drafter(model_id: str) -> str | None:

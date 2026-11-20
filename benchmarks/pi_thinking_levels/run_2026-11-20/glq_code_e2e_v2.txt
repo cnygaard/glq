@@ -1,0 +1,63 @@
+stub server PID 58238
+glq from /opt/dlami/nvme/glq_thinking_src/glq/__init__.py
+has pi_model_fields True
+E2E level=default rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+E2E level=off rc=0 sent={"chat_template_kwargs": {"enable_thinking": false, "preserve_thinking": true}}
+E2E level=low rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "low"}}
+E2E level=medium rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+E2E level=xhigh rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+--- the entry glq-code wrote (/opt/dlami/nvme/pi_probe/e2e_home/.pi/agent/models.json)
+[
+ {
+  "id": "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw",
+  "contextWindow": 65536,
+  "maxTokens": 32768,
+  "reasoning": true,
+  "thinkingLevelMap": {
+   "off": "none",
+   "minimal": null,
+   "low": "low",
+   "medium": "medium",
+   "high": null,
+   "xhigh": "xhigh",
+   "max": null
+  },
+  "compat": {
+   "thinkingFormat": "chat-template",
+   "chatTemplateKwargs": {
+    "enable_thinking": {
+     "$var": "thinking.enabled"
+    },
+    "preserve_thinking": true,
+    "reasoning_effort": {
+     "$var": "thinking.effort",
+     "omitWhenOff": true
+    }
+   }
+  }
+ }
+]
+--- pi's own view of it
+provider  model                                      context  max-out  thinking  images
+glq       xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw  65.5K    32.8K    yes       no    
+--- other pi versions, reading the entry glq-code wrote
+OLD pi=0.79.9 level=default rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+OLD pi=0.79.9 level=off rc=0 sent={"chat_template_kwargs": {"enable_thinking": false, "preserve_thinking": true}}
+OLD pi=0.79.9 level=low rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "low"}}
+OLD pi=0.79.9 level=medium rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+OLD pi=0.79.9 level=xhigh rc=0 sent={"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+OLD pi=0.79.0 level=default rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=0.79.0 level=off rc=0 sent={"reasoning_effort": "none"}
+OLD pi=0.79.0 level=low rc=0 sent={"reasoning_effort": "low"}
+OLD pi=0.79.0 level=medium rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=0.79.0 level=xhigh rc=0 sent={"reasoning_effort": "xhigh"}
+OLD pi=0.74.0 level=default rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=0.74.0 level=off rc=0 sent={"reasoning_effort": "none"}
+OLD pi=0.74.0 level=low rc=0 sent={"reasoning_effort": "low"}
+OLD pi=0.74.0 level=medium rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=0.74.0 level=xhigh rc=0 sent={"reasoning_effort": "xhigh"}
+OLD pi=mz0731 level=default rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=mz0731 level=off rc=0 sent={"reasoning_effort": "none"}
+OLD pi=mz0731 level=low rc=0 sent={"reasoning_effort": "low"}
+OLD pi=mz0731 level=medium rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=mz0731 level=xhigh rc=0 sent={"reasoning_effort": "xhigh"}

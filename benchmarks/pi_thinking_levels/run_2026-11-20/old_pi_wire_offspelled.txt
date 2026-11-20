@@ -1,0 +1,13 @@
+stub PID 57295
+OLD pi=0.79.0 level=default rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=0.79.0 level=off rc=0 sent={"reasoning_effort": "off"}
+OLD pi=0.79.0 level=low rc=0 sent={"reasoning_effort": "low"}
+OLD pi=0.79.0 level=xhigh rc=0 sent={"reasoning_effort": "xhigh"}
+OLD pi=0.74.0 level=default rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=0.74.0 level=off rc=0 sent={"reasoning_effort": "off"}
+OLD pi=0.74.0 level=low rc=0 sent={"reasoning_effort": "low"}
+OLD pi=0.74.0 level=xhigh rc=0 sent={"reasoning_effort": "xhigh"}
+OLD pi=mz0731 level=default rc=0 sent={"reasoning_effort": "medium"}
+OLD pi=mz0731 level=off rc=0 sent={"reasoning_effort": "off"}
+OLD pi=mz0731 level=low rc=0 sent={"reasoning_effort": "low"}
+OLD pi=mz0731 level=xhigh rc=0 sent={"reasoning_effort": "xhigh"}
