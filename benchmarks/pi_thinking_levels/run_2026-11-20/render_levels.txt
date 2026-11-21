@@ -1,0 +1,12 @@
+tools=False no kwargs (before)   tokens=  60 xhigh_instr=True  low_instr=False ends='im_start|>assistant\n<think>\n'
+tools=False off                  tokens=  24 xhigh_instr=False low_instr=False ends='ssistant\n<think>\n\n</think>\n\n'
+tools=False low                  tokens=  48 xhigh_instr=False low_instr=True  ends='im_start|>assistant\n<think>\n'
+tools=False medium               tokens=  22 xhigh_instr=False low_instr=False ends='im_start|>assistant\n<think>\n'
+tools=False xhigh                tokens=  60 xhigh_instr=True  low_instr=False ends='im_start|>assistant\n<think>\n'
+tools=False unaccepted 'high'    HTTP 400: {"error":{"message":"Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.","type":"BadRequestError","param":null,"c
+tools=True  no kwargs (before)   tokens= 303 xhigh_instr=True  low_instr=False ends='im_start|>assistant\n<think>\n'
+tools=True  off                  tokens= 267 xhigh_instr=False low_instr=False ends='ssistant\n<think>\n\n</think>\n\n'
+tools=True  low                  tokens= 291 xhigh_instr=False low_instr=True  ends='im_start|>assistant\n<think>\n'
+tools=True  medium               tokens= 265 xhigh_instr=False low_instr=False ends='im_start|>assistant\n<think>\n'
+tools=True  xhigh                tokens= 303 xhigh_instr=True  low_instr=False ends='im_start|>assistant\n<think>\n'
+tools=True  unaccepted 'high'    HTTP 400: {"error":{"message":"Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.","type":"BadRequestError","param":null,"c

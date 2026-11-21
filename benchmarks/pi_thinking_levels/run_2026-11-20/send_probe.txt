@@ -1,0 +1,20 @@
+VERSION 0.74.0 glq_listed=1 decoy_listed=1 err=
+VERSION 0.79.0 glq_listed=1 decoy_listed=1 err=
+stub server PID 55140
+/opt/dlami/nvme/pi_probe/pi_send_probe.sh: line 30: /opt/dlami/nvme/pi_probe/capture.jsonl: No such file or directory
+SEND pi=1.6.0 level=default rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+SEND pi=1.6.0 level=off rc=0 {"chat_template_kwargs": {"enable_thinking": false, "preserve_thinking": true}}
+SEND pi=1.6.0 level=minimal rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "low"}}
+SEND pi=1.6.0 level=low rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "low"}}
+SEND pi=1.6.0 level=medium rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+SEND pi=1.6.0 level=high rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+SEND pi=1.6.0 level=xhigh rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+SEND pi=1.6.0 level=max rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+SEND pi=0.79.9 level=default rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+SEND pi=0.79.9 level=off rc=0 {"chat_template_kwargs": {"enable_thinking": false, "preserve_thinking": true}}
+SEND pi=0.79.9 level=minimal rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "low"}}
+SEND pi=0.79.9 level=low rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "low"}}
+SEND pi=0.79.9 level=medium rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}
+SEND pi=0.79.9 level=high rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+SEND pi=0.79.9 level=xhigh rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "xhigh"}}
+SEND pi=0.79.9 level=max rc=0 {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true, "reasoning_effort": "medium"}}

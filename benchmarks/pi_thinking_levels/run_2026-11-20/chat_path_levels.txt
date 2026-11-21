@@ -1,0 +1,10 @@
+no kwargs (before)   prompt_tokens=60
+new pi off           prompt_tokens=24
+new pi low           prompt_tokens=48
+new pi medium        prompt_tokens=22
+new pi xhigh         prompt_tokens=60
+old pi off           HTTP 400: {"error":{"message":"1 validation error:\n  {'type': 'literal_error', 'loc': 'body.reasoning_effort', 'msg': \"Input should be 'none', 'mini
+old pi none          prompt_tokens=24
+old pi low           prompt_tokens=48
+old pi medium        prompt_tokens=22
+old pi xhigh         prompt_tokens=60

@@ -70,25 +70,34 @@ def pi_max_tokens(context_window) -> int:
 def pi_models_json(base_url: str, model_ids,
                    context_window=None, max_tokens=None,
                    provider: str = PROVIDER,
-                   api_key: str = API_KEY_PLACEHOLDER) -> dict:
+                   api_key: str = API_KEY_PLACEHOLDER,
+                   model_fields=None) -> dict:
     """The provider block for pi, in the shape of `examples/pi/models.json`.
 
     `provider`/`api_key` are overridable so the harbor bench agent — which names its provider
     from the `-m glq/<id>` split — shares this builder instead of hand-rolling the dict. The
     output-budget reasoning below is the reason that matters.
+
+    `model_fields` maps a model id to extra pi fields for its entry, such as its family's
+    reasoning levels (`tooling.pi_model_fields`). They never replace the id or the limits.
     """
+    def entry(m):
+        e = {"id": m,
+             # Without these, pi asks for the FULL window as its output budget and vLLM
+             # 400s every request — measured live: max_tokens=16384 against a 16384 window
+             # left "0 input tokens" for the prompt, and pi's --print mode swallowed the
+             # error into an empty assistant turn.
+             **({"contextWindow": int(context_window)} if context_window else {}),
+             **({"maxTokens": int(max_tokens)} if max_tokens else {})}
+        for k, v in ((model_fields or {}).get(m) or {}).items():
+            e.setdefault(k, v)
+        return e
+
     return {"providers": {provider: {
         "baseUrl": base_url,
         "api": "openai-completions",       # the dialect vLLM's server speaks
         "apiKey": api_key,
-        # Without these, pi asks for the FULL window as its output budget and vLLM
-        # 400s every request — measured live: max_tokens=16384 against a 16384 window
-        # left "0 input tokens" for the prompt, and pi's --print mode swallowed the
-        # error into an empty assistant turn.
-        "models": [{"id": m,
-                    **({"contextWindow": int(context_window)} if context_window else {}),
-                    **({"maxTokens": int(max_tokens)} if max_tokens else {})}
-                   for m in model_ids],
+        "models": [entry(m) for m in model_ids],
     }}}
 
 
@@ -104,7 +113,7 @@ def _write_private_json(path: Path, doc: dict) -> None:
 
 
 def write_pi_models(path, base_url: str, model_ids,
-                    context_window=None, max_tokens=None) -> None:
+                    context_window=None, max_tokens=None, model_fields=None) -> None:
     """Merge the `glq` provider into an existing pi config, preserving the others.
 
     An unreadable existing file is copied to `<name>.bak` before being replaced: we cannot
@@ -126,7 +135,7 @@ def write_pi_models(path, base_url: str, model_ids,
 
     doc["providers"][PROVIDER] = pi_models_json(
         base_url, model_ids, context_window=context_window,
-        max_tokens=max_tokens)["providers"][PROVIDER]
+        max_tokens=max_tokens, model_fields=model_fields)["providers"][PROVIDER]
     _write_private_json(path, doc)
 
 

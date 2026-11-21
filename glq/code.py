@@ -36,7 +36,8 @@ from glq.installer.prompt import open_tty, select_model
 from glq.installer.recommend import PREFERRED_FAMILIES
 from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
-from glq.tooling import ensure_gemma4_template, required_plugin, role_serve_args
+from glq.tooling import (ensure_gemma4_template, pi_model_fields, required_plugin,
+                         role_serve_args)
 
 #: The window a coding session falls back to when the card cannot be sized — a CPU box, or
 #: a `--model` whose config we could not read. A coding agent carries file contents, diffs
@@ -427,10 +428,16 @@ def main(argv=None) -> int:
     # mode the served window is the supervisor's choice, not an args value.
     # maxTokens = window/4: pi treats it as the per-turn output ask, and the transcript
     # grows with every tool round-trip — window/2 fits the first turn and 400s later ones.
+    #
+    # The family's reasoning levels go into the same entry, where the profile table has them
+    # (Arete-27B and Qwen3.8-27B): without them pi shows "Thinking level: off" and offers no
+    # levels, while the server still thinks at the template's default. Which level a session
+    # starts at stays pi's choice (see `tooling._QWEN38_27B`), so no `--thinking` is passed.
     write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
                     args.base_url, [args.model],
                     context_window=supervisor.max_model_len,
-                    max_tokens=pi_max_tokens(supervisor.max_model_len))
+                    max_tokens=pi_max_tokens(supervisor.max_model_len),
+                    model_fields={args.model: pi_model_fields(args.model)})
 
     # `kill` and a closed terminal end the process without unwinding the context
     # manager below; turn them into SystemExit so the server still comes down.

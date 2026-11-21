@@ -567,6 +567,51 @@ def test_plain_glq_code_passes_pi_nothing_extra(monkeypatch, tmp_path):
     assert cmd[1:] == ["--provider", "glq", "--model", SMOL], cmd
 
 
+# ---- pi's reasoning levels --------------------------------------------------------------
+
+ARETE = "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw"
+
+
+def _pi_entry(monkeypatch, tmp_path, model):
+    """Run glq-code with the REAL config writer, into a file under tmp_path, and return the
+    glq entry pi will read."""
+    import json
+    _run_code(monkeypatch, tmp_path)
+    path = tmp_path / "pi" / "models.json"
+    monkeypatch.setattr(code, "write_pi_models", lambda _path, base_url, ids, **kw:
+                        configure.write_pi_models(path, base_url, ids, **kw))
+    assert code.main(["--model", model]) == 0
+    (entry,) = json.loads(path.read_text())["providers"]["glq"]["models"]
+    return entry
+
+
+def test_arete_s_reasoning_levels_reach_pi(monkeypatch, tmp_path):
+    """`/thinking` in glq-code on Arete-27B showed "Thinking level: off": the entry glq-code
+    wrote held only the id and the limits, so pi took Arete for a model that cannot think."""
+    from glq.tooling import pi_model_fields
+    entry = _pi_entry(monkeypatch, tmp_path, ARETE)
+    assert entry == {"id": ARETE, "contextWindow": 16384,
+                     "maxTokens": configure.pi_max_tokens(16384), **pi_model_fields(ARETE)}
+    assert entry["reasoning"] is True
+
+
+@pytest.mark.parametrize("model", [SMOL, GEMMA])
+def test_a_family_with_no_checked_levels_keeps_the_plain_entry(monkeypatch, tmp_path, model):
+    entry = _pi_entry(monkeypatch, tmp_path, model)
+    assert set(entry) == {"id", "contextWindow", "maxTokens"}
+
+
+def test_glq_code_leaves_the_starting_level_to_pi(monkeypatch, tmp_path):
+    """pi starts at a resumed session's level, else the user's per-model setting, else their
+    default, else medium (pi 1.6.0 `core/sdk.js`), and `/thinking` saves the choice as that
+    default. A `--thinking` from glq-code would outrank every one of them, so it passes none;
+    `glq-code -- --thinking xhigh` is the user's to add."""
+    _, _, ran, _ = _run_code(monkeypatch, tmp_path)
+    code.main(["--model", ARETE])
+    cmd, _env = ran[0]
+    assert cmd[1:] == ["--provider", "glq", "--model", ARETE], cmd
+
+
 # ---- the pre-flight fit check -----------------------------------------------------------
 #
 # A checkpoint larger than the machine used to reach vLLM and fail with a CUDA

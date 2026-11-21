@@ -276,16 +276,91 @@ def test_the_qwen38_27b_line_prices_kv_at_or_above_every_measurement(model):
 
 
 def test_the_qwen38_27b_line_changes_only_its_measured_figures():
-    """Tool parser, reasoning, sampling, dtype: everything but the measured KV cost and
-    runtime overhead stays the Qwen profile's."""
+    """Tool parser, reasoning, sampling, dtype: everything but the measured KV cost, the
+    runtime overhead and pi's reasoning levels (read from this line's own chat template, below)
+    stays the Qwen profile's."""
     import dataclasses
 
     from glq.tooling import _QWEN, profile_for
     p = profile_for("NousResearch/Arete-27B", "template")
-    skip = {"family", "match", "kv_cost", "runtime_overhead"}
+    skip = {"family", "match", "kv_cost", "runtime_overhead", "pi_thinking"}
     for field in dataclasses.fields(p):
         if field.name not in skip:
             assert getattr(p, field.name) == getattr(_QWEN, field.name), field.name
+
+
+# ---- pi's reasoning levels, from the chat template ------------------------------------------
+
+#: What Arete-27B's chat_template.jinja accepts as `reasoning_effort` (the 4 bpw GLQ repo,
+#: snapshot 4899318, lines 46-55): `reasoning_effort|default('xhigh')`, and any other value
+#: raises, so vLLM answers that request with an error. Only xhigh and low add an instruction.
+#: Qwen3.8-27B's template is the same apart from its training-mask markers (`_DERIVED_FAMILIES`).
+_TEMPLATE_EFFORTS = {"xhigh", "medium", "low"}
+
+#: Every level pi has (`pi --help`, 0.79.9 and 1.6.0).
+_PI_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+@pytest.mark.parametrize("model", _QWEN38_27B_IDS)
+def test_the_qwen38_27b_line_tells_pi_how_to_set_its_reasoning(model):
+    """`/thinking` in glq-code on Arete-27B showed "Thinking level: off" and offered nothing:
+    glq-code's pi entry carried no `reasoning`, so pi took the model for one that cannot think,
+    while the server went on thinking at the template's default (xhigh). These are the fields
+    of the user's own pi config for Qwen3.8-27B under llama.cpp."""
+    from glq.tooling import pi_model_fields
+    f = pi_model_fields(model)
+    assert f["reasoning"] is True
+    assert f["compat"] == {
+        "thinkingFormat": "chat-template",
+        "chatTemplateKwargs": {
+            "enable_thinking": {"$var": "thinking.enabled"},
+            "preserve_thinking": True,
+            "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": True},
+        },
+    }
+
+
+def test_pi_can_send_only_efforts_the_template_accepts():
+    """Any other value fails every request. pi sends `thinkingLevelMap[level]` as
+    `reasoning_effort`, skips the levels mapped to null (and clamps a `--thinking` for one to a
+    neighbour: 0.79.9 and 1.6.0 sent low for minimal, xhigh for high, and xhigh or medium for
+    max, captured on 2026-11-20), and sends none at all when off (`omitWhenOff`)."""
+    from glq.tooling import pi_model_fields
+    levels = pi_model_fields("xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw")["thinkingLevelMap"]
+    assert set(levels) == _PI_LEVELS, "an unmapped level falls back to pi's own default"
+    sent = {v for k, v in levels.items() if k != "off" and v is not None}
+    assert sent == _TEMPLATE_EFFORTS
+    assert all(levels[k] == k for k in _TEMPLATE_EFFORTS), "pi's name means the template's"
+    assert {k for k, v in levels.items() if v is None} == {"minimal", "high", "max"}
+
+
+def test_off_is_spelled_the_way_vllm_accepts_it():
+    """pi before 0.79.9 has no chat-template format and sends the map's value as a top-level
+    `reasoning_effort` instead, "off" included (captured from 0.73.1, 0.74.0 and 0.79.0).
+    vLLM 0.33.0 accepts only none/minimal/low/medium/high/xhigh/max there and answered "off"
+    with HTTP 400; "none" turned thinking off (`enable_thinking` false, the closed think
+    block). pi 0.79.9 and later omit the value when off (`omitWhenOff`), so for them the
+    spelling does not matter."""
+    from glq.tooling import pi_model_fields
+    assert pi_model_fields("NousResearch/Arete-27B")["thinkingLevelMap"]["off"] == "none"
+
+
+@pytest.mark.parametrize("model", [m for m in IDS if m not in _QWEN38_27B_IDS])
+def test_no_other_family_gets_reasoning_fields_nobody_checked(model):
+    """Every other template is unread for this: the other Qwen checkpoints included, whose
+    `reasoning_effort` values were never compared, and a value a template rejects fails every
+    request. So they keep the plain entry, and pi shows them as before."""
+    from glq.tooling import pi_model_fields
+    assert pi_model_fields(model) == {}
+
+
+def test_the_fields_are_a_copy_of_the_table():
+    """The profile is module state shared by every caller; a caller editing what it got back
+    must not change what the next one gets."""
+    from glq.tooling import pi_model_fields
+    m = "NousResearch/Arete-27B"
+    pi_model_fields(m)["compat"]["chatTemplateKwargs"]["preserve_thinking"] = False
+    assert pi_model_fields(m)["compat"]["chatTemplateKwargs"]["preserve_thinking"] is True
 
 
 #: Arete-27B as glq-code sizes it: the Hub tree's bytes (2026-11-15; none of the three declares
