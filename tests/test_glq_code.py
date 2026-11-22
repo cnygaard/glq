@@ -644,8 +644,18 @@ def _run_adapter(monkeypatch, tmp_path, argv, *, download_error=None, device="cu
     monkeypatch.setattr(code, "_download_adapter", download)
     monkeypatch.setattr(code, "checkpoint_mtp", lambda repo: (0, False, 64))
     monkeypatch.setattr(code, "_model_max_len", lambda repo: 262_144)
+    # `dspark_kwargs` (glq.chat) sizes a drafter from the Hub: its bytes, its KV, the MoE shape.
+    import glq.chat as chat
+    monkeypatch.setattr(chat, "_draft_bytes", lambda repo: ARETE_DRAFT_BYTES)
+    monkeypatch.setattr(chat, "_draft_kv_per_token", lambda repo: ARETE_DRAFT_KV)
+    monkeypatch.setattr(chat, "checkpoint_moe_facts", lambda repo: (0, 0, 0))
     rc = code.main(argv)
     return events, sups, ran, downloads, rc
+
+
+ARETE_DRAFTER = "RedHatAI/Qwen3.8-27B-speculator.dspark"
+ARETE_DRAFT_BYTES = 3_976_869_890
+ARETE_DRAFT_KV = 20_480
 
 
 def test_the_adapter_is_served_on_the_checkpoint(monkeypatch, tmp_path):
@@ -711,15 +721,36 @@ def test_a_model_without_an_adapter_is_refused_before_anything(monkeypatch, tmp_
     assert "pi adapter" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("flags", [["--mtp", "1"], ["--dspark"], ["--dspark", "2"],
-                                   ["--draft-model", "org/drafter"]])
-def test_speculation_with_the_adapter_is_refused(monkeypatch, tmp_path, flags, capsys):
-    """A drafter does not apply the LoRA, so it drafts for a different model."""
+def test_mtp_with_the_adapter_is_refused(monkeypatch, tmp_path, capsys):
+    """MTP with the adapter has not been run; DSpark has (see below)."""
     events, sups, _, downloads, rc = _run_adapter(
-        monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter", *flags])
+        monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter", "--mtp", "1"])
     assert rc == 2
     assert events == [] and sups == [] and downloads == []
-    assert "adapter" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--mtp" in err and "--dspark" in err
+
+
+@pytest.mark.parametrize("flags,k,auto", [
+    (["--draft-model", ARETE_DRAFTER, "--dspark", "3"], 3, False),
+    (["--draft-model", ARETE_DRAFTER], 4, True),
+])
+def test_the_adapter_serves_with_a_dspark_drafter(monkeypatch, tmp_path, flags, k, auto):
+    """Measured on Arete-27B 4 bpw, one RTX PRO 6000, vLLM 0.33.0, at 131,072 tokens: the
+    hello.py check passed through the adapter, and 34.5% of the drafts were accepted (the
+    drafter runs without the LoRA; vLLM's LoRA config exempts drafters). The drafter's bytes and
+    its KV reach the planner, and the argv carries the LoRA and the speculative config."""
+    import json
+    _, sups, _, downloads, rc = _run_adapter(monkeypatch, tmp_path,
+                                             ["--model", ARETE, "--pi-adapter", *flags])
+    assert rc == 0 and len(downloads) == 1
+    sup = sups[0]
+    assert (sup.draft_model, sup._draft_requested, sup._draft_auto) == (ARETE_DRAFTER, k, auto)
+    assert sup.draft_bytes == ARETE_DRAFT_BYTES and sup.draft_kv_per_token == ARETE_DRAFT_KV
+    argv = sup.argv()
+    assert argv[argv.index("--lora-modules") + 1] == f"qwen3.8-pi={ADAPTER_SNAPSHOT}"
+    spec = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert spec == {"method": "dspark", "model": ARETE_DRAFTER, "num_speculative_tokens": k}
 
 
 def test_a_failed_download_stops_before_the_server(monkeypatch, tmp_path, capsys):

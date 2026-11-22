@@ -349,6 +349,164 @@ def test_kolibri_on_a_32_gb_card_plans_what_served(launcher):
 
 
 # ---------------------------------------------------------------------------
+# The drafter's own KV
+# ---------------------------------------------------------------------------
+#
+# A DSpark drafter is a small transformer with KV of its own. `glq-code --draft-model
+# RedHatAI/Qwen3.8-27B-speculator.dspark --dspark 3` on Arete-27B 4 bpw planned the full 262,144
+# window on one RTX PRO 6000 and vLLM 0.33.0 refused it at startup, with and without the pi
+# adapter: "21.39 GiB KV cache is needed, which is larger than the available KV cache memory
+# (19.78 GiB)". The family's KV cost was measured without a drafter, and nothing added its.
+# (`benchmarks/arete_pi_adapter/README.md`, 2026-11-22.)
+
+ARETE = "xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw"
+ARETE_DRAFTER = "RedHatAI/Qwen3.8-27B-speculator.dspark"
+#: Read live from the Hub 2026-11-22, the way the launchers size them.
+_ARETE_WEIGHTS = 18_236_907_824    # 16.98 GiB
+_ARETE_DRAFT = 3_976_869_890       # 3.70 GiB
+_PI_ADAPTER = int(0.40 * GIB)      # tooling's PiAdapter.gpu_bytes
+#: From the drafter's config.json (`transformer_layer_config`): 5 layers, 4 KV heads, head_dim
+#: 256, bf16. Its layers declare a 2,048-token sliding window, but vLLM 0.33 charged them at the
+#: full window: 21.39 GiB against Arete's own ~16.5 GiB at 262,144 is 5 x 4 KiB per token.
+_ARETE_DRAFT_KV = 5 * 2 * 4 * 256 * 2
+
+#: vLLM budgets against the CUDA total (95.03 GiB on that card); the planner reads nvidia-smi
+#: (95.59).
+_PRO6000_SMI, _PRO6000_CUDA = 95.59, 95.03
+#: A card on which an auto drafter's bytes fit beside Arete's 262,144-token window and its KV
+#: for that window does not. Found by sweeping this plan in 0.1 GiB steps: the band is 47.1 to
+#: 53.3 GiB (with 37.1-40.2 at 131,072 and 32.1-33.0 at 65,536).
+_AUTO_KV_BINDS_GIB = 48.0
+
+
+def _arete(vram_gib=_PRO6000_SMI, adapter=True, **kw):
+    base = dict(model=ARETE, device="cuda", serve=False,
+                weights_bytes=_ARETE_WEIGHTS + (_PI_ADAPTER if adapter else 0),
+                vram_bytes=int(vram_gib * GIB), ram_bytes=int(499 * GIB),
+                model_max_len=262_144, **_CODE)
+    base.update(kw)
+    return VllmSupervisor(**base)
+
+
+def _arete_dspark(k=3, kv=_ARETE_DRAFT_KV, **kw):
+    return _arete(draft_model=ARETE_DRAFTER, draft_tokens=k, draft_bytes=_ARETE_DRAFT,
+                  draft_kv_per_token=kv, **kw)
+
+
+@pytest.mark.parametrize("adapter,util,loaded,kv_had", [
+    # The two runs that stopped: the plan's utilization, vLLM's "Model loading took" and
+    # "Available KV cache memory", GiB.
+    (True, 0.4680, 21.19, 19.79),
+    (False, 0.4634, 20.89, 19.63),
+])
+def test_a_pinned_drafter_leaves_the_kv_vllm_asked_for(adapter, util, loaded, kv_had):
+    """Replays vLLM's own accounting of the stopped runs: what it kept outside weights and KV
+    (activations, graphs) is the budget less those two. The plan without the drafter's KV
+    reproduces the refusal; with it, the pool holds the 21.39 GiB one request needs."""
+    non_kv = util * _PRO6000_CUDA - loaded - kv_had
+
+    def kv_vllm_would_have(sup):
+        return sup.gpu_memory_utilization * _PRO6000_CUDA - loaded - non_kv
+
+    before = _arete_dspark(adapter=adapter, kv=0)
+    assert before.max_model_len == 262_144
+    assert round(before.gpu_memory_utilization, 3) == round(util, 3)   # the plan that ran
+    assert kv_vllm_would_have(before) < 21.39
+
+    after = _arete_dspark(adapter=adapter)
+    assert after.max_model_len == 262_144
+    assert after.kv_cost == (kv_cost(ARETE)[0], kv_cost(ARETE)[1] + _ARETE_DRAFT_KV)
+    assert kv_vllm_would_have(after) >= 21.39
+
+
+def test_the_drafter_s_kv_reaches_the_fit_check_floor():
+    """`fit.check_fit` prices its floor window from `supervisor.kv_cost`, so a drafter that
+    is loaded is in the floor too."""
+    from glq.supervisor import kv_floor_bytes
+
+    on, off = _arete_dspark(), _arete()
+    assert kv_floor_bytes(16384, 1, on.kv_cost) > kv_floor_bytes(16384, 1, off.kv_cost)
+
+
+def test_an_auto_drafter_is_kept_only_if_its_kv_fits_as_well():
+    """Auto plans the window without DSpark and keeps the drafter only if it fits in what is
+    left. On this card its bytes fit beside the window, its KV for that window does not."""
+    vram = _AUTO_KV_BINDS_GIB
+    bytes_only = _arete_dspark(k=4, kv=0, draft_auto=True, vram_gib=vram)
+    with_kv = _arete_dspark(k=4, draft_auto=True, vram_gib=vram)
+    assert bytes_only.max_model_len == with_kv.max_model_len == _arete(vram_gib=vram).max_model_len
+    assert bytes_only.spec_tokens == 4
+    assert with_kv.spec_tokens == 0 and with_kv.draft_model is None
+    assert "DSpark off" in with_kv._spec_note and "KV" in with_kv._spec_note
+    assert with_kv.kv_cost == kv_cost(ARETE)                # not paid for, not loaded
+
+
+def test_an_auto_drafter_that_is_kept_is_in_the_pool():
+    sup = _arete_dspark(k=4, draft_auto=True)
+    assert sup.spec_tokens == 4 and sup.max_model_len == 262_144
+    assert sup.kv_cost == (kv_cost(ARETE)[0], kv_cost(ARETE)[1] + _ARETE_DRAFT_KV)
+    assert sup.gpu_memory_utilization * _PRO6000_SMI * GIB >= (
+        sup.resident_bytes + window_kv_bytes(262_144, 1, sup.kv_cost))
+
+
+def test_families_whose_kv_price_covers_the_drafter_do_not_move():
+    """Super-VL's measured cost was taken with its drafter loaded, and Kolibri-1's envelope
+    served its drafter at 262,144 with KV to spare (1.73x the window). Their plans are the
+    released ones whatever the drafter's KV."""
+    for sup_kw in (dict(), dict(draft_auto=True, draft_tokens=4)):
+        a = _sup(24.0, draft_model=DRAFTER, draft_bytes=_DRAFT,
+                 **{"draft_tokens": 3, **sup_kw})
+        b = _sup(24.0, draft_model=DRAFTER, draft_bytes=_DRAFT, draft_kv_per_token=5_120,
+                 **{"draft_tokens": 3, **sup_kw})
+        assert _plan(a) == _plan(b) and b.kv_cost == kv_cost(SV)
+    facts = dict(model=KOLIBRI, device="cuda", serve=False, weights_bytes=30_819_045_448,
+                 expert_offload_bytes=28_740_327_000, nontext_bytes=0,
+                 vram_bytes=32623 * 1024 ** 2, ram_bytes=31_535_316 * 1024,
+                 model_max_len=262_144, moe_top_k=_K_TOPK, moe_layers=_K_MOE_LAYERS,
+                 arena_slot_bytes=_K_SLOT, draft_model=KOLIBRI_DRAFTER, draft_tokens=4,
+                 draft_auto=True, draft_bytes=_KOLIBRI_DRAFT, **_CODE)
+    on = VllmSupervisor(**facts, draft_kv_per_token=10_240)
+    assert _plan(on)[:3] == (262_144, 18, 4.0) and on.kv_cost == kv_cost(KOLIBRI)
+
+
+def _drafter_config(tmp_path, **tlc):
+    layer = dict(model_type="qwen3", num_hidden_layers=5, num_key_value_heads=4, head_dim=256,
+                 hidden_size=5120, num_attention_heads=20, sliding_window=2048)
+    layer.update(tlc)
+    (tmp_path / "config.json").write_text(json.dumps({
+        "architectures": ["DSparkDraftModel"], "speculators_model_type": "dspark",
+        "dtype": "bfloat16", "block_size": 8, "transformer_layer_config": layer}))
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize("tlc,expected", [
+    (dict(), 20_480),                                              # RedHatAI Qwen3.8-27B
+    (dict(num_key_value_heads=2, head_dim=128, hidden_size=4096,   # RedHatAI Super-VL
+          num_attention_heads=32), 5_120),
+    (dict(head_dim=128, hidden_size=2560), 10_240),                # intuit Kolibri-1
+    (dict(head_dim=None, hidden_size=5120, num_attention_heads=20), 20_480),  # hidden / heads
+])
+def test_the_drafter_s_kv_per_token_comes_from_its_config(tmp_path, tlc, expected):
+    from glq.chat import _draft_kv_per_token
+
+    assert _draft_kv_per_token(_drafter_config(tmp_path, **tlc)) == expected
+
+
+def test_an_unreadable_drafter_config_prices_nothing(tmp_path, monkeypatch):
+    from glq.chat import _draft_kv_per_token
+    from glq.installer import discovery
+
+    def offline(url, *a, **kw):
+        raise OSError(f"offline: {url}")
+
+    monkeypatch.setattr(discovery, "_fetch_json", offline)    # a repo id that cannot be read
+    assert _draft_kv_per_token("RedHatAI/not-a-drafter") == 0
+    assert _draft_kv_per_token("") == 0
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["DSparkDraftModel"]}))
+    assert _draft_kv_per_token(str(tmp_path)) == 0
+
+
+# ---------------------------------------------------------------------------
 # The launchers: drafter lookup, checkpoint facts, and the flag
 # ---------------------------------------------------------------------------
 
@@ -486,6 +644,7 @@ def launchers(monkeypatch):
     # `dspark_kwargs` lives in glq.chat and reads these from there, for both commands.
     monkeypatch.setattr(chat, "checkpoint_moe_facts", lambda repo: (_TOPK, 40, _SLOT))
     monkeypatch.setattr(chat, "_draft_bytes", lambda repo: _DRAFT)
+    monkeypatch.setattr(chat, "_draft_kv_per_token", lambda repo: 5_120)
     monkeypatch.setattr(chat, "_checkpoint_bytes", lambda repo: _WEIGHTS)
     for mod in (chat, code):
         monkeypatch.setattr(mod, "checkpoint_offload_bytes",
@@ -505,6 +664,7 @@ def test_both_launchers_pass_dspark_to_the_planner(launchers, monkeypatch, flags
         seen = _capture(mod, ["--no-serve", "--model", SV, *flags], monkeypatch)
         assert (seen["draft_model"], seen["draft_tokens"], seen["draft_auto"]) == expected
         assert seen["draft_bytes"] == _DRAFT
+        assert seen["draft_kv_per_token"] == 5_120
         assert (seen["moe_top_k"], seen["moe_layers"], seen["arena_slot_bytes"]) == \
                (_TOPK, 40, _SLOT)
 

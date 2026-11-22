@@ -94,3 +94,52 @@ Notes:
   - Its vocabulary, merges and added tokens match the adapter's.
   - The pre-tokenizer regex differs (`[\p{L}\p{M}]+` against `\p{L}+`), which matters only for
     decomposed accents.
+
+## The adapter with DSpark, and the drafter's KV (`step5_dspark_kv.sh`)
+
+vLLM 0.33 serves a LoRA together with speculative decoding. Its LoRA config notes that drafters
+do not run the adapter, so RedHatAI's Qwen3.8-27B DSpark drafter proposes the base model's tokens,
+and the adapter-served target verifies them.
+
+**Before the fix.** glq-code on main f0238a8 (#205, unreleased) refused `--pi-adapter` with
+`--dspark`. With that refusal lifted by hand, `--draft-model RedHatAI/Qwen3.8-27B-speculator.dspark --dspark 3` at the
+planned 262,144-token window did not start, with or without the adapter. vLLM needed 21.39 GiB of
+KV for one request and had 19.79 GiB (adapter) and 19.63 GiB (no adapter).
+- The plan priced Arete's own KV (`kv_cost`, measured without a drafter), about 16.5 GiB at that
+  window, but not the drafter's.
+- The drafter has 5 attention layers, each with 4 KV heads of head_dim 256: 20,480 bytes per
+  token in bf16. Its config gives them a 2,048-token sliding window, yet vLLM charged them at the
+  full window: 5.0 GiB at 262,144.
+- With `--max-model-len 131072` pinned, both served.
+
+**The fix.** The planner adds the drafter's KV per token, read from its `config.json`
+(`chat._draft_kv_per_token`), to a family's measured KV cost
+(`supervisor.draft_kv_bytes_per_token`).
+- A pinned depth is priced from the start.
+- An auto depth keeps the drafter only if its bytes and its KV both fit beside the window.
+- Super-VL's measured cost already includes its drafter (`kv_cost_has_drafter`), and Kolibri-1
+  uses the envelope, which served its drafter at 262,144. Neither plan changes.
+
+**After the fix,** RTX PRO 6000 (96 GB), vLLM 0.33.0, Arete-27B 4 bpw, B=1, 2026-11-22. glq
+0.8.38 with this branch's five changed files on top (overlay, sha256 in the log). The window was
+left to the planner in every row.
+
+| row | flags | plan util | window | vLLM KV | KV tokens | decode (3 repeats) | accepted | result |
+|---|---|--:|--:|--:|--:|--:|--:|---|
+| `kv_ds3` | `--pi-adapter --draft-model D --dspark 3` | 0.528 | 262,144 | 25.49 GiB | 312,316 | 55.1–59.9 tok/s | 36.0% (533/1479) | all gates pass |
+| `kv_auto` | `--pi-adapter --draft-model D` (planner chose depth 4) | 0.528 | 262,144 | 25.46 GiB | 309,631 | 59.8–60.9 tok/s | 29.0% (553/1904) | all gates pass |
+| `kv_base_ds3` | `--draft-model D --dspark 3`, no adapter | 0.524 | 262,144 | 25.33 GiB | 310,372 | 64.6 tok/s | 43.5% (664/1527) | control: the run's own gates pass |
+
+- **Baselines.** The same server without a draft decoded 32.8 tok/s with the adapter and
+  38.6 tok/s without it (Step 5's `full` and `base_cold` rows).
+- **The decode probe** is one prompt at temperature 0, so the table gives a feel, not a
+  SPEED-Bench result. Acceptance is vLLM's count over the whole run: the warm-up, the probe and
+  pi's turn.
+- **Thinking.** The no-adapter row runs with thinking on, so its text differs as well as its
+  weights.
+- **The control row's gates.** Its adapter gates fail because it has no adapter. The rest pass:
+  exit 0, 63 through a tool call, the planned window served, and the GPU free afterwards.
+- **The drafter's weights are under-priced, not fixed here.** vLLM's `Model loading took` rises
+  from 16.58 to 20.89 GiB with the drafter, which is 4.31 GiB against its 3.70 GiB Hub size. The
+  plan does not miss by that much, because Arete itself loads 0.40 GiB below its Hub size.
+- **Startup.** About 100 s still goes to graph capture (106 s in `kv_ds3`), as in Step 5.

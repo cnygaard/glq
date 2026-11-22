@@ -644,6 +644,34 @@ def _draft_bytes(repo_id: str) -> int:
     return int(_checkpoint_bytes(repo_id) or 0)
 
 
+def _draft_kv_per_token(repo_id: str) -> int:
+    """Bytes of KV the drafter's own attention layers hold per token, in bf16; 0 if unknown.
+
+    A DSpark drafter (`speculators` format) describes its layers in `transformer_layer_config`;
+    anything else is read from the top level. Per token it is `layers x 2 (K and V) x KV heads
+    x head_dim x 2 bytes`: RedHatAI's Qwen3.8-27B drafter is 5 x 2 x 4 x 256 x 2 = 20,480.
+    The layers' `sliding_window` is not applied, because vLLM 0.33.0 did not apply it either
+    (`supervisor.draft_kv_bytes_per_token`).
+
+    Never blocks, like `checkpoint_moe_facts`: a drafter that cannot be read prices nothing,
+    and vLLM's startup check decides.
+    """
+    if not repo_id:
+        return 0
+    try:
+        cfg = _sizing_fetch(repo_id)(
+            f"https://huggingface.co/{repo_id}/resolve/main/config.json")
+        layer = cfg.get("transformer_layer_config") or cfg
+        layers = int(layer.get("num_hidden_layers") or 0)
+        kv_heads = int(layer.get("num_key_value_heads") or 0)
+        head_dim = int(layer.get("head_dim") or 0)
+        if not head_dim and layer.get("num_attention_heads"):
+            head_dim = int(layer.get("hidden_size") or 0) // int(layer["num_attention_heads"])
+        return layers * 2 * kv_heads * head_dim * 2
+    except Exception:                                       # noqa: BLE001 - offline, 404, …
+        return 0
+
+
 def resolve_dspark(requested, draft_model, model: str):
     """``(drafter, tokens, auto, error)`` for DSpark speculation — the error exclusive of the
     rest.
@@ -708,6 +736,7 @@ def dspark_kwargs(args, parser):
               f"vLLM checks the real figure at startup", file=sys.stderr)
     top_k, layers, slot = checkpoint_moe_facts(args.model)
     return dict(draft_model=drafter, draft_tokens=tokens, draft_auto=auto, draft_bytes=size,
+                draft_kv_per_token=_draft_kv_per_token(drafter),
                 moe_top_k=top_k, moe_layers=layers, arena_slot_bytes=slot), None
 
 

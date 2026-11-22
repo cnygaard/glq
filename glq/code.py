@@ -320,8 +320,11 @@ def main(argv=None) -> int:
         return 2
 
     # The pi adapter, refused here with the other cheap guards: an adapter trained on another
-    # family's weights is meaningless, and a draft model does not apply the LoRA, so with
-    # --mtp or --dspark it would draft for a different model than the one it is checked against.
+    # family's weights is meaningless. A draft model does not apply the LoRA (vLLM 0.33's
+    # LoRA config says so), so it drafts for the base model and the target verifies with the
+    # adapter: output stays the adapter's, and only acceptance pays. That was measured for
+    # DSpark on Arete-27B 4 bpw (36.0% accepted at depth 3, 32.8 -> 55-60 tok/s;
+    # benchmarks/arete_pi_adapter/), never for MTP, so --mtp stays refused.
     adapter = None
     if args.pi_adapter:
         adapter = pi_adapter(args.model)
@@ -330,10 +333,11 @@ def main(argv=None) -> int:
                   f"was trained on Qwen3.8-27B,\nso --pi-adapter applies to Qwen3.8-27B and "
                   f"its fine-tune Arete-27B only.", file=sys.stderr)
             return 2
-        if args.mtp or args.dspark is not None or args.draft_model:
-            print("error: --pi-adapter cannot be combined with --mtp or --dspark: a draft "
-                  "model does not\napply the adapter, so it would draft for a different "
-                  "model.", file=sys.stderr)
+        if args.mtp:
+            print("error: --pi-adapter cannot be combined with --mtp: the MTP head does not "
+                  "apply the adapter,\nand that pairing has not been run. --dspark has been "
+                  "run with the adapter;\npass --draft-model <repo> --dspark to speculate.",
+                  file=sys.stderr)
             return 2
 
     # Some families need a third-party vLLM plugin as well as glq. Guarded here, with the

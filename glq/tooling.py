@@ -155,6 +155,10 @@ class ModelProfile:
     dspark_drafter: str | None = None
     #: `(fixed bytes per request, bytes per token)`, MEASURED, for `supervisor.kv_cost`.
     kv_cost: tuple | None = None
+    #: `kv_cost` was measured with the family's DSpark drafter loaded, so the drafter's own KV
+    #: is already in it. Otherwise a measured cost excludes it and the planner adds it
+    #: (`supervisor.draft_kv_bytes_per_token`).
+    kv_cost_has_drafter: bool = False
     #: VRAM beyond the planner's resident figure and the KV pool, MEASURED at vLLM's
     #: 2,048-token prefill step, for `supervisor.runtime_overhead_for`. Cards of 70 GiB and
     #: up prefill 8,192 tokens a step and keep the envelope.
@@ -485,6 +489,7 @@ _NEMOTRON_35_SUPER_VL = dataclasses.replace(
     # `_KV_SAFETY_FACTOR`. Without the drafter the cost is lower still (2.26 GiB at 262,144), so
     # one figure serves both.
     kv_cost=(int(0.75 * 1024**3), 10_000),
+    kv_cost_has_drafter=True,
 )
 
 _NEMOTRON = ModelProfile(
