@@ -109,13 +109,12 @@ class PiAdapter:
     """A LoRA trained to drive the pi coding agent, served by vLLM on top of the checkpoint.
 
     vLLM applies it at runtime in bf16 to the GLQ layers as they are: no new checkpoint.
-    `glq-code --pi-adapter` serves it as `name` and points pi at that name.
+    `glq-code --pi-adapter` serves it under the checkpoint's own id, which pi asks for as it
+    does without the adapter; the base model answers to `base_alias(model)` on that server.
     """
     repo: str
     #: A commit sha. glq-code downloads exactly this revision and gives vLLM the local path.
     revision: str
-    #: The name vLLM serves it under, and the model id pi asks for.
-    name: str
     rank: int
     #: PEFT target modules (adapter_config.json), for `--lora-target-modules`.
     targets: tuple
@@ -125,6 +124,24 @@ class PiAdapter:
     gpu_bytes: int
     #: The files vLLM reads. The repo also carries a tokenizer, a chat template and images.
     files: tuple = ("adapter_config.json", "adapter_model.safetensors")
+
+    @staticmethod
+    def base_alias(model_id: str) -> str:
+        """The name the BASE model answers to on a server that serves the adapter.
+
+        vLLM applies a LoRA only to requests that name it, and the adapter takes the
+        checkpoint's own id (a fixed `qwen3.8-pi` read as another model on an Arete build).
+        vLLM 0.33 refuses a LoRA named like a base model (`load_lora_adapter`: "conflicts with
+        a base model"), comparing served names only, so the base is served under this alias.
+        """
+        return f"{model_id}-base"
+
+    @staticmethod
+    def display_name(model_id: str) -> str:
+        """pi's `name` for the adapter's entry. The id is the checkpoint's own, as without the
+        adapter, so this name is what says the adapter is on. pi 1.6.0 shows the id, not the
+        name, in its footer and in `--list-models` (measured against a stub server)."""
+        return f"{Path(model_id).name} (pi adapter)"
 
 
 @dataclass(frozen=True, eq=False)
@@ -372,7 +389,10 @@ _QWEN38_27B = dataclasses.replace(
     # Sampling: the card's runs used temperature 0.8 and top-p 1.0 (the training sampling) with
     # thinking off. Its vLLM recipe sets no sampling, so top_k was the generation_config's 20,
     # which Arete's shares. All three are server-side here: pi 1.6.0 sends no temperature or
-    # top_p for an entry without reasoning fields (captured against a stub server, 2026-11-22).
+    # top_p, with or without reasoning fields in its entry (captured against a stub server,
+    # 2026-11-22). With them it sends `chat_template_kwargs` per level (`enable_thinking` false
+    # at off; true plus `reasoning_effort` low / medium / xhigh), starting at medium when nothing
+    # is saved, so thinking is on by default under the adapter; that is unmeasured.
     #
     # gpu_bytes: "Available KV cache memory" fell by 0.36 GiB at vLLM's 2,048-token step and
     # 0.35 at 8,192 (same window, util and card): +0.31 loaded weights, +0.05 graphs. 0.40
@@ -380,7 +400,6 @@ _QWEN38_27B = dataclasses.replace(
     pi_adapter=PiAdapter(
         repo="harness-hub/Qwen3.8-27B-pi-adapted",
         revision="7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
-        name="qwen3.8-pi",
         rank=32,
         targets=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
                  "down_proj"),
@@ -862,18 +881,24 @@ def pi_adapter(model_id: str) -> PiAdapter | None:
 def adapter_serve_args(model_id: str, path) -> list[str]:
     """vLLM flags that serve the family's pi adapter from `path`, as it was evaluated.
 
-    Thinking off is server-side (`--default-chat-template-kwargs`): glq-code gives pi an entry
-    without reasoning fields for it, so pi sends no `chat_template_kwargs` that could turn it
-    back on. The sampling replaces the card's, as one `--override-generation-config` (vLLM
-    keeps only the last). `--lora-target-modules` limits the wrapping to what the adapter
-    trained. Compact JSON, raw, as in `tool_serve_args`.
+    The adapter is served under `model_id` itself and the base under `PiAdapter.base_alias`
+    (`--served-model-name`, followed here by another flag so its nargs="+" takes one value).
+    vLLM's `--lora-modules name=path` splits on the first `=`, so a slash in the id is fine.
+    Thinking off is the server's DEFAULT (`--default-chat-template-kwargs`), the mode the
+    adapter was trained and measured in, for a client that sends no `chat_template_kwargs`. pi
+    does send them: its entry carries the family's reasoning levels, and vLLM merges a
+    request's kwargs over the default, so pi's level decides. The sampling replaces the card's,
+    as one `--override-generation-config` (vLLM keeps only the last). `--lora-target-modules`
+    limits the wrapping to what the adapter trained. Compact JSON, raw, as in
+    `tool_serve_args`.
     """
     a = pi_adapter(model_id)
     if a is None:
         raise ValueError(f"no pi adapter is known for {model_id}")
     return ["--enable-lora", "--max-lora-rank", str(a.rank), "--max-loras", "1",
             "--lora-target-modules", *a.targets,
-            "--lora-modules", f"{a.name}={path}",
+            "--served-model-name", a.base_alias(model_id),
+            "--lora-modules", f"{model_id}={path}",
             "--default-chat-template-kwargs",
             json.dumps({"enable_thinking": False}, separators=(",", ":")),
             "--override-generation-config",

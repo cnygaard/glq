@@ -34,7 +34,6 @@
     "adapter_model.safetensors"
    ],
    "gpu_bytes": 429496729,
-   "name": "qwen3.8-pi",
    "rank": 32,
    "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
    "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
@@ -164,7 +163,6 @@
     "adapter_model.safetensors"
    ],
    "gpu_bytes": 429496729,
-   "name": "qwen3.8-pi",
    "rank": 32,
    "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
    "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
@@ -249,7 +247,6 @@
     "adapter_model.safetensors"
    ],
    "gpu_bytes": 429496729,
-   "name": "qwen3.8-pi",
    "rank": 32,
    "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
    "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
@@ -751,7 +748,6 @@
     "adapter_model.safetensors"
    ],
    "gpu_bytes": 429496729,
-   "name": "qwen3.8-pi",
    "rank": 32,
    "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
    "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
@@ -1020,7 +1016,6 @@
     "adapter_model.safetensors"
    ],
    "gpu_bytes": 429496729,
-   "name": "qwen3.8-pi",
    "rank": 32,
    "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
    "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",

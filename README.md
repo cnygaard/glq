@@ -141,8 +141,12 @@ and `--force` overrides it. `glq-chat` carries the same check.
 [harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted),
 a rank-32 LoRA trained to drive pi, on top of an Arete-27B or Qwen3.8-27B GLQ checkpoint. The
 GLQ weights are not changed: vLLM applies the adapter at runtime. glq-code downloads one pinned
-revision of it and serves it the way it was trained, with thinking off and sampling 0.8 / top-p
-1.0. pi talks to it as `qwen3.8-pi`.
+revision of it and serves it with the sampling it was trained with, 0.8 / top-p 1.0. The adapter
+is served under the checkpoint's own id, so pi asks for and shows that id as usual; its
+`models.json` entry is named "Arete-27B-GLQ-trellis-3inst-4bpw (pi adapter)". On that server the
+base model answers to `<id>-base`. pi offers its reasoning levels. The adapter was trained and evaluated with thinking
+off (`/thinking off` in pi); pi starts at its own level (medium unless you saved another), and
+thinking on with the adapter has not been measured.
 
 ```bash
 glq-code --pi-adapter --model xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw
