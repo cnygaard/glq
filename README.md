@@ -150,8 +150,19 @@ glq-code --pi-adapter --model xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw
 
 The adapter was trained on Qwen3.8-27B in bf16, and its card's Terminal-Bench results were
 measured there, not on Arete and not on a 4-bit build. Whether it helps Arete has not been
-measured, which is why it is off by default. It cannot be combined with `--mtp` or `--dspark`,
-because a draft model does not apply the adapter.
+measured, which is why it is off by default.
+
+It combines with DSpark speculation through a named drafter. `--mtp` is refused with it: Arete
+has no MTP head, and the pairing has not been run on Qwen3.8-27B.
+
+```bash
+glq-code --pi-adapter --model xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw \
+    --draft-model RedHatAI/Qwen3.8-27B-speculator.dspark --dspark 3
+```
+
+The drafter does not apply the adapter, so it drafts for the base model. The adapter-served
+model checks every drafted token, so the mismatch shows up as lower acceptance, not as different
+output.
 
 Measured with vLLM 0.33.0 on one RTX PRO 6000 (96 GB), Arete-27B 4 bpw, B=1, 2026-11-22.
 Every row has a matching run without the adapter:
@@ -171,6 +182,18 @@ On a 24 GB card, emulated by capping the memory budget on the same GPU, glq-code
 build with the adapter: it is short by 0.30 GiB because its runtime estimate for Arete is
 conservative. With `--force`, vLLM held 25,988 tokens of KV for the planned 16,384-token
 window, and the same `hello.py` check passed.
+
+With the DSpark drafter on the same card, glq-code planned and served the full 262,144-token
+window. vLLM held 25.49 GiB of KV, enough for 1.19 such requests, and the `hello.py` check
+passed. The decode figures below come from one prompt at temperature 0: 256 tokens, three
+repeats. They give a feel for the speed-up, not a speed benchmark. Acceptance is vLLM's count
+over the whole run, pi's turns included. The no-adapter rows run with thinking on, so their
+text differs too.
+
+| decode, B=1 | no draft | DSpark, depth 3 | DSpark, auto (planner chose depth 4) |
+|---|--:|--:|--:|
+| with the adapter | 32.8 tok/s | 55.1–59.9 tok/s, 36.0% accepted | 59.8–60.9 tok/s, 29.0% accepted |
+| without it | 38.6 tok/s | 64.6 tok/s, 43.5% accepted | — |
 
 CPU-only serving on a machine that has a GPU you don't want used (no flag needed on a
 machine without one — the installer detects it):

@@ -421,6 +421,36 @@ def kv_cost(model_id) -> tuple[int, int]:
     return 0, _KV_BYTES_PER_TOKEN
 
 
+def draft_kv_bytes_per_token(model_id, drafter_per_token) -> int:
+    """What a DSpark drafter's own KV adds to this model's per-token price, in bytes.
+
+    `drafter_per_token` is the drafter's attention KV for one token in every layer
+    (`chat._draft_kv_per_token`). Its layers declare a 2,048-token sliding window, but vLLM
+    0.33.0 charged them at the full window: Arete-27B 4 bpw with RedHatAI's Qwen3.8-27B
+    drafter needed 21.39 GiB of KV for one 262,144-token request against ~16.5 GiB without it,
+    which is the drafter's 5 x 4 KiB per token (`benchmarks/arete_pi_adapter/README.md`). So it
+    is priced per token, at the full window.
+
+    Added only on top of a family cost MEASURED without a drafter, which is where it was
+    missing: that plan reserved 19.78 GiB and vLLM refused it at startup. Nothing is added
+    where the price already covers it:
+
+    * `kv_cost_has_drafter`: Super-VL's figure was measured with its drafter loaded.
+    * the envelope: Kolibri-1 3 bpw served its drafter at the full 262,144 window priced at the
+      envelope, with KV left for 1.73 such requests (RTX PRO 4500, vLLM 0.29.0).
+    """
+    p = tooling.profile_for(model_id or "", "template")
+    if p is None or p.kv_cost is None or p.kv_cost_has_drafter:
+        return 0
+    return max(0, int(drafter_per_token or 0))
+
+
+def _with_draft_kv(cost, draft_per_token) -> tuple[int, int]:
+    """`cost` with a drafter's per-token KV added (`draft_kv_bytes_per_token`)."""
+    fixed, per_token = cost
+    return fixed, per_token + int(draft_per_token or 0)
+
+
 #: Smallest card on which vLLM's API server prefills 8,192 tokens a step rather than 2,048
 #: (vLLM 0.33.0 `EngineArgs.get_batch_defaults`; A100 and GB10 stay on 2,048, which only
 #: leaves them on the envelope here). The step sets the activation peak: Arete-27B 4 bpw
@@ -998,7 +1028,8 @@ class VllmSupervisor:
                  window_concurrency=_WINDOW_CONCURRENCY, expert_offload_gib=None,
                  window_offload_extra_gib=0, mtp_tokens=0, decoder_layers=None,
                  mtp_layers=0, draft_model=None, draft_tokens=0, draft_auto=False,
-                 draft_bytes=0, moe_top_k=0, moe_layers=0, arena_slot_bytes=0):
+                 draft_bytes=0, draft_kv_per_token=0, moe_top_k=0, moe_layers=0,
+                 arena_slot_bytes=0):
         self.model = model
         self.port = int(port)
         self.base_url = base_url or f"http://127.0.0.1:{self.port}/v1"
@@ -1019,6 +1050,15 @@ class VllmSupervisor:
         self.draft_bytes = int(draft_bytes or 0) if self.draft_model else 0
         self._draft_requested = max(0, int(draft_tokens or 0)) if self.draft_model else 0
         self._draft_auto = bool(draft_auto)
+        #: Bytes per token the drafter's own KV adds to this model's price, 0 where the price
+        #: already covers it; see `draft_kv_bytes_per_token`. In `kv_cost` from the start when
+        #: the depth is PINNED, so every planner below and the fit check see it. An AUTO
+        #: drafter is added by `_plan_draft_tokens` only if it is kept, for the same reason its
+        #: bytes are: the window keeps priority.
+        self.draft_kv_per_token = (draft_kv_bytes_per_token(model, draft_kv_per_token)
+                                   if self.draft_model else 0)
+        if self.draft_model and not self._draft_auto:
+            self.kv_cost = _with_draft_kv(self.kv_cost, self.draft_kv_per_token)
         #: What one MoE layer's arena slot costs and how many a step routes to: `top_k`
         #: experts per token, over `moe_layers` layers. Together they price the arena that
         #: one DSpark verify step needs (`arena_floor_gib`). 0 = unknown.
@@ -1504,17 +1544,24 @@ class VllmSupervisor:
                 self.expert_arena_gib = need
             return k
         known = bool(with_drafter and self._vram_bytes)
+        # The window's KV with the drafter's own layers in it: kept, the drafter pays for
+        # both its bytes and its KV, and the window keeps its length.
+        with_kv = _with_draft_kv(self.kv_cost, self.draft_kv_per_token)
         spare = 0
         if known:
             resident = max(0, int(with_drafter) - self.ple_offload_bytes - self.nontext_bytes
                            - self.expert_offload_gib * 1024**3)
             spare = (kv_headroom_bytes(resident, self._vram_bytes, self.runtime_overhead)
-                     - self._window_kv(self.max_model_len))
+                     - window_kv_bytes(self.max_model_len, self.window_concurrency, with_kv))
+        what = f"the drafter's {self.draft_bytes / 2**30:.2f} GiB"
+        if self.draft_kv_per_token:
+            what += f" and its KV ({self.draft_kv_per_token:,} bytes per token)"
         if self.expert_offload_gib <= 0:
             if not known or spare >= 0:
+                self.kv_cost = with_kv
                 return k
-            return self._draft_off(f"the drafter's {self.draft_bytes / 2**30:.2f} GiB do not "
-                                   f"fit beside a {self.max_model_len}-token window")
+            return self._draft_off(f"{what} do not fit beside a "
+                                   f"{self.max_model_len}-token window")
         spare -= _ARENA_KV_SLACK_BYTES
         while k > 0:
             need = self.arena_floor_gib(1 + k)
@@ -1522,6 +1569,7 @@ class VllmSupervisor:
                 # The arena planned without the drafter may no longer fit beside it.
                 kept = min(float(self.expert_arena_gib), float(spare // 1024**3))
                 self.expert_arena_gib = max(need, kept)
+                self.kv_cost = with_kv
                 return k
             k -= 1
         floor = self.arena_floor_gib(2)
@@ -1536,6 +1584,7 @@ class VllmSupervisor:
         self._spec_note = f"DSpark off: {why}. --dspark N asks for a depth anyway"
         self.draft_model = None
         self.draft_bytes = 0
+        self.draft_kv_per_token = 0
         return 0
 
     def _plan_offload(self, *, weights_bytes, vram_bytes, ram_bytes, max_model_len,
