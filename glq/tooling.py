@@ -109,7 +109,8 @@ class PiAdapter:
     """A LoRA trained to drive the pi coding agent, served by vLLM on top of the checkpoint.
 
     vLLM applies it at runtime in bf16 to the GLQ layers as they are: no new checkpoint.
-    `glq-code --pi-adapter` serves it as `served_name(model)` and points pi at that name.
+    `glq-code --pi-adapter` serves it under the checkpoint's own id, which pi asks for as it
+    does without the adapter; the base model answers to `base_alias(model)` on that server.
     """
     repo: str
     #: A commit sha. glq-code downloads exactly this revision and gives vLLM the local path.
@@ -125,15 +126,22 @@ class PiAdapter:
     files: tuple = ("adapter_config.json", "adapter_model.safetensors")
 
     @staticmethod
-    def served_name(model_id: str) -> str:
-        """The name vLLM serves the adapter under on `model_id`, and the model pi asks for.
+    def base_alias(model_id: str) -> str:
+        """The name the BASE model answers to on a server that serves the adapter.
 
-        vLLM applies a LoRA only to requests that name it, and pi shows that name, so it is the
-        checkpoint's own id (with its bpw) plus `-pi`: the base name stays the plain model. A
-        fixed `qwen3.8-pi` read as another model on an Arete build. The id may carry a slash;
-        vLLM's `--lora-modules name=path` splits on the first `=`.
+        vLLM applies a LoRA only to requests that name it, and the adapter takes the
+        checkpoint's own id (a fixed `qwen3.8-pi` read as another model on an Arete build).
+        vLLM 0.33 refuses a LoRA named like a base model (`load_lora_adapter`: "conflicts with
+        a base model"), comparing served names only, so the base is served under this alias.
         """
-        return f"{model_id}-pi"
+        return f"{model_id}-base"
+
+    @staticmethod
+    def display_name(model_id: str) -> str:
+        """pi's `name` for the adapter's entry. The id is the checkpoint's own, as without the
+        adapter, so this name is what says the adapter is on. pi 1.6.0 shows the id, not the
+        name, in its footer and in `--list-models` (measured against a stub server)."""
+        return f"{Path(model_id).name} (pi adapter)"
 
 
 @dataclass(frozen=True, eq=False)
@@ -873,20 +881,24 @@ def pi_adapter(model_id: str) -> PiAdapter | None:
 def adapter_serve_args(model_id: str, path) -> list[str]:
     """vLLM flags that serve the family's pi adapter from `path`, as it was evaluated.
 
-    Served as `PiAdapter.served_name(model_id)`. Thinking off is the server's DEFAULT
-    (`--default-chat-template-kwargs`), the mode the adapter was trained and measured in, for a
-    client that sends no `chat_template_kwargs`. pi does send them: its entry carries the
-    family's reasoning levels, and vLLM merges a request's kwargs over the default, so pi's
-    level decides. The sampling replaces the card's, as one `--override-generation-config`
-    (vLLM keeps only the last). `--lora-target-modules` limits the wrapping to what the
-    adapter trained. Compact JSON, raw, as in `tool_serve_args`.
+    The adapter is served under `model_id` itself and the base under `PiAdapter.base_alias`
+    (`--served-model-name`, followed here by another flag so its nargs="+" takes one value).
+    vLLM's `--lora-modules name=path` splits on the first `=`, so a slash in the id is fine.
+    Thinking off is the server's DEFAULT (`--default-chat-template-kwargs`), the mode the
+    adapter was trained and measured in, for a client that sends no `chat_template_kwargs`. pi
+    does send them: its entry carries the family's reasoning levels, and vLLM merges a
+    request's kwargs over the default, so pi's level decides. The sampling replaces the card's,
+    as one `--override-generation-config` (vLLM keeps only the last). `--lora-target-modules`
+    limits the wrapping to what the adapter trained. Compact JSON, raw, as in
+    `tool_serve_args`.
     """
     a = pi_adapter(model_id)
     if a is None:
         raise ValueError(f"no pi adapter is known for {model_id}")
     return ["--enable-lora", "--max-lora-rank", str(a.rank), "--max-loras", "1",
             "--lora-target-modules", *a.targets,
-            "--lora-modules", f"{a.served_name(model_id)}={path}",
+            "--served-model-name", a.base_alias(model_id),
+            "--lora-modules", f"{model_id}={path}",
             "--default-chat-template-kwargs",
             json.dumps({"enable_thinking": False}, separators=(",", ":")),
             "--override-generation-config",

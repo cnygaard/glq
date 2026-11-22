@@ -667,7 +667,8 @@ def test_the_adapter_is_served_on_the_checkpoint(monkeypatch, tmp_path):
     assert rc == 0
     assert sups[0].extra_args == role_serve_args(ARETE, "code", adapter_path=ADAPTER_SNAPSHOT)
     argv = sups[0].argv()
-    assert argv[argv.index("--lora-modules") + 1] == f"{ARETE}-pi={ADAPTER_SNAPSHOT}"
+    assert argv[argv.index("--lora-modules") + 1] == f"{ARETE}={ADAPTER_SNAPSHOT}"
+    assert argv[argv.index("--served-model-name") + 1] == f"{ARETE}-base"
     assert "--enable-lora" in argv and "--enable-auto-tool-choice" in argv
 
 
@@ -681,13 +682,13 @@ def test_the_pinned_revision_is_downloaded_once_before_the_server(monkeypatch, t
 
 @pytest.mark.parametrize("model", [ARETE, "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw"])
 def test_pi_asks_for_the_adapter_under_the_checkpoint_s_name(monkeypatch, tmp_path, model):
-    """pi shows the model it asks for: the checkpoint and its bpw, plus `-pi` (it showed
+    """pi asks for the checkpoint's own id, which the adapter is served under (it asked for
     `qwen3.8-pi` on Arete). No `--thinking`, as without the adapter: the starting level is pi's
     (a saved one, else medium)."""
     _, _, ran, _, _ = _run_adapter(monkeypatch, tmp_path,
                                    ["--model", model, "--pi-adapter", "--", "-c"])
     cmd, _env = ran[0]
-    assert cmd[1:] == ["--provider", "glq", "--model", f"{model}-pi", "-c"], cmd
+    assert cmd[1:] == ["--provider", "glq", "--model", model, "-c"], cmd
 
 
 def test_the_adapter_s_pi_entry_carries_the_family_s_reasoning_levels(monkeypatch, tmp_path):
@@ -702,9 +703,44 @@ def test_the_adapter_s_pi_entry_carries_the_family_s_reasoning_levels(monkeypatc
     (entry,) = json.loads(path.read_text())["providers"]["glq"]["models"]
     fields = pi_model_fields(ARETE)
     assert fields["reasoning"] is True
-    assert entry["id"] == f"{ARETE}-pi"
-    assert set(entry) == {"id", "contextWindow", "maxTokens", *fields}
+    assert entry["id"] == ARETE
+    assert set(entry) == {"id", "name", "contextWindow", "maxTokens", *fields}
     assert {k: entry[k] for k in fields} == fields
+
+
+def test_the_adapter_s_pi_entry_says_the_adapter_is_on(monkeypatch, tmp_path):
+    """The id is the checkpoint's own, the same as without the adapter, so pi's display `name`
+    is what tells the two apart."""
+    import json
+    path = tmp_path / "pi" / "models.json"
+    _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"], pi_config=path)
+    (entry,) = json.loads(path.read_text())["providers"]["glq"]["models"]
+    assert (entry["id"], entry["name"]) == (ARETE, "Arete-27B-GLQ-trellis-3inst-4bpw (pi adapter)")
+
+
+def test_an_attached_server_without_the_adapter_is_refused(monkeypatch, tmp_path, capsys):
+    """With the adapter under the checkpoint's own name, a server that serves only the base
+    model would answer pi with the base, silently. glq-code did not start it, so it asks the
+    server what it serves before pi starts."""
+    monkeypatch.setattr(code, "_serves_adapter", lambda base_url, name: False)
+    events, _, ran, _, rc = _run_adapter(monkeypatch, tmp_path,
+                                         ["--model", ARETE, "--pi-adapter"], attach=True)
+    assert rc == 2 and ran == [] and events == ["start", "stop"]
+    err = capsys.readouterr().err
+    assert ARETE in err and "pi adapter" in err
+
+
+@pytest.mark.parametrize("served", [True, None])
+def test_an_attached_server_with_the_adapter_or_unreadable_goes_on(monkeypatch, tmp_path,
+                                                                   capsys, served):
+    """True: it serves the adapter under that name. None: /v1/models could not be read, so the
+    check cannot judge; say so and let pi report what the server says."""
+    monkeypatch.setattr(code, "_serves_adapter", lambda base_url, name: served)
+    _, _, ran, _, rc = _run_adapter(monkeypatch, tmp_path,
+                                    ["--model", ARETE, "--pi-adapter"], attach=True)
+    assert rc == 0 and len(ran) == 1
+    err = capsys.readouterr().err
+    assert ("could not check" in err) == (served is None)
 
 
 def test_the_adapter_s_bytes_reach_the_planner(monkeypatch, tmp_path):
@@ -757,7 +793,7 @@ def test_the_adapter_serves_with_a_dspark_drafter(monkeypatch, tmp_path, flags, 
     assert (sup.draft_model, sup._draft_requested, sup._draft_auto) == (ARETE_DRAFTER, k, auto)
     assert sup.draft_bytes == ARETE_DRAFT_BYTES and sup.draft_kv_per_token == ARETE_DRAFT_KV
     argv = sup.argv()
-    assert argv[argv.index("--lora-modules") + 1] == f"{ARETE}-pi={ADAPTER_SNAPSHOT}"
+    assert argv[argv.index("--lora-modules") + 1] == f"{ARETE}={ADAPTER_SNAPSHOT}"
     spec = json.loads(argv[argv.index("--speculative-config") + 1])
     assert spec == {"method": "dspark", "model": ARETE_DRAFTER, "num_speculative_tokens": k}
 
@@ -794,7 +830,7 @@ def test_no_serve_attaches_without_downloading(monkeypatch, tmp_path):
     _, _, ran, downloads, rc = _run_adapter(monkeypatch, tmp_path,
                                             ["--model", ARETE, "--pi-adapter", "--no-serve"])
     assert rc == 0 and downloads == []
-    assert ran[0][0][1:] == ["--provider", "glq", "--model", f"{ARETE}-pi"]
+    assert ran[0][0][1:] == ["--provider", "glq", "--model", ARETE]
 
 
 def test_the_cpu_backend_is_refused(monkeypatch, tmp_path, capsys):
@@ -809,7 +845,7 @@ def test_the_banner_names_the_adapter_and_its_limits(monkeypatch, tmp_path, caps
     _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"])
     err = capsys.readouterr().err
     assert "harness-hub/Qwen3.8-27B-pi-adapted" in err and "7d42b11" in err
-    assert f"served as {ARETE}-pi" in err
+    assert f"served as {ARETE}" in err and f"{ARETE}-base" in err
     # The levels are there now; the banner says which one matches the adapter's training.
     assert "/thinking off" in err and "not been measured" in err
     assert "Qwen3.8-27B" in err

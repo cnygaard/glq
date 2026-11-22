@@ -90,6 +90,23 @@ def _download_adapter(adapter) -> str:
                              allow_patterns=list(adapter.files))
 
 
+def _serves_adapter(base_url: str, name: str) -> bool | None:
+    """Does the server at `base_url` serve `name` as a LoRA? None when /models cannot be read.
+
+    vLLM lists a LoRA with its base model as `parent` and a base model with none. The adapter
+    takes the checkpoint's own id, so a server we did not start that serves only the base
+    model would answer pi with the base, silently: this is how glq-code tells them apart.
+    """
+    import json
+    import urllib.request
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=5) as r:
+            cards = json.load(r).get("data") or []
+    except (OSError, ValueError):
+        return None
+    return any(c.get("id") == name and c.get("parent") for c in cards)
+
+
 #: Worked examples, because the `--` convention lived in one `help=` string on a positional
 #: and the README never showed a glq-code command line at all.
 _EPILOG = """examples:
@@ -269,8 +286,9 @@ def main(argv=None) -> int:
     p.add_argument("--pi-adapter", action="store_true",
                    help="serve the LoRA adapter trained to drive pi on top of the checkpoint "
                         "(Qwen3.8-27B and Arete-27B: harness-hub/Qwen3.8-27B-pi-adapted), served "
-                        "as <model>-pi with its trained sampling and pi's reasoning levels; it "
-                        "was trained with thinking off (/thinking off). Default OFF: it was "
+                        "under the checkpoint's own id (the base model as <model>-base) with its "
+                        "trained sampling and pi's reasoning levels; it was trained with "
+                        "thinking off (/thinking off). Default OFF: it was "
                         "trained on Qwen3.8-27B's bf16 weights and has not been evaluated on "
                         "these builds.")
     p.add_argument("--ready-timeout", type=positive_seconds,
@@ -484,8 +502,8 @@ def main(argv=None) -> int:
                       f"{adapter.revision[:7]}: {exc}", file=sys.stderr)
                 return 2
             supervisor.extra_args = role_serve_args(args.model, "code", adapter_path=path)
-        pi_model = adapter.served_name(args.model)
-        print(f"  pi adapter: {adapter.repo} @ {adapter.revision[:7]}, served as {pi_model}"
+        print(f"  pi adapter: {adapter.repo} @ {adapter.revision[:7]}, served as {args.model}"
+              f" (the base model as {adapter.base_alias(args.model)})"
               f"\n  sampling {adapter.sampling['temperature']} / top-p "
               f"{adapter.sampling['top_p']}, as it was trained. It was trained and measured with "
               f"thinking off\n  (pi's /thinking off); pi starts at its own level, and thinking "
@@ -505,14 +523,18 @@ def main(argv=None) -> int:
     # levels, while the server still thinks at the template's default. Which level a session
     # starts at stays pi's choice (see `tooling._QWEN38_27B`), so no `--thinking` is passed.
     #
-    # With the adapter, pi asks for the adapter's served name and its entry gets the same
-    # levels (it showed "off" with none to pick). pi sends its level on every request, over the
-    # server's thinking-off default; at `off` that is how the adapter was trained and measured.
+    # With the adapter, the id is the same (the adapter is served under it) and so are the
+    # levels (it showed "off" with none to pick); pi's display `name` says the adapter is on.
+    # pi sends its level on every request, over the server's thinking-off default; at `off`
+    # that is how the adapter was trained and measured.
+    fields = pi_model_fields(args.model)
+    if adapter is not None:
+        fields["name"] = adapter.display_name(args.model)
     write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
                     args.base_url, [pi_model],
                     context_window=supervisor.max_model_len,
                     max_tokens=pi_max_tokens(supervisor.max_model_len),
-                    model_fields={pi_model: pi_model_fields(args.model)})
+                    model_fields={pi_model: fields})
 
     # `kill` and a closed terminal end the process without unwinding the context
     # manager below; turn them into SystemExit so the server still comes down.
@@ -533,9 +555,20 @@ def main(argv=None) -> int:
             print("  warning: attached to an already-running server — if it was not "
                   "started with tool\n  support, pi's requests will fail with a 400; "
                   "stop it and re-run glq-code.", file=sys.stderr)
-            if adapter is not None:
-                print(f"  It must also serve the pi adapter as {pi_model}, or pi's "
-                      f"requests will fail with a 404.", file=sys.stderr)
+        if adapter is not None and supervisor.proc is None:
+            # Not our server (attached, or --no-serve). The adapter goes by the checkpoint's
+            # own id, so a server with only the base model would answer pi with the base.
+            served = _serves_adapter(args.base_url, args.model)
+            if served is False:
+                print(f"error: the server at {args.base_url} does not serve the pi adapter as "
+                      f"{args.model}, so pi would get the base model without it.\n  Stop that "
+                      f"server and re-run glq-code --pi-adapter, or drop --pi-adapter.",
+                      file=sys.stderr)
+                return 2
+            if served is None:
+                print(f"  warning: could not check that {args.base_url} serves the pi adapter "
+                      f"as {args.model}; pi will report what the server says.",
+                      file=sys.stderr)
         # Drop a literal leading "--" from REMAINDER; everything else goes to pi as-is.
         passthrough = [a for i, a in enumerate(args.pi_args)
                        if not (i == 0 and a == "--")]

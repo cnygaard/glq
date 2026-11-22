@@ -463,7 +463,7 @@ def test_the_qwen38_27b_line_carries_the_pi_adapter(model):
     a = pi_adapter(model)
     assert a.repo == _PI_ADAPTER_REPO
     assert re.fullmatch(r"[0-9a-f]{40}", a.revision)
-    assert a.served_name(model) == f"{model}-pi"
+    assert a.base_alias(model) == f"{model}-base"
     assert a.rank == 32
     assert a.targets == _PI_ADAPTER_TARGETS
     # Only the two files vLLM loads; the repo also carries a tokenizer, a template and images.
@@ -479,19 +479,35 @@ def test_no_other_family_has_a_pi_adapter(model):
 
 
 @pytest.mark.parametrize("model", _QWEN38_27B_IDS)
-def test_the_adapter_is_served_under_the_checkpoint_s_name(model):
-    """pi shows the name it asks for, and vLLM applies a LoRA only to requests that name it, so
-    the name is the checkpoint's (with its bpw) plus `-pi`: `qwen3.8-pi` read as a different model
-    on an Arete build. Distinct from the base name, which vLLM serves without the adapter."""
+def test_the_adapter_takes_the_checkpoint_s_own_name(model):
+    """vLLM applies a LoRA only to requests that name it, and pi sends the id it was given, so
+    the LoRA is served as the checkpoint's own id (it was `qwen3.8-pi`, which read as another
+    model on an Arete build). vLLM refuses a LoRA named like a base model, so on this server the
+    base answers to an alias instead."""
+    from glq.tooling import adapter_serve_args, pi_adapter
+    argv = adapter_serve_args(model, "/snap/x")
+    assert argv[argv.index("--lora-modules") + 1] == f"{model}=/snap/x"
+    alias = argv[argv.index("--served-model-name") + 1]
+    assert alias == pi_adapter(model).base_alias(model) and alias != model
+
+
+@pytest.mark.parametrize("model,shown", [
+    ("xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw", "Arete-27B-GLQ-trellis-3inst-4bpw (pi adapter)"),
+    ("/opt/dlami/nvme/Arete-27B-GLQ-trellis-3inst-5bpw",
+     "Arete-27B-GLQ-trellis-3inst-5bpw (pi adapter)"),
+    ("Qwen/Qwen3.8-27B", "Qwen3.8-27B (pi adapter)"),
+])
+def test_pi_shows_the_checkpoint_and_that_the_adapter_is_on(model, shown):
+    """The id stays the checkpoint's own, so the adapter is noted in pi's `name` for the entry."""
     from glq.tooling import pi_adapter
-    name = pi_adapter(model).served_name(model)
-    assert name.startswith(model) and name != model
+    assert pi_adapter(model).display_name(model) == shown
 
 
 def _adapter_tail(path, model):
     return ["--enable-lora", "--max-lora-rank", "32", "--max-loras", "1",
             "--lora-target-modules", *_PI_ADAPTER_TARGETS,
-            "--lora-modules", f"{model}-pi={path}",
+            "--served-model-name", f"{model}-base",
+            "--lora-modules", f"{model}={path}",
             "--default-chat-template-kwargs", '{"enable_thinking":false}',
             "--override-generation-config", '{"temperature":0.8,"top_k":20,"top_p":1.0}']
 
