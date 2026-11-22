@@ -612,6 +612,175 @@ def test_glq_code_leaves_the_starting_level_to_pi(monkeypatch, tmp_path):
     assert cmd[1:] == ["--provider", "glq", "--model", ARETE], cmd
 
 
+# ---- --pi-adapter: the LoRA trained to drive pi, on Arete-27B / Qwen3.8-27B ---------------
+
+ADAPTER_SNAPSHOT = "/hf/hub/models--harness-hub--Qwen3.8-27B-pi-adapted/snapshots/7d42b119"
+
+
+def _run_adapter(monkeypatch, tmp_path, argv, *, download_error=None, device="cuda",
+                 pi_config=None, **kw):
+    """`_run_code`, plus the adapter download and the two checkpoint lookups that would
+    otherwise reach the Hub. `pi_config`: a path for the REAL pi config writer. Returns
+    (events, the supervisors built, pi runs, downloads, rc)."""
+    events, _made, ran, _wrote = _run_code(monkeypatch, tmp_path, **kw)
+    if pi_config is not None:
+        monkeypatch.setattr(code, "write_pi_models", lambda _path, base_url, ids, **wkw:
+                            configure.write_pi_models(pi_config, base_url, ids, **wkw))
+    downloads, sups = [], []
+    fake = code.VllmSupervisor                    # `_run_code`'s factory
+
+    def build(**skw):
+        sups.append(fake(**{**skw, "device": device}))
+        return sups[-1]
+
+    monkeypatch.setattr(code, "VllmSupervisor", build)
+
+    def download(adapter):
+        downloads.append(adapter)
+        if download_error is not None:
+            raise download_error
+        return ADAPTER_SNAPSHOT
+
+    monkeypatch.setattr(code, "_download_adapter", download)
+    monkeypatch.setattr(code, "checkpoint_mtp", lambda repo: (0, False, 64))
+    monkeypatch.setattr(code, "_model_max_len", lambda repo: 262_144)
+    rc = code.main(argv)
+    return events, sups, ran, downloads, rc
+
+
+def test_the_adapter_is_served_on_the_checkpoint(monkeypatch, tmp_path):
+    """The real argv: the LoRA flags with the LOCAL snapshot, so vLLM serves exactly the pinned
+    revision and does not fetch it again."""
+    from glq.tooling import role_serve_args
+    _, sups, _, downloads, rc = _run_adapter(monkeypatch, tmp_path,
+                                             ["--model", ARETE, "--pi-adapter"])
+    assert rc == 0
+    assert sups[0].extra_args == role_serve_args(ARETE, "code", adapter_path=ADAPTER_SNAPSHOT)
+    argv = sups[0].argv()
+    assert argv[argv.index("--lora-modules") + 1] == f"qwen3.8-pi={ADAPTER_SNAPSHOT}"
+    assert "--enable-lora" in argv and "--enable-auto-tool-choice" in argv
+
+
+def test_the_pinned_revision_is_downloaded_once_before_the_server(monkeypatch, tmp_path):
+    from glq.tooling import pi_adapter
+    events, _, _, downloads, _ = _run_adapter(monkeypatch, tmp_path,
+                                              ["--model", ARETE, "--pi-adapter"])
+    assert downloads == [pi_adapter(ARETE)]
+    assert events == ["start", "pi", "stop"]
+
+
+def test_pi_asks_for_the_adapter(monkeypatch, tmp_path):
+    _, _, ran, _, _ = _run_adapter(monkeypatch, tmp_path,
+                                   ["--model", ARETE, "--pi-adapter", "--", "-c"])
+    cmd, _env = ran[0]
+    assert cmd[1:] == ["--provider", "glq", "--model", "qwen3.8-pi", "-c"], cmd
+
+
+def test_the_adapter_s_pi_entry_has_no_reasoning_fields(monkeypatch, tmp_path):
+    """With `reasoning` in the entry pi sends its thinking level on every request, starting at
+    medium, which would override the server's thinking-off. The adapter was trained with
+    thinking off, so its entry is the plain one."""
+    import json
+    path = tmp_path / "pi" / "models.json"
+    _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"], pi_config=path)
+    (entry,) = json.loads(path.read_text())["providers"]["glq"]["models"]
+    assert set(entry) == {"id", "contextWindow", "maxTokens"}
+    assert entry["id"] == "qwen3.8-pi"
+
+
+def test_the_adapter_s_bytes_reach_the_planner(monkeypatch, tmp_path):
+    from glq.tooling import pi_adapter
+    _, sups, _, _, _ = _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"],
+                                    weights_gib=17.0)
+    assert sups[0].weights_bytes == int(17.0 * GIB) + pi_adapter(ARETE).gpu_bytes
+
+
+def test_an_unsized_checkpoint_stays_unsized(monkeypatch, tmp_path):
+    """No checkpoint size, no plan: the adapter alone must not look like a 0.4 GiB model."""
+    _, sups, _, _, _ = _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"])
+    assert sups[0].weights_bytes is None
+
+
+@pytest.mark.parametrize("model", [SMOL, GEMMA, "xv0y5ncu/Qwen3.5-0.8B-GLQ-trellis-3inst-4bpw"])
+def test_a_model_without_an_adapter_is_refused_before_anything(monkeypatch, tmp_path, model,
+                                                               capsys):
+    events, sups, _, downloads, rc = _run_adapter(monkeypatch, tmp_path,
+                                                  ["--model", model, "--pi-adapter"])
+    assert rc == 2
+    assert events == [] and sups == [] and downloads == []
+    assert "pi adapter" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", [["--mtp", "1"], ["--dspark"], ["--dspark", "2"],
+                                   ["--draft-model", "org/drafter"]])
+def test_speculation_with_the_adapter_is_refused(monkeypatch, tmp_path, flags, capsys):
+    """A drafter does not apply the LoRA, so it drafts for a different model."""
+    events, sups, _, downloads, rc = _run_adapter(
+        monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter", *flags])
+    assert rc == 2
+    assert events == [] and sups == [] and downloads == []
+    assert "adapter" in capsys.readouterr().err
+
+
+def test_a_failed_download_stops_before_the_server(monkeypatch, tmp_path, capsys):
+    events, _, _, _, rc = _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"],
+                                       download_error=OSError("no network (test)"))
+    assert rc == 2
+    assert events == []
+    err = capsys.readouterr().err
+    assert "harness-hub/Qwen3.8-27B-pi-adapted" in err and "no network (test)" in err
+
+
+def test_a_refused_fit_downloads_nothing(monkeypatch, tmp_path):
+    """The fit check comes first: a refused invocation never needed the 0.6 GB adapter."""
+    events, _, _, downloads, rc = _run_adapter(
+        monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"],
+        weights_gib=18_236_907_824 / GIB, vram_gib=24, ram_gib=64)
+    assert rc == 2
+    assert events == [] and downloads == []
+
+
+def test_force_serves_the_adapter_where_the_plan_refuses(monkeypatch, tmp_path):
+    events, sups, _, downloads, rc = _run_adapter(
+        monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter", "--force"],
+        weights_gib=18_236_907_824 / GIB, vram_gib=24, ram_gib=64)
+    assert rc == 0 and len(downloads) == 1
+    assert "--enable-lora" in sups[0].argv()
+
+
+def test_no_serve_attaches_without_downloading(monkeypatch, tmp_path):
+    """Someone else's server serves (or does not serve) the adapter; glq-code only points pi at
+    its name."""
+    _, _, ran, downloads, rc = _run_adapter(monkeypatch, tmp_path,
+                                            ["--model", ARETE, "--pi-adapter", "--no-serve"])
+    assert rc == 0 and downloads == []
+    assert ran[0][0][1:] == ["--provider", "glq", "--model", "qwen3.8-pi"]
+
+
+def test_the_cpu_backend_is_refused(monkeypatch, tmp_path, capsys):
+    """vLLM's LoRA path was checked on CUDA only."""
+    events, _, _, downloads, rc = _run_adapter(monkeypatch, tmp_path,
+                                               ["--model", ARETE, "--pi-adapter"], device="cpu")
+    assert rc == 2 and events == [] and downloads == []
+    assert "CUDA" in capsys.readouterr().err
+
+
+def test_the_banner_names_the_adapter_and_its_limits(monkeypatch, tmp_path, capsys):
+    _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"])
+    err = capsys.readouterr().err
+    assert "harness-hub/Qwen3.8-27B-pi-adapted" in err and "7d42b11" in err
+    assert "thinking off" in err
+    assert "Qwen3.8-27B" in err
+
+
+def test_without_the_flag_nothing_changes(monkeypatch, tmp_path):
+    from glq.tooling import role_serve_args
+    _, sups, ran, downloads, rc = _run_adapter(monkeypatch, tmp_path, ["--model", ARETE])
+    assert rc == 0 and downloads == []
+    assert sups[0].extra_args == role_serve_args(ARETE, "code")
+    assert ran[0][0][1:] == ["--provider", "glq", "--model", ARETE]
+
+
 # ---- the pre-flight fit check -----------------------------------------------------------
 #
 # A checkpoint larger than the machine used to reach vLLM and fail with a CUDA

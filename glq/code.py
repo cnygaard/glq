@@ -36,8 +36,8 @@ from glq.installer.prompt import open_tty, select_model
 from glq.installer.recommend import PREFERRED_FAMILIES
 from glq.supervisor import (DEFAULT_READY_TIMEOUT,
                             WINDOW_OFFLOAD_MAX_EXTRA_GIB, VllmSupervisor)
-from glq.tooling import (ensure_gemma4_template, pi_model_fields, required_plugin,
-                         role_serve_args)
+from glq.tooling import (ensure_gemma4_template, pi_adapter, pi_model_fields,
+                         required_plugin, role_serve_args)
 
 #: The window a coding session falls back to when the card cannot be sized — a CPU box, or
 #: a `--model` whose config we could not read. A coding agent carries file contents, diffs
@@ -77,6 +77,17 @@ def _find_pi() -> Path | None:
 
 def _run_pi(cmd, env) -> int:
     return subprocess.call(cmd, env=env)
+
+
+def _download_adapter(adapter) -> str:
+    """The local snapshot of `adapter` at its pinned revision, downloading it if needed.
+
+    Only the files vLLM reads (`adapter.files`), into the usual Hugging Face cache. vLLM then
+    gets the path, so it serves exactly this revision and never fetches the adapter itself.
+    """
+    from huggingface_hub import snapshot_download
+    return snapshot_download(adapter.repo, revision=adapter.revision,
+                             allow_patterns=list(adapter.files))
 
 
 #: Worked examples, because the `--` convention lived in one `help=` string on a positional
@@ -255,6 +266,11 @@ def main(argv=None) -> int:
                         "an L4, 3 beat 1 on a 32 GiB Blackwell. Output is NOT byte-identical "
                         "with speculation on, even at temperature 0.")
     add_dspark_flags(p)
+    p.add_argument("--pi-adapter", action="store_true",
+                   help="serve the LoRA adapter trained to drive pi on top of the checkpoint "
+                        "(Qwen3.8-27B and Arete-27B: harness-hub/Qwen3.8-27B-pi-adapted), with "
+                        "thinking off as it was trained. Default OFF: it was trained on "
+                        "Qwen3.8-27B's bf16 weights and has not been evaluated on these builds.")
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",
@@ -303,6 +319,23 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
+    # The pi adapter, refused here with the other cheap guards: an adapter trained on another
+    # family's weights is meaningless, and a draft model does not apply the LoRA, so with
+    # --mtp or --dspark it would draft for a different model than the one it is checked against.
+    adapter = None
+    if args.pi_adapter:
+        adapter = pi_adapter(args.model)
+        if adapter is None:
+            print(f"error: no pi adapter is known for {args.model}. The one glq-code serves "
+                  f"was trained on Qwen3.8-27B,\nso --pi-adapter applies to Qwen3.8-27B and "
+                  f"its fine-tune Arete-27B only.", file=sys.stderr)
+            return 2
+        if args.mtp or args.dspark is not None or args.draft_model:
+            print("error: --pi-adapter cannot be combined with --mtp or --dspark: a draft "
+                  "model does not\napply the adapter, so it would draft for a different "
+                  "model.", file=sys.stderr)
+            return 2
+
     # Some families need a third-party vLLM plugin as well as glq. Guarded here, with the
     # other pre-supervisor guards, for the same reason: without it vLLM fails at startup
     # with an unknown-architecture or unknown-parser error — minutes into a multi-GiB weight
@@ -347,6 +380,11 @@ def main(argv=None) -> int:
     # can never disagree. Letting them drift is how a pool sized for one request ends up
     # admitting eight.
     _seqs = args.max_num_seqs or DEFAULT_CODE_MAX_NUM_SEQS
+    # The adapter is resident VRAM the plan must make room for. It goes in as weights, the one
+    # figure every planner and `fit.check_fit` read. An unsized checkpoint stays unsized.
+    _weights = sizing_weights_bytes(args)
+    if adapter is not None and _weights is not None:
+        _weights += adapter.gpu_bytes
     supervisor = VllmSupervisor(
         model=args.model,
         port=_server_port(args.base_url),
@@ -362,7 +400,7 @@ def main(argv=None) -> int:
         window_concurrency=_seqs,
         timeout=args.ready_timeout,
         extra_args=tool_args,
-        weights_bytes=sizing_weights_bytes(args),
+        weights_bytes=_weights,
         vram_bytes=None if args.gpu_memory_utilization is not None else _vram_bytes(),
         # Host RAM, so the pinnable-expert cap can bind. Without it this command planned a
         # 42 GiB pinned offload for Flash-Next regardless of the host, which only a
@@ -388,6 +426,11 @@ def main(argv=None) -> int:
         # 5 GiB of offload, about 3% of decode. See WINDOW_OFFLOAD_MAX_EXTRA_GIB.
         window_offload_extra_gib=WINDOW_OFFLOAD_MAX_EXTRA_GIB,
     )
+
+    if adapter is not None and args.serve and supervisor.device == "cpu":
+        print("error: --pi-adapter is CUDA only: vLLM's LoRA path has not been run on its CPU "
+              "backend here.", file=sys.stderr)
+        return 2
 
     # The last guard, and the most expensive failure it prevents: a checkpoint larger than
     # this machine used to reach vLLM and die with a CUDA out-of-memory several minutes into
@@ -422,6 +465,26 @@ def main(argv=None) -> int:
         # to be declined.
         ensure_gemma4_template()
 
+    # Downloaded AFTER the fit check, like the template above: a refused invocation never
+    # needed it. Only `extra_args` changes, and the plan never reads it, so the supervisor
+    # planned above is still the one that serves.
+    pi_model = args.model
+    if adapter is not None:
+        if args.serve:
+            try:
+                path = _download_adapter(adapter)
+            except Exception as exc:                # noqa: BLE001 - offline, 404, disk, …
+                print(f"error: could not download the pi adapter {adapter.repo} at "
+                      f"{adapter.revision[:7]}: {exc}", file=sys.stderr)
+                return 2
+            supervisor.extra_args = role_serve_args(args.model, "code", adapter_path=path)
+        pi_model = adapter.name
+        print(f"  pi adapter: {adapter.repo} @ {adapter.revision[:7]}, served as {adapter.name}"
+              f"\n  thinking off and sampling {adapter.sampling['temperature']} / top-p "
+              f"{adapter.sampling['top_p']}, as it was trained. It was trained on Qwen3.8-27B in "
+              f"bf16,\n  and its card's results were not measured on {args.model}.",
+              file=sys.stderr)
+
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
     # provider always points at the server this process is about to own (merge-safe:
     # other providers are preserved). After supervisor construction, because in auto
@@ -433,11 +496,16 @@ def main(argv=None) -> int:
     # (Arete-27B and Qwen3.8-27B): without them pi shows "Thinking level: off" and offers no
     # levels, while the server still thinks at the template's default. Which level a session
     # starts at stays pi's choice (see `tooling._QWEN38_27B`), so no `--thinking` is passed.
+    #
+    # With the adapter, pi asks for the adapter's name, and its entry gets NO reasoning fields:
+    # with them pi sends its level on every request (medium by default), which would turn back
+    # on the thinking the adapter was trained without.
     write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
-                    args.base_url, [args.model],
+                    args.base_url, [pi_model],
                     context_window=supervisor.max_model_len,
                     max_tokens=pi_max_tokens(supervisor.max_model_len),
-                    model_fields={args.model: pi_model_fields(args.model)})
+                    model_fields={pi_model: ({} if adapter is not None
+                                             else pi_model_fields(args.model))})
 
     # `kill` and a closed terminal end the process without unwinding the context
     # manager below; turn them into SystemExit so the server still comes down.
@@ -458,6 +526,9 @@ def main(argv=None) -> int:
             print("  warning: attached to an already-running server — if it was not "
                   "started with tool\n  support, pi's requests will fail with a 400; "
                   "stop it and re-run glq-code.", file=sys.stderr)
+            if adapter is not None:
+                print(f"  It must also serve the pi adapter as {adapter.name}, or pi's "
+                      f"requests will fail with a 404.", file=sys.stderr)
         # Drop a literal leading "--" from REMAINDER; everything else goes to pi as-is.
         passthrough = [a for i, a in enumerate(args.pi_args)
                        if not (i == 0 and a == "--")]
@@ -465,7 +536,7 @@ def main(argv=None) -> int:
         # child's PATH or the shebang cannot resolve node.
         env = {**os.environ,
                "PATH": f"{pi.parent}{os.pathsep}{os.environ.get('PATH', '')}"}
-        return _run_pi([str(pi), "--provider", "glq", "--model", args.model,
+        return _run_pi([str(pi), "--provider", "glq", "--model", pi_model,
                         *passthrough], env)
 
 

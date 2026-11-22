@@ -5,6 +5,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -27,6 +28,31 @@
    547608330,
    65536
   ],
+  "pi_adapter": {
+   "files": [
+    "adapter_config.json",
+    "adapter_model.safetensors"
+   ],
+   "gpu_bytes": 429496729,
+   "name": "qwen3.8-pi",
+   "rank": 32,
+   "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
+   "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
+   "sampling": {
+    "temperature": 0.8,
+    "top_k": 20,
+    "top_p": 1.0
+   },
+   "targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+   ]
+  },
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -64,6 +90,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -101,6 +128,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -130,6 +158,31 @@
    547608330,
    65536
   ],
+  "pi_adapter": {
+   "files": [
+    "adapter_config.json",
+    "adapter_model.safetensors"
+   ],
+   "gpu_bytes": 429496729,
+   "name": "qwen3.8-pi",
+   "rank": 32,
+   "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
+   "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
+   "sampling": {
+    "temperature": 0.8,
+    "top_k": 20,
+    "top_p": 1.0
+   },
+   "targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+   ]
+  },
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -167,6 +220,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -189,6 +243,31 @@
    547608330,
    65536
   ],
+  "pi_adapter": {
+   "files": [
+    "adapter_config.json",
+    "adapter_model.safetensors"
+   ],
+   "gpu_bytes": 429496729,
+   "name": "qwen3.8-pi",
+   "rank": 32,
+   "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
+   "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
+   "sampling": {
+    "temperature": 0.8,
+    "top_k": 20,
+    "top_p": 1.0
+   },
+   "targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+   ]
+  },
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -226,6 +305,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -248,6 +328,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -283,6 +364,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -318,6 +400,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -340,6 +423,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -362,6 +446,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -384,6 +469,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -418,6 +504,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -440,6 +527,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -462,6 +550,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -496,6 +585,7 @@
    805306368,
    10000
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -533,6 +623,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -555,6 +646,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -592,6 +684,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -629,6 +722,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -651,6 +745,31 @@
    547608330,
    65536
   ],
+  "pi_adapter": {
+   "files": [
+    "adapter_config.json",
+    "adapter_model.safetensors"
+   ],
+   "gpu_bytes": 429496729,
+   "name": "qwen3.8-pi",
+   "rank": 32,
+   "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
+   "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
+   "sampling": {
+    "temperature": 0.8,
+    "top_k": 20,
+    "top_p": 1.0
+   },
+   "targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+   ]
+  },
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -688,6 +807,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -722,6 +842,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -759,6 +880,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -781,6 +903,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -815,6 +938,7 @@
    805306368,
    10000
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -852,6 +976,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -889,6 +1014,31 @@
    547608330,
    65536
   ],
+  "pi_adapter": {
+   "files": [
+    "adapter_config.json",
+    "adapter_model.safetensors"
+   ],
+   "gpu_bytes": 429496729,
+   "name": "qwen3.8-pi",
+   "rank": 32,
+   "repo": "harness-hub/Qwen3.8-27B-pi-adapted",
+   "revision": "7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
+   "sampling": {
+    "temperature": 0.8,
+    "top_k": 20,
+    "top_p": 1.0
+   },
+   "targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+   ]
+  },
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -926,6 +1076,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -963,6 +1114,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -985,6 +1137,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1014,6 +1167,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1049,6 +1203,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1084,6 +1239,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1106,6 +1262,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -1140,6 +1297,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1162,6 +1320,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -1184,6 +1343,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1206,6 +1366,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -1228,6 +1389,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
@@ -1250,6 +1412,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "float16",
@@ -1272,6 +1435,7 @@
    0,
    28201
   ],
+  "pi_adapter": null,
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
