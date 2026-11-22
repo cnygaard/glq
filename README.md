@@ -137,6 +137,41 @@ amount of extra offload can relieve, because pinned pages cannot be swapped out.
 refuses on a number it could not read (offline, no `nvidia-smi`, `--gpu-memory-utilization`),
 and `--force` overrides it. `glq-chat` carries the same check.
 
+**The pi adapter for Arete-27B (opt-in).** `glq-code --pi-adapter` serves
+[harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted),
+a rank-32 LoRA trained to drive pi, on top of an Arete-27B or Qwen3.8-27B GLQ checkpoint. The
+GLQ weights are not changed: vLLM applies the adapter at runtime. glq-code downloads one pinned
+revision of it and serves it the way it was trained, with thinking off and sampling 0.8 / top-p
+1.0. pi talks to it as `qwen3.8-pi`.
+
+```bash
+glq-code --pi-adapter --model xv0y5ncu/Arete-27B-GLQ-trellis-3inst-4bpw
+```
+
+The adapter was trained on Qwen3.8-27B in bf16, and its card's Terminal-Bench results were
+measured there, not on Arete and not on a 4-bit build. Whether it helps Arete has not been
+measured, which is why it is off by default. It cannot be combined with `--mtp` or `--dspark`,
+because a draft model does not apply the adapter.
+
+Measured with vLLM 0.33.0 on one RTX PRO 6000 (96 GB), Arete-27B 4 bpw, B=1, 2026-11-22.
+Every row has a matching run without the adapter:
+
+| | without | with the adapter |
+|---|--:|--:|
+| decode, `vllm bench serve`, 10 requests, 1,024-token prompts | 38.8 tok/s | 33.2 tok/s (−14%) |
+| TTFT, same requests | 0.41 s | 0.41 s |
+| decode, glq-code's server, 256 tokens, 3 repeats | 38.6 tok/s | 32.8 tok/s |
+| glq-code start to ready, first launch | 298 s | 326 s |
+| KV cache at the 262,144-token window | 23.31 GiB | 22.97 GiB |
+
+On that card glq-code planned and served the full 262,144-token window. pi read `hello.py`
+through a tool call and answered 63, and the adapter's turns carried no reasoning.
+
+On a 24 GB card, emulated by capping the memory budget on the same GPU, glq-code refuses this
+build with the adapter: it is short by 0.30 GiB because its runtime estimate for Arete is
+conservative. With `--force`, vLLM held 25,988 tokens of KV for the planned 16,384-token
+window, and the same `hello.py` check passed.
+
 CPU-only serving on a machine that has a GPU you don't want used (no flag needed on a
 machine without one — the installer detects it):
 

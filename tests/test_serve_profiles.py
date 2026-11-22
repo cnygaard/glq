@@ -129,7 +129,13 @@ def _snapshot(model_id: str, templates_dir: Path) -> dict:
         "recommended_sampling": T.recommended_sampling(model_id),
         "preferred_dtype": {d: T.preferred_dtype(model_id, d) for d in ("cuda", "cpu", "rocm")},
         "kv_cost": kv_cost(model_id),
+        "pi_adapter": _adapter_fields(T.pi_adapter(model_id)),
     })
+
+
+def _adapter_fields(a):
+    import dataclasses
+    return None if a is None else dataclasses.asdict(a)
 
 
 def _case_ids():
@@ -283,7 +289,7 @@ def test_the_qwen38_27b_line_changes_only_its_measured_figures():
 
     from glq.tooling import _QWEN, profile_for
     p = profile_for("NousResearch/Arete-27B", "template")
-    skip = {"family", "match", "kv_cost", "runtime_overhead", "pi_thinking"}
+    skip = {"family", "match", "kv_cost", "runtime_overhead", "pi_thinking", "pi_adapter"}
     for field in dataclasses.fields(p):
         if field.name not in skip:
             assert getattr(p, field.name) == getattr(_QWEN, field.name), field.name
@@ -432,6 +438,122 @@ def test_each_launcher_either_refuses_arete_27b_or_plans_a_window_vllm_can_hold(
     assert verdict.fits is True, verdict
     assert sup.max_model_len == want
     pool_kv = sup.gpu_memory_utilization * vram - (f["weights"] + _OTHER_GIB) * _GIB
+    for vllm in _VLLM_LAYOUT:
+        need = _vllm_need_bytes(sup.max_model_len, vllm)
+        assert pool_kv >= need, (vllm, sup.max_model_len, pool_kv / _GIB, need / _GIB)
+
+
+# ---- the pi adapter: a LoRA trained on Qwen3.8-27B to drive pi -------------------------------
+
+_PI_ADAPTER_REPO = "harness-hub/Qwen3.8-27B-pi-adapted"
+#: The 7 PEFT targets of its adapter_config.json (rev 7d42b119): attention on the 16
+#: full-attention layers, the MLP on all 64. vLLM wraps them as 160 modules (Step 0 of the plan:
+#: 64 gate_up_proj + 64 down_proj + 16 qkv_proj + 16 o_proj, all given weights).
+_PI_ADAPTER_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
+                       "down_proj")
+
+
+@pytest.mark.parametrize("model", _QWEN38_27B_IDS)
+def test_the_qwen38_27b_line_carries_the_pi_adapter(model):
+    """Pinned to one revision: an adapter that moves under a fixed name is a different model,
+    and glq-code passes vLLM a local snapshot of exactly this commit."""
+    import re
+
+    from glq.tooling import pi_adapter
+    a = pi_adapter(model)
+    assert a.repo == _PI_ADAPTER_REPO
+    assert re.fullmatch(r"[0-9a-f]{40}", a.revision)
+    assert a.name == "qwen3.8-pi"
+    assert a.rank == 32
+    assert a.targets == _PI_ADAPTER_TARGETS
+    # Only the two files vLLM loads; the repo also carries a tokenizer, a template and images.
+    assert set(a.files) == {"adapter_config.json", "adapter_model.safetensors"}
+
+
+@pytest.mark.parametrize("model", [m for m in IDS if m not in _QWEN38_27B_IDS])
+def test_no_other_family_has_a_pi_adapter(model):
+    """Trained on Qwen3.8-27B's weights: it means nothing on any other model, including the
+    other Qwen checkpoints."""
+    from glq.tooling import pi_adapter
+    assert pi_adapter(model) is None
+
+
+def _adapter_tail(path):
+    return ["--enable-lora", "--max-lora-rank", "32", "--max-loras", "1",
+            "--lora-target-modules", *_PI_ADAPTER_TARGETS,
+            "--lora-modules", f"qwen3.8-pi={path}",
+            "--default-chat-template-kwargs", '{"enable_thinking":false}',
+            "--override-generation-config", '{"temperature":0.8,"top_k":20,"top_p":1.0}']
+
+
+@pytest.mark.parametrize("model", _QWEN38_27B_IDS)
+def test_glq_code_serves_the_adapter_as_it_was_evaluated(model, tmp_path):
+    """The card's serving recipe, on the GLQ checkpoint: the LoRA at rank 32, thinking off, and
+    the training sampling (0.8 / top-p 1.0; top_k stays the generation_config's 20, which the
+    card's recipe never overrode). The tool parser is unchanged. The family's own sampling
+    (1.0 / 0.95) is REPLACED, not followed by a second override: vLLM keeps only the last."""
+    from glq import tooling as T
+    tdir = tmp_path / "templates"
+    tool = T.tool_serve_args(model, templates_dir=tdir)
+    got = T.role_serve_args(model, "code", templates_dir=tdir, adapter_path="/snap/x")
+    assert got == tool + _adapter_tail("/snap/x")
+    assert got.count("--override-generation-config") == 1
+    assert got.count("--default-chat-template-kwargs") == 1
+
+
+def test_an_adapter_path_for_a_family_without_one_is_refused(tmp_path):
+    from glq import tooling as T
+    with pytest.raises(ValueError):
+        T.role_serve_args("xv0y5ncu/SmolLM3-3B-trellis-3inst-6bpw", "code",
+                          adapter_path="/snap/x")
+
+
+def test_the_chat_role_takes_no_adapter():
+    from glq import tooling as T
+    with pytest.raises(ValueError):
+        T.role_serve_args("NousResearch/Arete-27B", "chat", adapter_path="/snap/x")
+
+
+#: What the adapter cost on top of the base serve, from vLLM's own log lines (Arete-27B 4 bpw,
+#: RTX PRO 6000, vLLM 0.33.0, window 131,072, max-num-seqs 1, util 0.92, 2026-11-22,
+#: `benchmarks/arete_pi_adapter/step0_2026-11-22/`): "Available KV cache memory" fell from
+#: 68.22 to 67.86 GiB at a 2,048-token step and from 67.98 to 67.63 at 8,192. Of that, the
+#: loaded weights rose 16.58 -> 16.89 and the two graph captures 0.13 -> 0.18.
+_PI_ADAPTER_MEASURED_GIB = (68.22 - 67.86, 67.98 - 67.63)
+
+
+def test_the_adapter_is_priced_at_or_above_what_it_cost():
+    from glq.tooling import pi_adapter
+    cost = pi_adapter("NousResearch/Arete-27B").gpu_bytes
+    assert max(_PI_ADAPTER_MEASURED_GIB) * _GIB <= cost <= 0.5 * _GIB
+
+
+@pytest.mark.parametrize("vram_gib,bpw", [(v, b) for v in (24, 31.86, 95.6) for b in "456"])
+def test_glq_code_with_the_adapter_refuses_or_plans_a_window_vllm_can_hold(vram_gib, bpw):
+    """The adapter's bytes reach the planner as weights. On every card, glq-code either refuses
+    before starting vLLM, or what it asks for holds the base serve's measured overhead, the
+    adapter's measured cost, and what vLLM needs for the planned window."""
+    from glq import fit
+    from glq.supervisor import VllmSupervisor
+    from glq.tooling import pi_adapter
+    floor, kw = _LAUNCHERS["code"]
+    f = _ARETE[bpw]
+    model = f"xv0y5ncu/Arete-27B-GLQ-trellis-3inst-{bpw}bpw"
+    vram = int(vram_gib * _GIB)
+    sup = VllmSupervisor(
+        model=model, device="cuda", serve=False,
+        weights_bytes=f["size"] + pi_adapter(model).gpu_bytes, vram_bytes=vram,
+        ram_bytes=64 * _GIB, model_max_len=262_144, **kw)
+    verdict = fit.check_fit(sup, ram_bytes=64 * _GIB, swap_bytes=0,
+                            available_ram_bytes=56 * _GIB, floor=floor)
+    if verdict.fits is False:
+        assert verdict.reason == "vram", verdict
+        assert _ARETE_PLANS[("code", vram_gib, bpw)] in (None, 16_384), \
+            "the adapter should cost at most the smallest window, not a fit"
+        return
+    assert verdict.fits is True, verdict
+    pool_kv = (sup.gpu_memory_utilization * vram
+               - (f["weights"] + _OTHER_GIB + max(_PI_ADAPTER_MEASURED_GIB)) * _GIB)
     for vllm in _VLLM_LAYOUT:
         need = _vllm_need_bytes(sup.max_model_len, vllm)
         assert pool_kv >= need, (vllm, sup.max_model_len, pool_kv / _GIB, need / _GIB)

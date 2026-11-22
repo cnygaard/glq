@@ -105,6 +105,29 @@ def _family_text(model_id: str) -> str:
 
 
 @dataclass(frozen=True, eq=False)
+class PiAdapter:
+    """A LoRA trained to drive the pi coding agent, served by vLLM on top of the checkpoint.
+
+    vLLM applies it at runtime in bf16 to the GLQ layers as they are: no new checkpoint.
+    `glq-code --pi-adapter` serves it as `name` and points pi at that name.
+    """
+    repo: str
+    #: A commit sha. glq-code downloads exactly this revision and gives vLLM the local path.
+    revision: str
+    #: The name vLLM serves it under, and the model id pi asks for.
+    name: str
+    rank: int
+    #: PEFT target modules (adapter_config.json), for `--lora-target-modules`.
+    targets: tuple
+    #: The sampling it was trained and evaluated with. Replaces the family's card sampling.
+    sampling: dict
+    #: VRAM it costs beyond the base serve, MEASURED, added to the weights the planner sizes.
+    gpu_bytes: int
+    #: The files vLLM reads. The repo also carries a tokenizer, a chat template and images.
+    files: tuple = ("adapter_config.json", "adapter_model.safetensors")
+
+
+@dataclass(frozen=True, eq=False)
 class ModelProfile:
     """What one family needs from vLLM, and what its card asks for.
 
@@ -148,6 +171,8 @@ class ModelProfile:
     #: chat template's accepted values were read: a value the template rejects fails every
     #: request.
     pi_thinking: dict | None = None
+    #: A LoRA trained for pi on this family's base weights, for `glq-code --pi-adapter`.
+    pi_adapter: PiAdapter | None = None
 
 
 _GEMMA4 = ModelProfile(
@@ -328,6 +353,36 @@ _QWEN38_27B = dataclasses.replace(
             },
         },
     },
+    # harness-hub/Qwen3.8-27B-pi-adapted: a PEFT LoRA (r 32, alpha 64, Apache-2.0) trained with
+    # RL on Qwen3.8-27B's bf16 weights to drive pi, thinking off. Its card reports 55.8% against
+    # the base model's 39.5% on Terminal-Bench 2.1 under pi (86 graded tasks, one attempt each).
+    # Arete-27B is a fine-tune of that base, and its GLQ builds are neither, so those numbers do
+    # not carry over: `glq-code --pi-adapter` is opt-in until it is measured on Arete.
+    #
+    # Served by vLLM as a runtime LoRA on the GLQ layers, unchanged. Checked on Arete-27B 4 bpw,
+    # vLLM 0.33.0, RTX PRO 6000 (`benchmarks/arete_pi_adapter/README.md`): vLLM wrapped
+    # the 160 target modules and gave every one adapter weights. Greedy logprobs moved by up to
+    # 0.18-0.28 against the base model's, and the base repeated itself exactly. Decode at B=1 was
+    # 30.12 ms/token with the adapter, 25.76 without.
+    #
+    # Sampling: the card's runs used temperature 0.8 and top-p 1.0 (the training sampling) with
+    # thinking off. Its vLLM recipe sets no sampling, so top_k was the generation_config's 20,
+    # which Arete's shares. All three are server-side here: pi 1.6.0 sends no temperature or
+    # top_p for an entry without reasoning fields (captured against a stub server, 2026-11-22).
+    #
+    # gpu_bytes: "Available KV cache memory" fell by 0.36 GiB at vLLM's 2,048-token step and
+    # 0.35 at 8,192 (same window, util and card): +0.31 loaded weights, +0.05 graphs. 0.40
+    # covers both with a margin for another card.
+    pi_adapter=PiAdapter(
+        repo="harness-hub/Qwen3.8-27B-pi-adapted",
+        revision="7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
+        name="qwen3.8-pi",
+        rank=32,
+        targets=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
+                 "down_proj"),
+        sampling={"temperature": 0.8, "top_p": 1.0, "top_k": 20},
+        gpu_bytes=int(0.40 * 1024**3),
+    ),
 )
 
 _SMOLLM3 = ModelProfile(
@@ -765,24 +820,59 @@ def merge_compilation_config(argv: list[str]) -> list[str]:
 ROLES = ("code", "chat")
 
 
-def role_serve_args(model_id: str, role: str, templates_dir=None) -> list[str] | None:
+def role_serve_args(model_id: str, role: str, templates_dir=None,
+                    adapter_path=None) -> list[str] | None:
     """The family's vLLM flags for one command, so glq-chat and glq-code cannot drift apart.
 
       "code"  tool calling plus the card's sampling, for a tool-using agent (glq-code, and the
               installer's printed command). None for a family with no known tool setup: the
               caller refuses rather than guess. Sampling is appended, not substituted: correct
               sampling with no tool parser is a useless coding session.
+              With `adapter_path` (a local copy of the family's `pi_adapter`), the LoRA flags,
+              thinking off and the adapter's own sampling instead of the card's.
       "chat"  the reasoning parser and the text-only load, for glq-chat. No tool flags (the
               chat sends no tools) and no sampling override (its sliders send every field).
     """
+    if adapter_path is not None and role != "code":
+        raise ValueError("only the code role serves a pi adapter")
     if role == "code":
         tool = tool_serve_args(model_id, templates_dir=templates_dir)
         if tool is None:
             return None
+        if adapter_path is not None:
+            return tool + adapter_serve_args(model_id, adapter_path)
         return tool + (sampling_serve_args(model_id) or [])
     if role == "chat":
         return reasoning_serve_args(model_id) + text_only_serve_args(model_id)
     raise ValueError(f"unknown role {role!r}; expected one of {ROLES}")
+
+
+def pi_adapter(model_id: str) -> PiAdapter | None:
+    """The pi LoRA trained for this model's family, or None. Matched on the name ("template"
+    scope), like the parsers: it was trained on one family's weights and chat template."""
+    p = profile_for(model_id, "template")
+    return p.pi_adapter if p is not None else None
+
+
+def adapter_serve_args(model_id: str, path) -> list[str]:
+    """vLLM flags that serve the family's pi adapter from `path`, as it was evaluated.
+
+    Thinking off is server-side (`--default-chat-template-kwargs`): glq-code gives pi an entry
+    without reasoning fields for it, so pi sends no `chat_template_kwargs` that could turn it
+    back on. The sampling replaces the card's, as one `--override-generation-config` (vLLM
+    keeps only the last). `--lora-target-modules` limits the wrapping to what the adapter
+    trained. Compact JSON, raw, as in `tool_serve_args`.
+    """
+    a = pi_adapter(model_id)
+    if a is None:
+        raise ValueError(f"no pi adapter is known for {model_id}")
+    return ["--enable-lora", "--max-lora-rank", str(a.rank), "--max-loras", "1",
+            "--lora-target-modules", *a.targets,
+            "--lora-modules", f"{a.name}={path}",
+            "--default-chat-template-kwargs",
+            json.dumps({"enable_thinking": False}, separators=(",", ":")),
+            "--override-generation-config",
+            json.dumps(a.sampling, separators=(",", ":"), sort_keys=True)]
 
 
 def required_plugin(model_id: str) -> tuple[str, str] | None:
