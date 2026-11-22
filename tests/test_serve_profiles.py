@@ -463,7 +463,7 @@ def test_the_qwen38_27b_line_carries_the_pi_adapter(model):
     a = pi_adapter(model)
     assert a.repo == _PI_ADAPTER_REPO
     assert re.fullmatch(r"[0-9a-f]{40}", a.revision)
-    assert a.name == "qwen3.8-pi"
+    assert a.served_name(model) == f"{model}-pi"
     assert a.rank == 32
     assert a.targets == _PI_ADAPTER_TARGETS
     # Only the two files vLLM loads; the repo also carries a tokenizer, a template and images.
@@ -478,10 +478,20 @@ def test_no_other_family_has_a_pi_adapter(model):
     assert pi_adapter(model) is None
 
 
-def _adapter_tail(path):
+@pytest.mark.parametrize("model", _QWEN38_27B_IDS)
+def test_the_adapter_is_served_under_the_checkpoint_s_name(model):
+    """pi shows the name it asks for, and vLLM applies a LoRA only to requests that name it, so
+    the name is the checkpoint's (with its bpw) plus `-pi`: `qwen3.8-pi` read as a different model
+    on an Arete build. Distinct from the base name, which vLLM serves without the adapter."""
+    from glq.tooling import pi_adapter
+    name = pi_adapter(model).served_name(model)
+    assert name.startswith(model) and name != model
+
+
+def _adapter_tail(path, model):
     return ["--enable-lora", "--max-lora-rank", "32", "--max-loras", "1",
             "--lora-target-modules", *_PI_ADAPTER_TARGETS,
-            "--lora-modules", f"qwen3.8-pi={path}",
+            "--lora-modules", f"{model}-pi={path}",
             "--default-chat-template-kwargs", '{"enable_thinking":false}',
             "--override-generation-config", '{"temperature":0.8,"top_k":20,"top_p":1.0}']
 
@@ -496,7 +506,7 @@ def test_glq_code_serves_the_adapter_as_it_was_evaluated(model, tmp_path):
     tdir = tmp_path / "templates"
     tool = T.tool_serve_args(model, templates_dir=tdir)
     got = T.role_serve_args(model, "code", templates_dir=tdir, adapter_path="/snap/x")
-    assert got == tool + _adapter_tail("/snap/x")
+    assert got == tool + _adapter_tail("/snap/x", model)
     assert got.count("--override-generation-config") == 1
     assert got.count("--default-chat-template-kwargs") == 1
 

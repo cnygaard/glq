@@ -268,9 +268,11 @@ def main(argv=None) -> int:
     add_dspark_flags(p)
     p.add_argument("--pi-adapter", action="store_true",
                    help="serve the LoRA adapter trained to drive pi on top of the checkpoint "
-                        "(Qwen3.8-27B and Arete-27B: harness-hub/Qwen3.8-27B-pi-adapted), with "
-                        "thinking off as it was trained. Default OFF: it was trained on "
-                        "Qwen3.8-27B's bf16 weights and has not been evaluated on these builds.")
+                        "(Qwen3.8-27B and Arete-27B: harness-hub/Qwen3.8-27B-pi-adapted), served "
+                        "as <model>-pi with its trained sampling and pi's reasoning levels; it "
+                        "was trained with thinking off (/thinking off). Default OFF: it was "
+                        "trained on Qwen3.8-27B's bf16 weights and has not been evaluated on "
+                        "these builds.")
     p.add_argument("--ready-timeout", type=positive_seconds,
                    default=DEFAULT_READY_TIMEOUT, metavar="SECONDS")
     p.add_argument("--no-serve", dest="serve", action="store_false",
@@ -482,34 +484,35 @@ def main(argv=None) -> int:
                       f"{adapter.revision[:7]}: {exc}", file=sys.stderr)
                 return 2
             supervisor.extra_args = role_serve_args(args.model, "code", adapter_path=path)
-        pi_model = adapter.name
-        print(f"  pi adapter: {adapter.repo} @ {adapter.revision[:7]}, served as {adapter.name}"
-              f"\n  thinking off and sampling {adapter.sampling['temperature']} / top-p "
-              f"{adapter.sampling['top_p']}, as it was trained. It was trained on Qwen3.8-27B in "
-              f"bf16,\n  and its card's results were not measured on {args.model}.",
+        pi_model = adapter.served_name(args.model)
+        print(f"  pi adapter: {adapter.repo} @ {adapter.revision[:7]}, served as {pi_model}"
+              f"\n  sampling {adapter.sampling['temperature']} / top-p "
+              f"{adapter.sampling['top_p']}, as it was trained. It was trained and measured with "
+              f"thinking off\n  (pi's /thinking off); pi starts at its own level, and thinking "
+              f"on with the adapter has not been measured.\n  It was trained on Qwen3.8-27B in "
+              f"bf16, and its card's results were not measured on {args.model}.",
               file=sys.stderr)
 
     # pi resolves `glq/<model>` through ~/.pi/agent/models.json; refresh it so the
     # provider always points at the server this process is about to own (merge-safe:
     # other providers are preserved). After supervisor construction, because in auto
     # mode the served window is the supervisor's choice, not an args value.
-    # maxTokens = window/4: pi treats it as the per-turn output ask, and the transcript
-    # grows with every tool round-trip — window/2 fits the first turn and 400s later ones.
+    # maxTokens is a share of the window (`pi_max_tokens`; why half, in
+    # `configure._PI_OUTPUT_SHARE`).
     #
     # The family's reasoning levels go into the same entry, where the profile table has them
     # (Arete-27B and Qwen3.8-27B): without them pi shows "Thinking level: off" and offers no
     # levels, while the server still thinks at the template's default. Which level a session
     # starts at stays pi's choice (see `tooling._QWEN38_27B`), so no `--thinking` is passed.
     #
-    # With the adapter, pi asks for the adapter's name, and its entry gets NO reasoning fields:
-    # with them pi sends its level on every request (medium by default), which would turn back
-    # on the thinking the adapter was trained without.
+    # With the adapter, pi asks for the adapter's served name and its entry gets the same
+    # levels (it showed "off" with none to pick). pi sends its level on every request, over the
+    # server's thinking-off default; at `off` that is how the adapter was trained and measured.
     write_pi_models(Path.home() / ".pi" / "agent" / "models.json",
                     args.base_url, [pi_model],
                     context_window=supervisor.max_model_len,
                     max_tokens=pi_max_tokens(supervisor.max_model_len),
-                    model_fields={pi_model: ({} if adapter is not None
-                                             else pi_model_fields(args.model))})
+                    model_fields={pi_model: pi_model_fields(args.model)})
 
     # `kill` and a closed terminal end the process without unwinding the context
     # manager below; turn them into SystemExit so the server still comes down.
@@ -531,7 +534,7 @@ def main(argv=None) -> int:
                   "started with tool\n  support, pi's requests will fail with a 400; "
                   "stop it and re-run glq-code.", file=sys.stderr)
             if adapter is not None:
-                print(f"  It must also serve the pi adapter as {adapter.name}, or pi's "
+                print(f"  It must also serve the pi adapter as {pi_model}, or pi's "
                       f"requests will fail with a 404.", file=sys.stderr)
         # Drop a literal leading "--" from REMAINDER; everything else goes to pi as-is.
         passthrough = [a for i, a in enumerate(args.pi_args)

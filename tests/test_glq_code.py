@@ -667,7 +667,7 @@ def test_the_adapter_is_served_on_the_checkpoint(monkeypatch, tmp_path):
     assert rc == 0
     assert sups[0].extra_args == role_serve_args(ARETE, "code", adapter_path=ADAPTER_SNAPSHOT)
     argv = sups[0].argv()
-    assert argv[argv.index("--lora-modules") + 1] == f"qwen3.8-pi={ADAPTER_SNAPSHOT}"
+    assert argv[argv.index("--lora-modules") + 1] == f"{ARETE}-pi={ADAPTER_SNAPSHOT}"
     assert "--enable-lora" in argv and "--enable-auto-tool-choice" in argv
 
 
@@ -679,23 +679,32 @@ def test_the_pinned_revision_is_downloaded_once_before_the_server(monkeypatch, t
     assert events == ["start", "pi", "stop"]
 
 
-def test_pi_asks_for_the_adapter(monkeypatch, tmp_path):
+@pytest.mark.parametrize("model", [ARETE, "xv0y5ncu/Qwen3.8-27B-GLQ-trellis-3inst-4bpw"])
+def test_pi_asks_for_the_adapter_under_the_checkpoint_s_name(monkeypatch, tmp_path, model):
+    """pi shows the model it asks for: the checkpoint and its bpw, plus `-pi` (it showed
+    `qwen3.8-pi` on Arete). No `--thinking`, as without the adapter: the starting level is pi's
+    (a saved one, else medium)."""
     _, _, ran, _, _ = _run_adapter(monkeypatch, tmp_path,
-                                   ["--model", ARETE, "--pi-adapter", "--", "-c"])
+                                   ["--model", model, "--pi-adapter", "--", "-c"])
     cmd, _env = ran[0]
-    assert cmd[1:] == ["--provider", "glq", "--model", "qwen3.8-pi", "-c"], cmd
+    assert cmd[1:] == ["--provider", "glq", "--model", f"{model}-pi", "-c"], cmd
 
 
-def test_the_adapter_s_pi_entry_has_no_reasoning_fields(monkeypatch, tmp_path):
-    """With `reasoning` in the entry pi sends its thinking level on every request, starting at
-    medium, which would override the server's thinking-off. The adapter was trained with
-    thinking off, so its entry is the plain one."""
+def test_the_adapter_s_pi_entry_carries_the_family_s_reasoning_levels(monkeypatch, tmp_path):
+    """pi showed "Thinking level: off" with no levels under the adapter: its entry had no
+    reasoning fields. It gets the family's, like the plain entry; at `off` pi sends
+    enable_thinking false, which is how the adapter was trained and measured."""
     import json
+
+    from glq.tooling import pi_model_fields
     path = tmp_path / "pi" / "models.json"
     _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"], pi_config=path)
     (entry,) = json.loads(path.read_text())["providers"]["glq"]["models"]
-    assert set(entry) == {"id", "contextWindow", "maxTokens"}
-    assert entry["id"] == "qwen3.8-pi"
+    fields = pi_model_fields(ARETE)
+    assert fields["reasoning"] is True
+    assert entry["id"] == f"{ARETE}-pi"
+    assert set(entry) == {"id", "contextWindow", "maxTokens", *fields}
+    assert {k: entry[k] for k in fields} == fields
 
 
 def test_the_adapter_s_bytes_reach_the_planner(monkeypatch, tmp_path):
@@ -748,7 +757,7 @@ def test_the_adapter_serves_with_a_dspark_drafter(monkeypatch, tmp_path, flags, 
     assert (sup.draft_model, sup._draft_requested, sup._draft_auto) == (ARETE_DRAFTER, k, auto)
     assert sup.draft_bytes == ARETE_DRAFT_BYTES and sup.draft_kv_per_token == ARETE_DRAFT_KV
     argv = sup.argv()
-    assert argv[argv.index("--lora-modules") + 1] == f"qwen3.8-pi={ADAPTER_SNAPSHOT}"
+    assert argv[argv.index("--lora-modules") + 1] == f"{ARETE}-pi={ADAPTER_SNAPSHOT}"
     spec = json.loads(argv[argv.index("--speculative-config") + 1])
     assert spec == {"method": "dspark", "model": ARETE_DRAFTER, "num_speculative_tokens": k}
 
@@ -785,7 +794,7 @@ def test_no_serve_attaches_without_downloading(monkeypatch, tmp_path):
     _, _, ran, downloads, rc = _run_adapter(monkeypatch, tmp_path,
                                             ["--model", ARETE, "--pi-adapter", "--no-serve"])
     assert rc == 0 and downloads == []
-    assert ran[0][0][1:] == ["--provider", "glq", "--model", "qwen3.8-pi"]
+    assert ran[0][0][1:] == ["--provider", "glq", "--model", f"{ARETE}-pi"]
 
 
 def test_the_cpu_backend_is_refused(monkeypatch, tmp_path, capsys):
@@ -800,7 +809,9 @@ def test_the_banner_names_the_adapter_and_its_limits(monkeypatch, tmp_path, caps
     _run_adapter(monkeypatch, tmp_path, ["--model", ARETE, "--pi-adapter"])
     err = capsys.readouterr().err
     assert "harness-hub/Qwen3.8-27B-pi-adapted" in err and "7d42b11" in err
-    assert "thinking off" in err
+    assert f"served as {ARETE}-pi" in err
+    # The levels are there now; the banner says which one matches the adapter's training.
+    assert "/thinking off" in err and "not been measured" in err
     assert "Qwen3.8-27B" in err
 
 
