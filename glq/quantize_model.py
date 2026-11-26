@@ -764,6 +764,35 @@ _MODEL_PROFILES = {
         # `_convert_state_kolibri1`.
         'convert_state': 'kolibri1',
     },
+    'Lfm2MoeForCausalLM': {
+        # LFM2-8B-A1B (Liquid AI, model_type `lfm2_moe`): a hybrid text MoE, 8.3B total. Each
+        # layer is a gated short convolution or full attention (`layer_types`; 18 conv + 6
+        # attention), then a dense SwiGLU MLP (`feed_forward.w1/w3/w2`, the first
+        # `num_dense_layers`) or a sparse block of 32 experts, top 4, with sigmoid routing and
+        # an fp32 `expert_bias`. Paths read off a meta-built `Lfm2MoeForCausalLM`.
+        'layers_attr': 'model.layers',
+        'embed_attr': 'model.embed_tokens',
+        # Not `rotary_emb`: the heuristic would find nothing, and the attention layers unpack
+        # `cos, sin = position_embeddings` from what it passes.
+        'rotary_attr': 'model.pos_emb',
+        'sd_prefix': 'model.layers',
+        'trust_remote_code': False,
+        # The layer takes the default kwargs whichever operator it holds. No `causal_mask`:
+        # the conv layers apply the mask as a 2-D padding mask, and sdpa with no mask is
+        # already causal for the attention layers.
+        'forward_kwargs': 'default',
+        # Experts are 3-D Parameters (`experts.gate_up_proj` [32, 3584, 2048],
+        # `experts.down_proj` [32, 2048, 1792]); the checkpoint stores them per expert.
+        'stacked_experts': True,
+        'convert_state': 'lfm2_moe',
+        # ...as `experts.{e}.w1|w3|w2`, and the GLQ checkpoint keeps those names: vLLM's
+        # LFM2-MoE loader reads experts by `ckpt_names=("w1", "w2", "w3")` and skips any other
+        # spelling without an error. Order is gate, up, down.
+        'expert_leaf_names': ('w1', 'w3', 'w2'),
+        # An fp32 buffer transformers keeps fp32 in a bf16 model. It is added to the sigmoid
+        # scores before top-k, so a bf16 copy changes which experts a token reaches near a tie.
+        'keep_fp32': ('expert_bias',),
+    },
     'Glm5NextForConditionalGeneration': {
         # GLM-5.3-Flash (model_type `glm5_next`, text `glm5_next_text`, transformers >= 5.17):
         # 314B total. A vision tower wrapped around a 45-layer hybrid decoder, 34 KDA (Kimi
@@ -1577,7 +1606,8 @@ def _require_supported_expert_layout(layers, arch, profile=None):
 
 
 def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
-                              dequantize_fn=None, joint_expert_gate_up=False):
+                              dequantize_fn=None, expert_leaf_names=None,
+                              joint_expert_gate_up=False):
     """Put the dequantized weights back into a replayed layer. ``-> n_restored``.
 
     Not optional and not bookkeeping: layer N's Hessians come from activations that passed
@@ -1593,12 +1623,16 @@ def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
       layer's weights, so missing them is not a rounding detail. It is also invisible from a
       dense model, which is why `tests/test_resume_replay_experts.py` builds a stacked layer.
 
+    ``expert_leaf_names`` is the profile's (gate, up, down) spelling of a gated expert's
+    artifacts (`_expert_leaf_names`); None is the default gate_proj/up_proj/down_proj.
+
     A gate/up pair the quantizer quantized as one matrix is decoded as one matrix
     (`_join_gate_up_arts`): always for stacked experts, and for per-expert ``nn.Linear``
     experts when the profile set ``fuse_expert_gate_up`` (``joint_expert_gate_up``).
     """
     if dequantize_fn is None:
         from .resume import dequantize_artifacts as dequantize_fn   # noqa: PLC0415
+    g_leaf, u_leaf, d_leaf = tuple(expert_leaf_names or _DEFAULT_EXPERT_LEAVES)
 
     n_restored = 0
     linears = {name: mod for name, mod in layer.named_modules()
@@ -1644,15 +1678,15 @@ def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
             # gate+up were quantized jointly and stored split: join the artifacts back
             # (gate rows first, the layout the forward and the save-side split share) and
             # decode the [2I, H] matrix that was actually quantized.
-            g = arts_map.get(f"{prefix}.{mn}.{e}.gate_proj")
-            u = arts_map.get(f"{prefix}.{mn}.{e}.up_proj")
+            g = arts_map.get(f"{prefix}.{mn}.{e}.{g_leaf}")
+            u = arts_map.get(f"{prefix}.{mn}.{e}.{u_leaf}")
             if g is not None and u is not None:
                 W_hat = dequantize_fn(_join_gate_up_arts(g, u), hdim, two_inter,
                                       codebook_type, codebook=codebook)
                 with torch.no_grad():
                     gup.data[e] = W_hat.to(dtype=gup.dtype, device=gup.device)
                 n_restored += 1
-            d = arts_map.get(f"{prefix}.{mn}.{e}.down_proj")
+            d = arts_map.get(f"{prefix}.{mn}.{e}.{d_leaf}")
             if d is not None:
                 dw = dequantize_fn(d, dwn.shape[2], dwn.shape[1], codebook_type,
                                    codebook=codebook)
@@ -2959,14 +2993,29 @@ _KOLIBRI1_EXPERT = re.compile(
     r"^(?P<pre>.*experts)\.(?P<idx>\d+)\.(?P<leaf>gate_proj|up_proj|down_proj)\.weight$")
 
 
-def _stack_gated_experts(experts, out):
-    """Stack ``{prefix: {expert: {gate_proj, up_proj, down_proj}}}`` into ``out``.
+_DEFAULT_EXPERT_LEAVES = ("gate_proj", "up_proj", "down_proj")
 
-    Writes ``{prefix}.gate_up_proj`` [E, 2I, H], gate rows first, and ``{prefix}.down_proj``
+
+def _expert_leaf_names(profile):
+    """(gate, up, down): what a routed expert's projections are called in the checkpoint.
+
+    The GLQ checkpoint stores each expert's artifacts under these, so the save drops the
+    source tensors by prefix and the serving loader finds them by its own names. Every
+    architecture but LFM2-MoE uses the default; LFM2's checkpoint says `w1`/`w3`/`w2`.
+    """
+    return tuple((profile or {}).get('expert_leaf_names') or _DEFAULT_EXPERT_LEAVES)
+
+
+def _stack_gated_experts(experts, out, leaves=_DEFAULT_EXPERT_LEAVES):
+    """Stack ``{prefix: {expert: {gate, up, down}}}`` into ``out``.
+
+    ``leaves`` names the (gate, up, down) projections as the checkpoint spells them. Writes
+    ``{prefix}.gate_up_proj`` [E, 2I, H], gate rows first, and ``{prefix}.down_proj``
     [E, H, I] — the layout transformers' `MergeModulelist` + `Concatenate(dim=1)` produce.
     Experts are popped as they are consumed rather than stacked with `torch.stack`, which
     would hold every source tensor and the result at the same time.
     """
+    g_leaf, u_leaf, d_leaf = leaves
     for prefix, per_idx in experts.items():
         idxs = sorted(per_idx)
         if idxs != list(range(len(idxs))):
@@ -2977,21 +3026,21 @@ def _stack_gated_experts(experts, out):
                 f"weights at the wrong expert index, which routing cannot detect.")
         for e in idxs:
             have = set(per_idx[e])
-            if have != {"gate_proj", "up_proj", "down_proj"}:
+            if have != set(leaves):
                 raise ValueError(
-                    f"{prefix}.{e}: expected gate_proj/up_proj/down_proj, got "
+                    f"{prefix}.{e}: expected {g_leaf}/{u_leaf}/{d_leaf}, got "
                     f"{sorted(have)}")
 
-        g0, u0, d0 = (per_idx[0][k] for k in ("gate_proj", "up_proj", "down_proj"))
+        g0, u0, d0 = (per_idx[0][k] for k in leaves)
         n_gate = g0.shape[0]
         gate_up = torch.empty((len(idxs), n_gate + u0.shape[0], g0.shape[1]),
                               dtype=g0.dtype, device=g0.device)
         down = torch.empty((len(idxs), *d0.shape), dtype=d0.dtype, device=d0.device)
         for e in idxs:
-            leaves = per_idx.pop(e)
-            gate_up[e, :n_gate] = leaves.pop("gate_proj")
-            gate_up[e, n_gate:] = leaves.pop("up_proj")
-            down[e] = leaves.pop("down_proj")
+            leaf = per_idx.pop(e)
+            gate_up[e, :n_gate] = leaf.pop(g_leaf)
+            gate_up[e, n_gate:] = leaf.pop(u_leaf)
+            down[e] = leaf.pop(d_leaf)
         out[f"{prefix}.gate_up_proj"] = gate_up
         out[f"{prefix}.down_proj"] = down
 
@@ -3167,11 +3216,40 @@ def _convert_state_glm5_next(state):
     return out
 
 
+_LFM2_MOE_EXPERT = re.compile(
+    r"^(?P<pre>.*experts)\.(?P<idx>\d+)\.(?P<leaf>w1|w2|w3)\.weight$")
+
+
+def _convert_state_lfm2_moe(state):
+    """Stack LFM2-MoE's per-expert tensors into the two 3-D parameters the module wants.
+
+        feed_forward.experts.{e}.w1.weight  (gate) \\
+        feed_forward.experts.{e}.w3.weight  (up)    -> feed_forward.experts.gate_up_proj [E, 2I, H]
+        feed_forward.experts.{e}.w2.weight  (down)  -> feed_forward.experts.down_proj    [E, H, I]
+
+    transformers' `lfm2_moe` conversion mapping does this inside `from_pretrained` (w1 then
+    w3, concatenated on dim 1); the streaming path's own `load_state_dict` does not. The dense
+    MLP of the first layers (`feed_forward.w1/w2/w3`, no `experts.`) and the fp32
+    `expert_bias` pass through unchanged.
+    """
+    out, experts = {}, {}
+    for key, val in state.items():
+        m = _LFM2_MOE_EXPERT.match(key)
+        if m:
+            experts.setdefault(m.group("pre"), {}) \
+                   .setdefault(int(m.group("idx")), {})[m.group("leaf")] = val
+        else:
+            out[key] = val
+    _stack_gated_experts(experts, out, leaves=("w1", "w3", "w2"))
+    return out
+
+
 #: Profiles select a converter by name, the way `forward_kwargs` selects a kwargs branch.
 _STATE_CONVERTERS = {
     "kolibri1": _convert_state_kolibri1,
     "nemotron_h": _convert_state_nemotron_h,
     "glm5_next": _convert_state_glm5_next,
+    "lfm2_moe": _convert_state_lfm2_moe,
 }
 
 
@@ -4299,6 +4377,7 @@ def quantize(
             n_restored = _restore_replayed_weights(
                 layer, arts_map, f"{sd_prefix}.{layer_idx}", codebook_type, codebook,
                 dequantize_fn=dequantize_artifacts,
+                expert_leaf_names=_expert_leaf_names(profile),
                 joint_expert_gate_up=bool(profile.get('fuse_expert_gate_up')))
             hidden_states = _forward_calibration(layer, hidden_states, layer_idx)
             print(f"  replayed from checkpoint ({n_restored} matrices restored) "
@@ -4403,6 +4482,11 @@ def quantize(
         del moe_expert_hessians
         moe_writeback = {}   # virtual_name -> (param3d, expert_idx)
         moe_gate_up = {}     # gate_up virtual_name -> (gate_name, up_name, inter)
+        # The checkpoint's names for a gated expert's projections. The virtual names (and the
+        # Hessian keys the expert hook writes) stay `gate_up_proj`/`down_proj`; only the
+        # stored artifacts take the checkpoint spelling.
+        g_leaf, u_leaf, d_leaf = _expert_leaf_names(profile)
+        moe_save_name = {}   # down_proj virtual_name -> stored name, where they differ
         for mn, emod in gemma4_experts:
             gup, dwn = emod.gate_up_proj, emod.down_proj
             n_exp, two_inter, hdim = gup.shape
@@ -4419,7 +4503,9 @@ def quantize(
                 linears[dn] = vdn
                 moe_writeback[gu] = (gup, e)
                 moe_writeback[dn] = (dwn, e)
-                moe_gate_up[gu] = (f"{mn}.{e}.gate_proj", f"{mn}.{e}.up_proj", inter)
+                moe_gate_up[gu] = (f"{mn}.{e}.{g_leaf}", f"{mn}.{e}.{u_leaf}", inter)
+                if d_leaf != "down_proj":
+                    moe_save_name[dn] = f"{mn}.{e}.{d_leaf}"
             dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.gate_up_proj")
             dropped_stacked_keys.add(f"{sd_prefix}.{layer_idx}.{mn}.down_proj")
         # Non-gated stacks take the same route, minus the gate/up row-split: with no fused
@@ -4517,7 +4603,8 @@ def quantize(
                 all_artifacts[f"{sd_prefix}.{layer_idx}.{up_name}"] = up_arts
                 return
             if name not in gate_up_fusion:
-                all_artifacts[f"{sd_prefix}.{layer_idx}.{name}"] = arts
+                stored = moe_save_name.get(name, name)
+                all_artifacts[f"{sd_prefix}.{layer_idx}.{stored}"] = arts
                 return
             real_gate, real_up, gate_out, gate_name, up_name = gate_up_fusion[name]
             up_out = real_up.weight.data.shape[0]

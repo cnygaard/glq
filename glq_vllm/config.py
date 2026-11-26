@@ -31,10 +31,13 @@ from .embedding_method import GLQEmbeddingMethod
 #: missing parameter to the *module*, so the error names neither the weight nor the layer).
 #: No ``_SHARD_GROUPS`` entry: this is a plain 2-part merge like gate_up_proj -- two vLLM
 #: partitions, two checkpoint matrices, 1:1 -- unlike in_proj_qkvz's 4-to-2 case.
+#: w13 is LFM2-MoE's dense MLP (the first `num_dense_layers`): vLLM merges the checkpoint's
+#: `feed_forward.w1`/`w3` into `feed_forward.w13` as shards 0/1, another plain 1:1 merge.
 _MERGE_MAP = {".qkv_proj": (".q_proj", ".k_proj", ".v_proj"),
               ".gate_up_proj": (".gate_proj", ".up_proj"),
               ".in_proj_qkvz": (".in_proj_qkv", ".in_proj_z"),
-              ".kv_proj": (".key_proj", ".value_proj")}
+              ".kv_proj": (".key_proj", ".value_proj"),
+              ".w13": (".w1", ".w3")}
 
 def _backbone_forms(prefix: str) -> set[str]:
     """Alias spellings for NemotronH's ``backbone.`` root. ``-> {alternative forms}``
@@ -91,6 +94,10 @@ class GLQvLLMConfig(QuantizationConfig):
         # because Flash-Next has 75,576 entries and 49 MoE layers would otherwise rescan
         # them all. See `_moe_is_quantized`.
         self._moe_containers = set()
+        #: container -> the projection names its experts are stored under (`gate_proj`,
+        #: `w1`, ...). vLLM's loader reads experts by the layer's own checkpoint names and
+        #: skips any other spelling without an error; see `_check_expert_names`.
+        self._moe_leaves = {}
         #: MTP layer indices present in `layer_bpw`. vLLM RENUMBERS the draft block — the
         #: checkpoint stores `mtp.layers.0.*` and vLLM places the head after the decoder's
         #: 0..47, asking about `mtp.layers.48.*` and rewriting the weight names to match.
@@ -99,7 +106,9 @@ class GLQvLLMConfig(QuantizationConfig):
         for _k in self.layer_bpw:
             _p = _k.split(".")
             if len(_p) >= 3 and _p[-2].isdigit():
-                self._moe_containers.add(".".join(_p[:-2]))
+                _c = ".".join(_p[:-2])
+                self._moe_containers.add(_c)
+                self._moe_leaves.setdefault(_c, set()).add(_p[-1])
             if len(_p) >= 3 and _p[0] == "mtp" and _p[1] == "layers" and _p[2].isdigit():
                 self._mtp_layer_indices.add(_p[2])
         self.codebook = codebook
@@ -224,6 +233,48 @@ class GLQvLLMConfig(QuantizationConfig):
                 best = max(best or 0, int(self.layer_bpw[f]))
         return best
 
+    def _moe_forms(self, prefix: str) -> set[str]:
+        """Every spelling of an experts container ``prefix`` that `layer_bpw` could use."""
+        forms = {prefix} | self._mtp_forms(prefix)
+        if prefix.startswith("model.") and ".language_model." not in prefix:
+            forms.add("model.language_model." + prefix[len("model."):])
+        if prefix.startswith("language_model.model."):
+            forms.add("model.language_model."
+                      + prefix[len("language_model.model."):])
+        if prefix.startswith("model.language_model."):
+            forms.add("language_model.model."
+                      + prefix[len("model.language_model."):])
+            forms.add("model." + prefix[len("model.language_model."):])
+        forms |= _backbone_forms(prefix)
+        return forms
+
+    def _check_expert_names(self, layer, prefix: str) -> None:
+        """Refuse a container whose stored expert names the layer will not load.
+
+        vLLM's experts layer maps checkpoint tensors by its own `ckpt_*_proj_name`s (LFM2-MoE:
+        `w1`, `w2`, `w3`; most models: `gate_proj`, `down_proj`, `up_proj`) and skips every
+        other name without an error. A GLQ checkpoint that stored its experts under different
+        leaves would load nothing into them and serve uninitialised memory, with the
+        footprint, the whitelist and the load all looking right. Skipped where the layer
+        does not carry the names (vLLM <= 0.23, or a layer built without `__init__`).
+        """
+        names = [getattr(layer, a, None) for a in (
+            "ckpt_gate_proj_name", "ckpt_up_proj_name", "ckpt_down_proj_name")]
+        if not any(names):
+            return
+        wanted = {n for n in names if n}
+        stored = set()
+        for f in self._moe_forms(prefix):
+            stored |= self._moe_leaves.get(f, set())
+        extra = stored - wanted
+        if extra:
+            raise ValueError(
+                f"GLQ MoE {prefix}: the checkpoint stores its experts as "
+                f"{sorted(stored)}, but vLLM loads this layer's experts by "
+                f"{sorted(wanted)} and would skip {sorted(extra)} without an error, serving "
+                f"uninitialised experts. The quantizer's profile for this architecture must "
+                f"save the experts under the checkpoint's own names (`expert_leaf_names`).")
+
     def _moe_is_quantized(self, prefix: str) -> bool:
         """Is this MoE container quantized in the checkpoint?
 
@@ -241,18 +292,7 @@ class GLQvLLMConfig(QuantizationConfig):
         """
         if self._lookup_bpw(prefix) is not None:
             return True                      # a directly-enumerated (non-stacked) MoE
-        forms = {prefix} | self._mtp_forms(prefix)
-        if prefix.startswith("model.") and ".language_model." not in prefix:
-            forms.add("model.language_model." + prefix[len("model."):])
-        if prefix.startswith("language_model.model."):
-            forms.add("model.language_model."
-                      + prefix[len("language_model.model."):])
-        if prefix.startswith("model.language_model."):
-            forms.add("language_model.model."
-                      + prefix[len("model.language_model."):])
-            forms.add("model." + prefix[len("model.language_model."):])
-        forms |= _backbone_forms(prefix)
-        return any(f in self._moe_containers for f in forms)
+        return any(f in self._moe_containers for f in self._moe_forms(prefix))
 
     def _is_prefused(self, prefix: str) -> bool:
         """True iff ``prefix`` is a DIRECT layer_bpw entry — i.e. the checkpoint
@@ -363,6 +403,7 @@ class GLQvLLMConfig(QuantizationConfig):
                 # enumerate nothing and quantize everything — keep being claimed.
                 if self.layer_bpw and not self._moe_is_quantized(prefix):
                     return None
+                self._check_expert_names(layer, prefix)
                 from vllm.platforms import current_platform
                 if getattr(current_platform, "device_type", "") == "cpu":
                     # Trellis MoE serves on CPU through the per-expert fallback

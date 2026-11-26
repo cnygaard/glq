@@ -643,6 +643,29 @@ def _replace_nemotron_h_experts(model: nn.Module, block_diagonal: bool = True,
 # for non-CUDA input anyway, and this exists to make CPU inference possible for
 # architectures vLLM refuses (its Qwen4Exp is "CUDA and ROCm only").
 
+#: The (gate, up, down) leaf names a gated expert checkpoint stores its halves under.
+_DEFAULT_GATED_LEAVES = ("gate_proj", "up_proj", "down_proj")
+
+#: Every spelling the loader recognises, the default first. LFM2-MoE keeps its source
+#: checkpoint's ``w1``/``w3``/``w2`` (gate, up, down): vLLM's LFM2 loader reads experts by
+#: exactly those names and skips any other spelling without an error.
+_GATED_LEAF_SPELLINGS = (_DEFAULT_GATED_LEAVES, ("w1", "w3", "w2"))
+
+
+def _detect_gated_leaves(prefix: str, shapes: dict | None) -> tuple[str, str, str]:
+    """The leaf spelling this container's experts are stored under, read off the header.
+
+    transformers 5.x assigns checkpoint tensors by key, so a landing pad under any other
+    name leaves the tensor unexpected and the expert at its initial value. The checkpoint
+    is the authority; without a readable header the default spelling is kept.
+    """
+    if shapes:
+        base = f"{prefix}.0." if prefix else "0."
+        for leaves in _GATED_LEAF_SPELLINGS:
+            if base + leaves[0] in shapes:
+                return leaves
+    return _DEFAULT_GATED_LEAVES
+
 
 class _GatedExpertPair(nn.Module):
     """One gated MoE expert: ``down(act(gate) * up)`` with gate/up FUSED.
@@ -663,6 +686,10 @@ class _GatedExpertPair(nn.Module):
     The checkpoint still stores the halves separately (``experts.{e}.gate_proj.*``), since
     the quantizer split the artifacts after quantizing them jointly, so a load pre-hook
     stitches them back together.
+
+    ``leaves`` is the checkpoint's (gate, up, down) spelling (`_detect_gated_leaves`). The
+    landing pads and the down projection are registered under it so the loader finds them;
+    :meth:`fuse_gate_up` leaves ``gate_up_proj`` and ``down_proj`` whatever the spelling.
     """
 
     #: Artifacts split ROW-wise by the quantizer (``_is_row_art``) — re-concatenated here.
@@ -671,8 +698,10 @@ class _GatedExpertPair(nn.Module):
 
     def __init__(self, hidden_dim: int, intermediate_dim: int,
                  block_diagonal: bool = True, codebook_type: str = "e8_shell",
-                 packed: dict | None = None):
+                 packed: dict | None = None,
+                 leaves: tuple[str, str, str] = _DEFAULT_GATED_LEAVES):
         super().__init__()
+        g_leaf, u_leaf, d_leaf = self._leaves = tuple(leaves)
         # Placement hints off the checkpoint header. Only the FUSED projection is sized:
         # the gate_proj/up_proj landing pads are transient (fuse_gate_up drops them after
         # load), so sizing all three would make accelerate count this expert twice.
@@ -686,23 +715,34 @@ class _GatedExpertPair(nn.Module):
                                         block_diagonal=block_diagonal,
                                         codebook_type=codebook_type,
                                         packed_shape=_gu)
-        self.down_proj = E8RHTLinear(intermediate_dim, hidden_dim, bias=False,
-                                     block_diagonal=block_diagonal,
-                                     codebook_type=codebook_type,
-                                     packed_shape=_dn)
+        # The real down projection, under the checkpoint's name so its tensors land on it.
+        setattr(self, d_leaf, E8RHTLinear(intermediate_dim, hidden_dim, bias=False,
+                                          block_diagonal=block_diagonal,
+                                          codebook_type=codebook_type,
+                                          packed_shape=_dn))
         # Landing pads for the checkpoint's separate halves. transformers 5.x loads through
         # `convert_and_load_state_dict_in_model`, which assigns by key and never calls
         # `_load_from_state_dict` or its pre-hooks -- which is why the NemotronH path uses a
         # class-level `_checkpoint_conversion_mapping` rather than a hook. A regex cannot
         # merge two keys into one, so the halves land here and `fuse_gate_up()` stitches
         # them afterwards, from `_process_model_after_weight_loading`.
-        self.gate_proj = E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
-                                     block_diagonal=block_diagonal,
-                                     codebook_type=codebook_type)
-        self.up_proj = E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
-                                   block_diagonal=block_diagonal,
-                                   codebook_type=codebook_type)
+        setattr(self, g_leaf, E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
+                                          block_diagonal=block_diagonal,
+                                          codebook_type=codebook_type))
+        setattr(self, u_leaf, E8RHTLinear(hidden_dim, intermediate_dim, bias=False,
+                                          block_diagonal=block_diagonal,
+                                          codebook_type=codebook_type))
         self._fused = False
+
+    def _pads(self):
+        """``(gate, up)`` landing pads under the checkpoint's names; None once fused."""
+        g_leaf, u_leaf, _ = self._leaves
+        return self._modules.get(g_leaf), self._modules.get(u_leaf)
+
+    def _down(self):
+        """The down projection: under the checkpoint's name until fused, ``down_proj`` after."""
+        d = self._modules.get("down_proj")
+        return d if d is not None else self._modules.get(self._leaves[2])
 
     def fuse_gate_up(self, skip: tuple[str, ...] = ()) -> bool:
         """Concatenate the loaded gate/up halves into the fused projection, then drop them.
@@ -720,7 +760,7 @@ class _GatedExpertPair(nn.Module):
         """
         if self._fused:
             return False
-        g, u, f = self.gate_proj, self.up_proj, self.gate_up_proj
+        (g, u), f = self._pads(), self.gate_up_proj
         if g is None or getattr(g, "trellis_packed", None) is None:
             return False
         for name, gv in list(g.named_buffers(recurse=False)):
@@ -743,8 +783,13 @@ class _GatedExpertPair(nn.Module):
         # whole point of fusing (blocks_m for 2I != two blocks_m for I).
         if hasattr(f, "_refresh_block_meta"):
             f._refresh_block_meta()
-        self.gate_proj = None
-        self.up_proj = None
+        g_leaf, u_leaf, d_leaf = self._leaves
+        setattr(self, g_leaf, None)
+        setattr(self, u_leaf, None)
+        if d_leaf != "down_proj":
+            # Everything downstream (the forward, the stacked CPU build, the arena) reads
+            # `down_proj`; the checkpoint-named module is that projection, so rename it.
+            self.down_proj = self._modules.pop(d_leaf)
         self._fused = True
         return True
 
@@ -789,7 +834,8 @@ class GLQStackedGatedExperts(nn.Module):
     def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int,
                  act_fn, block_diagonal: bool = True,
                  codebook_type: str = "e8_shell", packed: dict | None = None,
-                 swiglu_limit: float | None = None):
+                 swiglu_limit: float | None = None,
+                 leaves: tuple[str, str, str] | None = None):
         super().__init__()
         self.num_experts = int(num_experts)
         self.hidden_dim = int(hidden_dim)
@@ -803,7 +849,8 @@ class GLQStackedGatedExperts(nn.Module):
             self._modules[str(i)] = _GatedExpertPair(
                 self.hidden_dim, self.intermediate_dim,
                 block_diagonal=block_diagonal, codebook_type=codebook_type,
-                packed=(packed or {}).get(i))
+                packed=(packed or {}).get(i),
+                leaves=tuple(leaves or _DEFAULT_GATED_LEAVES))
 
     def __getitem__(self, idx: int) -> _GatedExpertPair:
         return self._modules[str(idx)]  # type: ignore[return-value]
@@ -1012,21 +1059,22 @@ class GLQStackedGatedExperts(nn.Module):
         if self.num_experts == 0:
             return "no experts"
         e0 = self[0]
-        if e0.gate_proj is None or getattr(e0.gate_proj, "trellis_packed", None) is None:
+        g0, _ = e0._pads()
+        if g0 is None or getattr(g0, "trellis_packed", None) is None:
             return "gate/up already fused or not loaded; use fuse_gate_up + _build_stacked_cpu"
-        if e0.gate_proj.trellis_packed.numel() == 0:
+        if g0.trellis_packed.numel() == 0:
             return "expert weights are not loaded yet"
 
         E = self.num_experts
-        gref = e0.gate_proj.trellis_packed
-        dref = e0.down_proj.trellis_packed
+        gref = g0.trellis_packed
+        dref = e0._down().trellis_packed
         half = gref.shape[0]
 
         w13 = torch.empty((E, 2 * half, gref.shape[1]), dtype=gref.dtype)
         w2 = torch.empty((E, *dref.shape), dtype=dref.dtype)
         for e in range(E):
             pair = self[e]
-            g, u, d = pair.gate_proj, pair.up_proj, pair.down_proj
+            (g, u), d = pair._pads(), pair._down()
             w13[e][:half].copy_(g.trellis_packed)        # gate: rows 0:I
             w13[e][half:].copy_(u.trellis_packed)        # up:   rows I:2I
             w2[e].copy_(d.trellis_packed)
@@ -1154,19 +1202,22 @@ def _is_stacked_gated_experts(mod: nn.Module) -> bool:
     return isinstance(gup, nn.Parameter) and gup.dim() == 3
 
 
-def _fused_packed_shapes(prefix: str, n_exp: int, shapes: dict | None):
+def _fused_packed_shapes(prefix: str, n_exp: int, shapes: dict | None,
+                         leaves: tuple[str, str, str] = _DEFAULT_GATED_LEAVES):
     """``{expert_idx: {"gate_up_proj": shape, "down_proj": shape}}`` from checkpoint shapes.
 
     The checkpoint stores gate and up separately because the quantizer split them, so the
-    fused buffer's size is the two halves stacked: same columns, twice the rows.
+    fused buffer's size is the two halves stacked: same columns, twice the rows. ``leaves``
+    is the checkpoint's (gate, up, down) spelling; the result is keyed by role either way.
     """
     if not shapes:
         return {}
+    g_leaf, _, d_leaf = leaves
     out = {}
     for e in range(n_exp):
         base = f"{prefix}.{e}." if prefix else f"{e}."
-        g = (shapes.get(base + "gate_proj") or {}).get("trellis_packed")
-        d = (shapes.get(base + "down_proj") or {}).get("trellis_packed")
+        g = (shapes.get(base + g_leaf) or {}).get("trellis_packed")
+        d = (shapes.get(base + d_leaf) or {}).get("trellis_packed")
         ent = {}
         if g and len(g) == 2:
             ent["gate_up_proj"] = (g[0] * 2, g[1])
@@ -1197,12 +1248,14 @@ def _replace_stacked_gated_experts(model: nn.Module, block_diagonal: bool = True
         # Build on meta: a 512-expert, 48-layer model is 73,728 E8RHTLinears, and HF
         # materializes them from the checkpoint immediately afterwards. Matches what
         # replace_with_glq_embedding already does.
-        packed = _fused_packed_shapes(name, n_exp, shapes)
+        leaves = _detect_gated_leaves(name, shapes)
+        packed = _fused_packed_shapes(name, n_exp, shapes, leaves=leaves)
         with torch.device("meta"):
             new_mod = GLQStackedGatedExperts(
                 n_exp, hidden, two_inter // 2, act_fn,
                 block_diagonal=block_diagonal, codebook_type=codebook_type,
-                packed=packed, swiglu_limit=getattr(mod, "swiglu_limit", None))
+                packed=packed, swiglu_limit=getattr(mod, "swiglu_limit", None),
+                leaves=leaves)
         new_mod.requires_grad_(False)
         model.set_submodule(name, new_mod)
     return len(targets)

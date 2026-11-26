@@ -151,6 +151,38 @@
    "hermes"
   ]
  },
+ "id:LiquidAI/LFM2-8B-A1B": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "pi_adapter": null,
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "min_p": 0.15,
+   "repetition_penalty": 1.05,
+   "temperature": 0.3,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"min_p\":0.15,\"repetition_penalty\":1.05,\"temperature\":0.3}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "lfm2"
+  ]
+ },
  "id:NousResearch/Arete-27B": {
   "dspark_drafter": null,
   "kv_cost": [
@@ -870,6 +902,38 @@
    "kolibri1"
   ]
  },
+ "id:xv0y5ncu/LFM2-8B-A1B-GLQ-trellis-3inst-4bpw": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "pi_adapter": null,
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "min_p": 0.15,
+   "repetition_penalty": 1.05,
+   "temperature": 0.3,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": [
+   "--override-generation-config",
+   "{\"min_p\":0.15,\"repetition_penalty\":1.05,\"temperature\":0.3}"
+  ],
+  "text_only_serve_args": [],
+  "tool_serve_args": [
+   "--enable-auto-tool-choice",
+   "--tool-call-parser",
+   "lfm2"
+  ]
+ },
  "id:xv0y5ncu/Ministral-3-3B-GLQ-trellis-3inst-4bpw": {
   "dspark_drafter": null,
   "kv_cost": [
@@ -1365,6 +1429,29 @@
   "preferred_dtype": {
    "cpu": "bfloat16",
    "cuda": "bfloat16",
+   "rocm": "bfloat16"
+  },
+  "reasoning_serve_args": [],
+  "recommended_sampling": {
+   "temperature": 1.0,
+   "top_k": 0,
+   "top_p": 1.0
+  },
+  "required_plugin": null,
+  "sampling_serve_args": null,
+  "text_only_serve_args": [],
+  "tool_serve_args": null
+ },
+ "local:liquid-box-copy": {
+  "dspark_drafter": null,
+  "kv_cost": [
+   0,
+   28201
+  ],
+  "pi_adapter": null,
+  "preferred_dtype": {
+   "cpu": "bfloat16",
+   "cuda": "float16",
    "rocm": "bfloat16"
   },
   "reasoning_serve_args": [],

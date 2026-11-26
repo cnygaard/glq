@@ -43,24 +43,51 @@ _PREFIX_PAIRS = (
     ("language_model.backbone.", "language_model.model."),
 )
 
+#: ``(checkpoint spelling, module spelling)`` pairs for one dotted SEGMENT anywhere in the
+#: name, translated in both directions like the prefixes. LFM2's checkpoint and transformers
+#: call the short-conv block ``conv``; vLLM renames it ``short_conv`` (`lfm2_moe.py`'s
+#: `hf_to_vllm_mapper`, so LoRA's regex does not also match the inner ``conv.conv``), while
+#: ``layer_bpw`` keeps ``conv``. The dots make it a whole segment: ``conv1d`` and
+#: ``patch_conv`` are untouched.
+_SEGMENT_PAIRS = (
+    (".conv.", ".short_conv."),
+)
 
-def backbone_aliases(name: str) -> set[str]:
-    """Alternative spellings of ``name``, excluding ``name`` itself.
 
-    Returning a set *without* the input is what lets a caller write
-    ``for cand in (name, *backbone_aliases(name))`` with no de-duplication, and leaves a
-    non-NemotronH model paying for no extra lookups.
-
-    The nested ``language_model.`` forms are checked first and win: a plain ``model.`` rule
-    would otherwise rewrite ``language_model.model.…`` only at its tail, producing a spelling
-    no checkpoint and no module tree ever uses.
-    """
+def _prefix_alias(name: str) -> set[str]:
     for ckpt, module in reversed(_PREFIX_PAIRS):      # longest (nested) prefix first
         if name.startswith(ckpt):
             return {module + name[len(ckpt):]}
         if name.startswith(module):
             return {ckpt + name[len(module):]}
     return set()
+
+
+def _segment_alias(name: str) -> set[str]:
+    out = set()
+    for ckpt, module in _SEGMENT_PAIRS:
+        if module in name:
+            out.add(name.replace(module, ckpt, 1))
+        elif ckpt in name:
+            out.add(name.replace(ckpt, module, 1))
+    return out
+
+
+def backbone_aliases(name: str) -> set[str]:
+    """Alternative spellings of ``name``, excluding ``name`` itself.
+
+    Returning a set *without* the input is what lets a caller write
+    ``for cand in (name, *backbone_aliases(name))`` with no de-duplication, and leaves a
+    model whose names match neither table paying for no extra lookups.
+
+    The nested ``language_model.`` forms are checked first and win: a plain ``model.`` rule
+    would otherwise rewrite ``language_model.model.…`` only at its tail, producing a spelling
+    no checkpoint and no module tree ever uses.
+
+    Prefix and segment aliases are independent, each applied to ``name`` alone: no model
+    needs both at once, and an alias that matches nothing costs a lookup, not a result.
+    """
+    return (_prefix_alias(name) | _segment_alias(name)) - {name}
 
 
 def with_aliases(name: str) -> tuple[str, ...]:

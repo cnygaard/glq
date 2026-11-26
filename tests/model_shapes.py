@@ -153,3 +153,17 @@ def load(slug: str) -> ModelShapes:
             f"Record one with: python tests/models/record.py --repo <id> --out {path}")
     with open(path) as f:
         return ModelShapes(json.load(f))
+
+
+def load_or_skip(slug: str) -> ModelShapes:
+    """`load`, or a pytest skip when the manifest is not in the tree.
+
+    For manifests kept out of git because of their base model's licence (see
+    `tests/models/README.md`): the tests built on them run where the manifest has been
+    recorded locally and skip elsewhere, naming the command that records it.
+    """
+    if slug not in available():
+        import pytest
+        pytest.skip(f"tests/models/{slug}.json is not in the tree (kept out of git for its "
+                    f"licence); record it with tests/models/record.py to run this test")
+    return load(slug)
