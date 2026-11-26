@@ -48,6 +48,21 @@ Nemotron-3.5-Super-VL is a second example of the same hazard: its card declares
 licence, **not** the NVIDIA Open Model License an earlier Nemotron draft card in this repo
 used. Take the name and the link from the model's own `cardData`, never from a sibling model.
 
+### Kept out of git
+
+`lfm2_8b_a1b.json` (`LiquidAI/LFM2-8B-A1B`, [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2-8B-A1B/blob/main/LICENSE))
+is recorded locally and not committed. That licence limits commercial use to organisations
+under a revenue threshold, and this repo is GPL-3.0, so the manifest stays out of the tree
+(`.gitignore` lists it). The tests built on it use `load_or_skip`: they skip, naming the
+command, until it is recorded:
+
+```bash
+python tests/models/record.py --repo LiquidAI/LFM2-8B-A1B --base-model LiquidAI/LFM2-8B-A1B \
+    --license "LFM Open License v1.0" \
+    --license-url https://huggingface.co/LiquidAI/LFM2-8B-A1B/blob/main/LICENSE \
+    --out tests/models/lfm2_8b_a1b.json
+```
+
 ## Recording another model
 
 ```bash

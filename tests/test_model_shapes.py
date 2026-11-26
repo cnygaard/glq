@@ -20,7 +20,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from model_shapes import ModelShapes, available, collapse, load  # noqa: E402
+from model_shapes import ModelShapes, available, collapse, load, load_or_skip  # noqa: E402
 
 RECORDED = available()
 
@@ -239,3 +239,15 @@ def test_values_beats_ranges_when_both_are_present():
                                "ranges": [[1, 87]], "values": [[1, 87]]}},
     })
     assert sorted(m.keys()) == ["a.1.w", "a.87.w"]
+
+
+def test_load_or_skip_skips_a_manifest_that_is_not_in_the_tree():
+    """Some manifests are kept out of git (their base model's licence; see
+    tests/models/README.md). A test built on one skips, naming how to record it, rather
+    than erroring on every machine that does not have it."""
+    with pytest.raises(pytest.skip.Exception, match="record.py"):
+        load_or_skip("no_such_manifest_recorded")
+
+
+def test_load_or_skip_loads_a_manifest_that_is_present():
+    assert load_or_skip("gemma_4_26b_a4b_it").n_keys == load("gemma_4_26b_a4b_it").n_keys

@@ -53,3 +53,7 @@ compass_artifact_*
 # (a bare `docs/` would hide them from git entirely — and from `git clean -xfd`).
 docs/*
 !docs/trellis-3inst.md
+
+# Shape manifests of models whose licence keeps them out of this GPL-3.0 repo
+# (tests/models/README.md, "Kept out of git"). Recorded locally; their tests skip without them.
+tests/models/lfm2_8b_a1b*.json

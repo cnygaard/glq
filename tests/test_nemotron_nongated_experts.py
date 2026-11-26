@@ -354,13 +354,16 @@ def test_replay_still_restores_gated_experts_unchanged():
     layer = _gated_container(n_exp=4, inter=8, hidden=6)
     emod = layer.mixer.experts
     arts = {}
+    # Row-shaped stubs (SU is a row artifact): gate and up are decoded joined, as one
+    # [2I, H] matrix, so each half's rows must still land in its own half.
     for e in range(4):
-        arts[f"L0.mixer.experts.{e}.gate_proj"] = _FakeArts(v=1.0)
-        arts[f"L0.mixer.experts.{e}.up_proj"] = _FakeArts(v=2.0)
-        arts[f"L0.mixer.experts.{e}.down_proj"] = _FakeArts(v=3.0)
+        arts[f"L0.mixer.experts.{e}.gate_proj"] = _FakeArts(SU=torch.full((8,), 1.0))
+        arts[f"L0.mixer.experts.{e}.up_proj"] = _FakeArts(SU=torch.full((8,), 2.0))
+        arts[f"L0.mixer.experts.{e}.down_proj"] = _FakeArts(SU=torch.full((6,), 3.0))
 
     def fake_dequant(a, in_f, out_f, codebook_type, codebook=None):
-        return torch.full((out_f, in_f), a["v"])
+        assert a["SU"].numel() == out_f, (a["SU"].numel(), out_f)
+        return a["SU"][:, None].expand(out_f, in_f).clone()
 
     n = qm._restore_replayed_weights(layer, arts, "L0", "trellis", None,
                                      dequantize_fn=fake_dequant)

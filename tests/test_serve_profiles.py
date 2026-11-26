@@ -71,6 +71,9 @@ IDS = [
     "mistralai/Devstral-Small-2-24B-Instruct-2512",
     "xv0y5ncu/Ministral-3-3B-GLQ-trellis-3inst-4bpw",
     "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    # LFM2 (LiquidAI)
+    "xv0y5ncu/LFM2-8B-A1B-GLQ-trellis-3inst-4bpw",
+    "LiquidAI/LFM2-8B-A1B",
     # unknown
     "someorg/BrandNewArch-9B-GLQ-4bpw",
     "",
@@ -86,6 +89,7 @@ LOCAL = {
                        "architectures": ["Glm5NextForConditionalGeneration"]},
     "q27-copy": {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"]},
     "g4-local": {"model_type": "gemma4", "architectures": ["Gemma4ForConditionalGeneration"]},
+    "liquid-box-copy": {"model_type": "lfm2_moe", "architectures": ["Lfm2MoeForCausalLM"]},
     "my-nemotron-build": None,
     "plain-build": None,
     "broken-config": "{not json",
@@ -621,6 +625,25 @@ def test_glq_chat_serves_the_reasoning_parser_and_the_text_only_load(case, tmp_p
     from glq import tooling as T
     m = _model_for(case, tmp_path)
     assert T.role_serve_args(m, "chat") == T.reasoning_serve_args(m) + T.text_only_serve_args(m)
+
+
+LFM2 = ["xv0y5ncu/LFM2-8B-A1B-GLQ-trellis-3inst-4bpw", "LiquidAI/LFM2-8B-A1B"]
+
+
+@pytest.mark.parametrize("model", LFM2)
+def test_lfm2_serves_with_vllms_lfm2_tool_parser_and_its_cards_sampling(model, tmp_path):
+    """LiquidAI's card asks for temperature 0.3, min_p 0.15 and repetition_penalty 1.05, and
+    LFM2-8B-A1B's generation_config.json carries token ids only. Neither glq-chat's sliders
+    nor pi send min_p or repetition_penalty, so the server override is the only place they
+    can be set. vLLM 0.33 registers the `lfm2` tool parser (checked on the box)."""
+    from glq import tooling as T
+    assert T.tool_serve_args(model, templates_dir=tmp_path) == [
+        "--enable-auto-tool-choice", "--tool-call-parser", "lfm2"]
+    assert T.sampling_serve_args(model) == [
+        "--override-generation-config",
+        '{"min_p":0.15,"repetition_penalty":1.05,"temperature":0.3}']
+    assert T.recommended_sampling(model)["temperature"] == 0.3
+    assert T.reasoning_serve_args(model) == []
 
 
 def test_an_unknown_role_is_refused():

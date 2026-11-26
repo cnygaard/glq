@@ -577,6 +577,17 @@ _GLM5 = ModelProfile(
     compilation_config={"cudagraph_mode": "FULL"},
 )
 
+_LFM2 = ModelProfile(
+    family="lfm2", match=("lfm2",),
+    # vLLM's own `lfm2` tool parser (`vllm/tool_parsers/lfm2_tool_parser.py`, registered in
+    # 0.33.0 — checked on the box). No reasoning parser: LFM2-8B-A1B's template does not think.
+    tool_parser="lfm2",
+    # LiquidAI/LFM2-8B-A1B's card. Its generation_config.json carries token ids only, and
+    # neither glq-chat's sliders nor pi send min_p or repetition_penalty, so this override
+    # is the only place those two are set. No top_k: the card names none.
+    sampling={"temperature": 0.3, "min_p": 0.15, "repetition_penalty": 1.05},
+)
+
 _MISTRAL = ModelProfile(
     family="mistral", match=("ministral", "mistral", "devstral"),
     # Activation outliers exceed fp16's 65504 range -> hard NaN. The observed case; see
@@ -600,6 +611,7 @@ PROFILES = (
     _NEMOTRON_35,
     _NEMOTRON,
     _GLM5,
+    _LFM2,
     _MISTRAL,
 )
 
