@@ -1577,7 +1577,7 @@ def _require_supported_expert_layout(layers, arch, profile=None):
 
 
 def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
-                              dequantize_fn=None):
+                              dequantize_fn=None, joint_expert_gate_up=False):
     """Put the dequantized weights back into a replayed layer. ``-> n_restored``.
 
     Not optional and not bookkeeping: layer N's Hessians come from activations that passed
@@ -1592,13 +1592,41 @@ def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
       Flash-Next, gemma-4 26B-A4B and Qwen4Exp these are the overwhelming majority of a
       layer's weights, so missing them is not a rounding detail. It is also invisible from a
       dense model, which is why `tests/test_resume_replay_experts.py` builds a stacked layer.
+
+    A gate/up pair the quantizer quantized as one matrix is decoded as one matrix
+    (`_join_gate_up_arts`): always for stacked experts, and for per-expert ``nn.Linear``
+    experts when the profile set ``fuse_expert_gate_up`` (``joint_expert_gate_up``).
     """
     if dequantize_fn is None:
         from .resume import dequantize_artifacts as dequantize_fn   # noqa: PLC0415
 
     n_restored = 0
-    for name, mod in layer.named_modules():
-        if not isinstance(mod, nn.Linear):
+    linears = {name: mod for name, mod in layer.named_modules()
+               if isinstance(mod, nn.Linear)}
+    joint_done = set()
+    if joint_expert_gate_up:
+        # The same pairing the quantizer fused (`gate_up_fusion`): routed experts only.
+        for name, gmod in linears.items():
+            if (not name.endswith('.gate_proj') or '.experts.' not in name
+                    or 'shared' in name):
+                continue
+            up_name = name[:-len('.gate_proj')] + '.up_proj'
+            umod = linears.get(up_name)
+            g = arts_map.get(f"{prefix}.{name}")
+            u = arts_map.get(f"{prefix}.{up_name}")
+            if umod is None or g is None or u is None:
+                continue
+            W_hat = dequantize_fn(_join_gate_up_arts(g, u), gmod.in_features,
+                                  gmod.out_features + umod.out_features, codebook_type,
+                                  codebook=codebook)
+            for mod, rows in ((gmod, W_hat[:gmod.out_features]),
+                              (umod, W_hat[gmod.out_features:])):
+                mod.weight.data = rows.to(mod.weight.dtype).to(mod.weight.device)
+            joint_done |= {name, up_name}
+            n_restored += 2
+
+    for name, mod in linears.items():
+        if name in joint_done:
             continue
         arts = arts_map.get(f"{prefix}.{name}")
         if arts is None:
@@ -1613,16 +1641,16 @@ def _restore_replayed_weights(layer, arts_map, prefix, codebook_type, codebook,
         n_exp, two_inter, hdim = gup.shape
         inter = two_inter // 2
         for e in range(n_exp):
-            # gate+up were quantized jointly and stored split; recombine by ROW in that
-            # order, which is the layout both the forward and the save-side split assume.
+            # gate+up were quantized jointly and stored split: join the artifacts back
+            # (gate rows first, the layout the forward and the save-side split share) and
+            # decode the [2I, H] matrix that was actually quantized.
             g = arts_map.get(f"{prefix}.{mn}.{e}.gate_proj")
             u = arts_map.get(f"{prefix}.{mn}.{e}.up_proj")
             if g is not None and u is not None:
-                gw = dequantize_fn(g, hdim, inter, codebook_type, codebook=codebook)
-                uw = dequantize_fn(u, hdim, inter, codebook_type, codebook=codebook)
+                W_hat = dequantize_fn(_join_gate_up_arts(g, u), hdim, two_inter,
+                                      codebook_type, codebook=codebook)
                 with torch.no_grad():
-                    gup.data[e] = torch.cat([gw, uw], dim=0).to(
-                        dtype=gup.dtype, device=gup.device)
+                    gup.data[e] = W_hat.to(dtype=gup.dtype, device=gup.device)
                 n_restored += 1
             d = arts_map.get(f"{prefix}.{mn}.{e}.down_proj")
             if d is not None:
@@ -2312,6 +2340,30 @@ def _split_gate_up_arts(arts, gate_rows, up_rows):
                 f"gate_up split: unhandled artifact key {k!r}; classify it "
                 f"in _is_row_art / _is_shared_art")
     return gate_arts, up_arts
+
+
+def _join_gate_up_arts(gate_arts, up_arts):
+    """The inverse of :func:`_split_gate_up_arts`: one [gate; up] artifact set again.
+
+    Row artifacts concatenate gate first (every split is a cut on axis 0, so ``cat`` restores
+    the bytes); shared ones are the copy the splitter gave both halves, so gate's is taken.
+
+    Decoding needs this. The pair was quantized as ONE [2I, H] matrix, and the decode applies
+    a row Hadamard over blocks of the full 2I rows, so a half decoded on its own inverts a
+    different transform: measured on random trellis weights, a max error of 0.33-0.38 against
+    a weight std of 0.05, where the joined decode reproduces the quantizer's W_hat exactly.
+    """
+    out = {}
+    for k, gv in gate_arts.items():
+        if _is_shared_art(k):
+            out[k] = gv
+        elif k.startswith('trellis_packed') or _is_row_art(k):
+            out[k] = torch.cat([gv, up_arts[k]], dim=0)
+        else:
+            raise ValueError(
+                f"gate_up join: unhandled artifact key {k!r}; classify it "
+                f"in _is_row_art / _is_shared_art")
+    return out
 
 
 def codebook_bpw(codebook):
@@ -4156,7 +4208,8 @@ def quantize(
             all_proxy_losses.update(losses_map)
             n_restored = _restore_replayed_weights(
                 layer, arts_map, f"{sd_prefix}.{layer_idx}", codebook_type, codebook,
-                dequantize_fn=dequantize_artifacts)
+                dequantize_fn=dequantize_artifacts,
+                joint_expert_gate_up=bool(profile.get('fuse_expert_gate_up')))
             hidden_states = _forward_calibration(layer, hidden_states, layer_idx)
             print(f"  replayed from checkpoint ({n_restored} matrices restored) "
                   f"{time.perf_counter() - t_layer:.1f}s")
