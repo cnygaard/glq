@@ -3565,6 +3565,96 @@ def _report_expert_routing(token_counts, expert_modules, emit=None):
                  f"that matches this model's languages")
 
 
+def _copy_generation_config(model_name: str, output_dir: str) -> bool:
+    """Copy the source model's generation_config.json into the output, byte for byte.
+
+    The file carries the model's stop tokens and recommended sampling. Without it, vLLM and
+    transformers fall back to config.json's `eos_token_id` and their own sampling defaults.
+    gemma-4 then misses stop id 50 (`<|tool_response>`): in glq-code it wrote its own tool
+    result instead of waiting for the real one. 41 of 47 published GLQ repos shipped without
+    the file until it was backfilled from each base model (2026-11-14).
+
+    Copied unchanged, not re-serialized through GenerationConfig, so it matches the base
+    model's file. Some models have none, so its absence is a note, not an error. This runs
+    after the weights are saved, so a failed download warns instead of raising: the run's
+    output is already complete and only this file needs adding by hand.
+    """
+    import shutil
+    dst = os.path.join(output_dir, "generation_config.json")
+    if os.path.isdir(model_name):
+        src = os.path.join(model_name, "generation_config.json")
+        if not os.path.isfile(src):
+            print(f"  no generation_config.json in {model_name}; none written")
+            return False
+    else:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError
+        try:
+            src = hf_hub_download(model_name, "generation_config.json")
+        except EntryNotFoundError:
+            print(f"  {model_name} has no generation_config.json; none written")
+            return False
+        except Exception as e:  # noqa: BLE001 - the weights are saved; do not lose the run
+            print(f"  WARNING: could not fetch generation_config.json from {model_name} "
+                  f"({type(e).__name__}: {e}). Without it the checkpoint uses vLLM's default "
+                  f"stop tokens and sampling; copy the file from {model_name} before uploading.")
+            return False
+    shutil.copyfile(src, dst)
+    print(f"  copied generation_config.json from {model_name}")
+    return True
+
+
+#: Top-level files a licence may require every derivative to carry. Matched
+#: case-sensitively, the way the Hub stores them.
+_LICENSE_FILE_PATTERNS = ("LICENSE*", "LICENCE*", "NOTICE*")
+
+
+def _copy_license_files(model_name: str, output_dir: str) -> list[str]:
+    """Copy the source repo's licence files into the output, byte for byte. ``-> names``.
+
+    Some licences require it: the LFM Open License v1.0 (LiquidAI/LFM2-*) asks that a copy
+    travel with any redistributed derivative, and its card's ``license_link: LICENSE`` is a
+    relative link that resolves only when the file sits in the same repo. The model card
+    inherits the base's licence fields, so without the file a published card links nowhere.
+
+    Top level only (a ``docs/LICENSE`` belongs to something else), copied unchanged. Same
+    failure policy as :func:`_copy_generation_config`: absence is a note, and a failed
+    listing or download warns rather than raising, because the weights are already saved.
+    """
+    import fnmatch
+    import shutil
+
+    def _wanted(names):
+        return sorted(n for n in names
+                      if "/" not in n
+                      and any(fnmatch.fnmatchcase(n, p) for p in _LICENSE_FILE_PATTERNS))
+
+    copied = []
+    try:
+        if os.path.isdir(model_name):
+            for name in _wanted(os.listdir(model_name)):
+                src = os.path.join(model_name, name)
+                if os.path.isfile(src):
+                    shutil.copyfile(src, os.path.join(output_dir, name))
+                    copied.append(name)
+        else:
+            from huggingface_hub import HfApi, hf_hub_download
+            for name in _wanted(HfApi().list_repo_files(model_name)):
+                shutil.copyfile(hf_hub_download(model_name, name),
+                                os.path.join(output_dir, name))
+                copied.append(name)
+    except Exception as e:  # noqa: BLE001 - the weights are saved; do not lose the run
+        print(f"  WARNING: could not copy the licence files from {model_name} "
+              f"({type(e).__name__}: {e}). If its licence requires a copy with every "
+              f"derivative, add it from {model_name} before uploading.")
+        return copied
+    if copied:
+        print(f"  copied {', '.join(copied)} from {model_name}")
+    else:
+        print(f"  no LICENSE/NOTICE file in {model_name}; none written")
+    return copied
+
+
 def quantize(
     model_name: str,
     output_dir: str,
@@ -5271,6 +5361,11 @@ def quantize(
             tc.pop("tokenizer_class")
             with open(tc_path, "w") as f:
                 json.dump(tc, f, indent=2)
+
+    # 5c. The base model's stop tokens and sampling, and any licence text its licence
+    # requires derivatives to carry, all unchanged (see the helpers for why).
+    _copy_generation_config(model_name, output_dir)
+    _copy_license_files(model_name, output_dir)
 
     print(f"Done! Saved to {output_dir}")
     print(f"  model.safetensors: {os.path.getsize(os.path.join(output_dir, 'model.safetensors')) / 1e6:.1f} MB")

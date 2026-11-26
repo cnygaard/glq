@@ -115,3 +115,11 @@ class TestSmolLM2Quantize:
         output_dir, _ = quantize_output
         tok_config = os.path.join(output_dir, "tokenizer_config.json")
         assert os.path.exists(tok_config)
+
+    def test_output_generation_config_is_the_source_file(self, quantize_output):
+        """quantize() copies the base model's generation_config.json unchanged."""
+        from huggingface_hub import hf_hub_download
+        output_dir, _ = quantize_output
+        src = hf_hub_download("HuggingFaceTB/SmolLM2-135M", "generation_config.json")
+        with open(src, "rb") as a, open(os.path.join(output_dir, "generation_config.json"), "rb") as b:
+            assert b.read() == a.read()

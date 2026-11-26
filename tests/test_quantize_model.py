@@ -758,3 +758,120 @@ class TestTrellisMixedBpwGuard:
                      bpw=bpw, codebook_type="trellis")
         assert "trellis codebook supports" not in str(exc.value)
         assert "uniform integer bpw" not in str(exc.value)
+
+
+class TestCopyGenerationConfig:
+    """The output carries the source model's generation_config.json, byte for byte.
+
+    That file holds the model's stop tokens and recommended sampling. Without it vLLM and
+    transformers fall back to config.json's eos_token_id and their own defaults: gemma-4 then
+    misses stop id 50 (`<|tool_response>`), and in glq-code it wrote its own tool result instead
+    of waiting for the real one. 41 of 47 published GLQ repos had shipped without it.
+    """
+
+    # Deliberately unusual formatting: a copy that went through GenerationConfig or json.dump
+    # would come out different, and the base model's file is what has to arrive unchanged.
+    RAW = b'{"bos_token_id": 2,\n   "eos_token_id": [1, 106, 50], "top_k": 64,\n"temperature": 1.0}\n'
+
+    def test_local_source_copied_byte_for_byte(self, tmp_path):
+        from glq.quantize_model import _copy_generation_config
+        src, out = tmp_path / "src", tmp_path / "out"
+        src.mkdir(); out.mkdir()
+        (src / "generation_config.json").write_bytes(self.RAW)
+        assert _copy_generation_config(str(src), str(out)) is True
+        assert (out / "generation_config.json").read_bytes() == self.RAW
+
+    def test_local_source_without_one_writes_nothing(self, tmp_path, capsys):
+        from glq.quantize_model import _copy_generation_config
+        src, out = tmp_path / "src", tmp_path / "out"
+        src.mkdir(); out.mkdir()
+        assert _copy_generation_config(str(src), str(out)) is False
+        assert not (out / "generation_config.json").exists()
+        assert "generation_config.json" in capsys.readouterr().out
+
+    def test_hub_source_copied_byte_for_byte(self, tmp_path):
+        from glq.quantize_model import _copy_generation_config
+        cached = tmp_path / "hub_cache_generation_config.json"
+        cached.write_bytes(self.RAW)
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch("huggingface_hub.hf_hub_download", return_value=str(cached)) as dl:
+            assert _copy_generation_config("org/base-model", str(out)) is True
+        assert dl.call_args.args[:2] == ("org/base-model", "generation_config.json")
+        assert (out / "generation_config.json").read_bytes() == self.RAW
+
+    def test_hub_source_without_one_is_not_an_error(self, tmp_path, capsys):
+        from huggingface_hub.utils import EntryNotFoundError
+        from glq.quantize_model import _copy_generation_config
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch("huggingface_hub.hf_hub_download",
+                   side_effect=EntryNotFoundError("no generation_config.json")):
+            assert _copy_generation_config("org/base-model", str(out)) is False
+        assert not (out / "generation_config.json").exists()
+        assert "generation_config.json" in capsys.readouterr().out
+
+    def test_hub_failure_warns_instead_of_discarding_the_run(self, tmp_path, capsys):
+        """It runs after the weights are saved: a network error must not cost the run."""
+        from glq.quantize_model import _copy_generation_config
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch("huggingface_hub.hf_hub_download", side_effect=OSError("offline")):
+            assert _copy_generation_config("org/base-model", str(out)) is False
+        printed = capsys.readouterr().out
+        assert "WARNING" in printed and "org/base-model" in printed
+
+
+class TestCopyLicenseFiles:
+    """The output carries the source repo's licence files, byte for byte.
+
+    Some licences require it of every derivative: the LFM Open License v1.0 (LiquidAI/LFM2-*)
+    asks that a copy of the licence travel with any redistributed model, and its card's
+    `license_link: LICENSE` is a relative link that only resolves when the file is in the repo.
+    Copied unchanged, never re-rendered. Top-level files only; absence is a note, a failed
+    download a warning, because the weights are already saved by the time this runs.
+    """
+
+    TEXT = b"LFM Open License v1.0\n\n  1. Definitions.\r\n"   # odd bytes on purpose
+
+    def test_local_source_copies_licence_and_notice(self, tmp_path):
+        from glq.quantize_model import _copy_license_files
+        src, out = tmp_path / "src", tmp_path / "out"
+        src.mkdir(); out.mkdir()
+        (src / "LICENSE").write_bytes(self.TEXT)
+        (src / "NOTICE.md").write_bytes(b"notice\n")
+        (src / "README.md").write_bytes(b"not a licence\n")
+        assert _copy_license_files(str(src), str(out)) == ["LICENSE", "NOTICE.md"]
+        assert (out / "LICENSE").read_bytes() == self.TEXT
+        assert (out / "NOTICE.md").read_bytes() == b"notice\n"
+        assert not (out / "README.md").exists()
+
+    def test_local_source_without_one_writes_nothing(self, tmp_path, capsys):
+        from glq.quantize_model import _copy_license_files
+        src, out = tmp_path / "src", tmp_path / "out"
+        src.mkdir(); out.mkdir()
+        assert _copy_license_files(str(src), str(out)) == []
+        assert list(out.iterdir()) == []
+        assert "LICENSE" in capsys.readouterr().out
+
+    def test_hub_source_copies_only_top_level_licence_files(self, tmp_path):
+        from glq.quantize_model import _copy_license_files
+        cached = tmp_path / "cached_LICENSE"
+        cached.write_bytes(self.TEXT)
+        out = tmp_path / "out"
+        out.mkdir()
+        listing = ["LICENSE", "README.md", "config.json", "docs/LICENSE", "model.safetensors"]
+        with patch("huggingface_hub.HfApi.list_repo_files", return_value=listing), \
+             patch("huggingface_hub.hf_hub_download", return_value=str(cached)) as dl:
+            assert _copy_license_files("org/base-model", str(out)) == ["LICENSE"]
+        assert [c.args[:2] for c in dl.call_args_list] == [("org/base-model", "LICENSE")]
+        assert (out / "LICENSE").read_bytes() == self.TEXT
+
+    def test_hub_failure_warns_instead_of_discarding_the_run(self, tmp_path, capsys):
+        from glq.quantize_model import _copy_license_files
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch("huggingface_hub.HfApi.list_repo_files", side_effect=OSError("offline")):
+            assert _copy_license_files("org/base-model", str(out)) == []
+        printed = capsys.readouterr().out
+        assert "WARNING" in printed and "org/base-model" in printed
